@@ -91,6 +91,44 @@ class FilesLineTest(unittest.TestCase):
         self.assertEqual([t.files for t in planparse.parse_plan(plan)], [["a.py"], ["b.py", "c.py"]])
 
 
+def _files(line, head="**Files:**\n"):
+    tasks = planparse.parse_plan(f"### Task 1: A\n{head}{line}\n")
+    return tasks[0].files if tasks else []
+
+
+def _two_tasks(line1, line2):
+    return planparse.parse_plan(f"### Task 1: A\n**Files:**\n{line1}\n"
+                                f"### Task 2: B\n**Files:**\n{line2}\n")
+
+
+class PathExtractionTest(unittest.TestCase):
+    def test_backticks_in_description_are_not_paths(self):
+        tasks = _two_tasks("- Modify: `common.py` (add `run_hook`)",
+                           "- Modify: `judge_tool.py` (call `run_hook`)")
+        self.assertEqual([t.files for t in tasks], [["common.py"], ["judge_tool.py"]])
+        self.assertEqual(planparse.shared_files(tasks), [])
+
+    def test_commas_in_description_are_not_paths(self):
+        tasks = _two_tasks("- Modify: a.py (tests, docs)", "- Modify: b.py (tests, docs)")
+        self.assertEqual([t.files for t in tasks], [["a.py"], ["b.py"]])
+        self.assertEqual(planparse.shared_files(tasks), [])
+
+    def test_leading_backticked_run_only(self):
+        self.assertEqual(_files("- Test: `a.py`, `b.py:3-9`"), ["a.py", "b.py"])
+        self.assertEqual(_files("- Modify: `a.py`, `b.py` (add `run_hook`)"), ["a.py", "b.py"])
+        self.assertEqual(_files("- Modify: add `x` first"), [])
+
+    def test_unquoted_paths(self):
+        self.assertEqual(_files("- Modify: a.py, b.py"), ["a.py", "b.py"])
+        self.assertEqual(_files("- Modify: a.py, b (see notes)"), ["a.py", "b"])
+        self.assertEqual(_files("- Modify: some words here"), [])
+
+    def test_no_files_markers(self):
+        for head in ["Files: empty", "Файлы: нет.", "Файлы: *нет*", "Файлы: нет (только чтение)",
+                     "Files: none — read-only"]:
+            self.assertEqual(_files("", head=head), [], head)
+
+
 class FenceTest(unittest.TestCase):
     def test_fenced_block_is_not_structure(self):
         plan = ("### Задача 1: Настоящая\n**Файлы:**\n- Создать: `a.py`\n\n"

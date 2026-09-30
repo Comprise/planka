@@ -8,8 +8,9 @@ _FILES_HEAD = re.compile(r"^\**\s*(?:Файлы|Files)\s*\**\s*:\s*\**\s*(.*)$",
 _ITEM = re.compile(r"^\s*[-*]\s+(.*)$")
 _PREFIX = re.compile(r"^(?:Create|Modify|Test|Delete|Создать|Изменить|Тест|Удалить)\s*:\s*",
                      re.IGNORECASE)
-_BACKTICK = re.compile(r"`([^`]+)`")
-_NO_FILES = {"", "нет", "none", "—", "-"}
+_NO_FILES = {"", "нет", "none", "empty", "—", "-"}
+_LEADING_SPAN = re.compile(r"[\s,]*`([^`]+)`")
+_TRAILING_PAREN = re.compile(r"\s*\([^()]*\)\s*$")
 _FENCE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
 
 
@@ -21,17 +22,28 @@ class PlanTask:
     files: list
 
 
+def _lines_suffix_stripped(path):
+    return re.sub(r":\d+(?:-\d+)?$", "", path).strip()
+
+
 def _paths(fragment):
-    """Пути из фрагмента строки: все в обратных кавычках, иначе части через запятую; без префикса
-    и «:строки». Часть без кавычек вида «нет»/«none»/«—» путём не считается."""
-    quoted = _BACKTICK.findall(fragment)
-    out = []
-    for raw in quoted or fragment.split(","):
-        raw = _PREFIX.sub("", raw.strip())
-        path = re.sub(r":\d+(?:-\d+)?$", "", raw).strip()
-        if path and (quoted or path.lower() not in _NO_FILES):
-            out.append(path)
-    return out
+    """Пути строки файлов: ведущая серия `…` через пробелы и запятые, а без кавычек — токены
+    без пробелов через запятую; описание и маркер «нет»/«none»/«empty»/«—» путём не считаются."""
+    text = _PREFIX.sub("", fragment.strip())
+    if "`" in text:
+        out, pos = [], 0
+        while m := _LEADING_SPAN.match(text, pos):
+            out.append(_lines_suffix_stripped(m.group(1)))
+            pos = m.end()
+        return [p for p in out if p]
+    text = _TRAILING_PAREN.sub("", text).strip().strip("*_").strip().rstrip(".;").strip()
+    first = text.split()[0].lower().strip(".,;:*_") if text else ""
+    if first in _NO_FILES:
+        return []
+    parts = [p.strip() for p in text.split(",")]
+    if not all(p and not any(c.isspace() for c in p) for p in parts):
+        return []
+    return [_lines_suffix_stripped(p) for p in parts]
 
 
 def parse_plan(text):
