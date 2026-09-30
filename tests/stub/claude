@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Подмена claude для тестов. Поведение задаёт PLANKA_STUB:
+#   ok        — вердикт ok=true
+#   deny      — ok=false, reason из PLANKA_STUB_REASON, violated ["Решения 4"]
+#   hang      — не отвечает 100 с
+#   garbage   — не JSON
+#   notlogged — is_error=true, "Not logged in"
+# При PLANKA_STUB_RECORD=<файл> пишет туда аргументы и stdin.
+if [ -n "${PLANKA_STUB_RECORD:-}" ]; then
+  { printf 'ARGV\n'; printf '%s\n' "$@"; printf 'STDIN\n'; cat; printf 'ENV PLANKA_JUDGE=%s\n' "${PLANKA_JUDGE:-}"; } > "$PLANKA_STUB_RECORD"
+else
+  cat > /dev/null
+fi
+case "${PLANKA_STUB:-ok}" in
+  ok)
+    printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"{\"ok\":true,\"violated\":[],\"reason\":\"\"}","structured_output":{"ok":true,"violated":[],"reason":""},"duration_ms":10}' ;;
+  deny)
+    R="${PLANKA_STUB_REASON:-в списке нет варианта, снимающего причину}"
+    printf '{"type":"result","subtype":"success","is_error":false,"result":"","structured_output":{"ok":false,"violated":["Решения 4"],"reason":"%s"},"duration_ms":10}\n' "$R" ;;
+  hang) sleep 100 ;;
+  garbage) printf 'nonsense\n' ;;
+  notlogged)
+    printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login","duration_ms":1}' ;;
+esac
