@@ -9,10 +9,12 @@ import subprocess
 import sys
 import tempfile
 
+from prompts import JUDGE_SCHEMA
+
 MAX_DENIES = 2
 JUDGE_TIMEOUT = 60
 JUDGE_FLAGS = ["-p", "--setting-sources", "", "--strict-mcp-config",
-               "--no-session-persistence", "--output-format", "json"]
+               "--no-session-persistence", "--output-format", "json", "--tools", ""]
 
 
 def barrier_active():
@@ -23,9 +25,12 @@ def barrier_active():
 def read_input():
     try:
         raw = sys.stdin.read()
-        return json.loads(raw) if raw.strip() else None
-    except (json.JSONDecodeError, OSError):
+        if not raw.strip():
+            return None
+        data = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
         return None
+    return data if isinstance(data, dict) else None
 
 
 def plugin_root():
@@ -89,25 +94,33 @@ def _skipped(error):
 
 def run_judge(system_prompt, user_prompt, *, timeout=JUDGE_TIMEOUT):
     """Вложенный claude -p; любая ошибка — пропуск с описанием в error."""
-    from prompts import JUDGE_SCHEMA  # здесь, чтобы common не зависел от prompts при импорте
     model = os.environ.get("PLANKA_MODEL", "sonnet")
     cmd = ["claude", *JUDGE_FLAGS, "--json-schema", json.dumps(JUDGE_SCHEMA),
            "--model", model, "--system-prompt", system_prompt]
     env = dict(os.environ, PLANKA_JUDGE="1")
     try:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, env=env,
-                                cwd=str(data_dir()), start_new_session=True)
+                                stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                                errors="replace", env=env, cwd=str(data_dir()),
+                                start_new_session=True)
     except FileNotFoundError:
         return _skipped("claude не найден в PATH")
+    except OSError as e:
+        return _skipped(f"claude не запущен: {e}")
     try:
         stdout, stderr = proc.communicate(user_prompt, timeout=timeout)
     except subprocess.TimeoutExpired:
         # Судья — отдельная группа процессов: убивается вместе с потомками, иначе
         # потомок держит stdout и communicate ждёт его до конца.
         os.killpg(proc.pid, signal.SIGKILL)
-        proc.communicate()
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
         return _skipped(f"таймаут судьи {timeout} с")
+    except (OSError, ValueError) as e:
+        os.killpg(proc.pid, signal.SIGKILL)
+        return _skipped(f"обмен с claude не удался: {e}")
     line = next((l for l in stdout.splitlines() if l.startswith("{")), None)
     if line is None:
         return _skipped(f"ответ судьи не JSON: {stdout[:200]!r} {stderr[:200]!r}")
@@ -126,16 +139,21 @@ def run_judge(system_prompt, user_prompt, *, timeout=JUDGE_TIMEOUT):
 
 def _atomic_write_json(path, obj):
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False)
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except BaseException:
+        pathlib.Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def deny_budget_exhausted(session_id, prompt_id, hook):
     """True, если по этому ключу уже было MAX_DENIES отказов; счётчик растёт при каждом вызове."""
     state_dir = data_dir() / "state"
     state_dir.mkdir(exist_ok=True)
-    path = state_dir / f"{session_id}.json"
+    safe = "".join(c if c.isalnum() and c.isascii() or c in "._-" else "_" for c in session_id)
+    path = state_dir / f"{safe or 'unknown'}.json"
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):

@@ -7,7 +7,7 @@
 #   notlogged — is_error=true, "Not logged in"
 # При PLANKA_STUB_RECORD=<файл> пишет туда аргументы и stdin.
 if [ -n "${PLANKA_STUB_RECORD:-}" ]; then
-  { printf 'ARGV\n'; printf '%s\n' "$@"; printf 'STDIN\n'; cat; printf 'ENV PLANKA_JUDGE=%s\n' "${PLANKA_JUDGE:-}"; } > "$PLANKA_STUB_RECORD"
+  { printf 'ARGV\n'; printf '%s\n' "$@"; printf 'STDIN\n'; cat; printf 'ENV PLANKA_JUDGE=%s\n' "${PLANKA_JUDGE:-}"; printf 'CWD %s\n' "$(pwd -P)"; } > "$PLANKA_STUB_RECORD"
 else
   cat > /dev/null
 fi

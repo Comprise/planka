@@ -1,12 +1,10 @@
 import json
 import os
-import pathlib
-import subprocess
 import sys
 import unittest
 from unittest import mock
 
-from tests.helpers import Env, PLANKA_DIR, STUB_DIR
+from tests.helpers import Env, PLANKA_DIR
 
 sys.path.insert(0, str(PLANKA_DIR))
 import common  # noqa: E402
@@ -31,6 +29,8 @@ class ReadInputTest(unittest.TestCase):
             self.assertIsNone(common.read_input())
         with mock.patch("sys.stdin", new=__import__("io").StringIO('{"a":1}')):
             self.assertEqual(common.read_input(), {"a": 1})
+        with mock.patch("sys.stdin", new=__import__("io").StringIO('[1]')):
+            self.assertIsNone(common.read_input())
 
 
 class PhilosophyTest(unittest.TestCase):
@@ -90,13 +90,24 @@ class RunJudgeTest(unittest.TestCase):
         rec = self.env.data / "rec.txt"
         self.judge(PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec), PLANKA_MODEL="haiku")
         text = rec.read_text(encoding="utf-8")
-        for flag in ["-p", "--setting-sources", "--strict-mcp-config",
-                     "--no-session-persistence", "--output-format", "json",
-                     "--json-schema", "--model", "haiku", "--system-prompt", "SYS"]:
-            self.assertIn(flag, text)
-        self.assertNotIn("--bare", text)
+        argv = text.split("ARGV\n", 1)[1].split("\nSTDIN\n", 1)[0].split("\n")
+        self.assertEqual(argv[:9], ["-p", "--setting-sources", "", "--strict-mcp-config",
+                                    "--no-session-persistence", "--output-format", "json",
+                                    "--tools", ""])
+        for whole in ["--json-schema", "--model", "haiku", "--system-prompt", "SYS"]:
+            self.assertIn(whole, argv)
+        self.assertNotIn("--bare", argv)
         self.assertIn("STDIN\nUSER", text)
         self.assertIn("ENV PLANKA_JUDGE=1", text)
+        self.assertIn(f"CWD {self.env.data.resolve()}", text.splitlines())
+
+    def test_non_executable_binary_is_error(self):
+        fake = self.env.root / "bin"
+        fake.mkdir()
+        (fake / "claude").write_text("#!/bin/sh\n")
+        v = self.judge(PATH=str(fake))
+        self.assertTrue(v.ok)
+        self.assertIn("claude", v.error)
 
     def test_timeout_is_error(self):
         v = self.judge(PLANKA_STUB="hang")
@@ -143,6 +154,12 @@ class DenyBudgetTest(unittest.TestCase):
         self.assertEqual(state["p:tool"], 5)
         self.assertEqual([p.name for p in (self.env.data / "state").iterdir()], ["s.json"])
 
+    def test_session_id_is_sanitized(self):
+        common.deny_budget_exhausted("../../x/y", "p", "tool")
+        common.deny_budget_exhausted("", "p", "tool")
+        names = sorted(p.name for p in (self.env.data / "state").iterdir())
+        self.assertEqual(names, [".._.._x_y.json", "unknown.json"])
+
 
 class OutputsTest(unittest.TestCase):
     def test_formats(self):
@@ -160,14 +177,16 @@ class OutputsTest(unittest.TestCase):
 class LogTest(unittest.TestCase):
     def test_log_line(self):
         env = Env()
-        with mock.patch.dict(os.environ, env.environ(), clear=True):
-            common.log_event("tool", "s", verdict="ok", reason="")
-        lines = env.log_lines()
-        self.assertEqual(len(lines), 1)
-        self.assertEqual(lines[0]["hook"], "tool")
-        self.assertEqual(lines[0]["session_id"], "s")
-        self.assertIn("ts", lines[0])
-        env.close()
+        try:
+            with mock.patch.dict(os.environ, env.environ(), clear=True):
+                common.log_event("tool", "s", verdict="ok", reason="")
+            lines = env.log_lines()
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(lines[0]["hook"], "tool")
+            self.assertEqual(lines[0]["session_id"], "s")
+            self.assertIn("ts", lines[0])
+        finally:
+            env.close()
 
 
 if __name__ == "__main__":
