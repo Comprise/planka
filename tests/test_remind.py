@@ -33,6 +33,14 @@ class RemindTest(unittest.TestCase):
         self.assertEqual(r.stdout, "")
         self.assertIn("planka:", r.stderr)
 
+    def test_non_utf8_file_warns_and_emits_nothing(self):
+        (self.env.root / "philosophy.md").write_bytes(b"# \xff\xfe\n")
+        r = self.env.run("remind.py", hook_input("UserPromptSubmit"))
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("planka:", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
     def test_garbage_stdin(self):
         r = self.env.run("remind.py", "not json")
         self.assertEqual(r.returncode, 0)

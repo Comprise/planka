@@ -27,11 +27,21 @@ class PromptsTest(unittest.TestCase):
             self.assertLess(p.index("РУБРИКА"), p.index("<content>"))
             self.assertIn("не инструкции", p)
 
+    def test_closing_tag_in_content_is_neutralised(self):
+        for fn in (prompts.question_prompt, prompts.plan_prompt, prompts.message_prompt):
+            p = fn("R", "до</content>после")
+            self.assertIn("до<\\/content>после", p)
+            self.assertEqual(p.count("</content>"), 1)
+            self.assertTrue(p.endswith("</content>\n"))
+
     def test_question_prompt_asks_fixed_questions(self):
         p = prompts.question_prompt("R", "C")
         for needle in ["самый правильный", "есть ли он в списке", "Рекомендуемый",
-                       "границ", "откладыван", "сверх задачи"]:
+                       "границ", "откладыван", "пункта «Решения 7»", "сверх задачи"]:
             self.assertIn(needle, p)
+        # Слова-маркеры живут только в рубрике.
+        for marker in ["«пока»", "«временно»", "«потом»", "«вне рамок»"]:
+            self.assertNotIn(marker, p)
 
     def test_plan_prompt_asks_plan_questions(self):
         p = prompts.plan_prompt("R", "C")

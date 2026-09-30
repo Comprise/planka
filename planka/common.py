@@ -8,11 +8,14 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 from prompts import JUDGE_SCHEMA
 
 MAX_DENIES = 2
 JUDGE_TIMEOUT = 60
+MAX_REASON = 2000
+STATE_TTL = 7 * 86400
 JUDGE_FLAGS = ["-p", "--setting-sources", "", "--strict-mcp-config",
                "--no-session-persistence", "--output-format", "json", "--tools", ""]
 
@@ -55,6 +58,9 @@ def philosophy_text():
         return p.read_text(encoding="utf-8")
     except OSError:
         warn(f"нет файла правил {p}")
+        return None
+    except UnicodeDecodeError:
+        warn(f"файл правил {p} не в UTF-8")
         return None
 
 
@@ -133,8 +139,10 @@ def run_judge(system_prompt, user_prompt, *, timeout=JUDGE_TIMEOUT):
     so = result.get("structured_output")
     if not isinstance(so, dict) or "ok" not in so:
         return _skipped(f"нет structured_output: {line[:200]!r}")
-    return Verdict(ok=bool(so["ok"]), violated=list(so.get("violated") or []),
-                   reason=str(so.get("reason") or ""))
+    reason = str(so.get("reason") or "")
+    if len(reason) > MAX_REASON:
+        reason = reason[:MAX_REASON - 1] + "…"
+    return Verdict(ok=bool(so["ok"]), violated=list(so.get("violated") or []), reason=reason)
 
 
 def _atomic_write_json(path, obj):
@@ -162,7 +170,19 @@ def deny_budget_exhausted(session_id, prompt_id, hook):
     before = int(state.get(key, 0))
     state[key] = before + 1
     _atomic_write_json(path, state)
+    _prune_state(state_dir)
     return before >= MAX_DENIES
+
+
+def _prune_state(state_dir):
+    """Удаляет счётчики сессий, не менявшиеся дольше STATE_TTL."""
+    cutoff = time.time() - STATE_TTL
+    for p in state_dir.glob("*.json"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+        except OSError:
+            pass
 
 
 def log_event(hook, session_id, **fields):
@@ -185,6 +205,15 @@ def block_output(reason):
 def context_output(text):
     return json.dumps({"hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit", "additionalContext": text}}, ensure_ascii=False)
+
+
+def run_hook(main):
+    """Граница отказа хука: любое исключение — строка planka: и выход 0, без решения."""
+    try:
+        main()
+    except Exception as e:
+        warn(f"внутренняя ошибка: {e!r}")
+        sys.exit(0)
 
 
 def emit(text):

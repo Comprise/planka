@@ -7,6 +7,7 @@ validate:
 	claude plugin validate .
 
 install:
+	mkdir -p "$(HOME)/.claude/skills"
 	ln -sfn "$(CURDIR)" "$(HOME)/.claude/skills/planka"
 	@echo "planka установлен: $(HOME)/.claude/skills/planka -> $(CURDIR); перезапустите сессию"
 

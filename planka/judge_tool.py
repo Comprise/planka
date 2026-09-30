@@ -10,6 +10,8 @@ import prompts
 
 def plan_file_from_transcript(path):
     """Последняя запись транскрипта с attachment.planFilePath; None, если её нет."""
+    if not isinstance(path, str) or not path:
+        return None
     found = None
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
@@ -18,8 +20,9 @@ def plan_file_from_transcript(path):
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                p = (entry.get("attachment") or {}).get("planFilePath") if isinstance(entry, dict) else None
-                if p:
+                att = entry.get("attachment") if isinstance(entry, dict) else None
+                p = att.get("planFilePath") if isinstance(att, dict) else None
+                if isinstance(p, str) and p:
                     found = p
     except OSError:
         return None
@@ -60,6 +63,8 @@ def judge_question(data):
         return
     rubric = common.philosophy_sections("Решения")
     if rubric is None:
+        # Предупреждение уже выдал philosophy_sections.
+        common.log_event("question", session, verdict="skipped", error="нет раздела рубрики")
         return
     _judge_and_emit("question", session, prompt_id, prompts.question_prompt(rubric, content), content)
 
@@ -89,6 +94,8 @@ def judge_plan(data):
             return
     rubric = common.philosophy_sections("Решения", "Планы")
     if rubric is None:
+        # Предупреждение уже выдал philosophy_sections.
+        common.log_event("plan", session, verdict="skipped", error="нет раздела рубрики")
         return
     _judge_and_emit("plan", session, prompt_id, prompts.plan_prompt(rubric, plan), plan)
 
@@ -107,4 +114,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    common.run_hook(main)

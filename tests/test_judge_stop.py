@@ -83,11 +83,35 @@ class StopHookTest(unittest.TestCase):
         self.assertIn("planka:", r.stderr)
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
 
+    def test_unusable_data_dir_passes_without_block(self):
+        blocker = self.env.data / "file"
+        blocker.write_text("", encoding="utf-8")
+        r = self.stop(OPTIONS_MSG, PLANKA_STUB="deny", CLAUDE_PLUGIN_DATA=str(blocker / "sub"))
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("planka: внутренняя ошибка", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
     def test_barrier_and_garbage(self):
         self.assertEqual(self.stop(OPTIONS_MSG, PLANKA_OFF="1").stdout, "")
         r = self.env.run("judge_stop.py", "garbage")
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout, "")
+
+
+class MissingRubricTest(unittest.TestCase):
+    def test_without_section_is_logged(self):
+        env = Env(philosophy="# X\n\n## Планы\n\n1. a\n")
+        try:
+            r = env.run("judge_stop.py", hook_input("Stop", last_assistant_message=OPTIONS_MSG))
+            self.assertEqual(r.returncode, 0)
+            self.assertEqual(r.stdout, "")
+            self.assertEqual(r.stderr.count("planka:"), 1)
+            last = env.log_lines()[-1]
+            self.assertEqual(last["verdict"], "skipped")
+            self.assertEqual(last["error"], "нет раздела рубрики")
+        finally:
+            env.close()
 
 
 if __name__ == "__main__":

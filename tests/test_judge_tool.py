@@ -47,6 +47,16 @@ class TranscriptTest(unittest.TestCase):
         ])
         self.assertEqual(str(judge_tool.plan_file_from_transcript(str(p))), "/b.md")
 
+    def test_malformed_entries_are_ignored(self):
+        p = self.write_transcript([
+            json.dumps({"type": "attachment", "attachment": {"planFilePath": "/a.md"}}),
+            json.dumps({"attachment": "x"}),
+            json.dumps({"attachment": {"planFilePath": 5}}),
+        ])
+        self.assertEqual(str(judge_tool.plan_file_from_transcript(str(p))), "/a.md")
+        self.assertIsNone(judge_tool.plan_file_from_transcript(None))
+        self.assertIsNone(judge_tool.plan_file_from_transcript(7))
+
     def test_no_plan_entry(self):
         p = self.write_transcript([json.dumps({"type": "user"})])
         self.assertIsNone(judge_tool.plan_file_from_transcript(str(p)))
@@ -155,12 +165,68 @@ class PlanTest(unittest.TestCase):
         self.assertIn("planka:", r.stderr)
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
 
+    def test_null_transcript_path_passes_with_warning(self):
+        r = self.exit_plan(None)
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("planka:", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
+
+    def test_non_dict_attachment_passes_with_warning(self):
+        t = self.env.data / "t.jsonl"
+        t.write_text(json.dumps({"attachment": "x"}) + "\n", encoding="utf-8")
+        r = self.exit_plan(str(t))
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("planka:", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
+
+    def test_unusable_data_dir_passes_without_deny(self):
+        blocker = self.env.data / "file"
+        blocker.write_text("", encoding="utf-8")
+        r = self.exit_plan(self.with_plan(PLAN_CONFLICT), CLAUDE_PLUGIN_DATA=str(blocker / "sub"))
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("planka: внутренняя ошибка", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
     def test_missing_plan_file_passes_with_warning(self):
         t = self.with_plan(PLAN_CLEAN)
         (self.env.data / "plan.md").unlink()
         r = self.exit_plan(t)
         self.assertEqual(r.stdout, "")
         self.assertIn("planka:", r.stderr)
+
+
+class MissingRubricTest(unittest.TestCase):
+    def setUp(self):
+        self.env = Env(philosophy="# X\n\n## Планы\n\n1. a\n")
+
+    def tearDown(self):
+        self.env.close()
+
+    def check_skipped(self, r):
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("planka:", r.stderr)
+        self.assertEqual(r.stderr.count("planka:"), 1)
+        last = self.env.log_lines()[-1]
+        self.assertEqual(last["verdict"], "skipped")
+        self.assertEqual(last["error"], "нет раздела рубрики")
+
+    def test_question_without_section_is_logged(self):
+        self.check_skipped(self.env.run("judge_tool.py", hook_input(
+            "PreToolUse", tool_name="AskUserQuestion", tool_input=QUESTION_INPUT)))
+
+    def test_plan_without_section_is_logged(self):
+        plan = self.env.data / "plan.md"
+        plan.write_text(PLAN_CLEAN, encoding="utf-8")
+        t = self.env.data / "t.jsonl"
+        t.write_text(json.dumps({"attachment": {"planFilePath": str(plan)}}) + "\n", encoding="utf-8")
+        self.check_skipped(self.env.run("judge_tool.py", hook_input(
+            "PreToolUse", tool_name="ExitPlanMode", tool_input={}, transcript_path=str(t))))
 
 
 if __name__ == "__main__":

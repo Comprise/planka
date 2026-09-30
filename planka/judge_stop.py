@@ -26,6 +26,8 @@ def main():
     prompt_id = data.get("prompt_id", "")
     rubric = common.philosophy_sections("Решения")
     if rubric is None:
+        # Предупреждение уже выдал philosophy_sections.
+        common.log_event("stop", session, verdict="skipped", error="нет раздела рубрики")
         return
     started = time.monotonic()
     verdict = common.run_judge(prompts.SYSTEM_PROMPT, prompts.message_prompt(rubric, message))
@@ -51,4 +53,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    common.run_hook(main)

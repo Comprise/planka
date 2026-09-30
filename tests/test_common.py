@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -86,6 +87,11 @@ class RunJudgeTest(unittest.TestCase):
         self.assertEqual(v.violated, ["Решения 4"])
         self.assertEqual(v.reason, "нет правильного варианта")
 
+    def test_long_reason_is_capped(self):
+        v = self.judge(PLANKA_STUB="deny", PLANKA_STUB_REASON="ы" * 3000)
+        self.assertEqual(len(v.reason), 2000)
+        self.assertTrue(v.reason.endswith("ы…"))
+
     def test_flags_stdin_and_env(self):
         rec = self.env.data / "rec.txt"
         self.judge(PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec), PLANKA_MODEL="haiku")
@@ -154,11 +160,40 @@ class DenyBudgetTest(unittest.TestCase):
         self.assertEqual(state["p:tool"], 5)
         self.assertEqual([p.name for p in (self.env.data / "state").iterdir()], ["s.json"])
 
+    def test_stale_state_is_pruned(self):
+        state = self.env.data / "state"
+        state.mkdir()
+        stale, fresh = state / "old.json", state / "new.json"
+        for p in (stale, fresh):
+            p.write_text("{}", encoding="utf-8")
+        week_ago = time.time() - 8 * 86400
+        os.utime(stale, (week_ago, week_ago))
+        common.deny_budget_exhausted("s", "p", "tool")
+        self.assertFalse(stale.exists())
+        self.assertTrue(fresh.exists())
+        self.assertTrue((state / "s.json").exists())
+
     def test_session_id_is_sanitized(self):
         common.deny_budget_exhausted("../../x/y", "p", "tool")
         common.deny_budget_exhausted("", "p", "tool")
         names = sorted(p.name for p in (self.env.data / "state").iterdir())
         self.assertEqual(names, [".._.._x_y.json", "unknown.json"])
+
+
+class RunHookTest(unittest.TestCase):
+    def test_exception_is_warning_and_exit_zero(self):
+        def main():
+            raise PermissionError("нет доступа")
+        with mock.patch("sys.stderr", new=__import__("io").StringIO()) as err:
+            with self.assertRaises(SystemExit) as cm:
+                common.run_hook(main)
+        self.assertEqual(cm.exception.code, 0)
+        self.assertIn("planka: внутренняя ошибка: PermissionError", err.getvalue())
+
+    def test_normal_main_returns(self):
+        calls = []
+        common.run_hook(lambda: calls.append(1))
+        self.assertEqual(calls, [1])
 
 
 class OutputsTest(unittest.TestCase):
