@@ -4,11 +4,13 @@ import re
 
 _WAVE = re.compile(r"^#+\s*(?:Волна|Wave)\s+(\d+)", re.IGNORECASE)
 _TASK = re.compile(r"^#+\s*(?:Задача|Task)\s+(\d+)\s*[:.]\s*(.*)$", re.IGNORECASE)
-_FILES_HEAD = re.compile(r"^\**\s*(?:Файлы|Files)\s*:\**\s*(.*)$", re.IGNORECASE)
+_FILES_HEAD = re.compile(r"^\**\s*(?:Файлы|Files)\s*\**\s*:\s*\**\s*(.*)$", re.IGNORECASE)
 _ITEM = re.compile(r"^\s*[-*]\s+(.*)$")
 _PREFIX = re.compile(r"^(?:Create|Modify|Test|Delete|Создать|Изменить|Тест|Удалить)\s*:\s*",
                      re.IGNORECASE)
 _BACKTICK = re.compile(r"`([^`]+)`")
+_NO_FILES = {"", "нет", "none", "—", "-"}
+_FENCE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
 
 
 @dataclasses.dataclass
@@ -19,12 +21,17 @@ class PlanTask:
     files: list
 
 
-def _path(fragment):
-    """Путь из фрагмента строки: из обратных кавычек, если есть; без префикса и «:строки»."""
-    m = _BACKTICK.search(fragment)
-    raw = m.group(1) if m else _PREFIX.sub("", fragment.strip())
-    raw = _PREFIX.sub("", raw.strip())
-    return re.sub(r":\d+(?:-\d+)?$", "", raw).strip()
+def _paths(fragment):
+    """Пути из фрагмента строки: все в обратных кавычках, иначе части через запятую; без префикса
+    и «:строки». Часть без кавычек вида «нет»/«none»/«—» путём не считается."""
+    quoted = _BACKTICK.findall(fragment)
+    out = []
+    for raw in quoted or fragment.split(","):
+        raw = _PREFIX.sub("", raw.strip())
+        path = re.sub(r":\d+(?:-\d+)?$", "", raw).strip()
+        if path and (quoted or path.lower() not in _NO_FILES):
+            out.append(path)
+    return out
 
 
 def parse_plan(text):
@@ -32,9 +39,23 @@ def parse_plan(text):
     wave = 1
     current = None
     lines = text.splitlines()
+    fence = None
     i = 0
     while i < len(lines):
         line = lines[i]
+        # Содержимое fenced-блока — пример, а не структура плана; блок закрывает
+        # строка из тех же символов не короче открывающей и без info-строки.
+        m = _FENCE.match(line)
+        if fence is None and m:
+            fence = m.group(1)
+            i += 1
+            continue
+        if fence is not None:
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) \
+                    and not m.group(2).strip():
+                fence = None
+            i += 1
+            continue
         m = _WAVE.match(line)
         if m:
             wave = int(m.group(1))
@@ -49,17 +70,13 @@ def parse_plan(text):
             continue
         m = _FILES_HEAD.match(line.strip()) if current is not None else None
         if m:
-            inline = m.group(1).strip()
-            if inline:
-                current.files.extend(p for p in (_path(f) for f in inline.split(",")) if p)
+            current.files.extend(_paths(m.group(1)))
             i += 1
             while i < len(lines):
                 item = _ITEM.match(lines[i])
                 if not item:
                     break
-                p = _path(item.group(1))
-                if p:
-                    current.files.append(p)
+                current.files.extend(_paths(item.group(1)))
                 i += 1
             continue
         i += 1

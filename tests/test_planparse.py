@@ -2,7 +2,8 @@ import pathlib
 import sys
 import unittest
 
-PLANKA_DIR = pathlib.Path(__file__).resolve().parent.parent / "planka"
+REPO = pathlib.Path(__file__).resolve().parent.parent
+PLANKA_DIR = REPO / "planka"
 sys.path.insert(0, str(PLANKA_DIR))
 import planparse  # noqa: E402
 
@@ -68,6 +69,49 @@ class SharedFilesTest(unittest.TestCase):
     def test_no_conflict(self):
         tasks = planparse.parse_plan(PLAN_RU.replace("`c/three.py`, `b/two.py`", "`c/three.py`"))
         self.assertEqual(planparse.shared_files(tasks), [])
+
+
+class FilesLineTest(unittest.TestCase):
+    def test_none_marker_is_no_files(self):
+        plan = ("### Задача 1: A\nФайлы: нет\n### Задача 2: B\nFiles: none\n"
+                "### Задача 3: C\n**Файлы:** нет\n### Задача 4: D\n**Файлы:**\n- —\n"
+                "### Задача 5: E\nФайлы: `e.py`\n")
+        tasks = planparse.parse_plan(plan)
+        self.assertEqual([(t.number, t.files) for t in tasks], [(5, ["e.py"])])
+        self.assertEqual(planparse.shared_files(tasks), [])
+        self.assertIsNone(planparse.parse_plan("### Задача 1: A\nФайлы: нет\n### Задача 2: B\nFiles: -\n"))
+
+    def test_several_backticked_paths_on_one_item(self):
+        plan = "### Task 1: A\n**Files:**\n- Test: `a.py`, `b.py:3-9`\n"
+        self.assertEqual(planparse.parse_plan(plan)[0].files, ["a.py", "b.py"])
+
+    def test_colon_outside_bold(self):
+        plan = ("### Задача 1: A\n**Файлы**:\n- Создать: `a.py`\n"
+                "### Task 2: B\n**Files**: `b.py`, `c.py`\n")
+        self.assertEqual([t.files for t in planparse.parse_plan(plan)], [["a.py"], ["b.py", "c.py"]])
+
+
+class FenceTest(unittest.TestCase):
+    def test_fenced_block_is_not_structure(self):
+        plan = ("### Задача 1: Настоящая\n**Файлы:**\n- Создать: `a.py`\n\n"
+                "```markdown\n### Задача 2: Пример в блоке\n**Файлы:**\n- Создать: `a.py`\n```\n")
+        tasks = planparse.parse_plan(plan)
+        self.assertEqual([(t.number, t.files) for t in tasks], [(1, ["a.py"])])
+
+    def test_fence_closes_only_with_same_char_and_length(self):
+        plan = ("### Задача 1: A\n**Файлы:**\n- Создать: `a.py`\n"
+                "````markdown\n```\n### Задача 2: B\nFiles: `a.py`\n```\n````\n"
+                "~~~\n### Задача 3: C\nFiles: `a.py`\n~~~\n")
+        self.assertEqual([t.number for t in planparse.parse_plan(plan)], [1])
+
+    def test_fence_nested_in_list_item(self):
+        plan = ("### Задача 1: A\n**Файлы:**\n- Создать: `a.py`\n\n1. Шаг\n\n"
+                "    ```markdown\n    Files: `z.py`\n    ```\n")
+        self.assertEqual([(t.number, t.files) for t in planparse.parse_plan(plan)], [(1, ["a.py"])])
+
+    def test_repo_plan_is_disjoint(self):
+        text = (REPO / "docs" / "superpowers" / "plans" / "2026-09-30-planka.md").read_text(encoding="utf-8")
+        self.assertEqual(planparse.shared_files(planparse.parse_plan(text)), [])
 
 
 if __name__ == "__main__":
