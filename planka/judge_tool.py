@@ -1,9 +1,11 @@
-"""PreToolUse: судья вопросов автору (AskUserQuestion) и планов (ExitPlanMode)."""
+"""PreToolUse: судья вопросов автору (AskUserQuestion), планов (ExitPlanMode) и
+детерминированная проверка команд Bash."""
 import json
 import pathlib
 import time
 
 import common
+import depcheck
 import planparse
 import prompts
 
@@ -92,12 +94,29 @@ def judge_plan(data):
             common.log_event("plan", session, verdict="deny-files", reason=reason, content=plan)
             common.emit(common.deny_output(reason))
             return
-    rubric = common.philosophy_sections("Решения", "Планы")
+    rubric = common.rubric(("Решения", "Планы"), ("planning", "subagents"))
     if rubric is None:
         # Предупреждение уже выдал philosophy_sections.
         common.log_event("plan", session, verdict="skipped", error="нет раздела рубрики")
         return
     _judge_and_emit("plan", session, prompt_id, prompts.plan_prompt(rubric, plan), plan)
+
+
+DEP_REASON = ("Новая зависимость — вопрос автору (ядро, «Границы»): назови пакет, зачем он и что "
+              "из stdlib или уже установленного задачу не закрывает; прочитай {rules}/dependencies.md. "
+              "После согласия автора повтори команду с префиксом {marker}. Команда: {command}")
+
+
+def judge_bash(data):
+    """Добавление пакета отклоняется детерминированно: без модели и без лимита отказов."""
+    command = (data.get("tool_input") or {}).get("command")
+    segment = depcheck.dependency_add(command)
+    if segment is None:
+        return
+    session = data.get("session_id", "")
+    reason = DEP_REASON.format(rules=common.rules_dir(), marker=depcheck.DEP_OK_MARKER, command=segment)
+    common.log_event("bash", session, verdict="deny-dep", reason=reason, content=command)
+    common.emit(common.deny_output(reason))
 
 
 def main():
@@ -111,6 +130,8 @@ def main():
         judge_question(data)
     elif tool == "ExitPlanMode":
         judge_plan(data)
+    elif tool == "Bash":
+        judge_bash(data)
 
 
 if __name__ == "__main__":

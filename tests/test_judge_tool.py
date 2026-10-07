@@ -229,5 +229,87 @@ class MissingRubricTest(unittest.TestCase):
             "PreToolUse", tool_name="ExitPlanMode", tool_input={}, transcript_path=str(t))))
 
 
+class BashTest(unittest.TestCase):
+    def setUp(self):
+        self.env = Env()
+
+    def tearDown(self):
+        self.env.close()
+
+    def bash(self, command, **extra):
+        return self.env.run("judge_tool.py", hook_input(
+            "PreToolUse", tool_name="Bash", tool_input={"command": command}, tool_use_id="b1"), **extra)
+
+    def test_dependency_add_denied_without_judge(self):
+        rec = self.env.data / "rec.txt"
+        r = self.bash("cd app && npm install left-pad", PLANKA_STUB_RECORD=str(rec))
+        out = json.loads(r.stdout)["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("вопрос автору", out["permissionDecisionReason"])
+        self.assertIn("npm install left-pad", out["permissionDecisionReason"])
+        self.assertIn("PLANKA_DEP_OK=1", out["permissionDecisionReason"])
+        self.assertIn(str(self.env.root / "rules" / "dependencies.md"), out["permissionDecisionReason"])
+        self.assertFalse(rec.exists())
+        self.assertEqual(self.env.log_lines()[-1]["verdict"], "deny-dep")
+
+    def test_marker_passes(self):
+        r = self.bash("PLANKA_DEP_OK=1 npm install left-pad")
+        self.assertEqual(r.stdout, "")
+        self.assertEqual(self.env.log_lines(), [])
+
+    def test_ordinary_command_passes_silently(self):
+        r = self.bash("make test")
+        self.assertEqual(r.stdout, "")
+        self.assertEqual(self.env.log_lines(), [])
+
+    def test_no_budget_for_dependency_denies(self):
+        for _ in range(4):
+            r = self.bash("npm install left-pad")
+            self.assertIn("deny", r.stdout)
+
+    def test_missing_or_non_string_command_passes(self):
+        for ti in ({}, {"command": None}, {"command": 5}):
+            r = self.env.run("judge_tool.py", hook_input("PreToolUse", tool_name="Bash", tool_input=ti))
+            self.assertEqual(r.returncode, 0)
+            self.assertEqual(r.stdout, "")
+            self.assertNotIn("Traceback", r.stderr)
+
+
+class PlanRubricTest(unittest.TestCase):
+    def setUp(self):
+        self.env = Env()
+
+    def tearDown(self):
+        self.env.close()
+
+    def with_plan(self, text):
+        plan = self.env.data / "plan.md"
+        plan.write_text(text, encoding="utf-8")
+        t = self.env.data / "t.jsonl"
+        t.write_text(json.dumps({"type": "attachment", "attachment": {
+            "type": "plan_mode", "planFilePath": str(plan)}}) + "\n", encoding="utf-8")
+        return str(t)
+
+    def test_plan_judge_gets_modules(self):
+        rec = self.env.data / "rec.txt"
+        r = self.env.run("judge_tool.py", hook_input(
+            "PreToolUse", tool_name="ExitPlanMode", tool_input={}, transcript_path=self.with_plan(PLAN_CLEAN)),
+            PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        text = rec.read_text(encoding="utf-8")
+        for needle in ["## Решения", "## Планы", "# Планирование", "# Субагенты"]:
+            self.assertIn(needle, text)
+        self.assertLess(text.index("## Планы"), text.index("# Планирование"))
+
+    def test_plan_judge_skips_without_module(self):
+        (self.env.root / "rules" / "subagents.md").unlink()
+        r = self.env.run("judge_tool.py", hook_input(
+            "PreToolUse", tool_name="ExitPlanMode", tool_input={}, transcript_path=self.with_plan(PLAN_CLEAN)))
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("planka:", r.stderr)
+        self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
+
+
 if __name__ == "__main__":
     unittest.main()

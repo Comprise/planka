@@ -13,7 +13,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "AskUserQuestion|ExitPlanMode",
+        "matcher": "AskUserQuestion|ExitPlanMode|Bash",
         "hooks": [
           {
             "type": "command",
