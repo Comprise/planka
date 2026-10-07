@@ -4,8 +4,8 @@
 возвращает `None`, `remind.take_snapshot` снимок не пишет и один раз за сессию предупреждает;
 фильтр «документация» в `judge_stop` в таком проекте не срабатывает никогда.
 
-**Чем доказано.** Чтением `snapshot.scan` и `remind.take_snapshot`; тест — через
-`PLANKA_TEST_MAX_FILES`.
+**Чем доказано.** Чтением `snapshot.scan` и `remind.take_snapshot`; тест
+`test_too_many_files_warns` с подменой `snapshot.MAX_FILES`.
 
 **Верное решение.** Не записано.
 

@@ -99,9 +99,10 @@ def main():
         return
     violated = f" (нарушено: {', '.join(verdict.violated)})" if verdict.violated else ""
     reason = f"planka: {verdict.reason}{violated}"
+    # Ответ запоминается до записи журнала: сбой записи не отменяет отказ.
+    common.emit(common.block_output(reason))
     common.log_event("stop", session, verdict="deny", reason=verdict.reason,
                      violated=verdict.violated, duration_ms=duration_ms, content=content, **meta)
-    common.emit(common.block_output(reason))
 
 
 if __name__ == "__main__":

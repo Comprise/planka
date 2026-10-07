@@ -89,6 +89,13 @@ class StopHookTest(unittest.TestCase):
         self.assertIn("planka:", "\n".join(messages(r)))
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
 
+    def test_block_survives_log_failure(self):
+        (self.env.data / "judge.log").mkdir()
+        r = self.stop(OPTIONS_MSG, PLANKA_STUB="deny")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(output(r)["decision"], "block")
+        self.assertTrue(any("внутренняя ошибка" in m for m in messages(r)))
+
     def test_unusable_data_dir_passes_without_block(self):
         blocker = self.env.data / "file"
         blocker.write_text("", encoding="utf-8")

@@ -1,19 +1,13 @@
 """UserPromptSubmit: подмешивает ядро, снимает снимок дерева, напоминает об инициализации документации."""
-import os
-
 import common
 import snapshot
 
-NO_DOCS_LINE = "Проект без документации: предложи автору инициализацию по rules/docs.md."
+NO_DOCS_LINE = "Проект без документации: предложи автору инициализацию по {RULES}/docs.md."
 
 
 def take_snapshot(session, prompt_id, root):
     if root is None:
         return
-    test_limit = os.environ.get("PLANKA_TEST_MAX_FILES")
-    if test_limit:
-        # PLANKA_TEST_MAX_FILES задаёт порог снимка; тестовый крючок.
-        snapshot.MAX_FILES = int(test_limit)
     files = snapshot.scan(root)
     if files is None:
         common.warn_once(session, "snapshot",
@@ -41,7 +35,7 @@ def main():
         root = common.project_root(cwd)
         # Строка об отсутствии документации считается вне защищённого блока.
         if not (root / "CLAUDE.md").exists():
-            text += "\n\n" + NO_DOCS_LINE
+            text += "\n\n" + common.substitute(NO_DOCS_LINE)
     try:
         # Снимок снимается до emit и фиксирует дерево до работы агента.
         take_snapshot(session, data.get("prompt_id", ""), root)

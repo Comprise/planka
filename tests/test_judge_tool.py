@@ -107,6 +107,13 @@ class QuestionTest(unittest.TestCase):
         self.assertIsNone(output(r))
         self.assertIn("лимит отказов", "\n".join(messages(r)))
 
+    def test_deny_survives_log_failure(self):
+        (self.env.data / "judge.log").mkdir()
+        r = self.ask(PLANKA_STUB="deny")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertTrue(any("внутренняя ошибка" in m for m in messages(r)))
+
     def test_judge_failure_passes(self):
         r = self.ask(PLANKA_STUB="notlogged")
         self.assertIsNone(output(r))

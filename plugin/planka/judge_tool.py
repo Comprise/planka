@@ -53,9 +53,10 @@ def _judge_and_emit(hook, session, prompt_id, user_prompt, content):
         return
     violated = f" (нарушено: {', '.join(verdict.violated)})" if verdict.violated else ""
     reason = f"planka: {verdict.reason}{violated}"
+    # Ответ запоминается до записи журнала: сбой записи не отменяет отказ.
+    common.emit(common.deny_output(reason))
     common.log_event(hook, session, verdict="deny", reason=verdict.reason,
                      violated=verdict.violated, duration_ms=duration_ms, content=content)
-    common.emit(common.deny_output(reason))
 
 
 def judge_question(data):

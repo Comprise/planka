@@ -39,14 +39,18 @@ planka — плагин Claude Code уровня пользователя: тр�
   `verification` — фильтр «готово»; `docs`, `comments` — фильтр «документация».
   `rules/dependencies.md` называет причина отказа `judge_tool.DEP_REASON`.
 - Метки `{RULES}`, `{COMMENT_LANG}`, `{DOC_LANG}` заменяет `common.substitute` при каждом чтении:
-  путь к `rules/` плагина и значения настроек; незаданный язык — `UNSET_LANG`.
+  путь к `rules/` плагина и значения настроек; незаданный язык — `UNSET_LANG`. Ссылка на модуль из
+  ядра и модулей пишется как `{RULES}/<имя>.md`, строка `remind.NO_DOCS_LINE` — так же: агент
+  получает абсолютный путь к правилам плагина, а `rules/` проекта с ним не путается.
 
 ## Ответ хука
 
 Все хуки запускаются через `common.run_hook`: stdout — один JSON (ответ из `common.emit` плюс
 `systemMessage` из `common.warn`) или пусто; stderr не пишется; исключение превращается в
 предупреждение «внутренняя ошибка». Причина отказа начинается с `planka: `. Отказ `PreToolUse` —
-`common.deny_output`, отказ `Stop` — `common.block_output`.
+`common.deny_output`, отказ `Stop` — `common.block_output`. Ответ запоминается до записи журнала:
+сбой записи не отменяет отказ. Сбой записи счётчика отказов (`common.deny_budget_exhausted`) —
+пропуск проверки: без счётчика нечем остановить цикл отказов.
 
 ## Судья
 
@@ -55,7 +59,11 @@ planka — плагин Claude Code уровня пользователя: тр�
 (по умолчанию `sonnet`), в отдельной группе процессов, с `cwd` в каталоге данных и окружением
 `PLANKA_JUDGE=1`. Каждый хук первым делом проверяет `common.barrier_active` и внутри судьи не
 работает. Любая ошибка судьи — `Verdict` с `error`, хук пропускает проверку с предупреждением.
-Таймаут — `JUDGE_TIMEOUT` (60 с) при таймауте хука 90 с в `hooks/hooks.json`.
+Проверяемое содержимое идёт судье блоком `<content>…</content>` (`prompts._wrap`); закрывающий тег
+внутри содержимого — в любом регистре и с пробелами (`prompts._CLOSING_TAG`) — экранируется.
+
+Таймаут — `JUDGE_TIMEOUT` (60 с); таймаут хука в `hooks/hooks.json` — 90 с у `PreToolUse` и 120 с у
+`Stop`: у `Stop` до судьи ещё `git rev-parse` (до 5 с) и два вызова `git` в `comments` (до 10 с каждый).
 
 Лимит отказов: `MAX_DENIES` = 2 на ключ `<prompt_id>:<hook>` (`common.deny_budget_exhausted`);
 отказ `judge_bash` лимитом не ограничен.

@@ -63,6 +63,7 @@
 - Модули импортируют друг друга по имени (`import common`), без пакета.
 - Точка входа: `common.run_hook(main)`; `main` начинается с `common.barrier_active()`.
 - Вывод — только через `common.emit` и `common.warn`; `print` и stderr не используются.
+- Отказ запоминается через `common.emit` до записи журнала: сбой записи не отменяет отказ.
 - Запись файлов состояния — атомарная, через временный файл и `os.replace`.
 
 Читать перед правкой: `context/architecture.md`, `context/testing.md`,

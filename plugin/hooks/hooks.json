@@ -29,7 +29,7 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/planka/judge_stop.py\"",
-            "timeout": 90
+            "timeout": 120
           }
         ]
       }

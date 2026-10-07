@@ -17,6 +17,8 @@ _HASH_NAMES = {"Makefile", "makefile", "GNUmakefile", "CMakeLists.txt", "Dockerf
 _DASH = {"sql", "lua", "hs"}
 _HTML = {"html", "xml", "vue", "svelte"}
 _DOCSTRING = {"py", "pyi"}
+_SHELL = {"sh", "bash", "zsh"}
+_DOCSTRING_OPEN = re.compile(r"[rRuU]?(\"\"\"|''')")
 _HASH_KEYS = _HASH | {n.lower() for n in _HASH_NAMES}
 _KNOWN = _C_FAMILY | _HASH_KEYS | _DASH | _HTML
 
@@ -29,14 +31,16 @@ def _strip_strings(line):
 def comment_lines(text, ext):
     ext = ext.lower()
     out = []
+    # Открытый многострочный блок: (закрывающий маркер, идут ли его строки в вывод).
     in_block = None
     for raw in text.split("\n"):
         line = raw.strip()
         if not line:
             continue
         if in_block:
-            out.append(line)
-            if in_block in line:
+            if in_block[1]:
+                out.append(line)
+            if in_block[0] in line:
                 in_block = None
             continue
         probe = _strip_strings(line)
@@ -48,18 +52,22 @@ def comment_lines(text, ext):
             elif j >= 0:
                 out.append(line[j:])
                 if "*/" not in probe[j:]:
-                    in_block = "*/"
+                    in_block = ("*/", True)
         elif ext in _HASH_KEYS:
-            i = _hash_start(probe)
+            i = _hash_start(probe, ext in _SHELL)
             if i >= 0 and not line.startswith("#!"):
                 out.append(line[i:])
             if ext in _DOCSTRING:
+                # Docstring — строка, которая начинается с тройных кавычек; тройные кавычки дальше
+                # в строке открывают строковый литерал, его строки пропускаются.
+                m = _DOCSTRING_OPEN.match(line)
                 for q in ('"""', "'''"):
                     k = line.find(q)
                     if k >= 0:
-                        out.append(line[k:])
+                        if m:
+                            out.append(line)
                         if line.count(q) == 1:
-                            in_block = q
+                            in_block = (q, bool(m))
                         break
         elif ext in _DASH:
             i = probe.find("--")
@@ -70,15 +78,19 @@ def comment_lines(text, ext):
             if i >= 0:
                 out.append(line[i:])
                 if "-->" not in probe[i:]:
-                    in_block = "-->"
+                    in_block = ("-->", True)
     return out
 
 
-def _hash_start(probe):
-    # Индекс «#», начинающего комментарий; «#» сразу после «$» или «{» ($#, ${#a[@]}) — код.
+def _hash_start(probe, shell):
+    """Индекс «#», начинающего комментарий; -1, если его нет.
+
+    «#» сразу после «$» или «{» ($#, ${#a[@]}) — код; в shell «#» начинает комментарий только в начале
+    строки или после пробела (${var#prefix} — код).
+    """
     i = probe.find("#")
     while i >= 0:
-        if i == 0 or probe[i - 1] not in "${":
+        if i == 0 or (probe[i - 1].isspace() if shell else probe[i - 1] not in "${"):
             return i
         i = probe.find("#", i + 1)
     return -1

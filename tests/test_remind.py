@@ -1,9 +1,17 @@
+import io
 import json
 import os
+import sys
 import time
 import unittest
+from unittest import mock
 
-from tests.helpers import Env, hook_input, messages, output
+from tests.helpers import Env, PLANKA_DIR, hook_input, messages, output
+
+sys.path.insert(0, str(PLANKA_DIR))
+import common  # noqa: E402
+import remind  # noqa: E402
+import snapshot  # noqa: E402
 
 
 class RemindTest(unittest.TestCase):
@@ -59,7 +67,7 @@ class RemindTest(unittest.TestCase):
     def test_no_claude_md_line(self):
         r = self.prompt()
         ctx = output(r)["hookSpecificOutput"]["additionalContext"]
-        self.assertTrue(ctx.endswith("Проект без документации: предложи автору инициализацию по rules/docs.md."))
+        self.assertTrue(ctx.endswith(f"Проект без документации: предложи автору инициализацию по {self.env.root / 'rules'}/docs.md."))
 
     def test_claude_md_present_no_line(self):
         (self.env.project / "CLAUDE.md").write_text("# x\n", encoding="utf-8")
@@ -82,11 +90,26 @@ class RemindTest(unittest.TestCase):
         ctx = output(r3)["hookSpecificOutput"]["additionalContext"]
         self.assertIn("Язык комментариев: en; язык документации: en.", ctx)
 
+    def run_in_process(self, *patches):
+        """remind.main через common.run_hook в этом процессе; возвращает строки systemMessage и ответ."""
+        stdin = io.StringIO(json.dumps(hook_input("UserPromptSubmit", prompt="x", cwd=str(self.env.project))))
+        with mock.patch.dict(os.environ, self.env.environ(), clear=True), \
+                mock.patch("sys.stdin", stdin), mock.patch("sys.stdout", new=io.StringIO()) as out:
+            for p in patches:
+                p.start()
+            try:
+                common.run_hook(remind.main)
+            finally:
+                for p in patches:
+                    p.stop()
+        reply = json.loads(out.getvalue())
+        return reply.get("systemMessage", "").splitlines(), reply.get("hookSpecificOutput")
+
     def test_too_many_files_warns(self):
         for i in range(3):
             (self.env.project / f"f{i}").write_text("x", encoding="utf-8")
-        r = self.prompt(PLANKA_TEST_MAX_FILES="2")
-        self.assertIn("50000", "\n".join(messages(r)))
+        msgs, _ = self.run_in_process(mock.patch.object(snapshot, "MAX_FILES", 2))
+        self.assertIn("50000", "\n".join(msgs))
         self.assertFalse((self.env.data / "state" / "sess-1.snap.json").exists())
 
     def test_reminder_survives_unwritable_state(self):
@@ -96,16 +119,15 @@ class RemindTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         ctx = output(r)["hookSpecificOutput"]["additionalContext"]
         self.assertTrue(ctx.startswith("# Философия работы"))
-        self.assertTrue(ctx.endswith("Проект без документации: предложи автору инициализацию по rules/docs.md."))
+        self.assertTrue(ctx.endswith(f"Проект без документации: предложи автору инициализацию по {self.env.root / 'rules'}/docs.md."))
         self.assertIn("planka:", "\n".join(messages(r)))
         self.assertNotIn("Traceback", r.stderr)
         self.assertNotIn("внутренняя ошибка", "\n".join(messages(r)))
 
-    def test_reminder_survives_bad_test_limit(self):
-        r = self.prompt(PLANKA_TEST_MAX_FILES="не число")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("# Философия работы", output(r)["hookSpecificOutput"]["additionalContext"])
-        self.assertNotIn("внутренняя ошибка", "\n".join(messages(r)))
+    def test_reminder_survives_snapshot_error(self):
+        msgs, out = self.run_in_process(mock.patch.object(snapshot, "scan", side_effect=ValueError("сбой")))
+        self.assertIn("# Философия работы", out["additionalContext"])
+        self.assertNotIn("внутренняя ошибка", "\n".join(msgs))
 
     def test_both_labels_when_state_unwritable(self):
         (self.env.data / "state").write_text("файл вместо каталога", encoding="utf-8")
@@ -113,10 +135,10 @@ class RemindTest(unittest.TestCase):
         self.assertIn("снимок дерева не записан:", "\n".join(messages(r)))
         self.assertIn("предупреждение о языке не записано:", "\n".join(messages(r)))
 
-    def test_bad_test_limit_only_snapshot_label(self):
-        r = self.prompt(PLANKA_TEST_MAX_FILES="не число")
-        self.assertIn("снимок дерева не записан:", "\n".join(messages(r)))
-        self.assertNotIn("предупреждение о языке не записано", "\n".join(messages(r)))
+    def test_snapshot_error_only_snapshot_label(self):
+        msgs, _ = self.run_in_process(mock.patch.object(snapshot, "scan", side_effect=ValueError("сбой")))
+        self.assertIn("снимок дерева не записан:", "\n".join(msgs))
+        self.assertNotIn("предупреждение о языке не записано", "\n".join(msgs))
 
     def test_snapshot_prunes_stale_state(self):
         state = self.env.data / "state"

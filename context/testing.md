@@ -23,9 +23,11 @@ CI нет; обе цели — в `Makefile`.
 `PLANKA_STUB_REASON`), `hang`, `garbage`, `notlogged`. При `PLANKA_STUB_RECORD=<файл>` пишет
 туда аргументы, stdin, `PLANKA_JUDGE` и `cwd`. Новый вид ответа судьи — новая ветка заглушки.
 
-## Тестовые крючки в коде
+## Тесты в том же процессе
 
-- `PLANKA_TEST_MAX_FILES` — порог снимка в `remind.take_snapshot`.
+Тестовых крючков в рабочем коде нет. Где нужно подменить модуль — порог `snapshot.MAX_FILES`,
+сбой `snapshot.scan`, — тест зовёт `common.run_hook(remind.main)` в своём процессе с `mock.patch`
+(`RemindTest.run_in_process`).
 
 ## Что тестами не покрыто
 

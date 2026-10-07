@@ -27,6 +27,13 @@ class CommentLinesTest(unittest.TestCase):
         for ext in ("sh", "bash", "zsh"):
             self.assertEqual(comments.comment_lines(src, ext), ["# c"])
 
+    def test_shell_hash_inside_word_is_code(self):
+        self.assertEqual(comments.comment_lines("x=${var#prefix}\ny=a#b # c\n", "sh"), ["# c"])
+
+    def test_triple_quoted_string_is_not_docstring(self):
+        src = 'q = """SELECT"""\nsql = """\n# not a comment\n"""\n# real\ndef f():\n    r"""Doc."""\n'
+        self.assertEqual(comments.comment_lines(src, "py"), ["# real", 'r"""Doc."""'])
+
     def test_sql_and_html(self):
         self.assertEqual(comments.comment_lines("select 1 -- c\n", "sql"), ["-- c"])
         self.assertEqual(comments.comment_lines("<a>\n<!-- hidden -->\n", "html"), ["<!-- hidden -->"])

@@ -76,7 +76,7 @@ class Env:
         return env
 
     def run(self, script, hook_input, **extra):
-        """Запускает planka/<script> как хук: stdin — JSON, возвращает CompletedProcess."""
+        """Запускает plugin/planka/<script> как хук: stdin — JSON, возвращает CompletedProcess."""
         stdin = hook_input if isinstance(hook_input, str) else json.dumps(hook_input)
         return subprocess.run(
             [sys.executable, str(PLANKA_DIR / script)],
