@@ -52,16 +52,56 @@ def warn(msg):
     print(f"planka: {msg}", file=sys.stderr)
 
 
+RULES_PLACEHOLDER = "{RULES}"
+
+
+def rules_dir():
+    return plugin_root() / "rules"
+
+
 def philosophy_text():
     p = plugin_root() / "philosophy.md"
     try:
-        return p.read_text(encoding="utf-8")
+        text = p.read_text(encoding="utf-8")
     except OSError:
         warn(f"нет файла правил {p}")
         return None
     except UnicodeDecodeError:
         warn(f"файл правил {p} не в UTF-8")
         return None
+    return text.replace(RULES_PLACEHOLDER, str(rules_dir()))
+
+
+def rule_texts(*names):
+    """Модули rules/<name>.md в порядке names; None, если хоть одного нет."""
+    out = []
+    for name in names:
+        p = rules_dir() / f"{name}.md"
+        try:
+            out.append(p.read_text(encoding="utf-8").strip())
+        except OSError:
+            warn(f"нет модуля правил {p}")
+            return None
+        except UnicodeDecodeError:
+            warn(f"модуль правил {p} не в UTF-8")
+            return None
+    return "\n\n".join(out)
+
+
+def rubric(sections, modules):
+    """Рубрика судьи: разделы ядра, затем модули; None, если любая часть недоступна."""
+    parts = []
+    if sections:
+        core = philosophy_sections(*sections)
+        if core is None:
+            return None
+        parts.append(core)
+    if modules:
+        mods = rule_texts(*modules)
+        if mods is None:
+            return None
+        parts.append(mods)
+    return "\n\n".join(parts)
 
 
 def philosophy_sections(*names):

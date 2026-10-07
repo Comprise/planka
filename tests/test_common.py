@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import sys
@@ -24,13 +25,13 @@ class BarrierTest(unittest.TestCase):
 
 class ReadInputTest(unittest.TestCase):
     def test_empty_and_garbage(self):
-        with mock.patch("sys.stdin", new=__import__("io").StringIO("")):
+        with mock.patch("sys.stdin", new=io.StringIO("")):
             self.assertIsNone(common.read_input())
-        with mock.patch("sys.stdin", new=__import__("io").StringIO("not json")):
+        with mock.patch("sys.stdin", new=io.StringIO("not json")):
             self.assertIsNone(common.read_input())
-        with mock.patch("sys.stdin", new=__import__("io").StringIO('{"a":1}')):
+        with mock.patch("sys.stdin", new=io.StringIO('{"a":1}')):
             self.assertEqual(common.read_input(), {"a": 1})
-        with mock.patch("sys.stdin", new=__import__("io").StringIO('[1]')):
+        with mock.patch("sys.stdin", new=io.StringIO('[1]')):
             self.assertIsNone(common.read_input())
 
 
@@ -53,15 +54,72 @@ class PhilosophyTest(unittest.TestCase):
         self.assertIn("Правило планов два.", text)
 
     def test_missing_section_is_none(self):
-        with mock.patch("sys.stderr", new=__import__("io").StringIO()) as err:
+        with mock.patch("sys.stderr", new=io.StringIO()) as err:
             self.assertIsNone(common.philosophy_sections("Решения", "Нет такого"))
             self.assertIn("planka:", err.getvalue())
 
     def test_missing_file_is_none(self):
         (self.env.root / "philosophy.md").unlink()
-        with mock.patch("sys.stderr", new=__import__("io").StringIO()) as err:
+        with mock.patch("sys.stderr", new=io.StringIO()) as err:
             self.assertIsNone(common.philosophy_text())
             self.assertIn("planka:", err.getvalue())
+
+
+class RulesTest(unittest.TestCase):
+    def setUp(self):
+        self.env = Env()
+        self.patch = mock.patch.dict(os.environ, self.env.environ(), clear=True)
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        self.env.close()
+
+    def test_placeholder_replaced_with_rules_dir(self):
+        text = common.philosophy_text()
+        self.assertNotIn("{RULES}", text)
+        self.assertIn(str(self.env.root / "rules"), text)
+
+    def test_rule_texts_in_order(self):
+        text = common.rule_texts("planning", "verification")
+        self.assertTrue(text.startswith("# Планирование"))
+        self.assertIn("# Доказательство", text)
+        self.assertLess(text.index("# Планирование"), text.index("# Доказательство"))
+
+    def test_missing_rule_is_none(self):
+        with mock.patch("sys.stderr", new=io.StringIO()) as err:
+            self.assertIsNone(common.rule_texts("verification", "nope"))
+            self.assertIn("planka:", err.getvalue())
+
+    def test_non_utf8_rule_is_none(self):
+        (self.env.root / "rules" / "verification.md").write_bytes(b"\xff\xfe")
+        with mock.patch("sys.stderr", new=io.StringIO()) as err:
+            self.assertIsNone(common.rule_texts("verification"))
+            self.assertIn("planka:", err.getvalue())
+
+    def test_rubric_combines(self):
+        text = common.rubric(("Решения", "Планы"), ("planning",))
+        self.assertTrue(text.startswith("## Решения"))
+        self.assertIn("## Планы", text)
+        self.assertIn("# Планирование", text)
+        self.assertLess(text.index("## Планы"), text.index("# Планирование"))
+
+    def test_rubric_sections_only_and_modules_only(self):
+        self.assertTrue(common.rubric(("Решения",), ()).startswith("## Решения"))
+        self.assertTrue(common.rubric((), ("verification",)).startswith("# Доказательство"))
+
+    def test_rubric_none_when_part_missing(self):
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            self.assertIsNone(common.rubric(("Решения",), ("nope",)))
+            self.assertIsNone(common.rubric(("Нет такого",), ("planning",)))
+
+    def test_rules_dir_missing_is_none(self):
+        import shutil
+        shutil.rmtree(self.env.root / "rules")
+        with mock.patch("sys.stderr", new=io.StringIO()) as err:
+            self.assertIsNone(common.rule_texts("planning"))
+            self.assertIn("planka:", err.getvalue())
+        self.assertIn(str(self.env.root / "rules"), common.philosophy_text())
 
 
 class RunJudgeTest(unittest.TestCase):
@@ -184,7 +242,7 @@ class RunHookTest(unittest.TestCase):
     def test_exception_is_warning_and_exit_zero(self):
         def main():
             raise PermissionError("нет доступа")
-        with mock.patch("sys.stderr", new=__import__("io").StringIO()) as err:
+        with mock.patch("sys.stderr", new=io.StringIO()) as err:
             with self.assertRaises(SystemExit) as cm:
                 common.run_hook(main)
         self.assertEqual(cm.exception.code, 0)

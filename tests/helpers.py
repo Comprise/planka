@@ -29,13 +29,23 @@ PHILOSOPHY = """# Философия работы
 
 1. Правило планов один.
 2. Правило планов два.
+
+## Модули
+
+Каталог: {RULES}
 """
+
+RULES = {
+    "verification": "# Доказательство\n\n- Правило проверки.\n",
+    "planning": "# Планирование\n\n- Правило планирования.\n",
+    "subagents": "# Субагенты\n\n- Правило субагентов.\n",
+}
 
 
 class Env:
-    """Временный CLAUDE_PLUGIN_ROOT с philosophy.md и CLAUDE_PLUGIN_DATA."""
+    """Временный CLAUDE_PLUGIN_ROOT с philosophy.md, rules/ и CLAUDE_PLUGIN_DATA."""
 
-    def __init__(self, philosophy=PHILOSOPHY):
+    def __init__(self, philosophy=PHILOSOPHY, rules=RULES):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.tmp.name) / "root"
         self.data = pathlib.Path(self.tmp.name) / "data"
@@ -43,6 +53,10 @@ class Env:
         self.data.mkdir()
         if philosophy is not None:
             (self.root / "philosophy.md").write_text(philosophy, encoding="utf-8")
+        if rules is not None:
+            (self.root / "rules").mkdir()
+            for name, text in rules.items():
+                (self.root / "rules" / f"{name}.md").write_text(text, encoding="utf-8")
 
     def environ(self, **extra):
         env = {k: v for k, v in os.environ.items() if not k.startswith("PLANKA_")}
