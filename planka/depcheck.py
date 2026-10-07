@@ -27,11 +27,16 @@ _NO_VALUE_FLAGS = frozenset()
 _ADD_FLAGS = {"poetry": _POETRY_VALUE_FLAGS, "cargo": _CARGO_VALUE_FLAGS, "bundle": _BUNDLE_VALUE_FLAGS}
 
 
+# shlex.split квадратичен по длине токена; _is_add смотрит только на ведущие слова сегмента.
+_WORDS_LIMIT = 4096
+
+
 def _words(segment):
+    segment = segment[:_WORDS_LIMIT]
     try:
         words = shlex.split(segment, posix=True, comments=True)
     except ValueError:
-        # Незакрытая кавычка: комментарий отсекается по первому " #" или ведущему "#".
+        # Кавычка не закрыта или обрезана лимитом: комментарий отсекается по первому " #" или ведущему "#".
         if segment.startswith("#"):
             segment = ""
         segment = segment.split(" #", 1)[0]
@@ -41,8 +46,8 @@ def _words(segment):
     return words
 
 
-def _positional(args, value_flags=_NO_VALUE_FLAGS):
-    """Первое слово-аргумент, похожее на имя пакета: не флаг, не значение флага, не локальный путь."""
+def _positionals(args, value_flags=_NO_VALUE_FLAGS):
+    """Слова-аргументы, похожие на имя пакета: не флаг, не значение флага, не локальный путь или архив."""
     skip = False
     for w in args:
         if skip:
@@ -51,16 +56,24 @@ def _positional(args, value_flags=_NO_VALUE_FLAGS):
         if w.startswith("-"):
             skip = w in value_flags
             continue
-        if not w or w.startswith((".", "/", "~", "file:")):
+        if not w or w.startswith((".", "/", "~", "file:")) or w.endswith((".whl", ".tar.gz")):
             continue
-        return w
-    return None
+        yield w
+
+
+def _positional(args, value_flags=_NO_VALUE_FLAGS):
+    return next(_positionals(args, value_flags), None)
+
+
+# Установщик и его спутники в venv пакетов в проект не добавляют.
+_PIP_BOOTSTRAP = {"pip", "setuptools", "wheel"}
 
 
 def _pip_add(args):
     if _PIP_REQ_FLAGS & set(args):
         return False
-    return _positional(args, _PIP_VALUE_FLAGS) is not None
+    names = set(_positionals(args, _PIP_VALUE_FLAGS))
+    return bool(names - _PIP_BOOTSTRAP)
 
 
 def _is_add(words):
@@ -114,13 +127,116 @@ def _strip_comment(line):
     return line
 
 
+_WORD_END = " \t;&|<>()"
+
+
+def _heredoc_word(line, i):
+    """Терминатор heredoc, начинающийся с позиции i, после снятия кавычек, и позиция за ним."""
+    word = []
+    while i < len(line) and line[i] not in _WORD_END:
+        c = line[i]
+        if c in "'\"":
+            end = line.find(c, i + 1)
+            end = len(line) if end < 0 else end
+            word.append(line[i + 1:end])
+            i = end + 1
+        elif c == "\\":
+            word.append(line[i + 1:i + 2])
+            i += 2
+        else:
+            word.append(c)
+            i += 1
+    return "".join(word), i
+
+
+def _heredocs(line):
+    """Heredoc, открытые строкой, по порядку: (терминатор, снимать ли ведущие табы).
+
+    `<<` в кавычках, here-string `<<<`, сдвиг в арифметике `((…))` и комментарий не считаются;
+    подстановка `$(…)` внутри двойных кавычек — снова команда.
+    """
+    found = []
+    stack = []  # "'", '"', "(" — подстановка или подоболочка, "A" — арифметика, "a" — скобка в ней
+    i = 0
+    while i < len(line):
+        top = stack[-1] if stack else None
+        c = line[i]
+        if top == "'":
+            if c == "'":
+                stack.pop()
+            i += 1
+        elif c == "\\":
+            i += 2
+        elif top == '"':
+            if c == '"':
+                stack.pop()
+                i += 1
+            elif line.startswith("$((", i):
+                stack.append("A")
+                i += 3
+            elif line.startswith("$(", i):
+                stack.append("(")
+                i += 2
+            else:
+                i += 1
+        elif c in "'\"":
+            stack.append(c)
+            i += 1
+        elif top in ("A", "a"):
+            if top == "A" and line.startswith("))", i):
+                stack.pop()
+                i += 2
+            else:
+                if c == "(":
+                    stack.append("a")
+                elif c == ")" and top == "a":
+                    stack.pop()
+                i += 1
+        elif line.startswith("$((", i) or line.startswith("((", i):
+            stack.append("A")
+            i += 3 if c == "$" else 2
+        elif line.startswith("$(", i) or c == "(":
+            stack.append("(")
+            i += 2 if c == "$" else 1
+        elif c == ")":
+            if top == "(":
+                stack.pop()
+            i += 1
+        elif c == "#" and (i == 0 or line[i - 1].isspace()):
+            break
+        elif line.startswith("<<<", i):
+            i += 3
+        elif line.startswith("<<", i):
+            i += 2
+            strip_tabs = line.startswith("-", i)
+            i += strip_tabs
+            while i < len(line) and line[i] in " \t":
+                i += 1
+            word, i = _heredoc_word(line, i)
+            if word:
+                found.append((word, strip_tabs))
+        else:
+            i += 1
+    return found
+
+
 def dependency_add(command):
-    """Сегмент команды, добавляющий пакет; None, если такого нет или стоит маркер согласия."""
+    """Сегмент команды, добавляющий пакет; None, если такого нет или стоит маркер согласия.
+
+    Тело heredoc — данные, а не команды: строки до терминатора не разбираются.
+    """
     if not isinstance(command, str) or DEP_OK_MARKER in command:
         return None
+    pending = []
     for line in command.split("\n"):
+        if pending:
+            term, strip_tabs = pending[0]
+            if (line.lstrip("\t") if strip_tabs else line) == term:
+                pending.pop(0)
+            continue
         for segment in _SPLIT.split(_strip_comment(line)):
             segment = segment.strip()
             if segment and _is_add(_words(segment)):
                 return segment
+        pending = _heredocs(line)
     return None

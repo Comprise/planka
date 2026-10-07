@@ -74,6 +74,63 @@ class DependencyAddTest(unittest.TestCase):
         self.assertIsNone(depcheck.dependency_add(5))
 
 
+class LongTokenTest(unittest.TestCase):
+    def test_megabyte_token_returns(self):
+        self.assertIsNone(depcheck.dependency_add("x" * 1_000_000))
+
+    def test_add_before_megabyte_token_detected(self):
+        self.assertIsNotNone(depcheck.dependency_add("npm install left-pad " + "x" * 1_000_000))
+
+
+class HeredocTest(unittest.TestCase):
+    def test_body_not_scanned(self):
+        for cmd in [
+            "cat <<'EOF' > README.md\n# Установка\n\npip install mypkg\nEOF",
+            'git commit -m "$(cat <<\'EOF\'\nfix: deps\n\nnpm install x\nEOF\n)"',
+            "cat <<-EOF\n\tnpm install x\n\tEOF",
+            'cat <<"EOF"\npip install y\nEOF',
+            "cat << EOF\npip install y\nEOF",
+        ]:
+            self.assertIsNone(depcheck.dependency_add(cmd), cmd)
+
+    def test_command_after_body_detected(self):
+        self.assertEqual(depcheck.dependency_add("cat <<EOF\nnpm install x\nEOF\nnpm install y"), "npm install y")
+
+    def test_introducing_line_checked(self):
+        self.assertIsNotNone(depcheck.dependency_add("npm install x <<EOF\nhi\nEOF"))
+
+    def test_quoted_operator_is_not_heredoc(self):
+        for cmd in ['echo "a <<b"\nnpm install x', "echo 'a <<b'\nnpm install x",
+                    "cat <<< EOF\nnpm install x", "echo $((1 << 2))\nnpm install x",
+                    "echo $(( (1 << 2) ))\nnpm install x", "(( x <<= 1 ))\nnpm install x",
+                    "echo hi # <<EOF\nnpm install x"]:
+            self.assertIsNotNone(depcheck.dependency_add(cmd), cmd)
+
+    def test_two_heredocs_on_one_line(self):
+        self.assertIsNone(depcheck.dependency_add("cat <<A <<B\npip install x\nA\npip install y\nB"))
+        self.assertIsNotNone(depcheck.dependency_add("cat <<A <<B\nA\nB\npip install z"))
+
+
+class PipBootstrapAndArchivesTest(unittest.TestCase):
+    def test_not_adds(self):
+        for cmd in [
+            "pip install --upgrade pip",
+            "python -m pip install --upgrade pip setuptools wheel",
+            "uv pip install -U pip",
+            "pip install dist/x.whl",
+            "pip install dist/x-1.0.tar.gz",
+        ]:
+            self.assertIsNone(depcheck.dependency_add(cmd), cmd)
+
+    def test_still_detected(self):
+        for cmd in [
+            "pip install --upgrade pip requests",
+            "pip install requests",
+            "pip install dist/x.whl requests",
+        ]:
+            self.assertIsNotNone(depcheck.dependency_add(cmd), cmd)
+
+
 class FalseDenyTest(unittest.TestCase):
     def test_not_adds(self):
         for cmd in [
