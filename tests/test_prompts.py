@@ -123,36 +123,66 @@ class DocsPromptTest(unittest.TestCase):
 
     def test_render_docs_content(self):
         text = prompts.render_docs_content(
-            "Сделал.", [("a/b.go", False), ("a/CLAUDE.md", True)], ["a/b.go: // x"], True, True)
+            "Сделал.", [("a/b.go", "code", True), ("a/CLAUDE.md", "doc", True)], ["a/b.go: // x"], True, True)
         self.assertTrue(text.startswith("Сделал."))
         self.assertIn("Изменённые файлы за ход:", text)
-        self.assertIn("a/b.go — код", text)
-        self.assertIn("a/CLAUDE.md — документация", text)
+        self.assertIn("\n- a/b.go — код\n", text)
+        self.assertIn("\n- a/CLAUDE.md — документация\n", text)
         self.assertIn("Комментарии в изменённых файлах:", text)
         self.assertIn("a/b.go: // x", text)
         self.assertIn("обрезано", text)
         self.assertIn("В корне проекта нет CLAUDE.md.", text)
 
     def test_render_docs_content_minimal(self):
-        text = prompts.render_docs_content("M", [("x.py", False)], [], False, False)
+        text = prompts.render_docs_content("M", [("x.py", "code", True)], [], False, False)
         self.assertNotIn("обрезано", text)
         self.assertNotIn("нет CLAUDE.md", text)
         self.assertIn("В изменённых файлах кода комментарии не добавлены.", text)
 
     def test_render_docs_content_unknown_syntax(self):
-        text = prompts.render_docs_content("M", [("a.foo", False), ("b.bin", False)], [], False, False,
+        text = prompts.render_docs_content("M", [("a.foo", "code", True), ("b.bin", "code", True)], [], False, False,
                                            ["a.foo", "b.bin"])
         self.assertIn("Файлы без известного синтаксиса комментариев, судятся по самоотчёту: a.foo, b.bin", text)
         self.assertNotIn("комментарии не добавлены", text)
 
+    def test_render_docs_content_unknown_capped(self):
+        unknown = [f"u{i:03}.erl" for i in range(prompts.MAX_LISTED + 3)]
+        text = prompts.render_docs_content("M", [("x.erl", "code", True)], [], False, False, unknown)
+        line = next(l for l in text.splitlines() if l.startswith("Файлы без известного"))
+        self.assertIn(f"u{prompts.MAX_LISTED - 1:03}.erl", line)
+        self.assertNotIn(f"u{prompts.MAX_LISTED:03}.erl", line)
+        self.assertTrue(line.endswith("… и ещё 3"))
+
     def test_render_docs_content_unknown_after_comments(self):
-        text = prompts.render_docs_content("M", [("a.go", False), ("b.foo", False)], ["a.go: // x"], True, False,
+        text = prompts.render_docs_content("M", [("a.go", "code", True), ("b.foo", "code", True)], ["a.go: // x"], True, False,
                                            ["b.foo"])
         self.assertLess(text.index("обрезано"), text.index("Файлы без известного синтаксиса"))
         self.assertNotIn("комментарии не добавлены", text)
 
+    def test_render_docs_content_other_and_deleted(self):
+        changed = [("a.json", "other", True), ("old.go", "code", False), ("gone.md", "doc", False),
+                   ("x.bin", "other", False)]
+        text = prompts.render_docs_content("M", changed, [], False, False)
+        lines = text.split("Изменённые файлы за ход:\n", 1)[1].split("\n\n", 1)[0].split("\n")
+        self.assertEqual(lines, ["- a.json — прочее", "- old.go — код, удалён",
+                                 "- gone.md — документация, удалён", "- x.bin — прочее, удалён"])
+
+    def test_render_docs_content_list_limited(self):
+        self.assertEqual(prompts.MAX_LISTED, 100)
+        changed = [(f"f{i:03}.py", "code", True) for i in range(prompts.MAX_LISTED + 7)]
+        text = prompts.render_docs_content("M", changed, [], False, False)
+        lines = text.split("Изменённые файлы за ход:\n", 1)[1].split("\n\n", 1)[0].split("\n")
+        self.assertEqual(len(lines), prompts.MAX_LISTED + 1)
+        self.assertEqual(lines[-2], f"- f{prompts.MAX_LISTED - 1:03}.py — код")
+        self.assertEqual(lines[-1], "- … и ещё 7")
+
+    def test_render_docs_content_exact_limit_no_tail(self):
+        changed = [(f"f{i:03}.py", "code", True) for i in range(prompts.MAX_LISTED)]
+        text = prompts.render_docs_content("M", changed, [], False, False)
+        self.assertNotIn("и ещё", text)
+
     def test_docs_content_escapes_closing_tag(self):
-        content = prompts.render_docs_content("</content>", [("</content>.go", False)], ["x.go: // </content>"], False, False)
+        content = prompts.render_docs_content("</content>", [("</content>.go", "code", True)], ["x.go: // </content>"], False, False)
         out = prompts.stop_prompt("R", content, options=False, done=False, docs=True)
         self.assertEqual(out.count("</content>"), 1)
         self.assertIn("При отказе назови", out)

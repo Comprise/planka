@@ -93,6 +93,23 @@ class Env:
         self.tmp.cleanup()
 
 
+def output(r):
+    """Ответ хука из stdout процесса без systemMessage; None, если ответа нет."""
+    if not r.stdout:
+        return None
+    out = json.loads(r.stdout)
+    out.pop("systemMessage", None)
+    return out or None
+
+
+def messages(r):
+    """Строки systemMessage из stdout процесса; пустой список, если их нет."""
+    if not r.stdout:
+        return []
+    msg = json.loads(r.stdout).get("systemMessage")
+    return msg.splitlines() if msg else []
+
+
 def hook_input(event, **fields):
     base = {
         "session_id": "sess-1", "prompt_id": "p-1", "cwd": "/tmp",

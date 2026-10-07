@@ -7,12 +7,16 @@ MAX_LINES = 300
 MAX_BYTES = 16_384
 
 _C_FAMILY = {"go", "c", "h", "cc", "cpp", "hpp", "java", "kt", "kts", "swift", "js", "jsx", "ts", "tsx",
-             "dart", "rs", "scala", "m", "mm", "cs"}
-_HASH = {"py", "sh", "bash", "zsh", "rb", "pl", "toml", "yaml", "yml", "mk", "makefile", "cfg", "ini", "ps1"}
+             "dart", "rs", "scala", "m", "mm", "cs", "php", "groovy", "gradle", "proto", "sol", "zig"}
+_HASH = {"py", "sh", "bash", "zsh", "rb", "pl", "toml", "yaml", "yml", "mk", "makefile", "cfg", "ini", "ps1",
+         "tf", "nix", "r", "jl", "ex", "exs"}
+# Файлы без расширения с синтаксисом «#»: ключ семейства — имя в нижнем регистре.
+_HASH_NAMES = {"Makefile", "makefile", "GNUmakefile", "Dockerfile", "Justfile", "Rakefile", "Gemfile"}
 _DASH = {"sql", "lua", "hs"}
 _HTML = {"html", "xml", "vue", "svelte"}
 _DOCSTRING = {"py"}
-_KNOWN = _C_FAMILY | _HASH | _DASH | _HTML
+_HASH_KEYS = _HASH | {n.lower() for n in _HASH_NAMES}
+_KNOWN = _C_FAMILY | _HASH_KEYS | _DASH | _HTML
 
 
 def _strip_strings(line):
@@ -43,7 +47,7 @@ def comment_lines(text, ext):
                 out.append(line[j:])
                 if "*/" not in probe[j:]:
                     in_block = "*/"
-        elif ext in _HASH:
+        elif ext in _HASH_KEYS:
             i = _hash_start(probe)
             if i >= 0 and not line.startswith("#!"):
                 out.append(line[i:])
@@ -80,8 +84,8 @@ def _hash_start(probe):
 
 def _ext(relpath):
     name = relpath.rsplit("/", 1)[-1]
-    if name == "Makefile":
-        return "makefile"
+    if name in _HASH_NAMES:
+        return name.lower()
     return name.rsplit(".", 1)[-1].lower() if "." in name else ""
 
 

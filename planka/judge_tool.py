@@ -92,8 +92,8 @@ def judge_plan(data):
                 return
             reason = ("planka: в одной волне файл принадлежит нескольким задачам:\n"
                       + planparse.format_conflicts(conflicts))
-            common.log_event("plan", session, verdict="deny-files", reason=reason, content=plan)
             common.emit(common.deny_output(reason))
+            common.log_event("plan", session, verdict="deny-files", reason=reason, content=plan)
             return
     rubric = common.rubric(("Решения", "Планы"), ("planning", "subagents"))
     if rubric is None:
@@ -116,8 +116,8 @@ def judge_bash(data):
         return
     session = data.get("session_id", "")
     reason = DEP_REASON.format(rules=common.rules_dir(), marker=depcheck.DEP_OK_MARKER, command=segment)
-    common.log_event("bash", session, verdict="deny-dep", reason=reason, content=command)
     common.emit(common.deny_output(reason))
+    common.log_event("bash", session, verdict="deny-dep", content=command)
 
 
 def main():
