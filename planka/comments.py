@@ -24,7 +24,7 @@ def comment_lines(text, ext):
     ext = ext.lower()
     out = []
     in_block = None
-    for raw in text.splitlines():
+    for raw in text.split("\n"):
         line = raw.strip()
         if not line:
             continue
@@ -108,7 +108,7 @@ def _unquote(path):
         if c != "\\" or i + 1 == len(body):
             out += c.encode("utf-8")
             i += 1
-        elif body[i + 1] in "01234567":
+        elif body[i + 1:i + 4].isdigit() and all(d in "01234567" for d in body[i + 1:i + 4]) and len(body[i + 1:i + 4]) == 3:
             out.append(int(body[i + 1:i + 4], 8) & 0xFF)
             i += 4
         else:
@@ -119,12 +119,12 @@ def _unquote(path):
 
 def _added_lines(root, relpaths):
     """{путь: добавленный текст} по одному git diff на все пути; None, если diff не получен."""
-    out = _git(root, "diff", "--no-color", "--no-ext-diff", "--relative", "--src-prefix=a/", "--dst-prefix=b/",
+    out = _git(root, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--relative", "--src-prefix=a/", "--dst-prefix=b/",
                "-U0", "HEAD", "--", *relpaths)
     if out is None:
         return None
     added, current, in_header = {}, None, False
-    for line in out.splitlines():
+    for line in out.split("\n"):
         if line.startswith("diff --git "):
             current, in_header = None, True
         elif in_header and line.startswith("+++ "):

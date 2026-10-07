@@ -147,5 +147,15 @@ class ExtractTest(unittest.TestCase):
         self.assertEqual(lines, ["a.py: # staged"])
 
 
+class UnquoteAndFramingTest(unittest.TestCase):
+    def test_malformed_escape_is_literal(self):
+        self.assertEqual(comments._unquote('"a\\1z.py"'), "a\\1z.py")
+        self.assertEqual(comments._unquote('"caf\\303\\251.py"'), "café.py")
+
+    def test_form_feed_inside_added_line_is_kept(self):
+        text = "x = 1  // a\x0cb\n"
+        self.assertEqual(comments.comment_lines(text, "go"), ["// a\x0cb"])
+
+
 if __name__ == "__main__":
     unittest.main()
