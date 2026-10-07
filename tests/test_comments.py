@@ -34,6 +34,31 @@ class CommentLinesTest(unittest.TestCase):
         src = 'q = """SELECT"""\nsql = """\n# not a comment\n"""\n# real\ndef f():\n    r"""Doc."""\n'
         self.assertEqual(comments.comment_lines(src, "py"), ["# real", 'r"""Doc."""'])
 
+    def test_triple_quote_inside_comment(self):
+        src = 'x = 1  # see the """ quoting\ny = 2\n# real comment\n'
+        self.assertEqual(comments.comment_lines(src, "py"), ['# see the """ quoting', "# real comment"])
+
+    def test_backticks_and_raw_strings_are_strings(self):
+        self.assertEqual(comments.comment_lines("const u = `https://e.com/x`; // c\n", "ts"), ["// c"])
+        self.assertEqual(comments.comment_lines('let s = r#"a " // not"#; // yes\n', "rs"), ["// yes"])
+
+    def test_yaml_hash_inside_word_is_value(self):
+        self.assertEqual(comments.comment_lines("url: http://a/b#frag\nk: 1 # c\n", "yaml"), ["# c"])
+
+    def test_shell_heredoc_body_is_data(self):
+        src = "cat <<EOF > s.md\n# Heading\nEOF\n# real\n"
+        self.assertEqual(comments.comment_lines(src, "sh"), ["# real"])
+
+    def test_block_comments_lua_haskell(self):
+        self.assertEqual(comments.comment_lines("--[[ block\nline two\n]]\nx = 1 -- tail\n", "lua"),
+                         ["--[[ block", "line two", "]]", "-- tail"])
+        self.assertEqual(comments.comment_lines("{- block\nline -}\nx = 1 -- tail\n", "hs"),
+                         ["{- block", "line -}", "-- tail"])
+
+    def test_vue_script_comments(self):
+        src = "<template>\n<!-- html -->\n</template>\n<script>\n// js comment\n</script>\n"
+        self.assertEqual(comments.comment_lines(src, "vue"), ["<!-- html -->", "// js comment"])
+
     def test_sql_and_html(self):
         self.assertEqual(comments.comment_lines("select 1 -- c\n", "sql"), ["-- c"])
         self.assertEqual(comments.comment_lines("<a>\n<!-- hidden -->\n", "html"), ["<!-- hidden -->"])
@@ -127,6 +152,43 @@ class ExtractTest(unittest.TestCase):
         self.write("u.py", "# untracked\n")
         lines, _, _ = comments.extract(self.root, ["a.go", "u.py"])
         self.assertEqual(lines, ["a.go: // new", "u.py: # untracked"])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_base_commit_sees_committed_lines(self):
+        self.git("init", "-q")
+        self.write("a.py", "x = 1\n")
+        self.commit("a.py")
+        base = subprocess.run(["git", "-C", str(self.root), "rev-parse", "HEAD"], capture_output=True,
+                              text=True, check=True).stdout.strip()
+        self.write("a.py", "x = 1\n# закоммичено в ходе\n")
+        self.commit("a.py")
+        self.assertEqual(comments.extract(self.root, ["a.py"])[0], [])
+        self.assertEqual(comments.extract(self.root, ["a.py"], base)[0], ["a.py: # закоммичено в ходе"])
+        self.assertEqual(comments.extract(self.root, ["a.py"], None)[0], ["a.py: # закоммичено в ходе"])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_submodule_file_added_lines_only(self):
+        lib = pathlib.Path(self.tmp.name + "-lib")
+        try:
+            self.git("init", "-q")
+            subprocess.run(["git", "init", "-q", str(lib)], check=True)
+            (lib / "s.py").write_text("# old sub comment\n", encoding="utf-8")
+            git = ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-c", "protocol.file.allow=always"]
+            subprocess.run([*git, "-C", str(lib), "add", "s.py"], check=True)
+            subprocess.run([*git, "-C", str(lib), "commit", "-qm", "i"], check=True)
+            subprocess.run([*git, "-C", str(self.root), "submodule", "add", "-q", str(lib), "sub"],
+                           check=True, capture_output=True)
+            self.write("sub/s.py", "# old sub comment\n# new sub\n")
+            lines, _, _ = comments.extract(self.root, ["sub/s.py"])
+            self.assertEqual(lines, ["sub/s.py: # new sub"])
+            sub_base = subprocess.run(["git", "-C", str(self.root / "sub"), "rev-parse", "HEAD"],
+                                      capture_output=True, text=True, check=True).stdout.strip()
+            subprocess.run([*git, "-C", str(self.root / "sub"), "commit", "-qam", "turn"], check=True)
+            self.assertEqual(comments.extract(self.root, ["sub/s.py"])[0], [])
+            self.assertEqual(comments.extract(self.root, ["sub/s.py"], "HEAD", {"sub": sub_base})[0],
+                             ["sub/s.py: # new sub"])
+        finally:
+            shutil.rmtree(lib, ignore_errors=True)
 
     @unittest.skipUnless(shutil.which("git"), "нет git")
     def test_git_two_calls_for_many_files(self):

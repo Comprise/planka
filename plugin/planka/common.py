@@ -1,4 +1,6 @@
 """Общее для хуков planka: барьеры, вход, судья, счётчик отказов, журнал, форматы ответа."""
+import ctypes
+import contextlib
 import dataclasses
 import datetime
 import fcntl
@@ -185,6 +187,19 @@ def _skipped(error):
     return Verdict(ok=True, violated=[], reason="", error=error)
 
 
+_PR_SET_PDEATHSIG = 1
+
+
+def _die_with_hook(hook_pid):
+    """preexec_fn судьи на Linux: SIGKILL судье, когда умирает процесс хука."""
+    def set_signal():
+        ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_PDEATHSIG, signal.SIGKILL)
+        # Хук умер до prctl — сигнала не будет.
+        if os.getppid() != hook_pid:
+            os.kill(os.getpid(), signal.SIGKILL)
+    return set_signal
+
+
 def run_judge(system_prompt, user_prompt, *, timeout=JUDGE_TIMEOUT):
     """Вложенный claude -p; любая ошибка — пропуск с описанием в error."""
     model = os.environ.get("CLAUDE_PLUGIN_OPTION_JUDGE_MODEL") or DEFAULT_JUDGE_MODEL
@@ -195,7 +210,8 @@ def run_judge(system_prompt, user_prompt, *, timeout=JUDGE_TIMEOUT):
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, encoding="utf-8",
                                 errors="replace", env=env, cwd=str(data_dir()),
-                                start_new_session=True)
+                                start_new_session=True,
+                                preexec_fn=_die_with_hook(os.getpid()) if sys.platform.startswith("linux") else None)
     except FileNotFoundError:
         return _skipped("claude не найден в PATH")
     except OSError as e:
@@ -232,11 +248,16 @@ def run_judge(system_prompt, user_prompt, *, timeout=JUDGE_TIMEOUT):
     return Verdict(ok=bool(so["ok"]), violated=list(so.get("violated") or []), reason=reason)
 
 
+def dumps(obj):
+    """JSON без ASCII-экранирования; одиночный суррогат (имя файла не в UTF-8) — JSON-escape `\\udcXX`."""
+    return json.dumps(obj, ensure_ascii=False).encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def _atomic_write_json(path, obj):
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False)
+            f.write(dumps(obj))
         os.replace(tmp, path)
     except BaseException:
         pathlib.Path(tmp).unlink(missing_ok=True)
@@ -249,19 +270,28 @@ def _safe_name(session_id):
     return safe or "unknown"
 
 
+@contextlib.contextmanager
+def _state_lock(state_dir):
+    """Чтение и запись файлов состояния — под блокировкой state/.lock: параллельные хуки не теряют записи."""
+    with open(state_dir / ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def deny_budget_exhausted(session_id, prompt_id, hook):
     """True, если по этому ключу уже было MAX_DENIES отказов; счётчик растёт при каждом вызове."""
     state_dir = data_dir() / "state"
     state_dir.mkdir(exist_ok=True)
     path = state_dir / f"{_safe_name(session_id)}.json"
-    try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        state = {}
-    key = f"{prompt_id}:{hook}"
-    before = int(state.get(key, 0))
-    state[key] = before + 1
-    _atomic_write_json(path, state)
+    with _state_lock(state_dir):
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            state = {}
+        key = f"{prompt_id}:{hook}"
+        before = int(state.get(key, 0))
+        state[key] = before + 1
+        _atomic_write_json(path, state)
     prune_state(state_dir)
     return before >= MAX_DENIES
 
@@ -309,14 +339,15 @@ def warn_once(session_id, key, msg):
     state_dir = data_dir() / "state"
     state_dir.mkdir(exist_ok=True)
     path = state_dir / f"{_safe_name(session_id)}.warned.json"
-    try:
-        seen = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        seen = []
-    if key in seen:
-        return False
-    seen.append(key)
-    _atomic_write_json(path, seen)
+    with _state_lock(state_dir):
+        try:
+            seen = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            seen = []
+        if key in seen:
+            return False
+        seen.append(key)
+        _atomic_write_json(path, seen)
     warn(msg)
     return True
 
@@ -349,7 +380,7 @@ def log_event(hook, session_id, *, content=None, **fields):
         except FileNotFoundError:
             pass
         with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.write(dumps(entry) + "\n")
 
 
 def deny_output(reason):
@@ -384,5 +415,5 @@ def run_hook(main):
     if _messages:
         out["systemMessage"] = "\n".join(_messages)
     if out:
-        sys.stdout.write(json.dumps(out, ensure_ascii=False))
+        sys.stdout.write(dumps(out))
         sys.stdout.flush()

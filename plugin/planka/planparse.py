@@ -6,6 +6,7 @@ _WAVE = re.compile(r"^#+\s*(?:Волна|Wave)\s+(\d+)", re.IGNORECASE)
 _TASK = re.compile(r"^#+\s*(?:Задача|Task)\s+(\d+)\s*[:.]\s*(.*)$", re.IGNORECASE)
 _FILES_HEAD = re.compile(r"^\**\s*(?:Файлы|Files)\s*\**\s*:\s*\**\s*(.*)$", re.IGNORECASE)
 _ITEM = re.compile(r"^\s*[-*]\s+(.*)$")
+_ITEM_MARK = re.compile(r"^[-*]\s+")
 _PREFIX = re.compile(r"^(?:Create|Modify|Test|Delete|Создать|Изменить|Тест|Удалить)\s*:\s*",
                      re.IGNORECASE)
 _NO_FILES = {"", "нет", "none", "empty", "—", "-"}
@@ -24,7 +25,11 @@ class PlanTask:
 
 
 def _lines_suffix_stripped(path):
-    return re.sub(r":\d+(?:-\d+)?$", "", path).strip()
+    """Путь без суффикса строк `:10-20` и ведущих `./`."""
+    path = re.sub(r":\d+(?:-\d+)?$", "", path).strip()
+    while path.startswith("./"):
+        path = path[2:]
+    return path
 
 
 def _paths(fragment):
@@ -81,16 +86,21 @@ def parse_plan(text):
             tasks.append(current)
             i += 1
             continue
-        m = _FILES_HEAD.match(line.strip()) if current is not None else None
+        # Строка файлов — отдельной строкой или пунктом списка (`- **Файлы:** …`).
+        m = _FILES_HEAD.match(_ITEM_MARK.sub("", line.strip(), 1)) if current is not None else None
         if m:
             current.files.extend(_paths(m.group(1)))
             i += 1
             while i < len(lines):
-                item = _ITEM.match(lines[i])
+                # Пустая строка внутри списка файлов его не обрывает, если за ней снова пункт.
+                j = i
+                while j < len(lines) and not lines[j].strip():
+                    j += 1
+                item = _ITEM.match(lines[j]) if j < len(lines) else None
                 if not item:
                     break
                 current.files.extend(_paths(item.group(1)))
-                i += 1
+                i = j + 1
             continue
         i += 1
     tasks = [t for t in tasks if t.files]

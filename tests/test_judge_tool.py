@@ -296,6 +296,13 @@ class BashTest(unittest.TestCase):
         self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertTrue(any("внутренняя ошибка" in m for m in messages(r)))
 
+    def test_lone_surrogate_in_command(self):
+        r = self.env.run("judge_tool.py", '{"session_id": "s", "tool_name": "Bash", '
+                                          '"tool_input": {"command": "npm install lodash\\udcff"}}')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stderr, "")
+        self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny")
+
     def test_marker_passes(self):
         r = self.bash("PLANKA_DEP_OK=1 npm install left-pad")
         self.assertEqual(r.stdout, "")

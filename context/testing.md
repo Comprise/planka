@@ -10,7 +10,8 @@ CI нет; обе цели — в `Makefile`.
 ## Устройство тестов
 
 - Модульные тесты импортируют `planka/<модуль>.py` напрямую через `sys.path`.
-- Входные данные тестов — `tests/fixtures/`: `plan-waves.md` — план с волнами для `test_planparse`.
+- Входные данные тестов — `tests/fixtures/`: `tests/fixtures/plan-waves.md` — план с волнами для
+  `test_planparse`.
 - Тесты снимка в режиме git (`GitScanTest`) создают временный репозиторий и пропускаются без `git`.
 - Тесты хуков запускают скрипт подпроцессом: `tests.helpers.Env` создаёт временные
   `CLAUDE_PLUGIN_ROOT` (свои `philosophy.md` и `rules/` из `helpers.PHILOSOPHY` и
@@ -22,8 +23,9 @@ CI нет; обе цели — в `Makefile`.
 ## Заглушка судьи
 
 `tests/stub/claude` ведёт себя по `PLANKA_STUB`: `ok`, `deny` (причина из
-`PLANKA_STUB_REASON`), `hang`, `garbage`, `notlogged`. При `PLANKA_STUB_RECORD=<файл>` пишет
-туда аргументы, stdin, `PLANKA_JUDGE` и `cwd`. Новый вид ответа судьи — новая ветка заглушки.
+`PLANKA_STUB_REASON`), `hang` (через `exec sleep`: висит сам процесс заглушки), `garbage`,
+`notlogged`. При `PLANKA_STUB_RECORD=<файл>` пишет туда аргументы, stdin, `PLANKA_JUDGE`, `cwd` и
+PID процесса. Новый вид ответа судьи — новая ветка заглушки.
 
 ## Тесты в том же процессе
 
@@ -33,7 +35,7 @@ CI нет; обе цели — в `Makefile`.
 
 ## Что тестами не покрыто
 
-- Реальные `plugin/philosophy.md` и `plugin/rules/*.md`: тесты берут свои тексты, поэтому переименование
-  раздела или модуля из контракта (`context/architecture.md`, «Контракт кода с текстами
-  правил») тесты не ловят.
+- Тесты хуков берут свои тексты правил (`helpers.PHILOSOPHY`, `helpers.RULES`); настоящие
+  `plugin/philosophy.md` и `plugin/rules/*.md` проверяет только `tests/test_contract.py`: разделы и
+  модули, которые код берёт по имени, полнота индекса «Модули», метки языков.
 - Живой `claude`: вызов судьи и показ `systemMessage` проверяются только вручную.

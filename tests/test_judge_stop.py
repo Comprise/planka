@@ -1,7 +1,10 @@
 import hashlib
 import json
 import os
+import shutil
+import subprocess
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -110,6 +113,41 @@ class StopHookTest(unittest.TestCase):
         r = self.env.run("judge_stop.py", "garbage")
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout, "")
+
+
+class JudgeDiesWithHookTest(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "PR_SET_PDEATHSIG — только Linux")
+    def test_judge_killed_with_hook(self):
+        env = Env()
+        try:
+            rec = env.data / "rec.txt"
+            proc = subprocess.Popen(
+                [sys.executable, str(PLANKA_DIR / "judge_stop.py")], stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=env.environ(PLANKA_STUB="hang", PLANKA_STUB_RECORD=str(rec)))
+            proc.stdin.write(json.dumps(hook_input("Stop", last_assistant_message=OPTIONS_MSG)).encode())
+            proc.stdin.close()
+            deadline = time.monotonic() + 10
+            while not (rec.exists() and "PID " in rec.read_text(encoding="utf-8")):
+                self.assertLess(time.monotonic(), deadline, "судья не запустился")
+                time.sleep(0.05)
+            judge_pid = int(rec.read_text(encoding="utf-8").split("PID ", 1)[1].split()[0])
+            proc.kill()
+            proc.wait()
+            deadline = time.monotonic() + 5
+            while _alive(judge_pid):
+                self.assertLess(time.monotonic(), deadline, "судья пережил хук")
+                time.sleep(0.05)
+        finally:
+            env.close()
+
+
+def _alive(pid):
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            return f.read().split(") ", 1)[1][0] != "Z"
+    except OSError:
+        return False
 
 
 class MissingRubricTest(unittest.TestCase):
@@ -356,8 +394,27 @@ class DocsFilterTest(unittest.TestCase):
         (self.project / "a.json").write_text("{}\n", encoding="utf-8")
         data = hook_input("Stop", cwd=str(self.project))
         with mock.patch.dict(os.environ, {"CLAUDE_PLUGIN_DATA": str(self.env.data)}):
-            _, changed = judge_stop.changed_this_turn(data)
+            _, (base, sub_bases), changed = judge_stop.changed_this_turn(data)
+        self.assertIsNone(base)
+        self.assertEqual(sub_bases, {})
         self.assertEqual(changed, [("a.json", "other", True), ("old.go", "code", False)])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_commit_during_turn_keeps_comments_visible(self):
+        git = ["git", "-C", str(self.project), "-c", "user.email=t@t", "-c", "user.name=t"]
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        (self.project / "a.py").write_text("x = 1\n", encoding="utf-8")
+        subprocess.run([*git, "add", "a.py"], check=True)
+        subprocess.run([*git, "commit", "-qm", "i"], check=True)
+        r = self.env.run("remind.py", hook_input("UserPromptSubmit", prompt="x", cwd=str(self.project)))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        (self.project / "a.py").write_text("x = 1\n# комментарий хода\n", encoding="utf-8")
+        subprocess.run([*git, "commit", "-qam", "turn"], check=True)
+        rec = self.env.data / "rec.txt"
+        self.stop("Поправил.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        text = rec.read_text(encoding="utf-8")
+        self.assertIn("a.py: # комментарий хода", text)
+        self.assertNotIn("комментарии не добавлены", text)
 
     def test_no_snapshot_no_trigger(self):
         (self.project / "a.py").write_text("x\n", encoding="utf-8")

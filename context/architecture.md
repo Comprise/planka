@@ -63,18 +63,29 @@ planka — плагин Claude Code уровня пользователя: тр�
 внутри содержимого — в любом регистре и с пробелами (`prompts._CLOSING_TAG`) — экранируется.
 
 Таймаут — `JUDGE_TIMEOUT` (60 с); таймаут хука в `hooks/hooks.json` — 90 с у `PreToolUse` и 120 с у
-`Stop`: у `Stop` до судьи ещё `git rev-parse` (до 5 с) и два вызова `git` в `comments` (до 10 с каждый).
+`Stop`: у `Stop` до судьи ещё `git rev-parse` (до 5 с), повторный снимок со сроком
+`judge_stop.SNAPSHOT_BUDGET` (20 с) и два вызова `git` в `comments` (до 10 с каждый) — вместе с судьёй
+(до 65 с) не больше 110 с. У `UserPromptSubmit` (10 с) снимок ограничен сроком
+`remind.SNAPSHOT_BUDGET` (7 с от старта хука); не уложился — `TimeoutError`, снимок пропускается с
+предупреждением, напоминание выдаётся.
 
 Лимит отказов: `MAX_DENIES` = 2 на ключ `<prompt_id>:<hook>` (`common.deny_budget_exhausted`);
 отказ `judge_bash` лимитом не ограничен.
+
+На Linux судья запускается с `PR_SET_PDEATHSIG` (`common._die_with_hook`): ядро убивает его, когда
+умирает процесс хука. Без этого хук, убитый по таймауту, оставлял бы работающий `claude -p`: судья в
+своей группе процессов (`start_new_session`), чтобы таймаут судьи убивал и его потомков.
 
 ## Состояние и журнал
 
 Каталог данных — `$CLAUDE_PLUGIN_DATA`, без него `.data/` в корне плагина (`common.data_dir`).
 
 - `state/<session>.json` — счётчики отказов; `state/<session>.warned.json` — выданные
-  однократные предупреждения; `state/<session>.snap.json` — снимок дерева текущей реплики.
-  Имя — `common._safe_name`. Запись атомарная (`common._atomic_write_json`, `snapshot.save`).
+  однократные предупреждения; `state/<session>.snap.json` — снимок дерева текущей реплики и коммиты
+  HEAD корня и подмодулей на её старте (`head`, `sub_heads`; базы для `comments.extract`). Имя — `common._safe_name`. Запись
+  атомарная (`common._atomic_write_json`, `snapshot.save`); чтение и запись счётчиков и
+  предупреждений — под `fcntl.flock` на `state/.lock` (`common._state_lock`). JSON пишется через
+  `common.dumps`: одиночный суррогат в имени файла не в UTF-8 — escape `\udcXX`.
   Файлы старше `STATE_TTL` (7 дней) удаляет `common.prune_state`.
 - `judge.log` — строка JSON на решение хука, только метаданные: содержимое — длиной и SHA-256
   (`common.log_event`). От `LOG_MAX_BYTES` (1 МиБ) переименовывается в `judge.log.1`; ротация

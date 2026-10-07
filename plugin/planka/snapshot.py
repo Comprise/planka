@@ -4,6 +4,7 @@ import os
 import pathlib
 import subprocess
 import tempfile
+import time
 
 # Каталоги, которые обход вне git пропускает всегда.
 IGNORED_DIRS = frozenset({".git", "node_modules", "__pycache__", ".venv", "venv", "target", "build",
@@ -34,34 +35,70 @@ def ignore_rules(directory):
     return names, exts
 
 
-def _git_ls(root, *args):
-    """Записи `git ls-files -z <args>` в root; None вне git или при сбое."""
+GIT_TIMEOUT = 10
+
+
+def _remaining(deadline):
+    """Секунды до срока deadline (time.monotonic), не больше GIT_TIMEOUT; TimeoutError, если срок прошёл."""
+    if deadline is None:
+        return GIT_TIMEOUT
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("снимок не уложился в срок")
+    return min(GIT_TIMEOUT, left)
+
+
+def _git(root, deadline, *args):
+    """stdout `git -C root <args>` байтами; None вне git или при сбое; TimeoutError по сроку deadline."""
     try:
-        proc = subprocess.run(["git", "-C", str(root), "ls-files", "-z", *args], capture_output=True, timeout=10)
+        proc = subprocess.run(["git", "-C", str(root), *args], capture_output=True, timeout=_remaining(deadline))
+    except subprocess.TimeoutExpired:
+        raise TimeoutError("git не уложился в срок снимка") from None
     except (OSError, subprocess.SubprocessError):
         return None
-    if proc.returncode != 0:
-        return None
-    return [os.fsdecode(e) for e in proc.stdout.split(b"\0") if e]
+    return proc.stdout if proc.returncode == 0 else None
 
 
-def _git_paths(root):
+def _git_ls(root, deadline, *args):
+    """Записи `git ls-files -z <args>` в root; None вне git или при сбое."""
+    out = _git(root, deadline, "ls-files", "-z", *args)
+    return None if out is None else [os.fsdecode(e) for e in out.split(b"\0") if e]
+
+
+def head(root, deadline=None):
+    """Коммит HEAD репозитория root; None вне git и в репозитории без коммитов."""
+    out = _git(root, deadline, "rev-parse", "--verify", "-q", "HEAD")
+    return out.decode().strip() or None if out else None
+
+
+def submodule_heads(root, deadline=None):
+    """{путь подмодуля: его HEAD} для инициализированных подмодулей root, вложенные — путём от root."""
+    heads = {}
+    for entry in _git_ls(root, deadline, "-s") or []:
+        meta, _, sub = entry.partition("\t")
+        if meta.startswith("160000 ") and os.path.exists(os.path.join(root, sub, ".git")):
+            heads[sub] = head(os.path.join(root, sub), deadline)
+            heads.update({f"{sub}/{p}": h for p, h in submodule_heads(os.path.join(root, sub), deadline).items()})
+    return heads
+
+
+def _git_paths(root, deadline):
     """Пути файлов рабочего дерева, которые git не игнорирует (отслеживаемые и новые), включая файлы
     подмодулей; None вне git.
 
     Подмодуль — запись с режимом 160000 в `ls-files -s` — обходится отдельным вызовом; подмодуль без
     своего `.git` не обходится.
     """
-    paths = _git_ls(root, "-co", "--exclude-standard")
+    paths = _git_ls(root, deadline, "-co", "--exclude-standard")
     if paths is None:
         return None
-    for entry in _git_ls(root, "-s") or []:
+    for entry in _git_ls(root, deadline, "-s") or []:
         meta, _, sub = entry.partition("\t")
         if meta.startswith("160000 "):
             if sub in paths:
                 paths.remove(sub)
             if os.path.exists(os.path.join(root, sub, ".git")):
-                paths += [f"{sub}/{p}" for p in _git_paths(os.path.join(root, sub)) or []]
+                paths += [f"{sub}/{p}" for p in _git_paths(os.path.join(root, sub), deadline) or []]
     return paths
 
 
@@ -81,20 +118,22 @@ def _stat_files(root, relpaths):
     return files
 
 
-def scan(root):
-    """{путь: [size, mtime_ns]} для файлов под root; None, если их больше MAX_FILES.
+def scan(root, deadline=None):
+    """{путь: [size, mtime_ns]} для файлов под root; None, если их больше MAX_FILES; TimeoutError, если
+    не уложился в срок deadline (time.monotonic).
 
     В git-репозитории — файлы, которые git не игнорирует: правила .gitignore, .git/info/exclude и
     глобального excludes точные. Вне git — обход каталогов: правила каталога — правила родителя плюс
     его собственный .gitignore, упрощённо по ignore_rules; действуют на его поддерево.
     """
     root = pathlib.Path(root)
-    paths = _git_paths(root)
+    paths = _git_paths(root, deadline)
     if paths is not None:
         return _stat_files(root, paths)
     rules_by_dir = {}
     files = {}
     for dirpath, dirnames, filenames in os.walk(root):
+        _remaining(deadline)
         parent = rules_by_dir.get(os.path.dirname(dirpath), (set(), set()))
         own = ignore_rules(pathlib.Path(dirpath))
         names, exts = parent[0] | own[0], parent[1] | own[1]
@@ -122,12 +161,15 @@ def _safe(session_id):
     return "".join(c if (c.isalnum() and c.isascii()) or c in "._-" else "_" for c in session_id) or "unknown"
 
 
-def save(state_dir, session_id, prompt_id, root, files):
+def save(state_dir, session_id, prompt_id, root, files, head_commit=None, sub_heads=None):
+    """Снимок state_dir/<session>.snap.json: реплика, корень, HEAD корня и подмодулей на старте реплики, файлы."""
     path = state_dir / f"{_safe(session_id)}.snap.json"
     fd, tmp = tempfile.mkstemp(dir=str(state_dir), prefix=".tmp-")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump({"prompt_id": prompt_id, "root": str(root), "files": files}, f, ensure_ascii=False)
+        # errors="backslashreplace": одиночный суррогат пишется JSON-escape `\\udcXX`.
+        with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace") as f:
+            json.dump({"prompt_id": prompt_id, "root": str(root), "head": head_commit,
+                       "sub_heads": sub_heads or {}, "files": files}, f, ensure_ascii=False)
         os.replace(tmp, path)
     except BaseException:
         pathlib.Path(tmp).unlink(missing_ok=True)

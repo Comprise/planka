@@ -1,3 +1,4 @@
+import concurrent.futures
 import hashlib
 import io
 import json
@@ -221,12 +222,19 @@ class DenyBudgetTest(unittest.TestCase):
         self.assertFalse(common.deny_budget_exhausted("s", "p", "stop"))
         self.assertFalse(common.deny_budget_exhausted("s", "p2", "tool"))
 
+    def test_parallel_calls_lose_nothing(self):
+        with concurrent.futures.ThreadPoolExecutor(20) as pool:
+            results = list(pool.map(lambda _: common.deny_budget_exhausted("s", "p", "stop"), range(20)))
+        self.assertEqual(results.count(False), common.MAX_DENIES)
+        state = json.loads((self.env.data / "state" / "s.json").read_text())
+        self.assertEqual(state["p:stop"], 20)
+
     def test_counter_survives_sequential_writes(self):
         for _ in range(5):
             common.deny_budget_exhausted("s", "p", "tool")
         state = json.loads((self.env.data / "state" / "s.json").read_text())
         self.assertEqual(state["p:tool"], 5)
-        self.assertEqual([p.name for p in (self.env.data / "state").iterdir()], ["s.json"])
+        self.assertEqual(sorted(p.name for p in (self.env.data / "state").iterdir()), [".lock", "s.json"])
 
     def test_stale_state_is_pruned(self):
         state = self.env.data / "state"
@@ -256,7 +264,7 @@ class DenyBudgetTest(unittest.TestCase):
     def test_session_id_is_sanitized(self):
         common.deny_budget_exhausted("../../x/y", "p", "tool")
         common.deny_budget_exhausted("", "p", "tool")
-        names = sorted(p.name for p in (self.env.data / "state").iterdir())
+        names = sorted(p.name for p in (self.env.data / "state").glob("*.json"))
         self.assertEqual(names, [".._.._x_y.json", "unknown.json"])
 
 
@@ -372,6 +380,10 @@ class LogTest(unittest.TestCase):
         self.assertEqual(entry["content_len"], len(text))
         self.assertEqual(entry["content_sha256"], hashlib.sha256(text.encode("utf-8")).hexdigest())
         self.assertNotIn("секрет", self.log.read_text(encoding="utf-8"))
+
+    def test_lone_surrogate_logged(self):
+        common.log_event("stop", "s", verdict="ok", files=["bad\udcff.py"])
+        self.assertEqual(self.env.log_lines()[0]["files"], ["bad\udcff.py"])
 
     def test_rotation_at_threshold(self):
         self.assertEqual(common.LOG_MAX_BYTES, 1_048_576)
