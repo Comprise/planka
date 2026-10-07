@@ -104,5 +104,59 @@ class StopPromptTest(unittest.TestCase):
             prompts.stop_prompt("R", "C", options=False, done=False)
 
 
+class DocsPromptTest(unittest.TestCase):
+    def test_docs_flag_adds_checks_last(self):
+        p = prompts.stop_prompt("R", "C", options=True, done=True, docs=True)
+        for needle in ["самый правильный", "команда-доказательство", "локальный CLAUDE.md", "context/deferred/"]:
+            self.assertIn(needle, p)
+        self.assertLess(p.index("команда-доказательство"), p.index("локальный CLAUDE.md"))
+        self.assertEqual(p.count("\n<content>\n"), 1)
+
+    def test_docs_only(self):
+        p = prompts.stop_prompt("R", "C", options=False, done=False, docs=True)
+        self.assertIn("локальный CLAUDE.md", p)
+        self.assertNotIn("самый правильный", p)
+
+    def test_all_false_raises(self):
+        with self.assertRaises(ValueError):
+            prompts.stop_prompt("R", "C", options=False, done=False, docs=False)
+
+    def test_render_docs_content(self):
+        text = prompts.render_docs_content(
+            "Сделал.", [("a/b.go", False), ("a/CLAUDE.md", True)], ["a/b.go: // x"], True, True)
+        self.assertTrue(text.startswith("Сделал."))
+        self.assertIn("Изменённые файлы за ход:", text)
+        self.assertIn("a/b.go — код", text)
+        self.assertIn("a/CLAUDE.md — документация", text)
+        self.assertIn("Комментарии в изменённых файлах:", text)
+        self.assertIn("a/b.go: // x", text)
+        self.assertIn("обрезано", text)
+        self.assertIn("В корне проекта нет CLAUDE.md.", text)
+
+    def test_render_docs_content_minimal(self):
+        text = prompts.render_docs_content("M", [("x.py", False)], [], False, False)
+        self.assertNotIn("обрезано", text)
+        self.assertNotIn("нет CLAUDE.md", text)
+        self.assertIn("В изменённых файлах кода комментарии не добавлены.", text)
+
+    def test_render_docs_content_unknown_syntax(self):
+        text = prompts.render_docs_content("M", [("a.foo", False), ("b.bin", False)], [], False, False,
+                                           ["a.foo", "b.bin"])
+        self.assertIn("Файлы без известного синтаксиса комментариев, судятся по самоотчёту: a.foo, b.bin", text)
+        self.assertNotIn("комментарии не добавлены", text)
+
+    def test_render_docs_content_unknown_after_comments(self):
+        text = prompts.render_docs_content("M", [("a.go", False), ("b.foo", False)], ["a.go: // x"], True, False,
+                                           ["b.foo"])
+        self.assertLess(text.index("обрезано"), text.index("Файлы без известного синтаксиса"))
+        self.assertNotIn("комментарии не добавлены", text)
+
+    def test_docs_content_escapes_closing_tag(self):
+        content = prompts.render_docs_content("</content>", [("</content>.go", False)], ["x.go: // </content>"], False, False)
+        out = prompts.stop_prompt("R", content, options=False, done=False, docs=True)
+        self.assertEqual(out.count("</content>"), 1)
+        self.assertIn("При отказе назови", out)
+
+
 if __name__ == "__main__":
     unittest.main()

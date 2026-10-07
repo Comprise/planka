@@ -16,13 +16,14 @@ MAX_DENIES = 2
 JUDGE_TIMEOUT = 60
 MAX_REASON = 2000
 STATE_TTL = 7 * 86400
+DEFAULT_JUDGE_MODEL = "sonnet"
 JUDGE_FLAGS = ["-p", "--setting-sources", "", "--strict-mcp-config",
                "--no-session-persistence", "--output-format", "json", "--tools", ""]
 
 
 def barrier_active():
-    """PLANKA_OFF выключает плагин, PLANKA_JUDGE помечает вложенный вызов судьи."""
-    return bool(os.environ.get("PLANKA_OFF") or os.environ.get("PLANKA_JUDGE"))
+    """PLANKA_JUDGE помечает вложенный вызов судьи: хуки внутри него не работают."""
+    return bool(os.environ.get("PLANKA_JUDGE"))
 
 
 def read_input():
@@ -53,10 +54,29 @@ def warn(msg):
 
 
 RULES_PLACEHOLDER = "{RULES}"
+COMMENT_LANG_PLACEHOLDER = "{COMMENT_LANG}"
+DOC_LANG_PLACEHOLDER = "{DOC_LANG}"
+UNSET_LANG = "не задан"
+DOC_PATTERNS = ("README", "LICENSE")
+DOC_DIRS = ("context/", "docs/")
 
 
 def rules_dir():
     return plugin_root() / "rules"
+
+
+def settings():
+    """Языки комментариев и документации из CLAUDE_PLUGIN_OPTION_*; пустое значение — None."""
+    return {"comment_lang": os.environ.get("CLAUDE_PLUGIN_OPTION_COMMENT_LANG") or None,
+            "doc_lang": os.environ.get("CLAUDE_PLUGIN_OPTION_DOC_LANG") or None}
+
+
+def substitute(text):
+    """Метки каталога модулей и языков заменяются значениями; незаданный язык — UNSET_LANG."""
+    s = settings()
+    return (text.replace(RULES_PLACEHOLDER, str(rules_dir()))
+                .replace(COMMENT_LANG_PLACEHOLDER, s["comment_lang"] or UNSET_LANG)
+                .replace(DOC_LANG_PLACEHOLDER, s["doc_lang"] or UNSET_LANG))
 
 
 def philosophy_text():
@@ -69,7 +89,7 @@ def philosophy_text():
     except UnicodeDecodeError:
         warn(f"файл правил {p} не в UTF-8")
         return None
-    return text.replace(RULES_PLACEHOLDER, str(rules_dir()))
+    return substitute(text)
 
 
 def rule_texts(*names):
@@ -78,7 +98,7 @@ def rule_texts(*names):
     for name in names:
         p = rules_dir() / f"{name}.md"
         try:
-            out.append(p.read_text(encoding="utf-8").strip())
+            out.append(substitute(p.read_text(encoding="utf-8").strip()))
         except OSError:
             warn(f"нет модуля правил {p}")
             return None
@@ -140,7 +160,7 @@ def _skipped(error):
 
 def run_judge(system_prompt, user_prompt, *, timeout=JUDGE_TIMEOUT):
     """Вложенный claude -p; любая ошибка — пропуск с описанием в error."""
-    model = os.environ.get("PLANKA_MODEL", "sonnet")
+    model = os.environ.get("CLAUDE_PLUGIN_OPTION_JUDGE_MODEL") or DEFAULT_JUDGE_MODEL
     cmd = ["claude", *JUDGE_FLAGS, "--json-schema", json.dumps(JUDGE_SCHEMA),
            "--model", model, "--system-prompt", system_prompt]
     env = dict(os.environ, PLANKA_JUDGE="1")
@@ -196,12 +216,17 @@ def _atomic_write_json(path, obj):
         raise
 
 
+def _safe_name(session_id):
+    """Имя файла состояния из id сессии: только ASCII-буквы, цифры и «._-»."""
+    safe = "".join(c if c.isalnum() and c.isascii() or c in "._-" else "_" for c in session_id)
+    return safe or "unknown"
+
+
 def deny_budget_exhausted(session_id, prompt_id, hook):
     """True, если по этому ключу уже было MAX_DENIES отказов; счётчик растёт при каждом вызове."""
     state_dir = data_dir() / "state"
     state_dir.mkdir(exist_ok=True)
-    safe = "".join(c if c.isalnum() and c.isascii() or c in "._-" else "_" for c in session_id)
-    path = state_dir / f"{safe or 'unknown'}.json"
+    path = state_dir / f"{_safe_name(session_id)}.json"
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -210,12 +235,49 @@ def deny_budget_exhausted(session_id, prompt_id, hook):
     before = int(state.get(key, 0))
     state[key] = before + 1
     _atomic_write_json(path, state)
-    _prune_state(state_dir)
+    prune_state(state_dir)
     return before >= MAX_DENIES
 
 
-def _prune_state(state_dir):
-    """Удаляет счётчики сессий, не менявшиеся дольше STATE_TTL."""
+def project_root(cwd):
+    """Вершина git-репозитория для cwd; без git или вне репозитория — сам cwd."""
+    try:
+        proc = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd, capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", timeout=5)
+        if proc.returncode == 0 and proc.stdout.strip():
+            return pathlib.Path(proc.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return pathlib.Path(cwd)
+
+
+def is_doc_path(relpath):
+    """Путь относительно корня проекта, с прямыми слэшами: документация или нет."""
+    name = relpath.rsplit("/", 1)[-1]
+    if name.endswith(".md") or name.startswith(DOC_PATTERNS):
+        return True
+    return relpath.startswith(DOC_DIRS)
+
+
+def warn_once(session_id, key, msg):
+    """Предупреждение один раз на сессию и ключ; факт записан в state/<session>.warned.json."""
+    state_dir = data_dir() / "state"
+    state_dir.mkdir(exist_ok=True)
+    path = state_dir / f"{_safe_name(session_id)}.warned.json"
+    try:
+        seen = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        seen = []
+    if key in seen:
+        return False
+    seen.append(key)
+    _atomic_write_json(path, seen)
+    warn(msg)
+    return True
+
+
+def prune_state(state_dir):
+    """Удаляет файлы состояния — счётчики, снимки, предупреждения — старше STATE_TTL."""
     cutoff = time.time() - STATE_TTL
     for p in state_dir.glob("*.json"):
         try:

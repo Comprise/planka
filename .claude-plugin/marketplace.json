@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "planka",
+  "description": "Философия работы для Claude Code: правильное решение вместо лёгкого, напоминание на каждом ходе и судья в точках выбора",
+  "owner": {
+    "name": "Elia Samoylov",
+    "url": "https://github.com/Comprise"
+  },
+  "plugins": [
+    {
+      "name": "planka",
+      "description": "Философия работы: напоминание на каждом ходе и судья в точках выбора",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

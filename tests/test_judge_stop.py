@@ -6,6 +6,7 @@ from tests.helpers import Env, PLANKA_DIR, hook_input
 
 sys.path.insert(0, str(PLANKA_DIR))
 import judge_stop  # noqa: E402
+import snapshot  # noqa: E402
 
 OPTIONS_MSG = """Есть два подхода:
 
@@ -94,7 +95,7 @@ class StopHookTest(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
 
     def test_barrier_and_garbage(self):
-        self.assertEqual(self.stop(OPTIONS_MSG, PLANKA_OFF="1").stdout, "")
+        self.assertEqual(self.stop(OPTIONS_MSG, PLANKA_JUDGE="1").stdout, "")
         r = self.env.run("judge_stop.py", "garbage")
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout, "")
@@ -182,6 +183,124 @@ class DoneHookTest(unittest.TestCase):
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
         self.assertEqual(self.env.log_lines()[-1]["filters"], ["done"])
         self.assertEqual(r.stderr.count("planka:"), 1)
+
+
+class DocsFilterTest(unittest.TestCase):
+    def setUp(self):
+        self.env = Env()
+        self.project = self.env.project
+        (self.project / "pkg").mkdir()
+
+    def tearDown(self):
+        self.env.close()
+
+    def snap(self, prompt_id="p-1"):
+        state = self.env.data / "state"
+        state.mkdir(exist_ok=True)
+        snapshot.save(state, "sess-1", prompt_id, self.project, snapshot.scan(self.project))
+
+    def stop(self, msg, **extra):
+        return self.env.run("judge_stop.py", hook_input(
+            "Stop", last_assistant_message=msg, stop_hook_active=False, cwd=str(self.project)), **extra)
+
+    def test_code_change_triggers_docs_judge(self):
+        self.snap()
+        (self.project / "pkg" / "a.go").write_text("// hello\nx := 1\n", encoding="utf-8")
+        rec = self.env.data / "rec.txt"
+        r = self.stop("Поправил.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        text = rec.read_text(encoding="utf-8")
+        self.assertIn("# Документация", text)
+        self.assertIn("# Комментарии", text)
+        self.assertIn("pkg/a.go — код", text)
+        self.assertIn("pkg/a.go: // hello", text)
+        self.assertIn("В корне проекта нет CLAUDE.md.", text)
+        self.assertIn("локальный CLAUDE.md", text)
+        last = self.env.log_lines()[-1]
+        self.assertEqual(last["filters"], ["docs"])
+        self.assertIn("pkg/a.go: // hello", last["content"])
+
+    def test_code_change_without_comments_says_so(self):
+        self.snap()
+        (self.project / "a.py").write_text("x = 1\n", encoding="utf-8")
+        rec = self.env.data / "rec.txt"
+        self.stop("Поправил.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        text = rec.read_text(encoding="utf-8")
+        self.assertIn("В изменённых файлах кода комментарии не добавлены.", text)
+        self.assertIn("При отказе назови файл, который нужно сверить, или строку комментария, "
+                      "которую нужно переписать.", text)
+
+    def test_unknown_syntax_named_not_none_added(self):
+        self.snap()
+        (self.project / "pkg" / "data.foo").write_text("// x\n", encoding="utf-8")
+        rec = self.env.data / "rec.txt"
+        self.stop("Поправил.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        text = rec.read_text(encoding="utf-8")
+        self.assertIn("Файлы без известного синтаксиса комментариев, судятся по самоотчёту: pkg/data.foo", text)
+        self.assertNotIn("комментарии не добавлены", text)
+
+    def test_absent_prompt_id_matches_empty_snapshot(self):
+        self.snap(prompt_id="")
+        (self.project / "a.py").write_text("x = 1\n", encoding="utf-8")
+        data = hook_input("Stop", last_assistant_message="Поправил.", stop_hook_active=False, cwd=str(self.project))
+        del data["prompt_id"]
+        rec = self.env.data / "rec.txt"
+        r = self.env.run("judge_stop.py", data, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertEqual(self.env.log_lines()[-1]["filters"], ["docs"])
+
+    def test_docs_only_change_no_trigger(self):
+        self.snap()
+        (self.project / "CLAUDE.md").write_text("# x\n", encoding="utf-8")
+        (self.project / "notes.md").write_text("n\n", encoding="utf-8")
+        r = self.stop("Поправил.")
+        self.assertEqual(r.stdout, "")
+        self.assertEqual(self.env.log_lines(), [])
+
+    def test_no_snapshot_no_trigger(self):
+        (self.project / "a.py").write_text("x\n", encoding="utf-8")
+        r = self.stop("Поправил.")
+        self.assertEqual(r.stdout, "")
+        self.assertEqual(r.stderr, "")
+        self.assertEqual(self.env.log_lines(), [])
+
+    def test_stale_snapshot_no_trigger(self):
+        self.snap(prompt_id="p-0")
+        (self.project / "a.py").write_text("x\n", encoding="utf-8")
+        r = self.stop("Поправил.")
+        self.assertEqual(r.stdout, "")
+        self.assertEqual(self.env.log_lines(), [])
+
+    def test_denied_blocks_with_reason(self):
+        self.snap()
+        (self.project / "a.py").write_text("# было так, стало эдак\n", encoding="utf-8")
+        r = self.stop("Поправил.", PLANKA_STUB="deny", PLANKA_STUB_REASON="сверь pkg/CLAUDE.md")
+        out = json.loads(r.stdout)
+        self.assertEqual(out["decision"], "block")
+        self.assertTrue(out["reason"].startswith("planka: "))
+        self.assertIn("сверь pkg/CLAUDE.md", out["reason"])
+
+    def test_three_filters_one_call(self):
+        self.snap()
+        (self.project / "a.py").write_text("x\n", encoding="utf-8")
+        rec = self.env.data / "rec.txt"
+        r = self.stop(OPTIONS_MSG + "\n\nГотово.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        text = rec.read_text(encoding="utf-8")
+        self.assertEqual(text.count("\n<content>\n"), 1)
+        for needle in ["## Решения", "# Доказательство", "# Документация", "# Комментарии"]:
+            self.assertIn(needle, text)
+        self.assertEqual(self.env.log_lines()[-1]["filters"], ["options", "done", "docs"])
+
+    def test_missing_docs_module_skips(self):
+        self.snap()
+        (self.project / "a.py").write_text("x\n", encoding="utf-8")
+        (self.env.root / "rules" / "comments.md").unlink()
+        r = self.stop("Поправил.")
+        self.assertEqual(r.stdout, "")
+        self.assertIn("planka:", r.stderr)
+        self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
+        self.assertEqual(self.env.log_lines()[-1]["filters"], ["docs"])
 
 
 if __name__ == "__main__":

@@ -1,6 +1,9 @@
 import io
 import json
 import os
+import pathlib
+import shutil
+import subprocess
 import sys
 import time
 import unittest
@@ -13,14 +16,14 @@ import common  # noqa: E402
 
 
 class BarrierTest(unittest.TestCase):
-    def test_off_and_judge_env(self):
-        with mock.patch.dict(os.environ, {"PLANKA_OFF": "1"}, clear=False):
-            self.assertTrue(common.barrier_active())
-        with mock.patch.dict(os.environ, {"PLANKA_JUDGE": "1"}, clear=False):
-            self.assertTrue(common.barrier_active())
+    def test_judge_env_only(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith("PLANKA_")}
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertFalse(common.barrier_active())
+            with mock.patch.dict(os.environ, {"PLANKA_JUDGE": "1"}, clear=False):
+                self.assertTrue(common.barrier_active())
+            with mock.patch.dict(os.environ, {"PLANKA_OFF": "1"}, clear=False):
+                self.assertFalse(common.barrier_active())
 
 
 class ReadInputTest(unittest.TestCase):
@@ -152,7 +155,7 @@ class RunJudgeTest(unittest.TestCase):
 
     def test_flags_stdin_and_env(self):
         rec = self.env.data / "rec.txt"
-        self.judge(PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec), PLANKA_MODEL="haiku")
+        self.judge(PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec), CLAUDE_PLUGIN_OPTION_JUDGE_MODEL="haiku")
         text = rec.read_text(encoding="utf-8")
         argv = text.split("ARGV\n", 1)[1].split("\nSTDIN\n", 1)[0].split("\n")
         self.assertEqual(argv[:9], ["-p", "--setting-sources", "", "--strict-mcp-config",
@@ -164,6 +167,12 @@ class RunJudgeTest(unittest.TestCase):
         self.assertIn("STDIN\nUSER", text)
         self.assertIn("ENV PLANKA_JUDGE=1", text)
         self.assertIn(f"CWD {self.env.data.resolve()}", text.splitlines())
+
+    def test_default_model(self):
+        rec = self.env.data / "rec.txt"
+        self.judge(PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        argv = rec.read_text(encoding="utf-8").split("ARGV\n", 1)[1].split("\nSTDIN\n", 1)[0].split("\n")
+        self.assertEqual(argv[argv.index("--model") + 1], "sonnet")
 
     def test_non_executable_binary_is_error(self):
         fake = self.env.root / "bin"
@@ -231,6 +240,18 @@ class DenyBudgetTest(unittest.TestCase):
         self.assertTrue(fresh.exists())
         self.assertTrue((state / "s.json").exists())
 
+    def test_prune_state_covers_all_suffixes(self):
+        state = self.env.data / "state"
+        state.mkdir()
+        old = time.time() - 8 * 86400
+        for name in ("x.json", "y.snap.json", "z.warned.json"):
+            p = state / name
+            p.write_text("{}", encoding="utf-8")
+            os.utime(p, (old, old))
+        (state / "fresh.snap.json").write_text("{}", encoding="utf-8")
+        common.prune_state(state)
+        self.assertEqual([p.name for p in state.iterdir()], ["fresh.snap.json"])
+
     def test_session_id_is_sanitized(self):
         common.deny_budget_exhausted("../../x/y", "p", "tool")
         common.deny_budget_exhausted("", "p", "tool")
@@ -278,6 +299,90 @@ class LogTest(unittest.TestCase):
             self.assertEqual(lines[0]["hook"], "tool")
             self.assertEqual(lines[0]["session_id"], "s")
             self.assertIn("ts", lines[0])
+        finally:
+            env.close()
+
+
+class SettingsTest(unittest.TestCase):
+    def setUp(self):
+        self.env = Env()
+        self.base = self.env.environ()
+
+    def tearDown(self):
+        self.env.close()
+
+    def test_settings_unset(self):
+        with mock.patch.dict(os.environ, self.base, clear=True):
+            self.assertEqual(common.settings(), {"comment_lang": None, "doc_lang": None})
+
+    def test_settings_set(self):
+        with mock.patch.dict(os.environ, {**self.base, "CLAUDE_PLUGIN_OPTION_COMMENT_LANG": "en+ru",
+                                          "CLAUDE_PLUGIN_OPTION_DOC_LANG": "ru"}, clear=True):
+            self.assertEqual(common.settings(), {"comment_lang": "en+ru", "doc_lang": "ru"})
+
+    def test_substitute_all_placeholders(self):
+        with mock.patch.dict(os.environ, {**self.base, "CLAUDE_PLUGIN_OPTION_COMMENT_LANG": "en",
+                                          "CLAUDE_PLUGIN_OPTION_DOC_LANG": "en"}, clear=True):
+            out = common.substitute("a {RULES} b {COMMENT_LANG} c {DOC_LANG}")
+            self.assertEqual(out, f"a {self.env.root / 'rules'} b en c en")
+
+    def test_substitute_unset_is_marker(self):
+        with mock.patch.dict(os.environ, self.base, clear=True):
+            self.assertEqual(common.substitute("{COMMENT_LANG}/{DOC_LANG}"), "не задан/не задан")
+
+    def test_philosophy_and_rules_substituted(self):
+        with mock.patch.dict(os.environ, {**self.base, "CLAUDE_PLUGIN_OPTION_COMMENT_LANG": "ru",
+                                          "CLAUDE_PLUGIN_OPTION_DOC_LANG": "ru"}, clear=True):
+            self.assertIn("Язык комментариев: ru; язык документации: ru.", common.philosophy_text())
+            self.assertIn("Язык: ru.", common.rule_texts("comments"))
+            self.assertNotIn("{COMMENT_LANG}", common.rule_texts("comments"))
+
+
+class ProjectRootTest(unittest.TestCase):
+    def setUp(self):
+        self.env = Env()
+
+    def tearDown(self):
+        self.env.close()
+
+    def test_non_git_is_cwd(self):
+        sub = self.env.project / "a" / "b"
+        sub.mkdir(parents=True)
+        self.assertEqual(common.project_root(str(sub)), sub)
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_git_toplevel(self):
+        subprocess.run(["git", "init", "-q", str(self.env.project)], check=True)
+        sub = self.env.project / "pkg"
+        sub.mkdir()
+        self.assertEqual(common.project_root(str(sub)).resolve(), self.env.project.resolve())
+
+    def test_missing_dir_is_path(self):
+        self.assertEqual(common.project_root("/nonexistent/x"), pathlib.Path("/nonexistent/x"))
+
+
+class DocPathTest(unittest.TestCase):
+    def test_doc_paths(self):
+        for p in ["README.md", "README", "README.rst", "LICENSE", "CLAUDE.md", "internal/x/CLAUDE.md",
+                  "context/a.md", "context/deferred/INDEX.md", "docs/en/x.md", "notes.md"]:
+            self.assertTrue(common.is_doc_path(p), p)
+
+    def test_code_paths(self):
+        for p in ["main.go", "a/b.py", "Makefile", "docs.py", "context.go", "readme_test.go", "x.toml"]:
+            self.assertFalse(common.is_doc_path(p), p)
+
+
+class WarnOnceTest(unittest.TestCase):
+    def test_once_per_session_and_key(self):
+        env = Env()
+        try:
+            with mock.patch.dict(os.environ, env.environ(), clear=True), \
+                 mock.patch("sys.stderr", new=io.StringIO()) as err:
+                self.assertTrue(common.warn_once("s", "lang", "раз"))
+                self.assertFalse(common.warn_once("s", "lang", "раз"))
+                self.assertTrue(common.warn_once("s", "other", "два"))
+                self.assertTrue(common.warn_once("s2", "lang", "три"))
+                self.assertEqual(err.getvalue().count("planka:"), 3)
         finally:
             env.close()
 
