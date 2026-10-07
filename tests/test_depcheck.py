@@ -101,3 +101,27 @@ class FalseDenyTest(unittest.TestCase):
             "uv add -r r.txt httpx",
         ]:
             self.assertIsNotNone(depcheck.dependency_add(cmd), cmd)
+
+
+class ManagerFlagsAndCommentsTest(unittest.TestCase):
+    def test_detected(self):
+        for cmd in [
+            "pnpm add -w left-pad",
+            "npm install -w packages/a left-pad",
+            "cargo add -v serde",
+            "gem install -v 1.0 rails",
+            "echo '#' ; npm install x",
+            "npm install x # c\npip install y",
+            'echo "a # b" && npm install x',
+        ]:
+            self.assertIsNotNone(depcheck.dependency_add(cmd), cmd)
+
+    def test_not_adds(self):
+        for cmd in [
+            "npm install -w packages/a",
+            "gem install -v 1.0",
+            "echo hi # a; npm install x",
+            "echo hi # a && npm install x",
+            "echo hi # a | npm install x",
+        ]:
+            self.assertIsNone(depcheck.dependency_add(cmd), cmd)
