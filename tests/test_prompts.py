@@ -145,6 +145,14 @@ class DocsPromptTest(unittest.TestCase):
         self.assertIn("Файлы без известного синтаксиса комментариев, судятся по самоотчёту: a.foo, b.bin", text)
         self.assertNotIn("комментарии не добавлены", text)
 
+    def test_render_docs_content_unknown_capped(self):
+        unknown = [f"u{i:03}.erl" for i in range(prompts.MAX_LISTED + 3)]
+        text = prompts.render_docs_content("M", [("x.erl", "code", True)], [], False, False, unknown)
+        line = next(l for l in text.splitlines() if l.startswith("Файлы без известного"))
+        self.assertIn(f"u{prompts.MAX_LISTED - 1:03}.erl", line)
+        self.assertNotIn(f"u{prompts.MAX_LISTED:03}.erl", line)
+        self.assertTrue(line.endswith("… и ещё 3"))
+
     def test_render_docs_content_unknown_after_comments(self):
         text = prompts.render_docs_content("M", [("a.go", "code", True), ("b.foo", "code", True)], ["a.go: // x"], True, False,
                                            ["b.foo"])

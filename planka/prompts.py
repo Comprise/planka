@@ -108,7 +108,10 @@ def render_docs_content(message, changed, comments, truncated, no_claude_md, unk
         if truncated:
             parts.append("- … обрезано")
     if unknown:
-        parts += ["", f"Файлы без известного синтаксиса комментариев, судятся по самоотчёту: {', '.join(unknown)}"]
+        listed = ", ".join(unknown[:MAX_LISTED])
+        rest = len(unknown) - MAX_LISTED
+        tail = f", … и ещё {rest}" if rest > 0 else ""
+        parts += ["", f"Файлы без известного синтаксиса комментариев, судятся по самоотчёту: {listed}{tail}"]
     if not comments and not unknown:
         parts += ["", "В изменённых файлах кода комментарии не добавлены."]
     if no_claude_md:
