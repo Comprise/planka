@@ -46,6 +46,12 @@ class RemindTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout, "")
 
+    def test_rules_dir_substituted(self):
+        r = self.env.run("remind.py", hook_input("UserPromptSubmit", prompt="привет"))
+        ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("{RULES}", ctx)
+        self.assertIn(str(self.env.root / "rules"), ctx)
+
 
 if __name__ == "__main__":
     unittest.main()
