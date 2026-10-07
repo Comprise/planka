@@ -14,7 +14,7 @@ def looks_like_options(text):
     return len(_LIST_ITEM.findall(text or "")) >= 2 and bool(_KEYWORDS.search(text or ""))
 
 
-_DONE = re.compile(r"\b(?:готов[оаы]?|сделан[оаы]?|исправлен[оаы]?|починен[оаы]?|проход[яи]т|"
+_DONE = re.compile(r"\b(?:готов[оаы]|сделан[оаы]?|исправлен[оаы]?|починен[оаы]?|проход[яи]т|"
                    r"прош[её]л|прошли|зел[её]н\w*|done|fixed|passing|passes|completed?)\b",
                    re.IGNORECASE)
 

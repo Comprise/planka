@@ -124,6 +124,8 @@ class DoneFilterTest(unittest.TestCase):
         self.assertTrue(judge_stop.claims_done("Fixed, all tests passing."))
         self.assertTrue(judge_stop.claims_done("Исправлено."))
         self.assertFalse(judge_stop.claims_done("Готовлю план."))
+        self.assertFalse(judge_stop.claims_done("Я готов обсудить"))
+        self.assertFalse(judge_stop.claims_done("Готов к работе"))
         self.assertFalse(judge_stop.claims_done("Смотрю, что сломалось."))
         self.assertFalse(judge_stop.claims_done(""))
         self.assertFalse(judge_stop.claims_done(None))
@@ -175,6 +177,8 @@ class DoneHookTest(unittest.TestCase):
         self.assertEqual(r.stdout, "")
         self.assertIn("planka:", r.stderr)
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
+        self.assertEqual(self.env.log_lines()[-1]["filters"], ["done"])
+        self.assertEqual(r.stderr.count("planka:"), 1)
 
 
 if __name__ == "__main__":
