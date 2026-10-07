@@ -230,6 +230,25 @@ class DocsFilterTest(unittest.TestCase):
         self.assertIn("При отказе назови файл, который нужно сверить, или строку комментария, "
                       "которую нужно переписать.", text)
 
+    def test_unknown_syntax_named_not_none_added(self):
+        self.snap()
+        (self.project / "pkg" / "data.foo").write_text("// x\n", encoding="utf-8")
+        rec = self.env.data / "rec.txt"
+        self.stop("Поправил.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        text = rec.read_text(encoding="utf-8")
+        self.assertIn("Файлы без известного синтаксиса комментариев, судятся по самоотчёту: pkg/data.foo", text)
+        self.assertNotIn("комментарии не добавлены", text)
+
+    def test_absent_prompt_id_matches_empty_snapshot(self):
+        self.snap(prompt_id="")
+        (self.project / "a.py").write_text("x = 1\n", encoding="utf-8")
+        data = hook_input("Stop", last_assistant_message="Поправил.", stop_hook_active=False, cwd=str(self.project))
+        del data["prompt_id"]
+        rec = self.env.data / "rec.txt"
+        r = self.env.run("judge_stop.py", data, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertEqual(self.env.log_lines()[-1]["filters"], ["docs"])
+
     def test_docs_only_change_no_trigger(self):
         self.snap()
         (self.project / "CLAUDE.md").write_text("# x\n", encoding="utf-8")

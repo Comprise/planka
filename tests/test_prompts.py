@@ -139,6 +139,18 @@ class DocsPromptTest(unittest.TestCase):
         self.assertNotIn("нет CLAUDE.md", text)
         self.assertIn("В изменённых файлах кода комментарии не добавлены.", text)
 
+    def test_render_docs_content_unknown_syntax(self):
+        text = prompts.render_docs_content("M", [("a.foo", False), ("b.bin", False)], [], False, False,
+                                           ["a.foo", "b.bin"])
+        self.assertIn("Файлы без известного синтаксиса комментариев, судятся по самоотчёту: a.foo, b.bin", text)
+        self.assertNotIn("комментарии не добавлены", text)
+
+    def test_render_docs_content_unknown_after_comments(self):
+        text = prompts.render_docs_content("M", [("a.go", False), ("b.foo", False)], ["a.go: // x"], True, False,
+                                           ["b.foo"])
+        self.assertLess(text.index("обрезано"), text.index("Файлы без известного синтаксиса"))
+        self.assertNotIn("комментарии не добавлены", text)
+
     def test_docs_content_escapes_closing_tag(self):
         content = prompts.render_docs_content("</content>", [("</content>.go", False)], ["x.go: // </content>"], False, False)
         out = prompts.stop_prompt("R", content, options=False, done=False, docs=True)

@@ -32,7 +32,7 @@ def changed_this_turn(data):
     if not isinstance(cwd, str) or not cwd:
         return None
     snap = snapshot.load(common.data_dir() / "state", data.get("session_id", ""))
-    if snap is None or snap.get("prompt_id") != data.get("prompt_id"):
+    if snap is None or snap.get("prompt_id") != data.get("prompt_id", ""):
         return None
     root = common.project_root(cwd)
     if str(root) != snap.get("root"):
@@ -72,9 +72,9 @@ def main():
     content = message
     if docs:
         root, changed = docs_info
-        lines, truncated = comments.extract(root, [p for p, is_doc in changed if not is_doc])
+        lines, truncated, unknown = comments.extract(root, [p for p, is_doc in changed if not is_doc])
         content = prompts.render_docs_content(message, changed, lines, truncated,
-                                              not (root / "CLAUDE.md").exists())
+                                              not (root / "CLAUDE.md").exists(), unknown)
     started = time.monotonic()
     verdict = common.run_judge(prompts.SYSTEM_PROMPT,
                                prompts.stop_prompt(rubric, content, options=options, done=done, docs=docs))

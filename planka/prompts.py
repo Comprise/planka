@@ -56,7 +56,7 @@ _DOCS_CHECKS = """Проверь сверку документации и ком
 
 
 def _wrap(rubric, checks, content):
-    # Закрывающий тег внутри содержимого экранируется, иначе он закончил бы блок данных раньше.
+    # Закрывающий тег внутри содержимого экранируется: единственный </content> в промпте закрывает блок данных.
     content = content.replace("</content>", "<\\/content>")
     return f"Рубрика:\n{rubric}\n\n{checks}\n\n{_DATA_NOTE}\n\n<content>\n{content}\n</content>\n"
 
@@ -93,7 +93,7 @@ def render_questions(tool_input):
     return "\n".join(out).strip()
 
 
-def render_docs_content(message, changed, comments, truncated, no_claude_md):
+def render_docs_content(message, changed, comments, truncated, no_claude_md, unknown=()):
     """Сообщение с изменёнными файлами и комментариями для судьи документации."""
     parts = [message, "", "Изменённые файлы за ход:"]
     parts += [f"- {path} — {'документация' if is_doc else 'код'}" for path, is_doc in changed]
@@ -101,7 +101,9 @@ def render_docs_content(message, changed, comments, truncated, no_claude_md):
         parts += ["", "Комментарии в изменённых файлах:"] + [f"- {c}" for c in comments]
         if truncated:
             parts.append("- … обрезано")
-    else:
+    if unknown:
+        parts += ["", f"Файлы без известного синтаксиса комментариев, судятся по самоотчёту: {', '.join(unknown)}"]
+    if not comments and not unknown:
         parts += ["", "В изменённых файлах кода комментарии не добавлены."]
     if no_claude_md:
         parts += ["", "В корне проекта нет CLAUDE.md."]
