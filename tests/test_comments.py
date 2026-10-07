@@ -35,6 +35,12 @@ class CommentLinesTest(unittest.TestCase):
         for ext in ("php", "groovy", "gradle", "proto", "sol", "zig"):
             self.assertEqual(comments.comment_lines("x = 1 // c\n", ext), ["// c"], ext)
 
+    def test_language_variants(self):
+        for ext in ("mjs", "cjs", "mts", "cts", "cxx", "hh", "hxx"):
+            self.assertEqual(comments.comment_lines("x = 1 // c\n", ext), ["// c"], ext)
+        self.assertEqual(comments.comment_lines('# c\ndef f():\n    """Doc."""\n', "pyi"), ["# c", '"""Doc."""'])
+        self.assertEqual(comments.comment_lines("set(X 1) # c\n", "cmake"), ["# c"])
+
     def test_hash_families(self):
         for ext in ("tf", "nix", "r", "jl", "ex", "exs"):
             self.assertEqual(comments.comment_lines("x = 1 # c\n", ext), ["# c"], ext)
@@ -87,7 +93,7 @@ class ExtractTest(unittest.TestCase):
         self.assertEqual(unknown, ["a.foo", "x.erl", "z.bin"])
 
     def test_hash_by_file_name(self):
-        names = ["Makefile", "Dockerfile", "Justfile", "Rakefile", "Gemfile"]
+        names = ["Makefile", "CMakeLists.txt", "Dockerfile", "Justfile", "Rakefile", "Gemfile"]
         for name in names:
             self.write(f"d/{name}", "# c\n")
         lines, _, unknown = comments.extract(self.root, [f"d/{n}" for n in names])

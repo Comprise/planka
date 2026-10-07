@@ -64,7 +64,8 @@ class Env:
                 (self.root / "rules" / f"{name}.md").write_text(text, encoding="utf-8")
 
     def environ(self, **extra):
-        env = {k: v for k, v in os.environ.items() if not k.startswith(("PLANKA_", "CLAUDE_PLUGIN_OPTION_"))}
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("PLANKA_", "CLAUDE_PLUGIN_OPTION_")) and k != "CLAUDE_PROJECT_DIR"}
         env.update({
             "CLAUDE_PLUGIN_ROOT": str(self.root),
             "CLAUDE_PLUGIN_DATA": str(self.data),

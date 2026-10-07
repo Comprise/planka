@@ -4,7 +4,6 @@ import shlex
 
 DEP_OK_MARKER = "PLANKA_DEP_OK=1"
 
-_SPLIT = re.compile(r"&&|\|\||;|\||\n")
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _PIP_REQ_FLAGS = {"-r", "--requirement"}
 
@@ -108,27 +107,6 @@ def _is_add(words):
     return False
 
 
-def _strip_comment(line):
-    """Строка без неэкранированного и не взятого в кавычки `#`-хвоста (`#` — в начале или после пробела)."""
-    quote = None
-    i = 0
-    while i < len(line):
-        c = line[i]
-        if quote:
-            if c == "\\" and quote == '"':
-                i += 1
-            elif c == quote:
-                quote = None
-        elif c == "\\":
-            i += 1
-        elif c in "'\"":
-            quote = c
-        elif c == "#" and (i == 0 or line[i - 1].isspace()):
-            return line[:i]
-        i += 1
-    return line
-
-
 _WORD_END = " \t;&|<>()"
 
 
@@ -222,23 +200,85 @@ def _heredocs(line):
     return found
 
 
-def dependency_add(command):
-    """Сегмент команды, добавляющий пакет; None, если такого нет или стоит маркер согласия.
+def _segments(command):
+    """Сегменты команды: границы — `&&`, `||`, `;`, `|` и перевод строки вне кавычек.
 
-    Тело heredoc — данные, а не команды: строки до терминатора не разбираются.
+    Кавычка, открытая на одной строке, продолжается на следующих; `\\` в конце строки продолжает
+    сегмент. Тело heredoc — данные, а не команды: строки до терминатора не входят ни в один
+    сегмент. Комментарий — `#` в начале строки или после пробела вне кавычек — до конца строки.
     """
-    if not isinstance(command, str) or DEP_OK_MARKER in command:
-        return None
+    segments, current = [], []
+    quote = None
     pending = []
+
+    def flush():
+        segments.append("".join(current))
+        current.clear()
+
     for line in command.split("\n"):
         if pending:
             term, strip_tabs = pending[0]
             if (line.lstrip("\t") if strip_tabs else line) == term:
                 pending.pop(0)
             continue
-        for segment in _SPLIT.split(_strip_comment(line)):
-            segment = segment.strip()
-            if segment and _is_add(_words(segment)):
-                return segment
-        pending = _heredocs(line)
+        # Позиция, с которой строка идёт вне кавычки, перенесённой с прошлых строк.
+        outside = 0 if quote is None else None
+        continued = False
+        i, n = 0, len(line)
+        while i < n:
+            c = line[i]
+            if quote == "'":
+                current.append(c)
+                if c == "'":
+                    quote = None
+            elif quote == '"':
+                if c == "\\" and i + 1 < n:
+                    current.append(line[i:i + 2])
+                    i += 2
+                    continue
+                current.append(c)
+                if c == '"':
+                    quote = None
+            elif c == "\\":
+                if i + 1 == n:
+                    continued = True
+                    break
+                current.append(line[i:i + 2])
+                i += 2
+                continue
+            elif c in "'\"":
+                quote = c
+                current.append(c)
+            elif c == "#" and (i == 0 or line[i - 1].isspace()):
+                break
+            elif line.startswith(("&&", "||"), i):
+                flush()
+                i += 2
+                continue
+            elif c in ";|":
+                flush()
+            else:
+                current.append(c)
+            if outside is None and quote is None:
+                outside = i + 1
+            i += 1
+        if quote is not None:
+            current.append("\n")
+        elif continued:
+            current.append(" ")
+        else:
+            flush()
+        pending = _heredocs(line[outside:]) if outside is not None else []
+    flush()
+    return segments
+
+
+def dependency_add(command):
+    """Сегмент команды, добавляющий пакет; None, если такого нет или стоит маркер согласия."""
+    if not isinstance(command, str) or DEP_OK_MARKER in command:
+        return None
+    for segment in _segments(command):
+        segment = segment.strip()
+        if segment and _is_add(_words(segment)):
+            return segment
     return None

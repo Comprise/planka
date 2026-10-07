@@ -6,15 +6,17 @@ import subprocess
 MAX_LINES = 300
 MAX_BYTES = 16_384
 
-_C_FAMILY = {"go", "c", "h", "cc", "cpp", "hpp", "java", "kt", "kts", "swift", "js", "jsx", "ts", "tsx",
-             "dart", "rs", "scala", "m", "mm", "cs", "php", "groovy", "gradle", "proto", "sol", "zig"}
-_HASH = {"py", "sh", "bash", "zsh", "rb", "pl", "toml", "yaml", "yml", "mk", "makefile", "cfg", "ini", "ps1",
-         "tf", "nix", "r", "jl", "ex", "exs"}
-# Файлы без расширения с синтаксисом «#»: ключ семейства — имя в нижнем регистре.
-_HASH_NAMES = {"Makefile", "makefile", "GNUmakefile", "Dockerfile", "Justfile", "Rakefile", "Gemfile"}
+_C_FAMILY = {"go", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx", "java", "kt", "kts", "swift",
+             "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "dart", "rs", "scala", "m", "mm", "cs",
+             "php", "groovy", "gradle", "proto", "sol", "zig"}
+_HASH = {"py", "pyi", "sh", "bash", "zsh", "rb", "pl", "toml", "yaml", "yml", "mk", "makefile", "cmake", "cfg",
+         "ini", "ps1", "tf", "nix", "r", "jl", "ex", "exs"}
+# Файлы с синтаксисом «#», узнаваемые по имени: ключ семейства — имя в нижнем регистре.
+_HASH_NAMES = {"Makefile", "makefile", "GNUmakefile", "CMakeLists.txt", "Dockerfile", "Justfile", "Rakefile",
+               "Gemfile"}
 _DASH = {"sql", "lua", "hs"}
 _HTML = {"html", "xml", "vue", "svelte"}
-_DOCSTRING = {"py"}
+_DOCSTRING = {"py", "pyi"}
 _HASH_KEYS = _HASH | {n.lower() for n in _HASH_NAMES}
 _KNOWN = _C_FAMILY | _HASH_KEYS | _DASH | _HTML
 

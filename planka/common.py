@@ -75,15 +75,17 @@ UNSET_LANG = "не задан"
 DOC_PATTERNS = ("README", "LICENSE")
 DOC_DIRS = ("context/", "docs/")
 CODE_EXTS = {
-    "go", "c", "h", "cc", "cpp", "hpp", "java", "kt", "kts", "swift", "js", "jsx", "ts", "tsx",
-    "dart", "rs", "scala", "m", "mm", "cs",
-    "py", "sh", "bash", "zsh", "rb", "pl", "toml", "yaml", "yml", "mk", "makefile", "cfg", "ini", "ps1",
+    "go", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx", "java", "kt", "kts", "swift",
+    "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "dart", "rs", "scala", "m", "mm", "cs",
+    "py", "pyi", "sh", "bash", "zsh", "rb", "pl", "toml", "yaml", "yml", "mk", "makefile", "cmake", "cfg",
+    "ini", "ps1",
     "sql", "lua", "hs",
     "html", "xml", "vue", "svelte",
     "php", "r", "jl", "ex", "exs", "erl", "clj", "fs", "vb", "nim", "zig", "sol", "proto", "gradle",
     "groovy", "tf", "nix", "el", "vim", "bat", "cmd",
 }
-CODE_NAMES = {"Makefile", "makefile", "GNUmakefile", "Dockerfile", "Justfile", "Rakefile", "Gemfile"}
+CODE_NAMES = {"Makefile", "makefile", "GNUmakefile", "CMakeLists.txt", "Dockerfile", "Justfile", "Rakefile",
+              "Gemfile"}
 
 
 def rules_dir():
@@ -265,15 +267,20 @@ def deny_budget_exhausted(session_id, prompt_id, hook):
 
 
 def project_root(cwd):
-    """Вершина git-репозитория для cwd; без git или вне репозитория — сам cwd."""
+    """Корень проекта сессии: вершина git-репозитория для CLAUDE_PROJECT_DIR, без неё — для cwd;
+    вне репозитория — сам каталог.
+
+    CLAUDE_PROJECT_DIR — каталог запуска сессии, после cd агента он не меняется; cwd хука меняется.
+    """
+    base = os.environ.get("CLAUDE_PROJECT_DIR") or cwd
     try:
-        proc = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd, capture_output=True,
+        proc = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=base, capture_output=True,
                               text=True, encoding="utf-8", errors="replace", timeout=5)
         if proc.returncode == 0 and proc.stdout.strip():
             return pathlib.Path(proc.stdout.strip())
     except (OSError, subprocess.SubprocessError):
         pass
-    return pathlib.Path(cwd)
+    return pathlib.Path(base)
 
 
 def is_doc_path(relpath):
@@ -285,14 +292,15 @@ def is_doc_path(relpath):
 
 
 def path_kind(relpath):
-    """Класс пути относительно корня проекта, с прямыми слэшами: "doc", "code" или "other"."""
+    """Класс пути относительно корня проекта, с прямыми слэшами: "code", "doc" или "other".
+
+    Расширение или имя кода дают "code" в любом каталоге, в том числе под context/ и docs/.
+    """
+    name = relpath.rsplit("/", 1)[-1]
+    if name in CODE_NAMES or ("." in name and name.rsplit(".", 1)[1].lower() in CODE_EXTS):
+        return "code"
     if is_doc_path(relpath):
         return "doc"
-    name = relpath.rsplit("/", 1)[-1]
-    if name in CODE_NAMES:
-        return "code"
-    if "." in name and name.rsplit(".", 1)[1].lower() in CODE_EXTS:
-        return "code"
     return "other"
 
 

@@ -50,9 +50,17 @@ class ParseTest(unittest.TestCase):
         self.assertIsNone(planparse.parse_plan("Просто текст без задач."))
         self.assertIsNone(planparse.parse_plan("### Задача 1: Без файлов\nделаем"))
 
-    def test_tasks_without_wave_are_wave_one(self):
+    def test_tasks_without_wave_have_no_wave(self):
         tasks = planparse.parse_plan(PLAN_EN)
-        self.assertEqual([t.wave for t in tasks], [1, 1])
+        self.assertEqual([t.wave for t in tasks], [None, None])
+
+    def test_plan_without_waves_has_no_conflicts(self):
+        self.assertEqual(planparse.shared_files(planparse.parse_plan(PLAN_EN)), [])
+
+    def test_task_before_first_wave_is_outside(self):
+        tasks = planparse.parse_plan("### Task 0: Prep\nFiles: `x.py`\n" + PLAN_RU)
+        self.assertEqual(tasks[0].wave, None)
+        self.assertEqual(planparse.shared_files(tasks), [("b/two.py", 1, [1, 2])])
 
 
 class SharedFilesTest(unittest.TestCase):

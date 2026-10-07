@@ -257,6 +257,20 @@ class DocsFilterTest(unittest.TestCase):
         self.assertEqual(r.stdout, "", r.stderr)
         self.assertEqual(self.env.log_lines()[-1]["filters"], ["docs"])
 
+    def test_cd_into_subdir_keeps_project_root(self):
+        project_dir = str(self.project)
+        r = self.env.run("remind.py", hook_input("UserPromptSubmit", prompt="x", cwd=str(self.project / "pkg")),
+                         CLAUDE_PROJECT_DIR=project_dir)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        (self.project / "a.py").write_text("x = 1\n", encoding="utf-8")
+        rec = self.env.data / "rec.txt"
+        r = self.env.run("judge_stop.py", hook_input(
+            "Stop", last_assistant_message="Поправил.", stop_hook_active=False, cwd=str(self.project / "pkg")),
+            CLAUDE_PROJECT_DIR=project_dir, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertIn("- a.py — код", rec.read_text(encoding="utf-8"))
+        self.assertEqual(self.env.log_lines()[-1]["filters"], ["docs"])
+
     def test_docs_only_change_no_trigger(self):
         self.snap()
         (self.project / "CLAUDE.md").write_text("# x\n", encoding="utf-8")

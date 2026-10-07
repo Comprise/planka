@@ -69,7 +69,14 @@ planka — плагин Claude Code уровня пользователя: тр�
   и запись под `fcntl.flock` на `judge.log.lock`.
 
 Снимок связывает `UserPromptSubmit` и `Stop`: `judge_stop.changed_this_turn` сравнивает его с
-текущим деревом, только если совпали `prompt_id` и корень проекта (`common.project_root`).
+текущим деревом, только если совпали `prompt_id` и корень проекта. Корень (`common.project_root`)
+— вершина git для `CLAUDE_PROJECT_DIR`, без неё — для `cwd` входа хука; `cwd` меняется после `cd`
+агента, `CLAUDE_PROJECT_DIR` — нет.
+
+Класс изменённого файла (`common.path_kind`): расширение из `CODE_EXTS` или имя из `CODE_NAMES` —
+код в любом каталоге; затем документация по `common.is_doc_path`; иначе прочее. Каждое
+расширение с синтаксисом комментариев в `comments.py` входит в `CODE_EXTS` (тест
+`test_code_exts_cover_comment_families`).
 
 ## Платформы
 

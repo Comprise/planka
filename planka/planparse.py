@@ -16,7 +16,8 @@ _FENCE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
 
 @dataclasses.dataclass
 class PlanTask:
-    wave: int
+    # None — задача до первого заголовка «Волна N»/«Wave N».
+    wave: int | None
     number: int
     title: str
     files: list
@@ -48,7 +49,7 @@ def _paths(fragment):
 
 def parse_plan(text):
     tasks = []
-    wave = 1
+    wave = None
     current = None
     lines = text.splitlines()
     fence = None
@@ -97,8 +98,11 @@ def parse_plan(text):
 
 
 def shared_files(tasks):
+    """Файлы, принадлежащие нескольким задачам одной волны; задачи вне волны не участвуют."""
     owners = {}
     for t in tasks:
+        if t.wave is None:
+            continue
         for f in dict.fromkeys(t.files):
             owners.setdefault((t.wave, f), []).append(t.number)
     return [(f, wave, nums) for (wave, f), nums in sorted(owners.items()) if len(nums) > 1]

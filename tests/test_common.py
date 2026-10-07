@@ -428,9 +428,18 @@ class SettingsTest(unittest.TestCase):
 class ProjectRootTest(unittest.TestCase):
     def setUp(self):
         self.env = Env()
+        self.patch = mock.patch.dict(os.environ, self.env.environ(), clear=True)
+        self.patch.start()
 
     def tearDown(self):
+        self.patch.stop()
         self.env.close()
+
+    def test_project_dir_wins_over_cwd(self):
+        sub = self.env.project / "a" / "b"
+        sub.mkdir(parents=True)
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(self.env.project)}):
+            self.assertEqual(common.project_root(str(sub)), self.env.project)
 
     def test_non_git_is_cwd(self):
         sub = self.env.project / "a" / "b"
@@ -463,7 +472,11 @@ class PathKindTest(unittest.TestCase):
     def test_kinds(self):
         cases = {
             "README.md": "doc", "README": "doc", "LICENSE": "doc", "docs/en/x.md": "doc",
-            "context/x.go": "doc", "internal/CLAUDE.md": "doc",
+            "internal/CLAUDE.md": "doc", "context/notes.txt": "doc",
+            "context/x.go": "code", "docs/docs.go": "code", "READMEParser.java": "code",
+            "LICENSE_check.py": "code",
+            "a.mjs": "code", "a.cjs": "code", "a.mts": "code", "a.cts": "code", "a.pyi": "code",
+            "a.cxx": "code", "a.hh": "code", "a.hxx": "code", "CMakeLists.txt": "code", "m/x.cmake": "code",
             "pkg/x.go": "code", "a/b.py": "code", "Makefile": "code", "Dockerfile": "code",
             "sub/Justfile": "code", "makefile": "code", "GNUmakefile": "code", "Rakefile": "code", "Gemfile": "code", "x.toml": "code",
             "src/App.TSX": "code", "a.php": "code", "infra/main.tf": "code",
@@ -480,7 +493,8 @@ class PathKindTest(unittest.TestCase):
         for ext in ("php", "r", "jl", "ex", "exs", "erl", "clj", "fs", "vb", "nim", "zig", "sol",
                     "proto", "gradle", "groovy", "tf", "nix", "el", "vim", "bat", "cmd"):
             self.assertIn(ext, common.CODE_EXTS)
-        self.assertEqual(common.CODE_NAMES, {"Makefile", "makefile", "GNUmakefile", "Dockerfile", "Justfile", "Rakefile", "Gemfile"})
+        self.assertEqual(common.CODE_NAMES, {"Makefile", "makefile", "GNUmakefile", "CMakeLists.txt", "Dockerfile",
+                                             "Justfile", "Rakefile", "Gemfile"})
 
 
 class WarnOnceTest(unittest.TestCase):

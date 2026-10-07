@@ -14,7 +14,7 @@ CI нет; обе цели — в `Makefile`.
   `CLAUDE_PLUGIN_ROOT` (свои `philosophy.md` и `rules/` из `helpers.PHILOSOPHY` и
   `helpers.RULES`), `CLAUDE_PLUGIN_DATA` и каталог проекта; `Env.run` подаёт вход хука в stdin.
   Ответ разбирают `helpers.output` и `helpers.messages` (строки `systemMessage`).
-- Окружение `Env.environ` вычищает `PLANKA_*` и `CLAUDE_PLUGIN_OPTION_*` и ставит
+- Окружение `Env.environ` вычищает `PLANKA_*`, `CLAUDE_PLUGIN_OPTION_*` и `CLAUDE_PROJECT_DIR` и ставит
   `tests/stub` первым в `PATH`: вместо `claude` отвечает заглушка `tests/stub/claude`.
 
 ## Заглушка судьи

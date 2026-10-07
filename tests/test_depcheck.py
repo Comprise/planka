@@ -187,3 +187,24 @@ class ManagerFlagsAndCommentsTest(unittest.TestCase):
             "echo hi # a | npm install x",
         ]:
             self.assertIsNone(depcheck.dependency_add(cmd), cmd)
+
+
+class QuotedSeparatorsTest(unittest.TestCase):
+    def test_separators_inside_quotes_are_text(self):
+        for cmd in [
+            'git commit -m "docs; pip install requests"',
+            'echo "a && npm install x"',
+            "echo 'a | npm install x'",
+            'git commit -m "first line\n\npip install requests\n"',
+            "echo 'one\ntwo; npm install x'",
+        ]:
+            self.assertIsNone(depcheck.dependency_add(cmd), cmd)
+
+    def test_add_after_closed_quote_detected(self):
+        for cmd in [
+            'git commit -m "a; b" && pip install requests',
+            'echo "multi\nline"; npm install x',
+            "npm install \\\n  left-pad",
+        ]:
+            self.assertIsNotNone(depcheck.dependency_add(cmd), cmd)
+

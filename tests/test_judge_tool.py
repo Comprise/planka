@@ -147,6 +147,14 @@ class PlanTest(unittest.TestCase):
         self.assertFalse(rec.exists())
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "deny-files")
 
+    def test_plan_without_waves_goes_to_judge(self):
+        rec = self.env.data / "rec.txt"
+        plan = PLAN_CONFLICT.replace("## Волна 1\n", "")
+        r = self.exit_plan(self.with_plan(plan), PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertTrue(rec.exists())
+        self.assertEqual(self.env.log_lines()[-1]["verdict"], "ok")
+
     def test_clean_plan_goes_to_judge_with_plan_rubric(self):
         rec = self.env.data / "rec.txt"
         r = self.exit_plan(self.with_plan(PLAN_CLEAN), PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
