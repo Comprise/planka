@@ -2,15 +2,17 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
 import unittest
 from unittest import mock
 
-from tests.helpers import Env, PLANKA_DIR, hook_input, messages, output
+from tests.helpers import RULES, Env, PLANKA_DIR, messages, output
 
 sys.path.insert(0, str(PLANKA_DIR))
+import common  # noqa: E402
 import judge_stop  # noqa: E402
 import prompts  # noqa: E402
 import snapshot  # noqa: E402
@@ -24,6 +26,25 @@ OPTIONS_MSG = """Есть два подхода:
 
 PLAIN_MSG = "Смотрю, что сломалось."
 
+TURN_MISSING = "planka: сообщения реплики не найдены в транскрипте, судья видит последнее сообщение"
+
+
+def write_turn(env, *texts):
+    """Транскрипт env: реплика автора, затем ответы ассистента texts; между ответами — tool_use и tool_result."""
+    entries = [{"type": "user", "message": {"role": "user", "content": "реплика автора"}}]
+    for i, text in enumerate(texts):
+        if i:
+            entries.append({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": f"t{i}", "content": "вывод"}]}})
+        entries.append({"type": "assistant", "message": {"model": "claude-test-model", "content": [
+            {"type": "text", "text": text}, {"type": "tool_use", "id": f"t{i + 1}", "name": "Bash", "input": {}}]}})
+    env.transcript.write_text("".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8")
+
+
+def judged(rec):
+    """Блок <content> промпта судьи из записи заглушки."""
+    return rec.read_text(encoding="utf-8").split("\n<content>\n", 1)[1].split("\n</content>\n", 1)[0]
+
 
 class FilterTest(unittest.TestCase):
     def test_filter(self):
@@ -32,6 +53,12 @@ class FilterTest(unittest.TestCase):
         self.assertFalse(judge_stop.looks_like_options(PLAIN_MSG))
         self.assertFalse(judge_stop.looks_like_options("рекомендую перезапустить"))
         self.assertFalse(judge_stop.looks_like_options("- один пункт\nи вариант в прозе"))
+
+    def test_keywords_are_whole_words(self):
+        for word in ("Варианты:", "два подхода", "рекомендую", "Options:", "two approaches", "I recommend"):
+            self.assertTrue(judge_stop.looks_like_options(f"{word}\n- a\n- b"), word)
+        for word in ("это подходит", "подходящий", "optional", "Option<T>", "Option::None", "adoption"):
+            self.assertFalse(judge_stop.looks_like_options(f"{word}\n- a\n- b"), word)
 
 
 class StopHookTest(unittest.TestCase):
@@ -42,8 +69,9 @@ class StopHookTest(unittest.TestCase):
         self.env.close()
 
     def stop(self, msg, **extra):
+        write_turn(self.env, msg)
         return self.env.run("judge_stop.py",
-                            hook_input("Stop", last_assistant_message=msg, stop_hook_active=False),
+                            self.env.hook_input("Stop", last_assistant_message=msg, stop_hook_active=False),
                             **extra)
 
     def test_plain_message_passes_without_judge(self):
@@ -77,20 +105,96 @@ class StopHookTest(unittest.TestCase):
         self.assertNotIn("## Поведение", text)
         self.assertIn("<content>\n" + OPTIONS_MSG, text)
 
-    def test_budget_exhausted_passes_with_warning(self):
+    def test_budget_exhausted_passes_without_judge(self):
         for _ in range(2):
             r = self.stop(OPTIONS_MSG, PLANKA_STUB="deny")
             self.assertEqual(output(r)["decision"], "block")
-        r = self.stop(OPTIONS_MSG, PLANKA_STUB="deny")
+        rec = self.env.data / "rec.txt"
+        r = self.stop(OPTIONS_MSG, PLANKA_STUB="deny", PLANKA_STUB_RECORD=str(rec))
         self.assertIsNone(output(r))
-        self.assertIn("лимит отказов", "\n".join(messages(r)))
+        self.assertEqual(messages(r), ["planka: лимит отказов, пропущено без проверки"])
+        self.assertFalse(rec.exists())
+        last = self.env.log_lines()[-1]
+        self.assertEqual((last["verdict"], last["filters"]), ("budget", ["options"]))
+        r = self.env.run("judge_stop.py", self.env.hook_input("Stop", last_assistant_message=OPTIONS_MSG,
+                                                               prompt_id="p-2"), PLANKA_STUB="deny")
+        self.assertEqual(output(r)["decision"], "block")
 
-    def test_judge_failure_passes_with_warning(self):
-        r = self.stop(OPTIONS_MSG, PLANKA_STUB="garbage")
+    def test_judge_failure_passes_with_one_warning(self):
+        r = self.stop(OPTIONS_MSG, PLANKA_STUB="notlogged")
         self.assertEqual(r.returncode, 0)
         self.assertIsNone(output(r))
-        self.assertIn("planka:", "\n".join(messages(r)))
-        self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
+        self.assertEqual(messages(r), ["planka: судья пропущен: ошибка судьи: Not logged in · Please run /login"])
+        last = self.env.log_lines()[-1]
+        self.assertEqual((last["verdict"], last["error"]), ("skipped", "ошибка судьи"))
+        self.assertNotIn("Not logged in", json.dumps(last, ensure_ascii=False))
+
+    def test_all_turn_messages_go_to_judge(self):
+        rec = self.env.data / "rec.txt"
+        write_turn(self.env, "Первый ответ.", OPTIONS_MSG)
+        r = self.env.run("judge_stop.py", self.env.hook_input("Stop", last_assistant_message=OPTIONS_MSG),
+                         PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertEqual(judged(rec), "Первый ответ." + prompts.TURN_SEPARATOR + OPTIONS_MSG)
+        self.assertIn(prompts.TURN_LABEL, rec.read_text(encoding="utf-8"))
+        self.assertEqual(self.env.log_lines()[-1]["content_len"], len(judged(rec)))
+
+    def test_long_turn_is_limited_to_latest_messages(self):
+        rec = self.env.data / "rec.txt"
+        early = ["ранее-" + "а" * (prompts.MAX_TURN_CHARS // 4) for _ in range(6)]
+        write_turn(self.env, *early, OPTIONS_MSG)
+        r = self.env.run("judge_stop.py", self.env.hook_input("Stop", last_assistant_message=OPTIONS_MSG),
+                         PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        content = judged(rec)
+        self.assertTrue(content.startswith("… ранние сообщения реплики опущены: "))
+        self.assertLessEqual(len(content.split(prompts.TURN_SEPARATOR, 1)[1]), prompts.MAX_TURN_CHARS)
+        self.assertTrue(content.endswith(prompts.TURN_SEPARATOR + OPTIONS_MSG))
+
+    def test_long_turn_of_short_messages_counts_separators(self):
+        rec = self.env.data / "rec.txt"
+        short = [f"сообщение-{i:03d}-" + "ж" * 80 for i in range(400)]
+        write_turn(self.env, *short, OPTIONS_MSG)
+        r = self.env.run("judge_stop.py", self.env.hook_input("Stop", last_assistant_message=OPTIONS_MSG),
+                         PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        content = judged(rec)
+        self.assertTrue(content.startswith("… ранние сообщения реплики опущены: "))
+        kept = content.split(prompts.TURN_SEPARATOR, 1)[1]
+        self.assertLessEqual(len(kept), prompts.MAX_TURN_CHARS)
+        self.assertGreater(kept.count(prompts.TURN_SEPARATOR) * len(prompts.TURN_SEPARATOR), 100)
+
+    def test_filters_use_last_message_only(self):
+        rec = self.env.data / "rec.txt"
+        write_turn(self.env, OPTIONS_MSG, PLAIN_MSG)
+        r = self.env.run("judge_stop.py", self.env.hook_input("Stop", last_assistant_message=PLAIN_MSG),
+                         PLANKA_STUB="deny", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "")
+        self.assertFalse(rec.exists())
+
+    def test_last_message_appended_when_transcript_lags(self):
+        rec = self.env.data / "rec.txt"
+        write_turn(self.env, "Первый ответ.")
+        r = self.env.run("judge_stop.py", self.env.hook_input("Stop", last_assistant_message=OPTIONS_MSG),
+                         PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertEqual(judged(rec), "Первый ответ." + prompts.TURN_SEPARATOR + OPTIONS_MSG)
+
+    def test_no_turn_in_transcript_falls_back_with_warning_once(self):
+        rec = self.env.data / "rec.txt"
+        data = self.env.hook_input("Stop", last_assistant_message=OPTIONS_MSG)
+        r = self.env.run("judge_stop.py", data, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertIsNone(output(r))
+        self.assertEqual(messages(r), [TURN_MISSING])
+        self.assertEqual(judged(rec), OPTIONS_MSG)
+        r = self.env.run("judge_stop.py", data, PLANKA_STUB="ok")
+        self.assertEqual(r.stdout, "", r.stderr)
+
+    def test_session_model_from_transcript(self):
+        rec = self.env.data / "rec.txt"
+        r = self.stop(OPTIONS_MSG, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertIn("\n--model\nclaude-test-model\n", rec.read_text(encoding="utf-8"))
 
     def test_block_survives_log_failure(self):
         (self.env.data / "judge.log").mkdir()
@@ -109,7 +213,11 @@ class StopHookTest(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
 
     def test_barrier_and_garbage(self):
-        self.assertEqual(self.stop(OPTIONS_MSG, PLANKA_JUDGE="1").stdout, "")
+        rec = self.env.data / "rec.txt"
+        r = self.stop(OPTIONS_MSG, PLANKA_JUDGE="1", PLANKA_STUB="deny", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "")
+        self.assertFalse(rec.exists())
+        self.assertEqual(self.env.log_lines(), [])
         r = self.env.run("judge_stop.py", "garbage")
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout, "")
@@ -119,13 +227,14 @@ class JudgeDiesWithHookTest(unittest.TestCase):
     @unittest.skipUnless(sys.platform.startswith("linux"), "PR_SET_PDEATHSIG — только Linux")
     def test_judge_killed_with_hook(self):
         env = Env()
+        proc, judge_pid = None, None
         try:
             rec = env.data / "rec.txt"
             proc = subprocess.Popen(
                 [sys.executable, str(PLANKA_DIR / "judge_stop.py")], stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 env=env.environ(PLANKA_STUB="hang", PLANKA_STUB_RECORD=str(rec)))
-            proc.stdin.write(json.dumps(hook_input("Stop", last_assistant_message=OPTIONS_MSG)).encode())
+            proc.stdin.write(json.dumps(env.hook_input("Stop", last_assistant_message=OPTIONS_MSG)).encode())
             proc.stdin.close()
             deadline = time.monotonic() + 10
             while not (rec.exists() and "PID " in rec.read_text(encoding="utf-8")):
@@ -139,6 +248,11 @@ class JudgeDiesWithHookTest(unittest.TestCase):
                 self.assertLess(time.monotonic(), deadline, "судья пережил хук")
                 time.sleep(0.05)
         finally:
+            if proc is not None:
+                proc.kill()
+                proc.wait()
+            if judge_pid is not None and _alive(judge_pid):
+                os.kill(judge_pid, signal.SIGKILL)
             env.close()
 
 
@@ -154,7 +268,7 @@ class MissingRubricTest(unittest.TestCase):
     def test_without_section_is_logged(self):
         env = Env(philosophy="# X\n\n## Планы\n\n1. a\n")
         try:
-            r = env.run("judge_stop.py", hook_input("Stop", last_assistant_message=OPTIONS_MSG))
+            r = env.run("judge_stop.py", env.hook_input("Stop", last_assistant_message=OPTIONS_MSG))
             self.assertEqual(r.returncode, 0)
             self.assertIsNone(output(r))
             self.assertEqual("\n".join(messages(r)).count("planka:"), 1)
@@ -174,6 +288,11 @@ class DoneFilterTest(unittest.TestCase):
         self.assertTrue(judge_stop.claims_done(DONE_MSG))
         self.assertTrue(judge_stop.claims_done("Fixed, all tests passing."))
         self.assertTrue(judge_stop.claims_done("Исправлено."))
+        for text in ("All 42 tests passed.", "Build succeeded.", "Фикс готов.", "Фикс готов", "Патч готов, тесты ниже",
+                     "Выполнено.", "Задачи выполнены", "Завершено.", "Работа завершена"):
+            self.assertTrue(judge_stop.claims_done(text), text)
+        for text in ("Выполнение идёт", "завершение работы", "Готов к работе", "готовность 50%"):
+            self.assertFalse(judge_stop.claims_done(text), text)
         self.assertFalse(judge_stop.claims_done("Готовлю план."))
         self.assertFalse(judge_stop.claims_done("Я готов обсудить"))
         self.assertFalse(judge_stop.claims_done("Готов к работе"))
@@ -190,8 +309,9 @@ class DoneHookTest(unittest.TestCase):
         self.env.close()
 
     def stop(self, msg, **extra):
+        write_turn(self.env, msg)
         return self.env.run("judge_stop.py",
-                            hook_input("Stop", last_assistant_message=msg, stop_hook_active=False), **extra)
+                            self.env.hook_input("Stop", last_assistant_message=msg, stop_hook_active=False), **extra)
 
     def test_done_judged_with_verification_module(self):
         rec = self.env.data / "rec.txt"
@@ -228,7 +348,7 @@ class DoneHookTest(unittest.TestCase):
         r = self.stop(DONE_MSG)
         self.assertEqual(r.returncode, 0)
         self.assertIsNone(output(r))
-        self.assertIn("planka:", "\n".join(messages(r)))
+        self.assertEqual(messages(r), [f"planka: нет модуля правил {self.env.root / 'rules' / 'verification.md'}"])
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
         self.assertEqual(self.env.log_lines()[-1]["filters"], ["done"])
         self.assertEqual("\n".join(messages(r)).count("planka:"), 1)
@@ -246,10 +366,11 @@ class DocsFilterTest(unittest.TestCase):
     def snap(self, prompt_id="p-1"):
         state = self.env.data / "state"
         state.mkdir(exist_ok=True)
-        snapshot.save(state, "sess-1", prompt_id, self.project, snapshot.scan(self.project))
+        snapshot.store(state, "sess-1", prompt_id, self.project, snapshot.capture(self.project))
 
     def stop(self, msg, **extra):
-        return self.env.run("judge_stop.py", hook_input(
+        write_turn(self.env, msg)
+        return self.env.run("judge_stop.py", self.env.hook_input(
             "Stop", last_assistant_message=msg, stop_hook_active=False, cwd=str(self.project)), **extra)
 
     def test_code_change_triggers_docs_judge(self):
@@ -265,6 +386,8 @@ class DocsFilterTest(unittest.TestCase):
         self.assertIn("pkg/a.go: // hello", text)
         self.assertIn("В корне проекта нет CLAUDE.md.", text)
         self.assertIn("локальный CLAUDE.md", text)
+        for needle in ["# Паттерны", "# Рефакторинг"]:
+            self.assertIn(needle, text)
         last = self.env.log_lines()[-1]
         self.assertEqual(last["filters"], ["docs"])
         judged = text.split("\n<content>\n", 1)[1].split("\n</content>\n", 1)[0]
@@ -295,8 +418,9 @@ class DocsFilterTest(unittest.TestCase):
     def test_absent_prompt_id_matches_empty_snapshot(self):
         self.snap(prompt_id="")
         (self.project / "a.py").write_text("x = 1\n", encoding="utf-8")
-        data = hook_input("Stop", last_assistant_message="Поправил.", stop_hook_active=False, cwd=str(self.project))
+        data = self.env.hook_input("Stop", last_assistant_message="Поправил.", stop_hook_active=False, cwd=str(self.project))
         del data["prompt_id"]
+        write_turn(self.env, "Поправил.")
         rec = self.env.data / "rec.txt"
         r = self.env.run("judge_stop.py", data, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         self.assertEqual(r.stdout, "", r.stderr)
@@ -304,12 +428,13 @@ class DocsFilterTest(unittest.TestCase):
 
     def test_cd_into_subdir_keeps_project_root(self):
         project_dir = str(self.project)
-        r = self.env.run("remind.py", hook_input("UserPromptSubmit", prompt="x", cwd=str(self.project / "pkg")),
+        r = self.env.run("remind.py", self.env.hook_input("UserPromptSubmit", prompt="x", cwd=str(self.project / "pkg")),
                          CLAUDE_PROJECT_DIR=project_dir)
         self.assertEqual(r.returncode, 0, r.stderr)
         (self.project / "a.py").write_text("x = 1\n", encoding="utf-8")
         rec = self.env.data / "rec.txt"
-        r = self.env.run("judge_stop.py", hook_input(
+        write_turn(self.env, "Поправил.")
+        r = self.env.run("judge_stop.py", self.env.hook_input(
             "Stop", last_assistant_message="Поправил.", stop_hook_active=False, cwd=str(self.project / "pkg")),
             CLAUDE_PROJECT_DIR=project_dir, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         self.assertEqual(r.stdout, "", r.stderr)
@@ -383,38 +508,160 @@ class DocsFilterTest(unittest.TestCase):
         self.assertEqual(files, [f"f{i:03}.py" for i in range(prompts.MAX_LISTED)])
 
     def test_files_logged_only_with_docs_filter(self):
-        r = self.stop(OPTIONS_MSG, PLANKA_STUB="ok")
+        rec = self.env.data / "rec.txt"
+        r = self.stop(OPTIONS_MSG, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         self.assertEqual(r.stdout, "", r.stderr)
         self.assertNotIn("files", self.env.log_lines()[-1])
+        for needle in ["# Паттерны", "# Рефакторинг"]:
+            self.assertNotIn(needle, rec.read_text(encoding="utf-8"))
+
+    def test_docs_skips_without_new_modules(self):
+        for name in ("refactoring", "design-patterns"):
+            with self.subTest(name=name):
+                self.snap()
+                (self.project / "a.py").write_text(f"# {name}\n", encoding="utf-8")
+                path = self.env.root / "rules" / f"{name}.md"
+                path.unlink()
+                r = self.stop("Поправил.")
+                self.assertIsNone(output(r))
+                self.assertEqual(messages(r), [f"planka: нет модуля правил {path}"])
+                path.write_text(RULES[name], encoding="utf-8")
+
+    def test_budget_exhausted_skips_docs_judge(self):
+        rec = self.env.data / "rec.txt"
+        for i in range(3):
+            self.snap()
+            (self.project / "a.py").write_text(f"x = {i}\n", encoding="utf-8")
+            r = self.stop("Поправил.", PLANKA_STUB="deny", PLANKA_STUB_RECORD=str(rec) if i == 2 else "")
+        self.assertIsNone(output(r))
+        self.assertEqual(messages(r), ["planka: лимит отказов, пропущено без проверки"])
+        self.assertFalse(rec.exists())
+        last = self.env.log_lines()[-1]
+        self.assertEqual((last["verdict"], last["filters"], last["files"]), ("budget", ["docs"], ["a.py"]))
+
+    def in_process(self, data, **patches):
+        """judge_stop.changed_this_turn в процессе теста, с окружением Env; (результат, предупреждения)."""
+        common._reset()
+        try:
+            with mock.patch.dict(os.environ, self.env.environ(), clear=True):
+                if patches:
+                    with mock.patch.multiple(snapshot, **patches):
+                        result = judge_stop.changed_this_turn(data)
+                else:
+                    result = judge_stop.changed_this_turn(data)
+            return result, list(common._messages)
+        finally:
+            common._reset()
 
     def test_changed_this_turn_triples(self):
         (self.project / "old.go").write_text("x\n", encoding="utf-8")
         self.snap()
         (self.project / "old.go").unlink()
         (self.project / "a.json").write_text("{}\n", encoding="utf-8")
-        data = hook_input("Stop", cwd=str(self.project))
-        with mock.patch.dict(os.environ, {"CLAUDE_PLUGIN_DATA": str(self.env.data)}):
-            _, (base, sub_bases), changed = judge_stop.changed_this_turn(data)
+        (_, (base, sub_bases), changed), warned = self.in_process(self.env.hook_input("Stop"))
         self.assertIsNone(base)
         self.assertEqual(sub_bases, {})
         self.assertEqual(changed, [("a.json", "other", True), ("old.go", "code", False)])
+        self.assertEqual(warned, [])
+
+    def test_changed_this_turn_foreign_root(self):
+        state = self.env.data / "state"
+        state.mkdir()
+        snapshot.store(state, "sess-1", "p-1", self.env.data, {"mode": "walk", "head": None, "sub_heads": {},
+                                                               "files": {}})
+        (self.project / "a.py").write_text("x\n", encoding="utf-8")
+        self.assertEqual(self.in_process(self.env.hook_input("Stop")), (None, []))
+
+    def test_changed_this_turn_timeout_warns(self):
+        self.snap()
+        result, warned = self.in_process(self.env.hook_input("Stop"),
+                                         changed_since=mock.Mock(side_effect=TimeoutError("снимок не уложился в срок")))
+        self.assertIsNone(result)
+        self.assertEqual(warned, ["planka: сверка документации не проверена: снимок не уложился в срок"])
+
+    def test_changed_this_turn_undetermined_is_none(self):
+        self.snap()
+        (self.project / "a.py").write_text("x\n", encoding="utf-8")
+        text = "planka: сверка документации не проверена: дерево больше 0 файлов"
+        self.assertEqual(self.in_process(self.env.hook_input("Stop"), MAX_FILES=0), (None, [text]))
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_changed_this_turn_git_mode(self):
+        git = ["git", "-C", str(self.project), "-c", "user.email=t@t", "-c", "user.name=t"]
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        (self.project / "keep.py").write_text("x\n", encoding="utf-8")
+        subprocess.run([*git, "add", "keep.py"], check=True)
+        subprocess.run([*git, "commit", "-qm", "i"], check=True)
+        head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+        r = self.env.run("remind.py", self.env.hook_input("UserPromptSubmit", prompt="x"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        (self.project / "a.py").write_text("x\n", encoding="utf-8")
+        (self.project / "notes.md").write_text("n\n", encoding="utf-8")
+        (_, (base, sub_bases), changed), warned = self.in_process(self.env.hook_input("Stop"))
+        self.assertEqual((base, sub_bases), (head, {}))
+        self.assertEqual(changed, [("a.py", "code", True), ("notes.md", "doc", True)])
+        self.assertEqual(warned, [])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_docs_failure_keeps_other_filters(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        r = self.env.run("remind.py", self.env.hook_input("UserPromptSubmit", prompt="x"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        snap_path = self.env.data / "state" / "sess-1.snap.json"
+        snap = json.loads(snap_path.read_text(encoding="utf-8"))
+        snap["head"] = 5
+        snap_path.write_text(json.dumps(snap), encoding="utf-8")
+        (self.project / "a.py").write_text("# x\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.project), "add", "a.py"], check=True)
+        rec = self.env.data / "rec.txt"
+        r = self.stop(OPTIONS_MSG, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(len(messages(r)), 1, messages(r))
+        self.assertTrue(messages(r)[0].startswith("planka: сверка документации не проверена: TypeError("),
+                        messages(r))
+        self.assertTrue(rec.exists())
+        self.assertEqual(self.env.log_lines()[-1]["filters"], ["options"])
 
     @unittest.skipUnless(shutil.which("git"), "нет git")
     def test_commit_during_turn_keeps_comments_visible(self):
         git = ["git", "-C", str(self.project), "-c", "user.email=t@t", "-c", "user.name=t"]
         subprocess.run(["git", "init", "-q", str(self.project)], check=True)
-        (self.project / "a.py").write_text("x = 1\n", encoding="utf-8")
+        (self.project / "a.py").write_text("# старый комментарий\nx = 1\n", encoding="utf-8")
         subprocess.run([*git, "add", "a.py"], check=True)
         subprocess.run([*git, "commit", "-qm", "i"], check=True)
-        r = self.env.run("remind.py", hook_input("UserPromptSubmit", prompt="x", cwd=str(self.project)))
+        r = self.env.run("remind.py", self.env.hook_input("UserPromptSubmit", prompt="x", cwd=str(self.project)))
         self.assertEqual(r.returncode, 0, r.stderr)
-        (self.project / "a.py").write_text("x = 1\n# комментарий хода\n", encoding="utf-8")
+        (self.project / "a.py").write_text("# старый комментарий\nx = 1\n# комментарий хода\n", encoding="utf-8")
         subprocess.run([*git, "commit", "-qam", "turn"], check=True)
         rec = self.env.data / "rec.txt"
         self.stop("Поправил.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         text = rec.read_text(encoding="utf-8")
         self.assertIn("a.py: # комментарий хода", text)
+        self.assertNotIn("старый комментарий", text)
         self.assertNotIn("комментарии не добавлены", text)
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_commit_in_submodule_during_turn(self):
+        lib = self.env.data / "lib"
+        git = ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-c", "protocol.file.allow=always"]
+        subprocess.run(["git", "init", "-q", str(lib)], check=True)
+        (lib / "s.py").write_text("# старый комментарий подмодуля\n", encoding="utf-8")
+        subprocess.run([*git, "-C", str(lib), "add", "s.py"], check=True)
+        subprocess.run([*git, "-C", str(lib), "commit", "-qm", "i"], check=True)
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        subprocess.run([*git, "-C", str(self.project), "submodule", "add", "-q", str(lib), "sub"],
+                       check=True, capture_output=True)
+        subprocess.run([*git, "-C", str(self.project), "commit", "-qm", "i"], check=True)
+        r = self.env.run("remind.py", self.env.hook_input("UserPromptSubmit", prompt="x"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        (self.project / "sub" / "s.py").write_text("# старый комментарий подмодуля\n# новый в подмодуле\n",
+                                                   encoding="utf-8")
+        subprocess.run([*git, "-C", str(self.project / "sub"), "commit", "-qam", "turn"], check=True)
+        rec = self.env.data / "rec.txt"
+        r = self.stop("Поправил.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        text = rec.read_text(encoding="utf-8")
+        self.assertIn("sub/s.py: # новый в подмодуле", text)
+        self.assertNotIn("старый комментарий подмодуля", text)
 
     def test_no_snapshot_no_trigger(self):
         (self.project / "a.py").write_text("x\n", encoding="utf-8")
@@ -458,7 +705,7 @@ class DocsFilterTest(unittest.TestCase):
         (self.env.root / "rules" / "comments.md").unlink()
         r = self.stop("Поправил.")
         self.assertIsNone(output(r))
-        self.assertIn("planka:", "\n".join(messages(r)))
+        self.assertEqual(messages(r), [f"planka: нет модуля правил {self.env.root / 'rules' / 'comments.md'}"])
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
         self.assertEqual(self.env.log_lines()[-1]["filters"], ["docs"])
 

@@ -2,24 +2,49 @@
 import dataclasses
 import re
 
-_WAVE = re.compile(r"^#+\s*(?:Волна|Wave)\s+(\d+)", re.IGNORECASE)
-_TASK = re.compile(r"^#+\s*(?:Задача|Task)\s+(\d+)\s*[:.]\s*(.*)$", re.IGNORECASE)
-_FILES_HEAD = re.compile(r"^\**\s*(?:Файлы|Files)\s*\**\s*:\s*\**\s*(.*)$", re.IGNORECASE)
-_ITEM = re.compile(r"^\s*[-*]\s+(.*)$")
-_ITEM_MARK = re.compile(r"^[-*]\s+")
-_PREFIX = re.compile(r"^(?:Create|Modify|Test|Delete|Создать|Изменить|Тест|Удалить)\s*:\s*",
-                     re.IGNORECASE)
+# Заголовок ATX: уровень — число `#`; закрывающие `#` отбрасываются.
+_ATX = re.compile(r"^\s{0,3}(#{1,6})\s*(.*?)(?:\s+#+)?\s*$")
+# Подчёркивание setext: `===` — уровень 1, `---` — уровень 2.
+_SETEXT = re.compile(r"^\s{0,3}(=+|-+)\s*$")
+# Уровень строки целиком жирным (`**Волна 1**`): глубже любого ATX.
+_BOLD_LEVEL = 7
+_WAVE = re.compile(r"^(?:Волна|Wave)\s+(\d+)(?!\d)", re.IGNORECASE)
+# Волна строкой жирным: за номером — разделитель или конец.
+_WAVE_BOLD = re.compile(r"^(?:Волна|Wave)\s+(\d+)\s*(?:[:.—–(-].*)?$", re.IGNORECASE)
+_TASK = re.compile(r"^(?:Задача|Task)\s+(\d+(?:\.\d+)*)(?:\s*\(([^()]*)\))?\s*(?:[:.—–-]\s*(.*))?$",
+                   re.IGNORECASE)
+_FILES_HEAD = re.compile(r"^\**\s*(?:Файлы|Файл|Files|File)\s*\**\s*:\s*\**\s*(.*)$", re.IGNORECASE)
+_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.*)$")
+_ITEM_MARK = re.compile(r"^(?:[-*+]|\d+[.)])\s+")
+_PREFIX = re.compile(r"^\**\s*(?:Create|Created|Modify|Modified|Test|Tests|Delete|Deleted|Update|Updated|Edit|"
+                     r"Создать|Изменить|Тест|Тесты|Удалить|Обновить)\s*\**\s*:\s*\**\s*", re.IGNORECASE)
 _NO_FILES = {"", "нет", "none", "empty", "—", "-"}
-_LEADING_SPAN = re.compile(r"[\s,]*`([^`]+)`")
-_TRAILING_PAREN = re.compile(r"\s*\([^()]*\)\s*$")
+# Серия путей в обратных кавычках: между путями — пробелы, запятые и пометки в скобках.
+_SEP = re.compile(r"[\s,;]*")
+_NOTE = re.compile(r"\(([^()]*)\)")
+_SPAN = re.compile(r"`([^`]+)`")
+_DASH = re.compile(r"\s*[—–-]\s*")
+_TRAILING_PAREN = re.compile(r"\s*\(([^()]*)\)\s*$")
+# Пометка чтения: текст пометки начинается с неё, дальше конец, знак `,;:.` или тире через пробел;
+# «чтение конфига», «read-write», «readme» пометкой не считаются.
+_READ_NOTE = re.compile(
+    r"[\s*_]*(?:только\s+(?:для\s+)?чтени[еяю]|только\s+читать|чтение|читать|"
+    r"не\s+(?:трогать|менять|изменять|править)|read[\s-]?only|read|"
+    r"(?:do\s+not|don['’]t)\s+(?:modify|edit|touch|change))"
+    r"[\s*_]*(?:$|[,;:.]|\s+[—–-])", re.IGNORECASE)
 _FENCE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+# Пункт целиком из путей: `…` или слова с `.` или `/` через пробелы, запятые и пометки в скобках; `…` с
+# пробелом путём не станет в _paths.
+_PATH_WORD = r"(?:`[^`]+`|[^`\s,;()]*[./][^`\s,;()]*)"
+_WHOLE_PATH = re.compile(rf"{_PATH_WORD}(?:(?:[\s,;]|\([^()]*\))+{_PATH_WORD})*(?:\s*\([^()]*\))?[\s.,;]*")
 
 
 @dataclasses.dataclass
 class PlanTask:
-    # None — задача до первого заголовка «Волна N»/«Wave N».
+    # None — задача до первого заголовка «Волна N»/«Wave N» или после заголовка, закрывшего волну.
     wave: int | None
-    number: int
+    # Номер как в плане: «2», «1.1».
+    number: str
     title: str
     files: list
 
@@ -33,15 +58,39 @@ def _lines_suffix_stripped(path):
 
 
 def _paths(fragment):
-    """Пути строки файлов: ведущая серия `…` через пробелы и запятые, а без кавычек — токены
-    без пробелов через запятую; описание и маркер «нет»/«none»/«empty»/«—» путём не считаются."""
-    text = _PREFIX.sub("", fragment.strip())
+    """Пути строки файлов: ведущая серия `…` через пробелы, запятые и пометки в скобках, а без
+    кавычек — токены без пробелов через запятую; описание, путь с пробелом и маркер
+    «нет»/«none»/«empty»/«—» путём не считаются.
+
+    Без префикса владения путь с пометкой чтения — в скобках сразу за ним или после тире в конце
+    серии — не владение; пометка относится только к пути перед ней.
+    """
+    stripped = fragment.strip()
+    check_read = not _PREFIX.match(stripped)
+    text = _PREFIX.sub("", stripped)
     if "`" in text:
-        out, pos = [], 0
-        while m := _LEADING_SPAN.match(text, pos):
-            out.append(_lines_suffix_stripped(m.group(1)))
-            pos = m.end()
+        # last — индекс в out пути, к которому относится следующая пометка.
+        out, pos, last = [], 0, None
+        while True:
+            pos = _SEP.match(text, pos).end()
+            if note := _NOTE.match(text, pos):
+                if check_read and last is not None and _READ_NOTE.match(note.group(1)):
+                    out[last] = ""
+                last, pos = None, note.end()
+            elif span := _SPAN.match(text, pos):
+                last = None
+                if not any(c.isspace() for c in span.group(1)):
+                    out.append(_lines_suffix_stripped(span.group(1)))
+                    last = len(out) - 1
+                pos = span.end()
+            else:
+                break
+        dash = _DASH.match(text, pos)
+        if check_read and last is not None and dash and _READ_NOTE.match(text, dash.end()):
+            out[last] = ""
         return [p for p in out if p]
+    trailing = _TRAILING_PAREN.search(text)
+    read_last = check_read and trailing is not None and _READ_NOTE.match(trailing.group(1))
     text = _TRAILING_PAREN.sub("", text).strip().strip("*_").strip().rstrip(".;").strip()
     first = text.split()[0].lower().strip(".,;:*_") if text else ""
     if first in _NO_FILES:
@@ -49,73 +98,142 @@ def _paths(fragment):
     parts = [p.strip() for p in text.split(",")]
     if not all(p and not any(c.isspace() for c in p) for p in parts):
         return []
+    if read_last:
+        parts.pop()
     return [_lines_suffix_stripped(p) for p in parts]
 
 
-def parse_plan(text):
-    tasks = []
-    wave = None
-    current = None
-    lines = text.splitlines()
+def _structure_lines(text):
+    """Строки плана с вырезанными HTML-комментариями `<!-- -->`; строка fenced-блока — None.
+
+    Содержимое fenced-блока — пример, а не структура плана; блок закрывает строка из тех же
+    символов не короче открывающей и без info-строки.
+    """
     fence = None
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        # Содержимое fenced-блока — пример, а не структура плана; блок закрывает
-        # строка из тех же символов не короче открывающей и без info-строки.
+    in_comment = False
+    for line in text.splitlines():
+        if in_comment:
+            end = line.find("-->")
+            if end < 0:
+                yield ""
+                continue
+            line = line[end + 3:]
+            in_comment = False
         m = _FENCE.match(line)
         if fence is None and m:
             fence = m.group(1)
-            i += 1
+            yield None
             continue
         if fence is not None:
-            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) \
-                    and not m.group(2).strip():
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not m.group(2).strip():
                 fence = None
+            yield None
+            continue
+        while (start := line.find("<!--")) >= 0:
+            end = line.find("-->", start + 4)
+            if end < 0:
+                line = line[:start]
+                in_comment = True
+                break
+            line = line[:start] + line[end + 3:]
+        yield line
+
+
+def _unbold(text):
+    return text.replace("**", "").replace("__", "").strip()
+
+
+def _heading(lines, i):
+    """Заголовок, начатый строкой i: (уровень, текст, число строк) или None.
+
+    ATX — любой; setext с `===` — любой, с `---` — только волна или задача (иначе это
+    горизонтальная черта); строка жирным — только волна или задача.
+    """
+    line = lines[i]
+    m = _ATX.match(line)
+    if m:
+        return len(m.group(1)), _unbold(m.group(2)), 1
+    stripped = line.strip()
+    if not stripped or _ITEM.match(line):
+        return None
+    nxt = lines[i + 1] if i + 1 < len(lines) else None
+    u = _SETEXT.match(nxt) if nxt else None
+    text = _unbold(stripped)
+    if u and (u.group(1)[0] == "=" or _WAVE.match(text) or _TASK.match(text)):
+        return (1 if u.group(1)[0] == "=" else 2), text, 2
+    if stripped.startswith(("**", "__")) and (_WAVE_BOLD.match(text) or _TASK.match(text)):
+        return _BOLD_LEVEL, text, 1
+    return None
+
+
+def parse_plan(text):
+    """Задачи плана с файлами; None, если ни у одной задачи нет файлов.
+
+    Любой заголовок закрывает текущую задачу; заголовок не волны и не задачи уровнем не глубже
+    заголовка волны закрывает волну.
+    """
+    tasks = []
+    wave, wave_level = None, None
+    current = None
+    collecting, blank = False, False
+    lines = list(_structure_lines(text))
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line is None:
+            collecting = False
             i += 1
             continue
-        m = _WAVE.match(line)
-        if m:
-            wave = int(m.group(1))
-            current = None
-            i += 1
+        heading = _heading(lines, i)
+        if heading:
+            level, title, size = heading
+            i += size
+            current, collecting = None, False
+            if m := _WAVE.match(title):
+                wave, wave_level = int(m.group(1)), level
+            elif m := _TASK.match(title):
+                current = PlanTask(wave=wave, number=m.group(1),
+                                   title=(m.group(3) or m.group(2) or "").strip(), files=[])
+                tasks.append(current)
+            elif wave_level is not None and level <= wave_level:
+                wave, wave_level = None, None
             continue
-        m = _TASK.match(line)
-        if m:
-            current = PlanTask(wave=wave, number=int(m.group(1)), title=m.group(2).strip(), files=[])
-            tasks.append(current)
-            i += 1
-            continue
+        if collecting:
+            if not line.strip():
+                blank = True
+                i += 1
+                continue
+            item = _ITEM.match(line)
+            # Пункт без префикса — владение, только если он целиком из путей; иной пункт сразу под списком
+            # пропускается, после пустой строки — заканчивает список.
+            owned = item and (_PREFIX.match(item.group(1).strip()) or _WHOLE_PATH.fullmatch(item.group(1).strip()))
+            if owned or item and not blank:
+                if owned:
+                    current.files.extend(_paths(item.group(1)))
+                blank = False
+                i += 1
+                continue
+            collecting = False
         # Строка файлов — отдельной строкой или пунктом списка (`- **Файлы:** …`).
         m = _FILES_HEAD.match(_ITEM_MARK.sub("", line.strip(), 1)) if current is not None else None
         if m:
             current.files.extend(_paths(m.group(1)))
-            i += 1
-            while i < len(lines):
-                # Пустая строка внутри списка файлов его не обрывает, если за ней снова пункт.
-                j = i
-                while j < len(lines) and not lines[j].strip():
-                    j += 1
-                item = _ITEM.match(lines[j]) if j < len(lines) else None
-                if not item:
-                    break
-                current.files.extend(_paths(item.group(1)))
-                i = j + 1
-            continue
+            collecting, blank = True, False
         i += 1
     tasks = [t for t in tasks if t.files]
     return tasks or None
 
 
 def shared_files(tasks):
-    """Файлы, принадлежащие нескольким задачам одной волны; задачи вне волны не участвуют."""
+    """Файлы, принадлежащие задачам с разными номерами одной волны; номера — без повторов, в порядке плана.
+    Задачи вне волны не участвуют; задача, повторённая с тем же номером, — одна задача."""
     owners = {}
     for t in tasks:
         if t.wave is None:
             continue
-        for f in dict.fromkeys(t.files):
-            owners.setdefault((t.wave, f), []).append(t.number)
-    return [(f, wave, nums) for (wave, f), nums in sorted(owners.items()) if len(nums) > 1]
+        for f in t.files:
+            owners.setdefault((t.wave, f), {})[t.number] = None
+    return [(f, wave, list(nums)) for (wave, f), nums in sorted(owners.items()) if len(nums) > 1]
 
 
 def _join(nums):

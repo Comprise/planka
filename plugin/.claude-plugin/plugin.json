@@ -1,6 +1,6 @@
 {
   "name": "planka",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Философия работы: напоминание на каждом ходе и судья в точках выбора",
   "author": {
     "name": "Elia Samoylov"
@@ -9,8 +9,15 @@
     "judge_model": {
       "type": "string",
       "title": "Модель судьи",
-      "description": "Модель вложенного claude -p, который судит варианты, планы и отчёты «готово»",
-      "default": "sonnet"
+      "description": "Модель вложенного claude -p, который судит варианты, планы и отчёты «готово»; session — модель текущей сессии",
+      "options": [
+        "session",
+        "sonnet",
+        "opus",
+        "haiku",
+        "fable"
+      ],
+      "default": "session"
     },
     "comment_lang": {
       "type": "string",
@@ -21,7 +28,7 @@
         "ru",
         "en+ru"
       ],
-      "required": true
+      "default": "ru"
     },
     "doc_lang": {
       "type": "string",
@@ -31,7 +38,7 @@
         "en",
         "ru"
       ],
-      "required": true
+      "default": "ru"
     }
   }
 }
