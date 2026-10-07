@@ -16,14 +16,14 @@ import common  # noqa: E402
 
 
 class BarrierTest(unittest.TestCase):
-    def test_off_and_judge_env(self):
-        with mock.patch.dict(os.environ, {"PLANKA_OFF": "1"}, clear=False):
-            self.assertTrue(common.barrier_active())
-        with mock.patch.dict(os.environ, {"PLANKA_JUDGE": "1"}, clear=False):
-            self.assertTrue(common.barrier_active())
+    def test_judge_env_only(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith("PLANKA_")}
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertFalse(common.barrier_active())
+            with mock.patch.dict(os.environ, {"PLANKA_JUDGE": "1"}, clear=False):
+                self.assertTrue(common.barrier_active())
+            with mock.patch.dict(os.environ, {"PLANKA_OFF": "1"}, clear=False):
+                self.assertFalse(common.barrier_active())
 
 
 class ReadInputTest(unittest.TestCase):
@@ -155,7 +155,7 @@ class RunJudgeTest(unittest.TestCase):
 
     def test_flags_stdin_and_env(self):
         rec = self.env.data / "rec.txt"
-        self.judge(PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec), PLANKA_MODEL="haiku")
+        self.judge(PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec), CLAUDE_PLUGIN_OPTION_JUDGE_MODEL="haiku")
         text = rec.read_text(encoding="utf-8")
         argv = text.split("ARGV\n", 1)[1].split("\nSTDIN\n", 1)[0].split("\n")
         self.assertEqual(argv[:9], ["-p", "--setting-sources", "", "--strict-mcp-config",
@@ -167,6 +167,12 @@ class RunJudgeTest(unittest.TestCase):
         self.assertIn("STDIN\nUSER", text)
         self.assertIn("ENV PLANKA_JUDGE=1", text)
         self.assertIn(f"CWD {self.env.data.resolve()}", text.splitlines())
+
+    def test_default_model(self):
+        rec = self.env.data / "rec.txt"
+        self.judge(PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        argv = rec.read_text(encoding="utf-8").split("ARGV\n", 1)[1].split("\nSTDIN\n", 1)[0].split("\n")
+        self.assertEqual(argv[argv.index("--model") + 1], "sonnet")
 
     def test_non_executable_binary_is_error(self):
         fake = self.env.root / "bin"

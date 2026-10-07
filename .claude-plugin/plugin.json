@@ -6,6 +6,12 @@
     "name": "Elia Samoylov"
   },
   "userConfig": {
+    "judge_model": {
+      "type": "string",
+      "title": "Модель судьи",
+      "description": "Модель вложенного claude -p, который судит варианты, планы и отчёты «готово»",
+      "default": "sonnet"
+    },
     "comment_lang": {
       "type": "string",
       "title": "Язык комментариев",

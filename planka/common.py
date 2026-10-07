@@ -16,13 +16,14 @@ MAX_DENIES = 2
 JUDGE_TIMEOUT = 60
 MAX_REASON = 2000
 STATE_TTL = 7 * 86400
+DEFAULT_JUDGE_MODEL = "sonnet"
 JUDGE_FLAGS = ["-p", "--setting-sources", "", "--strict-mcp-config",
                "--no-session-persistence", "--output-format", "json", "--tools", ""]
 
 
 def barrier_active():
-    """PLANKA_OFF выключает плагин, PLANKA_JUDGE помечает вложенный вызов судьи."""
-    return bool(os.environ.get("PLANKA_OFF") or os.environ.get("PLANKA_JUDGE"))
+    """PLANKA_JUDGE помечает вложенный вызов судьи: хуки внутри него не работают."""
+    return bool(os.environ.get("PLANKA_JUDGE"))
 
 
 def read_input():
@@ -159,7 +160,7 @@ def _skipped(error):
 
 def run_judge(system_prompt, user_prompt, *, timeout=JUDGE_TIMEOUT):
     """Вложенный claude -p; любая ошибка — пропуск с описанием в error."""
-    model = os.environ.get("PLANKA_MODEL", "sonnet")
+    model = os.environ.get("CLAUDE_PLUGIN_OPTION_JUDGE_MODEL") or DEFAULT_JUDGE_MODEL
     cmd = ["claude", *JUDGE_FLAGS, "--json-schema", json.dumps(JUDGE_SCHEMA),
            "--model", model, "--system-prompt", system_prompt]
     env = dict(os.environ, PLANKA_JUDGE="1")

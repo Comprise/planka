@@ -20,11 +20,10 @@ class RemindTest(unittest.TestCase):
         self.assertTrue(ctx.startswith("# Философия работы"))
         self.assertIn("## Планы", ctx)
 
-    def test_barriers(self):
-        for var in ("PLANKA_OFF", "PLANKA_JUDGE"):
-            r = self.env.run("remind.py", hook_input("UserPromptSubmit"), **{var: "1"})
-            self.assertEqual(r.returncode, 0)
-            self.assertEqual(r.stdout, "")
+    def test_barrier(self):
+        r = self.env.run("remind.py", hook_input("UserPromptSubmit"), PLANKA_JUDGE="1")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
 
     def test_missing_file_warns_and_emits_nothing(self):
         (self.env.root / "philosophy.md").unlink()

@@ -95,7 +95,7 @@ class StopHookTest(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
 
     def test_barrier_and_garbage(self):
-        self.assertEqual(self.stop(OPTIONS_MSG, PLANKA_OFF="1").stdout, "")
+        self.assertEqual(self.stop(OPTIONS_MSG, PLANKA_JUDGE="1").stdout, "")
         r = self.env.run("judge_stop.py", "garbage")
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout, "")
