@@ -278,6 +278,15 @@ class DocsFilterTest(unittest.TestCase):
                 self.assertEqual(r.stdout, "")
                 self.assertEqual(self.env.log_lines(), [])
 
+    def test_deleted_code_file_alone_triggers_docs_judge(self):
+        (self.project / "old.go").write_text("// old\n", encoding="utf-8")
+        self.snap()
+        (self.project / "old.go").unlink()
+        rec = self.env.data / "rec.txt"
+        self.stop("Удалил.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertIn("- old.go — код, удалён", rec.read_text(encoding="utf-8"))
+        self.assertEqual(self.env.log_lines()[-1]["filters"], ["docs"])
+
     def test_three_kinds_and_deleted_listed(self):
         (self.project / "old.go").write_text("// old\n", encoding="utf-8")
         (self.project / "old.erl").write_text("% old\n", encoding="utf-8")

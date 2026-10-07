@@ -265,6 +265,22 @@ class BashTest(unittest.TestCase):
         self.assertEqual(last["content_len"], len(command))
         self.assertEqual(last["content_sha256"], hashlib.sha256(command.encode("utf-8")).hexdigest())
 
+    def test_dependency_log_reason_without_command(self):
+        self.bash("SECRET_TOKEN=abc npm install left-pad")
+        last = self.env.log_lines()[-1]
+        self.assertEqual(last["verdict"], "deny-dep")
+        entry = json.dumps(last, ensure_ascii=False)
+        self.assertNotIn("left-pad", entry)
+        self.assertNotIn("SECRET_TOKEN", entry)
+
+    def test_dependency_deny_survives_log_failure(self):
+        data = self.env.data / "as-file"
+        data.write_text("x", encoding="utf-8")
+        r = self.bash("npm install left-pad", CLAUDE_PLUGIN_DATA=str(data))
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertTrue(any("внутренняя ошибка" in m for m in messages(r)))
+
     def test_marker_passes(self):
         r = self.bash("PLANKA_DEP_OK=1 npm install left-pad")
         self.assertEqual(r.stdout, "")

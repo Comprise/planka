@@ -176,5 +176,12 @@ class UnquoteAndFramingTest(unittest.TestCase):
         self.assertEqual(comments.comment_lines(text, "go"), ["// a\x0cb"])
 
 
+
+class MakefileNamesTest(unittest.TestCase):
+    def test_all_code_names_have_hash_syntax(self):
+        import common
+        for name in common.CODE_NAMES:
+            self.assertEqual(comments.extract("/nonexistent", [name])[2], [], name)
+
 if __name__ == "__main__":
     unittest.main()

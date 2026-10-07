@@ -11,7 +11,7 @@ _C_FAMILY = {"go", "c", "h", "cc", "cpp", "hpp", "java", "kt", "kts", "swift", "
 _HASH = {"py", "sh", "bash", "zsh", "rb", "pl", "toml", "yaml", "yml", "mk", "makefile", "cfg", "ini", "ps1",
          "tf", "nix", "r", "jl", "ex", "exs"}
 # Файлы без расширения с синтаксисом «#»: ключ семейства — имя в нижнем регистре.
-_HASH_NAMES = {"Makefile", "Dockerfile", "Justfile", "Rakefile", "Gemfile"}
+_HASH_NAMES = {"Makefile", "makefile", "GNUmakefile", "Dockerfile", "Justfile", "Rakefile", "Gemfile"}
 _DASH = {"sql", "lua", "hs"}
 _HTML = {"html", "xml", "vue", "svelte"}
 _DOCSTRING = {"py"}

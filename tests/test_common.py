@@ -465,7 +465,7 @@ class PathKindTest(unittest.TestCase):
             "README.md": "doc", "README": "doc", "LICENSE": "doc", "docs/en/x.md": "doc",
             "context/x.go": "doc", "internal/CLAUDE.md": "doc",
             "pkg/x.go": "code", "a/b.py": "code", "Makefile": "code", "Dockerfile": "code",
-            "sub/Justfile": "code", "Rakefile": "code", "Gemfile": "code", "x.toml": "code",
+            "sub/Justfile": "code", "makefile": "code", "GNUmakefile": "code", "Rakefile": "code", "Gemfile": "code", "x.toml": "code",
             "src/App.TSX": "code", "a.php": "code", "infra/main.tf": "code",
             "a.json": "other", "img.png": "other", "LICENSE-third-party.txt": "doc",
             "notes.txt": "other", "bin/tool": "other", "go.sum": "other",
@@ -480,7 +480,7 @@ class PathKindTest(unittest.TestCase):
         for ext in ("php", "r", "jl", "ex", "exs", "erl", "clj", "fs", "vb", "nim", "zig", "sol",
                     "proto", "gradle", "groovy", "tf", "nix", "el", "vim", "bat", "cmd"):
             self.assertIn(ext, common.CODE_EXTS)
-        self.assertEqual(common.CODE_NAMES, {"Makefile", "Dockerfile", "Justfile", "Rakefile", "Gemfile"})
+        self.assertEqual(common.CODE_NAMES, {"Makefile", "makefile", "GNUmakefile", "Dockerfile", "Justfile", "Rakefile", "Gemfile"})
 
 
 class WarnOnceTest(unittest.TestCase):

@@ -1,6 +1,7 @@
 """Общее для хуков planka: барьеры, вход, судья, счётчик отказов, журнал, форматы ответа."""
 import dataclasses
 import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -82,7 +83,7 @@ CODE_EXTS = {
     "php", "r", "jl", "ex", "exs", "erl", "clj", "fs", "vb", "nim", "zig", "sol", "proto", "gradle",
     "groovy", "tf", "nix", "el", "vim", "bat", "cmd",
 }
-CODE_NAMES = {"Makefile", "Dockerfile", "Justfile", "Rakefile", "Gemfile"}
+CODE_NAMES = {"Makefile", "makefile", "GNUmakefile", "Dockerfile", "Justfile", "Rakefile", "Gemfile"}
 
 
 def rules_dir():
@@ -331,13 +332,16 @@ def log_event(hook, session_id, *, content=None, **fields):
         entry["content_len"] = len(content)
         entry["content_sha256"] = hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()
     path = data_dir() / "judge.log"
-    try:
-        if path.stat().st_size >= LOG_MAX_BYTES:
-            os.replace(path, path.with_name("judge.log.1"))
-    except FileNotFoundError:
-        pass
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    # Ротация и запись идут под блокировкой judge.log.lock.
+    with open(path.with_name("judge.log.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            if path.stat().st_size >= LOG_MAX_BYTES:
+                os.replace(path, path.with_name("judge.log.1"))
+        except FileNotFoundError:
+            pass
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def deny_output(reason):
