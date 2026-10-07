@@ -2,12 +2,12 @@
 # Подмена claude для тестов. Поведение задаёт PLANKA_STUB:
 #   ok        — вердикт ok=true
 #   deny      — ok=false, reason из PLANKA_STUB_REASON, violated ["Решения 4"]
-#   hang      — не отвечает 100 с
+#   hang      — не отвечает 100 с (exec: процесс заглушки и есть висящий процесс)
 #   garbage   — не JSON
 #   notlogged — is_error=true, "Not logged in"
-# При PLANKA_STUB_RECORD=<файл> пишет туда аргументы и stdin.
+# При PLANKA_STUB_RECORD=<файл> пишет туда аргументы, stdin, окружение, каталог и PID.
 if [ -n "${PLANKA_STUB_RECORD:-}" ]; then
-  { printf 'ARGV\n'; printf '%s\n' "$@"; printf 'STDIN\n'; cat; printf 'ENV PLANKA_JUDGE=%s\n' "${PLANKA_JUDGE:-}"; printf 'CWD %s\n' "$(pwd -P)"; } > "$PLANKA_STUB_RECORD"
+  { printf 'ARGV\n'; printf '%s\n' "$@"; printf 'STDIN\n'; cat; printf 'ENV PLANKA_JUDGE=%s\n' "${PLANKA_JUDGE:-}"; printf 'CWD %s\n' "$(pwd -P)"; printf 'PID %s\n' "$$"; } > "$PLANKA_STUB_RECORD"
 else
   cat > /dev/null
 fi
@@ -17,7 +17,7 @@ case "${PLANKA_STUB:-ok}" in
   deny)
     R="${PLANKA_STUB_REASON:-в списке нет варианта, снимающего причину}"
     printf '{"type":"result","subtype":"success","is_error":false,"result":"","structured_output":{"ok":false,"violated":["Решения 4"],"reason":"%s"},"duration_ms":10}\n' "$R" ;;
-  hang) sleep 100 ;;
+  hang) exec sleep 100 ;;
   garbage) printf 'nonsense\n' ;;
   notlogged)
     printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login","duration_ms":1}' ;;

@@ -137,6 +137,21 @@ class PathExtractionTest(unittest.TestCase):
             self.assertEqual(_files("", head=head), [], head)
 
 
+class FilesFormsTest(unittest.TestCase):
+    def test_files_as_list_item(self):
+        plan = "## Волна 1\n### Задача 1: A\n- **Файлы:** `a.py`\n### Задача 2: B\n- **Файлы:** `a.py`\n"
+        self.assertEqual(planparse.shared_files(planparse.parse_plan(plan)), [("a.py", 1, [1, 2])])
+
+    def test_blank_line_inside_list(self):
+        plan = ("## Волна 1\n### Задача 1: A\n**Файлы:**\n- `a.py`\n\n- `b.py`\n"
+                "### Задача 2: B\n**Файлы:**\n- `b.py`\n")
+        self.assertEqual(planparse.shared_files(planparse.parse_plan(plan)), [("b.py", 1, [1, 2])])
+
+    def test_dot_slash_is_same_file(self):
+        plan = "## Волна 1\n### Задача 1: A\nФайлы: `./a.py`\n### Задача 2: B\nФайлы: `a.py`\n"
+        self.assertEqual(planparse.shared_files(planparse.parse_plan(plan)), [("a.py", 1, [1, 2])])
+
+
 class FenceTest(unittest.TestCase):
     def test_fenced_block_is_not_structure(self):
         plan = ("### Задача 1: Настоящая\n**Файлы:**\n- Создать: `a.py`\n\n"

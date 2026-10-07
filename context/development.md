@@ -9,7 +9,9 @@ claude plugin marketplace add ~/Projects/planka
 claude plugin install planka@planka
 ```
 
-Правки подхватываются в следующей сессии или по `/reload-plugins`. Хуки запускаются как
+Установленный плагин — копия в `~/.claude/plugins/cache/planka/planka/<version>/`; правки рабочей
+копии попадают в неё через `claude plugin marketplace update planka` и `claude plugin update
+planka@planka` с перезапуском сессии (`README.md`, «Установка»). Хуки запускаются как
 `python3 "${CLAUDE_PLUGIN_ROOT}/planka/<скрипт>.py"`; модули `planka/` импортируют друг друга
 по имени (`import common`), каталог скрипта — первый в `sys.path`.
 

@@ -5,14 +5,21 @@ import shlex
 DEP_OK_MARKER = "PLANKA_DEP_OK=1"
 
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_PIP_REQ_FLAGS = {"-r", "--requirement"}
+# Слова перед командой, которые её не меняют: ключевые слова shell и обёртки.
+_PREFIX_WORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "time", "nohup", "exec", "command",
+                 "builtin", "env"}
+# Флаги sudo, чьё следующее слово — значение.
+_SUDO_VALUE_FLAGS = {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-T"}
+# Команды, которым тело heredoc передаётся как команды, а не данные.
+_SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "ssh"}
+_PIP = re.compile(r"pip\d*(?:\.\d+)*$")
 
 # Флаги, чьё следующее слово — значение, а не пакет; наборы по менеджерам.
 _NPM_VALUE_FLAGS = {"--prefix", "-C", "--dir", "--filter", "-w", "--workspace", "--registry", "--tag", "--cache"}
 _PNPM_VALUE_FLAGS = {"--prefix", "-C", "--dir", "--filter", "--registry"}
 _YARN_VALUE_FLAGS = {"--cwd", "--registry"}
 _PIP_VALUE_FLAGS = {
-    "-c", "--constraint", "-i", "--index-url", "--extra-index-url", "-f", "--find-links",
+    "-r", "--requirement", "-c", "--constraint", "-i", "--index-url", "--extra-index-url", "-f", "--find-links",
     "-t", "--target", "--prefix", "--root", "-e", "--editable", "--platform",
     "--python-version", "--implementation", "--abi",
 }
@@ -40,9 +47,28 @@ def _words(segment):
             segment = ""
         segment = segment.split(" #", 1)[0]
         words = segment.split()
-    while words and (_ENV_ASSIGN.match(words[0]) or words[0] == "sudo"):
-        words.pop(0)
+    while words:
+        if _ENV_ASSIGN.match(words[0]) or words[0] in _PREFIX_WORDS:
+            words.pop(0)
+        elif words[0] == "sudo":
+            words.pop(0)
+            while words and words[0].startswith("-"):
+                flag = words.pop(0)
+                if flag in _SUDO_VALUE_FLAGS and words:
+                    words.pop(0)
+        else:
+            break
     return words
+
+
+def _has_marker(segment):
+    """Маркер согласия стоит среди ведущих присваиваний сегмента."""
+    for word in segment.split():
+        if word == DEP_OK_MARKER:
+            return True
+        if not _ENV_ASSIGN.match(word):
+            return False
+    return False
 
 
 def _positionals(args, value_flags=_NO_VALUE_FLAGS):
@@ -71,15 +97,27 @@ _PIP_NAME_END = re.compile(r"[<>=!~\[;@]")
 
 
 def _pip_add(args):
-    if _PIP_REQ_FLAGS & set(args):
-        return False
     names = {_PIP_NAME_END.split(w, 1)[0].lower() for w in _positionals(args, _PIP_VALUE_FLAGS)}
     return bool(names - _PIP_BOOTSTRAP)
+
+
+def _subcommand(words, value_flags):
+    """Слова с подкоманды: глобальные флаги менеджера перед ней (`pnpm -C sub add`) пропускаются."""
+    i = 1
+    while i < len(words) and words[i].startswith("-"):
+        i += 2 if words[i] in value_flags else 1
+    return [words[0], *words[i:]]
 
 
 def _is_add(words):
     if not words:
         return False
+    if words[0] == "npm":
+        words = _subcommand(words, _NPM_VALUE_FLAGS)
+    elif words[0] == "pnpm":
+        words = _subcommand(words, _PNPM_VALUE_FLAGS)
+    elif words[0] == "yarn":
+        words = _subcommand(words, _YARN_VALUE_FLAGS)
     w = words
     if w[0] == "go" and len(w) > 1 and w[1] == "get":
         return _positional(w[2:]) is not None
@@ -89,7 +127,7 @@ def _is_add(words):
         return _positional(w[2:], _PNPM_VALUE_FLAGS) is not None
     if w[0] == "yarn" and len(w) > 1 and w[1] == "add":
         return _positional(w[2:], _YARN_VALUE_FLAGS) is not None
-    if w[0] in ("pip", "pip3") and len(w) > 1 and w[1] == "install":
+    if _PIP.match(w[0]) and len(w) > 1 and w[1] == "install":
         return _pip_add(w[2:])
     if w[0].startswith("python") and len(w) > 3 and w[1] == "-m" and w[2] == "pip" and w[3] == "install":
         return _pip_add(w[4:])
@@ -129,7 +167,7 @@ def _heredoc_word(line, i):
     return "".join(word), i
 
 
-def _heredocs(line):
+def heredocs(line):
     """Heredoc, открытые строкой, по порядку: (терминатор, снимать ли ведущие табы).
 
     `<<` в кавычках, here-string `<<<`, сдвиг в арифметике `((…))` и комментарий не считаются;
@@ -201,11 +239,11 @@ def _heredocs(line):
 
 
 def _segments(command):
-    """Сегменты команды: границы — `&&`, `||`, `;`, `|` и перевод строки вне кавычек.
+    """Сегменты команды: границы — `&&`, `||`, `;`, `|`, `&`, `(`, `)` и перевод строки вне кавычек.
 
     Кавычка, открытая на одной строке, продолжается на следующих; `\\` в конце строки продолжает
-    сегмент. Тело heredoc — данные, а не команды: строки до терминатора не входят ни в один
-    сегмент. Комментарий — `#` в начале строки или после пробела вне кавычек — до конца строки.
+    сегмент. Тело heredoc — данные: строки до терминатора не входят ни в один сегмент; у heredoc
+    команды из _SHELLS (`bash <<EOF`, `ssh host <<EOF`) тело — команды. Комментарий — `#` в начале строки или после пробела вне кавычек — до конца строки.
     """
     segments, current = [], []
     quote = None
@@ -223,6 +261,7 @@ def _segments(command):
             continue
         # Позиция, с которой строка идёт вне кавычки, перенесённой с прошлых строк.
         outside = 0 if quote is None else None
+        first_segment = len(segments)
         continued = False
         i, n = 0, len(line)
         while i < n:
@@ -255,7 +294,7 @@ def _segments(command):
                 flush()
                 i += 2
                 continue
-            elif c in ";|":
+            elif c in ";|()" or (c == "&" and line[i - 1:i] not in ("<", ">") and line[i + 1:i + 2] != ">"):
                 flush()
             else:
                 current.append(c)
@@ -268,17 +307,20 @@ def _segments(command):
             current.append(" ")
         else:
             flush()
-        pending = _heredocs(line[outside:]) if outside is not None else []
+        pending = heredocs(line[outside:]) if outside is not None else []
+        if any(_words(s)[:1] and _words(s)[0] in _SHELLS for s in segments[first_segment:] + ["".join(current)]):
+            pending = []
     flush()
     return segments
 
 
 def dependency_add(command):
-    """Сегмент команды, добавляющий пакет; None, если такого нет или стоит маркер согласия."""
-    if not isinstance(command, str) or DEP_OK_MARKER in command:
+    """Сегмент команды, добавляющий пакет; None, если такого нет. Маркер согласия снимает проверку с
+    сегмента, где он стоит среди ведущих присваиваний (`PLANKA_DEP_OK=1 npm install x`)."""
+    if not isinstance(command, str):
         return None
     for segment in _segments(command):
         segment = segment.strip()
-        if segment and _is_add(_words(segment)):
+        if segment and not _has_marker(segment) and _is_add(_words(segment)):
             return segment
     return None

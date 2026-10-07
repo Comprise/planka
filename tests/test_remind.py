@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import shutil
 import sys
 import time
 import unittest
@@ -123,6 +124,22 @@ class RemindTest(unittest.TestCase):
         self.assertIn("planka:", "\n".join(messages(r)))
         self.assertNotIn("Traceback", r.stderr)
         self.assertNotIn("внутренняя ошибка", "\n".join(messages(r)))
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_slow_git_keeps_reminder(self):
+        real_git = shutil.which("git")
+        bin_dir = self.env.data / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "git").write_text(f'#!/bin/sh\ncase " $* " in *" ls-files "*) sleep 5;; esac\nexec {real_git} "$@"\n',
+                                     encoding="utf-8")
+        (bin_dir / "git").chmod(0o755)
+        path = f"{bin_dir}:{self.env.environ()['PATH']}"
+        started = time.monotonic()
+        msgs, out = self.run_in_process(mock.patch.object(remind, "SNAPSHOT_BUDGET", 1),
+                                        mock.patch.dict(os.environ, {"PATH": path}))
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertIn("# Философия работы", out["additionalContext"])
+        self.assertTrue(any("снимок дерева не записан" in m for m in msgs), msgs)
 
     def test_reminder_survives_snapshot_error(self):
         msgs, out = self.run_in_process(mock.patch.object(snapshot, "scan", side_effect=ValueError("сбой")))

@@ -208,3 +208,48 @@ class QuotedSeparatorsTest(unittest.TestCase):
         ]:
             self.assertIsNotNone(depcheck.dependency_add(cmd), cmd)
 
+
+class ShellFormsTest(unittest.TestCase):
+    def test_detected(self):
+        for cmd in [
+            "sleep 1 & npm install lodash",
+            "(npm install lodash)",
+            "x=$(npm install lodash)",
+            "if true; then npm install lodash; fi",
+            "for x in a; do npm install lodash; done",
+            "! npm install lodash",
+            "{ npm install lodash; }",
+            "time npm install lodash",
+            "env A=1 npm install lodash",
+            "sudo -E pip install requests",
+            "sudo -u bob npm install lodash",
+            "bash <<EOF\nnpm install lodash\nEOF",
+            "ssh h <<EOF\npip install x\nEOF",
+            "pip install -r req.txt requests",
+            "pnpm -C sub add lodash",
+            "npm --save install lodash",
+            "npm -w pkg install lodash",
+            "pip3.11 install requests",
+        ]:
+            self.assertIsNotNone(depcheck.dependency_add(cmd), cmd)
+
+    def test_not_adds(self):
+        for cmd in [
+            "make test 2>&1 | tail -3",
+            "cmd &> log",
+            "echo $((1 + 2))",
+            "cat <<EOF > notes.md\nnpm install x\nEOF",
+        ]:
+            self.assertIsNone(depcheck.dependency_add(cmd), cmd)
+
+
+class MarkerScopeTest(unittest.TestCase):
+    def test_marker_only_in_own_segment(self):
+        for cmd in [
+            "npm install lodash # PLANKA_DEP_OK=1",
+            "echo PLANKA_DEP_OK=1; npm install lodash",
+            "PLANKA_DEP_OK=1 npm install a && npm install b",
+        ]:
+            self.assertIsNotNone(depcheck.dependency_add(cmd), cmd)
+        self.assertIsNone(depcheck.dependency_add("CI=1 PLANKA_DEP_OK=1 npm install lodash"))
+

@@ -26,9 +26,13 @@ def claims_done(text):
     return bool(_DONE.search(text or ""))
 
 
+# Срок повторного снимка на Stop, с: таймаут хука в hooks.json — 120 с, из них судье — до 65 с.
+SNAPSHOT_BUDGET = 20
+
+
 def changed_this_turn(data):
-    """Корень проекта и (путь, класс по common.path_kind, есть ли файл сейчас) со снимка текущей реплики;
-    None без снимка."""
+    """Корень проекта, HEAD корня и подмодулей на старте реплики и (путь, класс по common.path_kind, есть ли
+    файл сейчас) со снимка текущей реплики; None без снимка или если повторный снимок не уложился в срок."""
     cwd = data.get("cwd")
     if not isinstance(cwd, str) or not cwd:
         return None
@@ -38,10 +42,16 @@ def changed_this_turn(data):
     root = common.project_root(cwd)
     if str(root) != snap.get("root"):
         return None
-    now = snapshot.scan(root)
+    try:
+        now = snapshot.scan(root, time.monotonic() + SNAPSHOT_BUDGET)
+    except TimeoutError as e:
+        common.warn(f"сверка документации не проверена: {e}")
+        return None
     if now is None:
         return None
-    return root, [(p, common.path_kind(p), (root / p).is_file()) for p in snapshot.diff(snap["files"], now)]
+    changed = [(p, common.path_kind(p), (root / p).is_file()) for p in snapshot.diff(snap["files"], now)]
+    # Снимок без поля head записан до появления поля: база — текущий HEAD.
+    return root, (snap.get("head", "HEAD"), snap.get("sub_heads") or {}), changed
 
 
 def main():
@@ -54,13 +64,13 @@ def main():
     options = looks_like_options(message)
     done = claims_done(message)
     docs_info = changed_this_turn(data)
-    docs = bool(docs_info and any(kind == "code" for _, kind, _ in docs_info[1]))
+    docs = bool(docs_info and any(kind == "code" for _, kind, _ in docs_info[2]))
     if not (options or done or docs):
         return
     filters = [name for flag, name in ((options, "options"), (done, "done"), (docs, "docs")) if flag]
     meta = {"filters": filters}
     if docs:
-        meta["files"] = [p for p, _, _ in docs_info[1][:prompts.MAX_LISTED]]
+        meta["files"] = [p for p, _, _ in docs_info[2][:prompts.MAX_LISTED]]
     session = data.get("session_id", "")
     prompt_id = data.get("prompt_id", "")
     modules = []
@@ -75,9 +85,9 @@ def main():
         return
     content = message
     if docs:
-        root, changed = docs_info
+        root, (base, sub_bases), changed = docs_info
         lines, truncated, unknown = comments.extract(
-            root, [p for p, kind, exists in changed if kind == "code" and exists])
+            root, [p for p, kind, exists in changed if kind == "code" and exists], base, sub_bases)
         content = prompts.render_docs_content(message, changed, lines, truncated,
                                               not (root / "CLAUDE.md").exists(), unknown)
     started = time.monotonic()

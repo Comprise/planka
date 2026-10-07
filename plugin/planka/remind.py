@@ -1,25 +1,33 @@
 """UserPromptSubmit: подмешивает ядро, снимает снимок дерева, напоминает об инициализации документации."""
+import time
+
 import common
 import snapshot
+
+# Срок снимка от старта хука, с: таймаут хука в hooks.json — 10 с, напоминание выводится после снимка.
+SNAPSHOT_BUDGET = 7
 
 NO_DOCS_LINE = "Проект без документации: предложи автору инициализацию по {RULES}/docs.md."
 
 
-def take_snapshot(session, prompt_id, root):
+def take_snapshot(session, prompt_id, root, deadline):
     if root is None:
         return
-    files = snapshot.scan(root)
+    head_commit = snapshot.head(root, deadline)
+    sub_heads = snapshot.submodule_heads(root, deadline)
+    files = snapshot.scan(root, deadline)
     if files is None:
         common.warn_once(session, "snapshot",
                          f"дерево больше {snapshot.DEFAULT_MAX_FILES} файлов, сверка документации не проверяется")
         return
     state_dir = common.data_dir() / "state"
     state_dir.mkdir(exist_ok=True)
-    snapshot.save(state_dir, session, prompt_id, root, files)
+    snapshot.save(state_dir, session, prompt_id, root, files, head_commit, sub_heads)
     common.prune_state(state_dir)
 
 
 def main():
+    deadline = time.monotonic() + SNAPSHOT_BUDGET
     if common.barrier_active():
         return
     data = common.read_input()
@@ -38,7 +46,7 @@ def main():
             text += "\n\n" + common.substitute(NO_DOCS_LINE)
     try:
         # Снимок снимается до emit и фиксирует дерево до работы агента.
-        take_snapshot(session, data.get("prompt_id", ""), root)
+        take_snapshot(session, data.get("prompt_id", ""), root, deadline)
     except Exception as e:
         common.warn(f"снимок дерева не записан: {e!r}")
     try:

@@ -135,6 +135,9 @@ class GitScanTest(unittest.TestCase):
                            check=True, capture_output=True)
             (self.root / "sub" / "new.py").write_text("y", encoding="utf-8")
             self.assertEqual(sorted(snapshot.scan(self.root)), [".gitmodules", "sub/f.py", "sub/new.py"])
+            lib_head = subprocess.run(["git", "-C", str(lib), "rev-parse", "HEAD"], capture_output=True,
+                                      text=True, check=True).stdout.strip()
+            self.assertEqual(snapshot.submodule_heads(self.root), {"sub": lib_head})
             subprocess.run([*git, "-C", str(self.root), "commit", "-qm", "s"], check=True)
             clone = pathlib.Path(self.tmp.name + "-clone")
             subprocess.run([*git, "clone", "-q", str(self.root), str(clone)], check=True, capture_output=True)
@@ -164,6 +167,13 @@ class SaveLoadDiffTest(unittest.TestCase):
         self.assertEqual(got["root"], str(self.root))
         self.assertEqual(got["files"], files)
         self.assertEqual([p.name for p in self.state.iterdir()], ["sess_1.snap.json"])
+
+    def test_roundtrip_non_utf8_name(self):
+        files = {"bad\udcff.py": [1, 2]}
+        snapshot.save(self.state, "s", "p", self.root, files, "abc")
+        got = snapshot.load(self.state, "s")
+        self.assertEqual(got["files"], files)
+        self.assertEqual(got["head"], "abc")
 
     def test_load_missing_or_garbage(self):
         self.assertIsNone(snapshot.load(self.state, "none"))
