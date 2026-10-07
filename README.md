@@ -34,7 +34,7 @@ claude plugin configure planka@planka --values-stdin <<< '{"comment_lang":"en+ru
 ```
 
 Переход со старой установки ссылкой: если `claude plugin list` показывает `planka@skills-dir`,
-перед добавлением маркетплейса выполнить `rm ~/.claude/skills/planka`, иначе хуки сработают дважды.
+перед добавлением маркетплейса выполнить `rm ~/.claude/skills/planka`: иначе один плагин установлен дважды, под двумя id.
 
 Требования: `python3` 3.10+, `claude` в `PATH`, вход в Claude Code выполнен (OAuth или ключ).
 
