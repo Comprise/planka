@@ -72,3 +72,32 @@ class DependencyAddTest(unittest.TestCase):
     def test_non_string(self):
         self.assertIsNone(depcheck.dependency_add(None))
         self.assertIsNone(depcheck.dependency_add(5))
+
+
+class FalseDenyTest(unittest.TestCase):
+    def test_not_adds(self):
+        for cmd in [
+            "pip install -e .[dev]",
+            "pip install -e .",
+            "npm install # temp",
+            "npm install  # reinstall deps",
+            "npm install --prefix app",
+            "pnpm install --filter app",
+            "pip install -c constraints.txt",
+            "uv add -r r.txt",
+            "npm install ../other",
+            "npm install ~/pkg",
+            "npm install file:../x",
+            'pip install ""',
+            "npm install --prefix app  # note",
+        ]:
+            self.assertIsNone(depcheck.dependency_add(cmd), cmd)
+
+    def test_still_detected(self):
+        for cmd in [
+            "npm install --prefix app left-pad",
+            "pip install -c c.txt requests",
+            "npm install left-pad # temp",
+            "uv add -r r.txt httpx",
+        ]:
+            self.assertIsNotNone(depcheck.dependency_add(cmd), cmd)
