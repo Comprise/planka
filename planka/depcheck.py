@@ -67,12 +67,14 @@ def _positional(args, value_flags=_NO_VALUE_FLAGS):
 
 # Установщик и его спутники в venv пакетов в проект не добавляют.
 _PIP_BOOTSTRAP = {"pip", "setuptools", "wheel"}
+# Имя проекта в требовании pip кончается на первом спецификаторе версии, extras, маркере или URL.
+_PIP_NAME_END = re.compile(r"[<>=!~\[;@]")
 
 
 def _pip_add(args):
     if _PIP_REQ_FLAGS & set(args):
         return False
-    names = set(_positionals(args, _PIP_VALUE_FLAGS))
+    names = {_PIP_NAME_END.split(w, 1)[0].lower() for w in _positionals(args, _PIP_VALUE_FLAGS)}
     return bool(names - _PIP_BOOTSTRAP)
 
 

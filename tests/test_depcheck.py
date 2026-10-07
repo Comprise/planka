@@ -117,6 +117,9 @@ class PipBootstrapAndArchivesTest(unittest.TestCase):
             "pip install --upgrade pip",
             "python -m pip install --upgrade pip setuptools wheel",
             "uv pip install -U pip",
+            "pip install pip==24.0",
+            'pip install -U "pip>=24"',
+            'python -m pip install "pip>=24" "setuptools>=70" wheel',
             "pip install dist/x.whl",
             "pip install dist/x-1.0.tar.gz",
         ]:
@@ -125,6 +128,8 @@ class PipBootstrapAndArchivesTest(unittest.TestCase):
     def test_still_detected(self):
         for cmd in [
             "pip install --upgrade pip requests",
+            'pip install "requests>=2"',
+            "pip install pip==24.0 requests",
             "pip install requests",
             "pip install dist/x.whl requests",
         ]:
