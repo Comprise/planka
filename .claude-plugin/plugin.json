@@ -2,5 +2,30 @@
   "name": "planka",
   "version": "0.1.0",
   "description": "Философия работы: напоминание на каждом ходе и судья в точках выбора",
-  "author": { "name": "Elia Samoylov" }
+  "author": {
+    "name": "Elia Samoylov"
+  },
+  "userConfig": {
+    "comment_lang": {
+      "type": "string",
+      "title": "Язык комментариев",
+      "description": "Язык комментариев в коде: en, ru или en+ru (английский, затем русский перевод)",
+      "options": [
+        "en",
+        "ru",
+        "en+ru"
+      ],
+      "required": true
+    },
+    "doc_lang": {
+      "type": "string",
+      "title": "Язык документации",
+      "description": "Язык CLAUDE.md, context/ и записей deferred/: en или ru",
+      "options": [
+        "en",
+        "ru"
+      ],
+      "required": true
+    }
+  }
 }
