@@ -1,8 +1,9 @@
+import hashlib
 import json
 import sys
 import unittest
 
-from tests.helpers import Env, PLANKA_DIR, hook_input
+from tests.helpers import Env, PLANKA_DIR, hook_input, messages, output
 
 sys.path.insert(0, str(PLANKA_DIR))
 import judge_stop  # noqa: E402
@@ -56,7 +57,7 @@ class StopHookTest(unittest.TestCase):
     def test_options_denied_blocks_with_reason(self):
         r = self.stop(OPTIONS_MSG, PLANKA_STUB="deny", PLANKA_STUB_REASON="нет варианта с причиной")
         self.assertEqual(r.returncode, 0, r.stderr)
-        out = json.loads(r.stdout)
+        out = output(r)
         self.assertEqual(out["decision"], "block")
         self.assertIn("нет варианта с причиной", out["reason"])
         self.assertIn("Решения 4", out["reason"])
@@ -73,16 +74,16 @@ class StopHookTest(unittest.TestCase):
     def test_budget_exhausted_passes_with_warning(self):
         for _ in range(2):
             r = self.stop(OPTIONS_MSG, PLANKA_STUB="deny")
-            self.assertIn("block", r.stdout)
+            self.assertEqual(output(r)["decision"], "block")
         r = self.stop(OPTIONS_MSG, PLANKA_STUB="deny")
-        self.assertEqual(r.stdout, "")
-        self.assertIn("лимит отказов", r.stderr)
+        self.assertIsNone(output(r))
+        self.assertIn("лимит отказов", "\n".join(messages(r)))
 
     def test_judge_failure_passes_with_warning(self):
         r = self.stop(OPTIONS_MSG, PLANKA_STUB="garbage")
         self.assertEqual(r.returncode, 0)
-        self.assertEqual(r.stdout, "")
-        self.assertIn("planka:", r.stderr)
+        self.assertIsNone(output(r))
+        self.assertIn("planka:", "\n".join(messages(r)))
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
 
     def test_unusable_data_dir_passes_without_block(self):
@@ -90,8 +91,8 @@ class StopHookTest(unittest.TestCase):
         blocker.write_text("", encoding="utf-8")
         r = self.stop(OPTIONS_MSG, PLANKA_STUB="deny", CLAUDE_PLUGIN_DATA=str(blocker / "sub"))
         self.assertEqual(r.returncode, 0)
-        self.assertEqual(r.stdout, "")
-        self.assertIn("planka: внутренняя ошибка", r.stderr)
+        self.assertIsNone(output(r))
+        self.assertIn("planka: внутренняя ошибка", "\n".join(messages(r)))
         self.assertNotIn("Traceback", r.stderr)
 
     def test_barrier_and_garbage(self):
@@ -107,8 +108,8 @@ class MissingRubricTest(unittest.TestCase):
         try:
             r = env.run("judge_stop.py", hook_input("Stop", last_assistant_message=OPTIONS_MSG))
             self.assertEqual(r.returncode, 0)
-            self.assertEqual(r.stdout, "")
-            self.assertEqual(r.stderr.count("planka:"), 1)
+            self.assertIsNone(output(r))
+            self.assertEqual("\n".join(messages(r)).count("planka:"), 1)
             last = env.log_lines()[-1]
             self.assertEqual(last["verdict"], "skipped")
             self.assertEqual(last["error"], "нет раздела рубрики")
@@ -156,7 +157,7 @@ class DoneHookTest(unittest.TestCase):
 
     def test_done_denied_blocks(self):
         r = self.stop(DONE_MSG, PLANKA_STUB="deny", PLANKA_STUB_REASON="нет команды-доказательства")
-        out = json.loads(r.stdout)
+        out = output(r)
         self.assertEqual(out["decision"], "block")
         self.assertIn("нет команды-доказательства", out["reason"])
         self.assertTrue(out["reason"].startswith("planka: "))
@@ -178,11 +179,11 @@ class DoneHookTest(unittest.TestCase):
         (self.env.root / "rules" / "verification.md").unlink()
         r = self.stop(DONE_MSG)
         self.assertEqual(r.returncode, 0)
-        self.assertEqual(r.stdout, "")
-        self.assertIn("planka:", r.stderr)
+        self.assertIsNone(output(r))
+        self.assertIn("planka:", "\n".join(messages(r)))
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
         self.assertEqual(self.env.log_lines()[-1]["filters"], ["done"])
-        self.assertEqual(r.stderr.count("planka:"), 1)
+        self.assertEqual("\n".join(messages(r)).count("planka:"), 1)
 
 
 class DocsFilterTest(unittest.TestCase):
@@ -218,7 +219,11 @@ class DocsFilterTest(unittest.TestCase):
         self.assertIn("локальный CLAUDE.md", text)
         last = self.env.log_lines()[-1]
         self.assertEqual(last["filters"], ["docs"])
-        self.assertIn("pkg/a.go: // hello", last["content"])
+        judged = text.split("\n<content>\n", 1)[1].split("\n</content>\n", 1)[0]
+        self.assertIn("pkg/a.go: // hello", judged)
+        self.assertNotIn("content", last)
+        self.assertEqual(last["content_len"], len(judged))
+        self.assertEqual(last["content_sha256"], hashlib.sha256(judged.encode("utf-8")).hexdigest())
 
     def test_code_change_without_comments_says_so(self):
         self.snap()
@@ -261,6 +266,7 @@ class DocsFilterTest(unittest.TestCase):
         (self.project / "a.py").write_text("x\n", encoding="utf-8")
         r = self.stop("Поправил.")
         self.assertEqual(r.stdout, "")
+        self.assertEqual(messages(r), [])
         self.assertEqual(r.stderr, "")
         self.assertEqual(self.env.log_lines(), [])
 
@@ -275,7 +281,7 @@ class DocsFilterTest(unittest.TestCase):
         self.snap()
         (self.project / "a.py").write_text("# было так, стало эдак\n", encoding="utf-8")
         r = self.stop("Поправил.", PLANKA_STUB="deny", PLANKA_STUB_REASON="сверь pkg/CLAUDE.md")
-        out = json.loads(r.stdout)
+        out = output(r)
         self.assertEqual(out["decision"], "block")
         self.assertTrue(out["reason"].startswith("planka: "))
         self.assertIn("сверь pkg/CLAUDE.md", out["reason"])
@@ -297,8 +303,8 @@ class DocsFilterTest(unittest.TestCase):
         (self.project / "a.py").write_text("x\n", encoding="utf-8")
         (self.env.root / "rules" / "comments.md").unlink()
         r = self.stop("Поправил.")
-        self.assertEqual(r.stdout, "")
-        self.assertIn("planka:", r.stderr)
+        self.assertIsNone(output(r))
+        self.assertIn("planka:", "\n".join(messages(r)))
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
         self.assertEqual(self.env.log_lines()[-1]["filters"], ["docs"])
 

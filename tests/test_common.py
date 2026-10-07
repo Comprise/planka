@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import os
@@ -57,15 +58,15 @@ class PhilosophyTest(unittest.TestCase):
         self.assertIn("Правило планов два.", text)
 
     def test_missing_section_is_none(self):
-        with mock.patch("sys.stderr", new=io.StringIO()) as err:
-            self.assertIsNone(common.philosophy_sections("Решения", "Нет такого"))
-            self.assertIn("planka:", err.getvalue())
+        common._reset()
+        self.assertIsNone(common.philosophy_sections("Решения", "Нет такого"))
+        self.assertTrue(any(m.startswith("planka:") for m in common._messages))
 
     def test_missing_file_is_none(self):
         (self.env.root / "philosophy.md").unlink()
-        with mock.patch("sys.stderr", new=io.StringIO()) as err:
-            self.assertIsNone(common.philosophy_text())
-            self.assertIn("planka:", err.getvalue())
+        common._reset()
+        self.assertIsNone(common.philosophy_text())
+        self.assertTrue(any(m.startswith("planka:") for m in common._messages))
 
 
 class RulesTest(unittest.TestCase):
@@ -90,15 +91,15 @@ class RulesTest(unittest.TestCase):
         self.assertLess(text.index("# Планирование"), text.index("# Доказательство"))
 
     def test_missing_rule_is_none(self):
-        with mock.patch("sys.stderr", new=io.StringIO()) as err:
-            self.assertIsNone(common.rule_texts("verification", "nope"))
-            self.assertIn("planka:", err.getvalue())
+        common._reset()
+        self.assertIsNone(common.rule_texts("verification", "nope"))
+        self.assertTrue(any(m.startswith("planka:") for m in common._messages))
 
     def test_non_utf8_rule_is_none(self):
         (self.env.root / "rules" / "verification.md").write_bytes(b"\xff\xfe")
-        with mock.patch("sys.stderr", new=io.StringIO()) as err:
-            self.assertIsNone(common.rule_texts("verification"))
-            self.assertIn("planka:", err.getvalue())
+        common._reset()
+        self.assertIsNone(common.rule_texts("verification"))
+        self.assertTrue(any(m.startswith("planka:") for m in common._messages))
 
     def test_rubric_combines(self):
         text = common.rubric(("Решения", "Планы"), ("planning",))
@@ -112,16 +113,16 @@ class RulesTest(unittest.TestCase):
         self.assertTrue(common.rubric((), ("verification",)).startswith("# Доказательство"))
 
     def test_rubric_none_when_part_missing(self):
-        with mock.patch("sys.stderr", new=io.StringIO()):
-            self.assertIsNone(common.rubric(("Решения",), ("nope",)))
-            self.assertIsNone(common.rubric(("Нет такого",), ("planning",)))
+        common._reset()
+        self.assertIsNone(common.rubric(("Решения",), ("nope",)))
+        self.assertIsNone(common.rubric(("Нет такого",), ("planning",)))
 
     def test_rules_dir_missing_is_none(self):
         import shutil
         shutil.rmtree(self.env.root / "rules")
-        with mock.patch("sys.stderr", new=io.StringIO()) as err:
-            self.assertIsNone(common.rule_texts("planning"))
-            self.assertIn("planka:", err.getvalue())
+        common._reset()
+        self.assertIsNone(common.rule_texts("planning"))
+        self.assertTrue(any(m.startswith("planka:") for m in common._messages))
         self.assertIn(str(self.env.root / "rules"), common.philosophy_text())
 
 
@@ -259,48 +260,134 @@ class DenyBudgetTest(unittest.TestCase):
         self.assertEqual(names, [".._.._x_y.json", "unknown.json"])
 
 
+def run_captured(main):
+    """run_hook с перехваченными stdout и stderr: (stdout, stderr)."""
+    with mock.patch("sys.stdout", new=io.StringIO()) as out, \
+         mock.patch("sys.stderr", new=io.StringIO()) as err:
+        common.run_hook(main)
+    return out.getvalue(), err.getvalue()
+
+
 class RunHookTest(unittest.TestCase):
-    def test_exception_is_warning_and_exit_zero(self):
+    def test_exception_is_system_message(self):
         def main():
             raise PermissionError("нет доступа")
-        with mock.patch("sys.stderr", new=io.StringIO()) as err:
-            with self.assertRaises(SystemExit) as cm:
-                common.run_hook(main)
-        self.assertEqual(cm.exception.code, 0)
-        self.assertIn("planka: внутренняя ошибка: PermissionError", err.getvalue())
+        out, err = run_captured(main)
+        self.assertEqual(err, "")
+        msg = json.loads(out)
+        self.assertEqual(list(msg), ["systemMessage"])
+        self.assertTrue(msg["systemMessage"].startswith("planka: внутренняя ошибка: PermissionError"))
+
+    def test_exception_keeps_emitted_output(self):
+        def main():
+            common.emit(common.block_output("r"))
+            raise ValueError("x")
+        out, _ = run_captured(main)
+        msg = json.loads(out)
+        self.assertEqual(msg["decision"], "block")
+        self.assertIn("planka: внутренняя ошибка: ValueError", msg["systemMessage"])
 
     def test_normal_main_returns(self):
         calls = []
-        common.run_hook(lambda: calls.append(1))
+        out, err = run_captured(lambda: calls.append(1))
         self.assertEqual(calls, [1])
+        self.assertEqual(out, "")
+        self.assertEqual(err, "")
+
+    def test_warnings_only(self):
+        def main():
+            common.warn("раз")
+            common.warn("два")
+        out, err = run_captured(main)
+        self.assertEqual(err, "")
+        self.assertEqual(json.loads(out), {"systemMessage": "planka: раз\nplanka: два"})
+
+    def test_merge_with_each_output(self):
+        for build in (common.deny_output, common.block_output, common.context_output):
+            def main():
+                common.warn("внимание")
+                common.emit(build("текст"))
+            out, err = run_captured(main)
+            self.assertEqual(err, "")
+            self.assertEqual(json.loads(out), {**build("текст"), "systemMessage": "planka: внимание"})
+
+    def test_output_without_warnings(self):
+        out, _ = run_captured(lambda: common.emit(common.block_output("r")))
+        self.assertEqual(json.loads(out), {"decision": "block", "reason": "r"})
+
+    def test_state_reset_between_runs(self):
+        def first():
+            common.warn("старое")
+            common.emit(common.block_output("r"))
+        run_captured(first)
+        out, _ = run_captured(lambda: None)
+        self.assertEqual(out, "")
+
+    def test_warn_does_not_write_stderr(self):
+        common._reset()
+        with mock.patch("sys.stderr", new=io.StringIO()) as err:
+            common.warn("x")
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(common._messages, ["planka: x"])
 
 
 class OutputsTest(unittest.TestCase):
     def test_formats(self):
-        d = json.loads(common.deny_output("r"))
+        d = common.deny_output("r")
         self.assertEqual(d["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(d["hookSpecificOutput"]["hookEventName"], "PreToolUse")
         self.assertEqual(d["hookSpecificOutput"]["permissionDecisionReason"], "r")
-        b = json.loads(common.block_output("r"))
-        self.assertEqual(b, {"decision": "block", "reason": "r"})
-        c = json.loads(common.context_output("t"))
+        self.assertEqual(common.block_output("r"), {"decision": "block", "reason": "r"})
+        c = common.context_output("t")
         self.assertEqual(c["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit")
         self.assertEqual(c["hookSpecificOutput"]["additionalContext"], "t")
 
 
 class LogTest(unittest.TestCase):
+    def setUp(self):
+        self.env = Env()
+        self.patch = mock.patch.dict(os.environ, self.env.environ(), clear=True)
+        self.patch.start()
+        self.log = self.env.data / "judge.log"
+
+    def tearDown(self):
+        self.patch.stop()
+        self.env.close()
+
     def test_log_line(self):
-        env = Env()
-        try:
-            with mock.patch.dict(os.environ, env.environ(), clear=True):
-                common.log_event("tool", "s", verdict="ok", reason="")
-            lines = env.log_lines()
-            self.assertEqual(len(lines), 1)
-            self.assertEqual(lines[0]["hook"], "tool")
-            self.assertEqual(lines[0]["session_id"], "s")
-            self.assertIn("ts", lines[0])
-        finally:
-            env.close()
+        common.log_event("tool", "s", verdict="ok", reason="")
+        lines = self.env.log_lines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["hook"], "tool")
+        self.assertEqual(lines[0]["session_id"], "s")
+        self.assertIn("ts", lines[0])
+        self.assertNotIn("content_len", lines[0])
+        self.assertNotIn("content_sha256", lines[0])
+
+    def test_content_is_hashed(self):
+        text = "секрет // comment"
+        common.log_event("stop", "s", verdict="ok", content=text)
+        entry = self.env.log_lines()[0]
+        self.assertNotIn("content", entry)
+        self.assertEqual(entry["content_len"], len(text))
+        self.assertEqual(entry["content_sha256"], hashlib.sha256(text.encode("utf-8")).hexdigest())
+        self.assertNotIn("секрет", self.log.read_text(encoding="utf-8"))
+
+    def test_rotation_at_threshold(self):
+        self.assertEqual(common.LOG_MAX_BYTES, 1_048_576)
+        (self.env.data / "judge.log.1").write_text("прежний\n", encoding="utf-8")
+        old = "x" * (common.LOG_MAX_BYTES - 1) + "\n"
+        self.log.write_text(old, encoding="utf-8")
+        common.log_event("tool", "s", verdict="ok")
+        self.assertEqual((self.env.data / "judge.log.1").read_text(encoding="utf-8"), old)
+        self.assertEqual(len(self.env.log_lines()), 1)
+
+    def test_no_rotation_below_threshold(self):
+        old = "x" * (common.LOG_MAX_BYTES - 2) + "\n"
+        self.log.write_text(old, encoding="utf-8")
+        common.log_event("tool", "s", verdict="ok")
+        self.assertFalse((self.env.data / "judge.log.1").exists())
+        self.assertTrue(self.log.read_text(encoding="utf-8").startswith(old))
 
 
 class SettingsTest(unittest.TestCase):
@@ -372,17 +459,41 @@ class DocPathTest(unittest.TestCase):
             self.assertFalse(common.is_doc_path(p), p)
 
 
+class PathKindTest(unittest.TestCase):
+    def test_kinds(self):
+        cases = {
+            "README.md": "doc", "README": "doc", "LICENSE": "doc", "docs/en/x.md": "doc",
+            "context/x.go": "doc", "internal/CLAUDE.md": "doc",
+            "pkg/x.go": "code", "a/b.py": "code", "Makefile": "code", "Dockerfile": "code",
+            "sub/Justfile": "code", "Rakefile": "code", "Gemfile": "code", "x.toml": "code",
+            "src/App.TSX": "code", "a.php": "code", "infra/main.tf": "code",
+            "a.json": "other", "img.png": "other", "LICENSE-third-party.txt": "doc",
+            "notes.txt": "other", "bin/tool": "other", "go.sum": "other",
+        }
+        for path, kind in cases.items():
+            self.assertEqual(common.path_kind(path), kind, path)
+
+    def test_code_exts_cover_comment_families(self):
+        import comments
+        known = comments._C_FAMILY | comments._HASH | comments._DASH | comments._HTML
+        self.assertLessEqual(known, common.CODE_EXTS)
+        for ext in ("php", "r", "jl", "ex", "exs", "erl", "clj", "fs", "vb", "nim", "zig", "sol",
+                    "proto", "gradle", "groovy", "tf", "nix", "el", "vim", "bat", "cmd"):
+            self.assertIn(ext, common.CODE_EXTS)
+        self.assertEqual(common.CODE_NAMES, {"Makefile", "Dockerfile", "Justfile", "Rakefile", "Gemfile"})
+
+
 class WarnOnceTest(unittest.TestCase):
     def test_once_per_session_and_key(self):
         env = Env()
         try:
-            with mock.patch.dict(os.environ, env.environ(), clear=True), \
-                 mock.patch("sys.stderr", new=io.StringIO()) as err:
+            common._reset()
+            with mock.patch.dict(os.environ, env.environ(), clear=True):
                 self.assertTrue(common.warn_once("s", "lang", "раз"))
                 self.assertFalse(common.warn_once("s", "lang", "раз"))
                 self.assertTrue(common.warn_once("s", "other", "два"))
                 self.assertTrue(common.warn_once("s2", "lang", "три"))
-                self.assertEqual(err.getvalue().count("planka:"), 3)
+            self.assertEqual(common._messages, ["planka: раз", "planka: два", "planka: три"])
         finally:
             env.close()
 

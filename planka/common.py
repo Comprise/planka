@@ -1,6 +1,7 @@
 """Общее для хуков planka: барьеры, вход, судья, счётчик отказов, журнал, форматы ответа."""
 import dataclasses
 import datetime
+import hashlib
 import json
 import os
 import pathlib
@@ -16,6 +17,7 @@ MAX_DENIES = 2
 JUDGE_TIMEOUT = 60
 MAX_REASON = 2000
 STATE_TTL = 7 * 86400
+LOG_MAX_BYTES = 1_048_576
 DEFAULT_JUDGE_MODEL = "sonnet"
 JUDGE_FLAGS = ["-p", "--setting-sources", "", "--strict-mcp-config",
                "--no-session-persistence", "--output-format", "json", "--tools", ""]
@@ -49,8 +51,20 @@ def data_dir():
     return d
 
 
+# Предупреждения и ответ текущего вызова хука; run_hook сбрасывает их и выводит одним JSON.
+_messages = []
+_output = None
+
+
+def _reset():
+    global _output
+    _messages.clear()
+    _output = None
+
+
 def warn(msg):
-    print(f"planka: {msg}", file=sys.stderr)
+    """Строка «planka: msg» уходит пользователю полем systemMessage ответа хука."""
+    _messages.append(f"planka: {msg}")
 
 
 RULES_PLACEHOLDER = "{RULES}"
@@ -59,6 +73,16 @@ DOC_LANG_PLACEHOLDER = "{DOC_LANG}"
 UNSET_LANG = "не задан"
 DOC_PATTERNS = ("README", "LICENSE")
 DOC_DIRS = ("context/", "docs/")
+CODE_EXTS = {
+    "go", "c", "h", "cc", "cpp", "hpp", "java", "kt", "kts", "swift", "js", "jsx", "ts", "tsx",
+    "dart", "rs", "scala", "m", "mm", "cs",
+    "py", "sh", "bash", "zsh", "rb", "pl", "toml", "yaml", "yml", "mk", "makefile", "cfg", "ini", "ps1",
+    "sql", "lua", "hs",
+    "html", "xml", "vue", "svelte",
+    "php", "r", "jl", "ex", "exs", "erl", "clj", "fs", "vb", "nim", "zig", "sol", "proto", "gradle",
+    "groovy", "tf", "nix", "el", "vim", "bat", "cmd",
+}
+CODE_NAMES = {"Makefile", "Dockerfile", "Justfile", "Rakefile", "Gemfile"}
 
 
 def rules_dir():
@@ -259,6 +283,18 @@ def is_doc_path(relpath):
     return relpath.startswith(DOC_DIRS)
 
 
+def path_kind(relpath):
+    """Класс пути относительно корня проекта, с прямыми слэшами: "doc", "code" или "other"."""
+    if is_doc_path(relpath):
+        return "doc"
+    name = relpath.rsplit("/", 1)[-1]
+    if name in CODE_NAMES:
+        return "code"
+    if "." in name and name.rsplit(".", 1)[1].lower() in CODE_EXTS:
+        return "code"
+    return "other"
+
+
 def warn_once(session_id, key, msg):
     """Предупреждение один раз на сессию и ключ; факт записан в state/<session>.warned.json."""
     state_dir = data_dir() / "state"
@@ -287,37 +323,54 @@ def prune_state(state_dir):
             pass
 
 
-def log_event(hook, session_id, **fields):
+def log_event(hook, session_id, *, content=None, **fields):
+    """Строка judge.log; содержимое — только длина и SHA-256. Файл от LOG_MAX_BYTES уходит в judge.log.1."""
     entry = {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
              "hook": hook, "session_id": session_id, **fields}
-    with open(data_dir() / "judge.log", "a", encoding="utf-8") as f:
+    if content is not None:
+        entry["content_len"] = len(content)
+        entry["content_sha256"] = hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()
+    path = data_dir() / "judge.log"
+    try:
+        if path.stat().st_size >= LOG_MAX_BYTES:
+            os.replace(path, path.with_name("judge.log.1"))
+    except FileNotFoundError:
+        pass
+    with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def deny_output(reason):
-    return json.dumps({"hookSpecificOutput": {
+    return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse", "permissionDecision": "deny",
-        "permissionDecisionReason": reason}}, ensure_ascii=False)
+        "permissionDecisionReason": reason}}
 
 
 def block_output(reason):
-    return json.dumps({"decision": "block", "reason": reason}, ensure_ascii=False)
+    return {"decision": "block", "reason": reason}
 
 
 def context_output(text):
-    return json.dumps({"hookSpecificOutput": {
-        "hookEventName": "UserPromptSubmit", "additionalContext": text}}, ensure_ascii=False)
+    return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}}
+
+
+def emit(obj):
+    """Ответ хука; выводит его run_hook."""
+    global _output
+    _output = obj
 
 
 def run_hook(main):
-    """Граница отказа хука: любое исключение — строка planka: и выход 0, без решения."""
+    """Граница отказа хука: исключение — предупреждение «внутренняя ошибка»; stdout — один JSON
+    из ответа и systemMessage или пусто; stderr не пишется."""
+    _reset()
     try:
         main()
     except Exception as e:
         warn(f"внутренняя ошибка: {e!r}")
-        sys.exit(0)
-
-
-def emit(text):
-    sys.stdout.write(text)
-    sys.stdout.flush()
+    out = dict(_output or {})
+    if _messages:
+        out["systemMessage"] = "\n".join(_messages)
+    if out:
+        sys.stdout.write(json.dumps(out, ensure_ascii=False))
+        sys.stdout.flush()

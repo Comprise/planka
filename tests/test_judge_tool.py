@@ -1,8 +1,9 @@
+import hashlib
 import json
 import sys
 import unittest
 
-from tests.helpers import Env, PLANKA_DIR, hook_input
+from tests.helpers import Env, PLANKA_DIR, hook_input, messages, output
 
 sys.path.insert(0, str(PLANKA_DIR))
 import judge_tool  # noqa: E402
@@ -83,7 +84,7 @@ class QuestionTest(unittest.TestCase):
 
     def test_deny(self):
         r = self.ask(PLANKA_STUB="deny", PLANKA_STUB_REASON="рекомендован по трудозатратам")
-        out = json.loads(r.stdout)["hookSpecificOutput"]
+        out = output(r)["hookSpecificOutput"]
         self.assertEqual(out["permissionDecision"], "deny")
         self.assertEqual(out["hookEventName"], "PreToolUse")
         self.assertIn("рекомендован по трудозатратам", out["permissionDecisionReason"])
@@ -101,15 +102,15 @@ class QuestionTest(unittest.TestCase):
 
     def test_budget(self):
         for _ in range(2):
-            self.assertIn("deny", self.ask(PLANKA_STUB="deny").stdout)
+            self.assertEqual(output(self.ask(PLANKA_STUB="deny"))["hookSpecificOutput"]["permissionDecision"], "deny")
         r = self.ask(PLANKA_STUB="deny")
-        self.assertEqual(r.stdout, "")
-        self.assertIn("лимит отказов", r.stderr)
+        self.assertIsNone(output(r))
+        self.assertIn("лимит отказов", "\n".join(messages(r)))
 
     def test_judge_failure_passes(self):
         r = self.ask(PLANKA_STUB="notlogged")
-        self.assertEqual(r.stdout, "")
-        self.assertIn("Not logged in", r.stderr)
+        self.assertIsNone(output(r))
+        self.assertIn("Not logged in", "\n".join(messages(r)))
 
     def test_other_tool_passes_silently(self):
         r = self.env.run("judge_tool.py", hook_input("PreToolUse", tool_name="Read", tool_input={}))
@@ -139,7 +140,7 @@ class PlanTest(unittest.TestCase):
     def test_conflict_denied_without_judge(self):
         rec = self.env.data / "rec.txt"
         r = self.exit_plan(self.with_plan(PLAN_CONFLICT), PLANKA_STUB_RECORD=str(rec))
-        out = json.loads(r.stdout)["hookSpecificOutput"]
+        out = output(r)["hookSpecificOutput"]
         self.assertEqual(out["permissionDecision"], "deny")
         self.assertIn("файл x.py принадлежит задачам 1 и 2 волны 1", out["permissionDecisionReason"])
         self.assertTrue(out["permissionDecisionReason"].startswith("planka: "))
@@ -158,22 +159,22 @@ class PlanTest(unittest.TestCase):
 
     def test_plan_deny(self):
         r = self.exit_plan(self.with_plan(PLAN_CLEAN), PLANKA_STUB="deny", PLANKA_STUB_REASON="нет схождения после волны 1")
-        reason = json.loads(r.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        reason = output(r)["hookSpecificOutput"]["permissionDecisionReason"]
         self.assertIn("нет схождения после волны 1", reason)
         self.assertTrue(reason.startswith("planka: "))
 
     def test_missing_transcript_passes_with_warning(self):
         r = self.exit_plan("/nonexistent/t.jsonl")
         self.assertEqual(r.returncode, 0)
-        self.assertEqual(r.stdout, "")
-        self.assertIn("planka:", r.stderr)
+        self.assertIsNone(output(r))
+        self.assertIn("planka:", "\n".join(messages(r)))
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
 
     def test_null_transcript_path_passes_with_warning(self):
         r = self.exit_plan(None)
         self.assertEqual(r.returncode, 0)
-        self.assertEqual(r.stdout, "")
-        self.assertIn("planka:", r.stderr)
+        self.assertIsNone(output(r))
+        self.assertIn("planka:", "\n".join(messages(r)))
         self.assertNotIn("Traceback", r.stderr)
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
 
@@ -182,8 +183,8 @@ class PlanTest(unittest.TestCase):
         t.write_text(json.dumps({"attachment": "x"}) + "\n", encoding="utf-8")
         r = self.exit_plan(str(t))
         self.assertEqual(r.returncode, 0)
-        self.assertEqual(r.stdout, "")
-        self.assertIn("planka:", r.stderr)
+        self.assertIsNone(output(r))
+        self.assertIn("planka:", "\n".join(messages(r)))
         self.assertNotIn("Traceback", r.stderr)
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
 
@@ -192,16 +193,16 @@ class PlanTest(unittest.TestCase):
         blocker.write_text("", encoding="utf-8")
         r = self.exit_plan(self.with_plan(PLAN_CONFLICT), CLAUDE_PLUGIN_DATA=str(blocker / "sub"))
         self.assertEqual(r.returncode, 0)
-        self.assertEqual(r.stdout, "")
-        self.assertIn("planka: внутренняя ошибка", r.stderr)
+        self.assertIsNone(output(r))
+        self.assertIn("planka: внутренняя ошибка", "\n".join(messages(r)))
         self.assertNotIn("Traceback", r.stderr)
 
     def test_missing_plan_file_passes_with_warning(self):
         t = self.with_plan(PLAN_CLEAN)
         (self.env.data / "plan.md").unlink()
         r = self.exit_plan(t)
-        self.assertEqual(r.stdout, "")
-        self.assertIn("planka:", r.stderr)
+        self.assertIsNone(output(r))
+        self.assertIn("planka:", "\n".join(messages(r)))
 
 
 class MissingRubricTest(unittest.TestCase):
@@ -213,9 +214,9 @@ class MissingRubricTest(unittest.TestCase):
 
     def check_skipped(self, r):
         self.assertEqual(r.returncode, 0)
-        self.assertEqual(r.stdout, "")
-        self.assertIn("planka:", r.stderr)
-        self.assertEqual(r.stderr.count("planka:"), 1)
+        self.assertIsNone(output(r))
+        self.assertIn("planka:", "\n".join(messages(r)))
+        self.assertEqual("\n".join(messages(r)).count("planka:"), 1)
         last = self.env.log_lines()[-1]
         self.assertEqual(last["verdict"], "skipped")
         self.assertEqual(last["error"], "нет раздела рубрики")
@@ -247,7 +248,7 @@ class BashTest(unittest.TestCase):
     def test_dependency_add_denied_without_judge(self):
         rec = self.env.data / "rec.txt"
         r = self.bash("cd app && npm install left-pad", PLANKA_STUB_RECORD=str(rec))
-        out = json.loads(r.stdout)["hookSpecificOutput"]
+        out = output(r)["hookSpecificOutput"]
         reason = out["permissionDecisionReason"]
         self.assertEqual(out["permissionDecision"], "deny")
         self.assertTrue(reason.startswith("planka: "))
@@ -258,7 +259,11 @@ class BashTest(unittest.TestCase):
         self.assertIn(str(self.env.root / "rules" / "dependencies.md"), reason)
         self.assertFalse(rec.exists())
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "deny-dep")
-        self.assertEqual(self.env.log_lines()[-1]["content"], "cd app && npm install left-pad")
+        last = self.env.log_lines()[-1]
+        command = "cd app && npm install left-pad"
+        self.assertNotIn("content", last)
+        self.assertEqual(last["content_len"], len(command))
+        self.assertEqual(last["content_sha256"], hashlib.sha256(command.encode("utf-8")).hexdigest())
 
     def test_marker_passes(self):
         r = self.bash("PLANKA_DEP_OK=1 npm install left-pad")
@@ -273,7 +278,7 @@ class BashTest(unittest.TestCase):
     def test_no_budget_for_dependency_denies(self):
         for _ in range(4):
             r = self.bash("npm install left-pad")
-            self.assertIn("deny", r.stdout)
+            self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_missing_or_non_string_command_passes(self):
         for ti in ({}, {"command": None}, {"command": 5}):
@@ -314,8 +319,8 @@ class PlanRubricTest(unittest.TestCase):
         r = self.env.run("judge_tool.py", hook_input(
             "PreToolUse", tool_name="ExitPlanMode", tool_input={}, transcript_path=self.with_plan(PLAN_CLEAN)))
         self.assertEqual(r.returncode, 0)
-        self.assertEqual(r.stdout, "")
-        self.assertIn("planka:", r.stderr)
+        self.assertIsNone(output(r))
+        self.assertIn("planka:", "\n".join(messages(r)))
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
 
 
