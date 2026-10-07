@@ -21,6 +21,11 @@ class CommentLinesTest(unittest.TestCase):
         self.assertEqual(comments.comment_lines(src, "py"),
                          ["# note", '"""Doc line."""', "# tail"])
 
+    def test_shell_hash_expansions_are_code(self):
+        src = "echo $#\necho ${#a[@]}\necho $# # c\n"
+        for ext in ("sh", "bash", "zsh"):
+            self.assertEqual(comments.comment_lines(src, ext), ["# c"])
+
     def test_sql_and_html(self):
         self.assertEqual(comments.comment_lines("select 1 -- c\n", "sql"), ["-- c"])
         self.assertEqual(comments.comment_lines("<a>\n<!-- hidden -->\n", "html"), ["<!-- hidden -->"])

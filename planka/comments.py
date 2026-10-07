@@ -43,7 +43,7 @@ def comment_lines(text, ext):
                 if "*/" not in probe[j:]:
                     in_block = "*/"
         elif ext in _HASH:
-            i = probe.find("#")
+            i = _hash_start(probe)
             if i >= 0 and not line.startswith("#!"):
                 out.append(line[i:])
             if ext in _DOCSTRING:
@@ -65,6 +65,16 @@ def comment_lines(text, ext):
                 if "-->" not in probe[i:]:
                     in_block = "-->"
     return out
+
+
+def _hash_start(probe):
+    # Индекс «#», начинающего комментарий; «#» сразу после «$» или «{» ($#, ${#a[@]}) — код.
+    i = probe.find("#")
+    while i >= 0:
+        if i == 0 or probe[i - 1] not in "${":
+            return i
+        i = probe.find("#", i + 1)
+    return -1
 
 
 def _ext(relpath):
