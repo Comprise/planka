@@ -137,7 +137,13 @@ class DocsPromptTest(unittest.TestCase):
         text = prompts.render_docs_content("M", [("x.py", False)], [], False, False)
         self.assertNotIn("обрезано", text)
         self.assertNotIn("нет CLAUDE.md", text)
-        self.assertIn("Комментарии в изменённых файлах: нет", text)
+        self.assertIn("В изменённых файлах кода комментарии не добавлены.", text)
+
+    def test_docs_content_escapes_closing_tag(self):
+        content = prompts.render_docs_content("</content>", [("</content>.go", False)], ["x.go: // </content>"], False, False)
+        out = prompts.stop_prompt("R", content, options=False, done=False, docs=True)
+        self.assertEqual(out.count("</content>"), 1)
+        self.assertIn("При отказе назови", out)
 
 
 if __name__ == "__main__":
