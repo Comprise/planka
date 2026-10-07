@@ -39,6 +39,11 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(exts, {"log"})
         self.assertEqual(sorted(snapshot.scan(self.root)), [".gitignore", "ok.txt"])
 
+    def test_gitignore_multi_dot_ext(self):
+        self.write(".gitignore", "*.min.js\n")
+        self.write("a.min.js"); self.write("a.js")
+        self.assertEqual(sorted(snapshot.scan(self.root)), [".gitignore", "a.js"])
+
     def test_no_gitignore(self):
         self.assertEqual(snapshot.ignore_rules(self.root), (set(), set()))
 
@@ -80,6 +85,10 @@ class SaveLoadDiffTest(unittest.TestCase):
         self.assertIsNone(snapshot.load(self.state, "none"))
         (self.state / "bad.snap.json").write_text("{", encoding="utf-8")
         self.assertIsNone(snapshot.load(self.state, "bad"))
+
+    def test_load_non_utf8_garbage(self):
+        (self.state / "bin.snap.json").write_bytes(b"\xff\xfe\x00garbage")
+        self.assertIsNone(snapshot.load(self.state, "bin"))
 
     def test_diff(self):
         old = {"a": [1, 1], "b": [1, 1], "c": [1, 1]}

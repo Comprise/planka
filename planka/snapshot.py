@@ -37,7 +37,7 @@ def scan(root):
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in skip and not os.path.islink(os.path.join(dirpath, d))]
         for name in filenames:
-            if name in names or (exts and name.rsplit(".", 1)[-1] in exts and "." in name):
+            if name in names or any(name.endswith("." + e) for e in exts):
                 continue
             full = os.path.join(dirpath, name)
             try:
@@ -73,7 +73,8 @@ def load(state_dir, session_id):
     path = state_dir / f"{_safe(session_id)}.snap.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    # ValueError покрывает JSONDecodeError и UnicodeDecodeError.
+    except (OSError, ValueError):
         return None
     if not isinstance(data, dict) or not isinstance(data.get("files"), dict):
         return None
