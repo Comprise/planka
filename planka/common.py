@@ -235,7 +235,7 @@ def deny_budget_exhausted(session_id, prompt_id, hook):
     before = int(state.get(key, 0))
     state[key] = before + 1
     _atomic_write_json(path, state)
-    _prune_state(state_dir)
+    prune_state(state_dir)
     return before >= MAX_DENIES
 
 
@@ -276,8 +276,8 @@ def warn_once(session_id, key, msg):
     return True
 
 
-def _prune_state(state_dir):
-    """Удаляет счётчики сессий, не менявшиеся дольше STATE_TTL."""
+def prune_state(state_dir):
+    """Удаляет файлы состояния — счётчики, снимки, предупреждения — старше STATE_TTL."""
     cutoff = time.time() - STATE_TTL
     for p in state_dir.glob("*.json"):
         try:

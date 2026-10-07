@@ -240,6 +240,18 @@ class DenyBudgetTest(unittest.TestCase):
         self.assertTrue(fresh.exists())
         self.assertTrue((state / "s.json").exists())
 
+    def test_prune_state_covers_all_suffixes(self):
+        state = self.env.data / "state"
+        state.mkdir()
+        old = time.time() - 8 * 86400
+        for name in ("x.json", "y.snap.json", "z.warned.json"):
+            p = state / name
+            p.write_text("{}", encoding="utf-8")
+            os.utime(p, (old, old))
+        (state / "fresh.snap.json").write_text("{}", encoding="utf-8")
+        common.prune_state(state)
+        self.assertEqual([p.name for p in state.iterdir()], ["fresh.snap.json"])
+
     def test_session_id_is_sanitized(self):
         common.deny_budget_exhausted("../../x/y", "p", "tool")
         common.deny_budget_exhausted("", "p", "tool")

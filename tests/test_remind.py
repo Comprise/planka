@@ -1,4 +1,6 @@
 import json
+import os
+import time
 import unittest
 
 from tests.helpers import Env, hook_input
@@ -104,6 +106,28 @@ class RemindTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("# Философия работы", r.stdout)
         self.assertNotIn("внутренняя ошибка", r.stderr)
+
+    def test_both_labels_when_state_unwritable(self):
+        (self.env.data / "state").write_text("файл вместо каталога", encoding="utf-8")
+        r = self.prompt()
+        self.assertIn("снимок дерева не записан:", r.stderr)
+        self.assertIn("предупреждение о языке не записано:", r.stderr)
+
+    def test_bad_test_limit_only_snapshot_label(self):
+        r = self.prompt(PLANKA_TEST_MAX_FILES="не число")
+        self.assertIn("снимок дерева не записан:", r.stderr)
+        self.assertNotIn("предупреждение о языке не записано", r.stderr)
+
+    def test_snapshot_prunes_stale_state(self):
+        state = self.env.data / "state"
+        state.mkdir()
+        stale = state / "old.snap.json"
+        stale.write_text("{}", encoding="utf-8")
+        week_ago = time.time() - 8 * 86400
+        os.utime(stale, (week_ago, week_ago))
+        self.prompt()
+        self.assertFalse(stale.exists())
+        self.assertTrue((state / "sess-1.snap.json").exists())
 
 
 if __name__ == "__main__":

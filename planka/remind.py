@@ -12,7 +12,7 @@ def take_snapshot(session, prompt_id, root):
         return
     test_limit = os.environ.get("PLANKA_TEST_MAX_FILES")
     if test_limit:
-        # Тестовый крючок: порог снимка уменьшается, чтобы проверить ветку отказа.
+        # PLANKA_TEST_MAX_FILES задаёт порог снимка; тестовый крючок.
         snapshot.MAX_FILES = int(test_limit)
     files = snapshot.scan(root)
     if files is None:
@@ -22,6 +22,7 @@ def take_snapshot(session, prompt_id, root):
     state_dir = common.data_dir() / "state"
     state_dir.mkdir(exist_ok=True)
     snapshot.save(state_dir, session, prompt_id, root, files)
+    common.prune_state(state_dir)
 
 
 def main():
@@ -38,18 +39,21 @@ def main():
     root = None
     if isinstance(cwd, str) and cwd:
         root = common.project_root(cwd)
-        # Строка об отсутствии документации считается вне защищённого блока: напоминание не зависит от снимка.
+        # Строка об отсутствии документации считается вне защищённого блока.
         if not (root / "CLAUDE.md").exists():
             text += "\n\n" + NO_DOCS_LINE
     try:
-        # Снимок снимается до emit: он фиксирует дерево до работы агента. Сбой не отменяет напоминание.
+        # Снимок снимается до emit и фиксирует дерево до работы агента.
         take_snapshot(session, data.get("prompt_id", ""), root)
+    except Exception as e:
+        common.warn(f"снимок дерева не записан: {e!r}")
+    try:
         s = common.settings()
         if not (s["comment_lang"] and s["doc_lang"]):
             common.warn_once(session, "lang",
                              "задайте comment_lang и doc_lang: claude plugin configure planka@<маркетплейс> --values-stdin; id — в claude plugin list")
     except Exception as e:
-        common.warn(f"снимок дерева не записан: {e!r}")
+        common.warn(f"предупреждение о языке не записано: {e!r}")
     common.emit(common.context_output(text))
 
 
