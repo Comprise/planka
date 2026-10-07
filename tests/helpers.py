@@ -8,7 +8,7 @@ import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 STUB_DIR = REPO / "tests" / "stub"
-PLANKA_DIR = REPO / "planka"
+PLANKA_DIR = REPO / "plugin" / "planka"
 
 PHILOSOPHY = """# Философия работы
 
@@ -64,7 +64,8 @@ class Env:
                 (self.root / "rules" / f"{name}.md").write_text(text, encoding="utf-8")
 
     def environ(self, **extra):
-        env = {k: v for k, v in os.environ.items() if not k.startswith(("PLANKA_", "CLAUDE_PLUGIN_OPTION_"))}
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("PLANKA_", "CLAUDE_PLUGIN_OPTION_")) and k != "CLAUDE_PROJECT_DIR"}
         env.update({
             "CLAUDE_PLUGIN_ROOT": str(self.root),
             "CLAUDE_PLUGIN_DATA": str(self.data),
@@ -75,7 +76,7 @@ class Env:
         return env
 
     def run(self, script, hook_input, **extra):
-        """Запускает planka/<script> как хук: stdin — JSON, возвращает CompletedProcess."""
+        """Запускает plugin/planka/<script> как хук: stdin — JSON, возвращает CompletedProcess."""
         stdin = hook_input if isinstance(hook_input, str) else json.dumps(hook_input)
         return subprocess.run(
             [sys.executable, str(PLANKA_DIR / script)],

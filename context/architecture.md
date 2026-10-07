@@ -1,0 +1,101 @@
+# Архитектура
+
+planka — плагин Claude Code уровня пользователя: три хука из `hooks/hooks.json` подмешивают
+правила из `philosophy.md` и `rules/*.md` в контекст агента и отклоняют его действия через
+вложенного судью-модель или детерминированные проверки. Пользовательское описание поведения —
+`README.md`, разделы «Как это работает» и «Известные ограничения».
+
+Плагин — каталог `plugin/`: маркетплейс отдаёт пользователям только его (`"source": "./plugin"` в
+`.claude-plugin/marketplace.json`). Пути ниже, кроме `.claude-plugin/marketplace.json`, — от
+`plugin/`, он же `CLAUDE_PLUGIN_ROOT` хуков.
+
+## Компоненты
+
+| Файл | Роль |
+| --- | --- |
+| `hooks/hooks.json` | регистрация хуков: `UserPromptSubmit` → `remind.py`, `PreToolUse` на `AskUserQuestion\|ExitPlanMode\|Bash` → `judge_tool.py`, `Stop` → `judge_stop.py` |
+| `planka/remind.py` | `philosophy.md` целиком как `additionalContext`; снимок дерева; строка об отсутствии `CLAUDE.md`; предупреждение о незаданных языках |
+| `planka/judge_tool.py` | судья вопроса (`judge_question`), плана (`judge_plan`), отказ на добавление пакета (`judge_bash`) |
+| `planka/judge_stop.py` | фильтры «варианты», «готово», «документация» по последнему сообщению и изменениям со снимка; один вызов судьи |
+| `planka/common.py` | барьер, чтение входа, рубрика, `run_judge`, лимит отказов, журнал, классы путей, формат ответа (`run_hook`) |
+| `planka/prompts.py` | системный промпт, схема ответа `JUDGE_SCHEMA`, вопросы судье по видам проверки, сборка содержимого |
+| `planka/planparse.py` | разбор плана на волны и задачи, владение файлами (`shared_files`) |
+| `planka/depcheck.py` | разбор команды Bash: добавляет ли она пакет (`dependency_add`), маркер `DEP_OK_MARKER` |
+| `planka/snapshot.py` | снимок дерева `{путь: [size, mtime_ns]}`: в git — файлы, которые git не игнорирует, с файлами подмодулей; вне git — обход с упрощённым `.gitignore`; порог `MAX_FILES` |
+| `planka/comments.py` | строки комментариев изменённых файлов для судьи документации (`extract`) |
+| `philosophy.md` | ядро правил; индекс «Модули» в конце |
+| `rules/*.md` | модули правил, по файлу на область |
+| `.claude-plugin/plugin.json` | манифест и `userConfig`: `judge_model`, `comment_lang`, `doc_lang` |
+| `.claude-plugin/marketplace.json` | маркетплейс `planka` в корне репозитория, источник плагина — `./plugin` |
+
+## Контракт кода с текстами правил
+
+Код ищет тексты правил по именам; переименование ломает хук без ошибки теста — хук пропускает
+проверку с предупреждением.
+
+- Разделы ядра берутся по заголовку `## <имя>` (`common.philosophy_sections`): `Решения` —
+  рубрика вопроса, плана и фильтра «варианты»; `Планы` — рубрика плана.
+- Модули берутся по имени файла (`common.rule_texts`): `planning`, `subagents` — план;
+  `verification` — фильтр «готово»; `docs`, `comments` — фильтр «документация».
+  `rules/dependencies.md` называет причина отказа `judge_tool.DEP_REASON`.
+- Метки `{RULES}`, `{COMMENT_LANG}`, `{DOC_LANG}` заменяет `common.substitute` при каждом чтении:
+  путь к `rules/` плагина и значения настроек; незаданный язык — `UNSET_LANG`. Ссылка на модуль из
+  ядра и модулей пишется как `{RULES}/<имя>.md`, строка `remind.NO_DOCS_LINE` — так же: агент
+  получает абсолютный путь к правилам плагина, а `rules/` проекта с ним не путается.
+
+## Ответ хука
+
+Все хуки запускаются через `common.run_hook`: stdout — один JSON (ответ из `common.emit` плюс
+`systemMessage` из `common.warn`) или пусто; stderr не пишется; исключение превращается в
+предупреждение «внутренняя ошибка». Причина отказа начинается с `planka: `. Отказ `PreToolUse` —
+`common.deny_output`, отказ `Stop` — `common.block_output`. Ответ запоминается до записи журнала:
+сбой записи не отменяет отказ. Сбой записи счётчика отказов (`common.deny_budget_exhausted`) —
+пропуск проверки: без счётчика нечем остановить цикл отказов.
+
+## Судья
+
+`common.run_judge` запускает `claude` с `JUDGE_FLAGS` (`-p`, `--setting-sources ""`,
+`--tools ""` и др.), схемой `JUDGE_SCHEMA` и моделью из `CLAUDE_PLUGIN_OPTION_JUDGE_MODEL`
+(по умолчанию `sonnet`), в отдельной группе процессов, с `cwd` в каталоге данных и окружением
+`PLANKA_JUDGE=1`. Каждый хук первым делом проверяет `common.barrier_active` и внутри судьи не
+работает. Любая ошибка судьи — `Verdict` с `error`, хук пропускает проверку с предупреждением.
+Проверяемое содержимое идёт судье блоком `<content>…</content>` (`prompts._wrap`); закрывающий тег
+внутри содержимого — в любом регистре и с пробелами (`prompts._CLOSING_TAG`) — экранируется.
+
+Таймаут — `JUDGE_TIMEOUT` (60 с); таймаут хука в `hooks/hooks.json` — 90 с у `PreToolUse` и 120 с у
+`Stop`: у `Stop` до судьи ещё `git rev-parse` (до 5 с) и два вызова `git` в `comments` (до 10 с каждый).
+
+Лимит отказов: `MAX_DENIES` = 2 на ключ `<prompt_id>:<hook>` (`common.deny_budget_exhausted`);
+отказ `judge_bash` лимитом не ограничен.
+
+## Состояние и журнал
+
+Каталог данных — `$CLAUDE_PLUGIN_DATA`, без него `.data/` в корне плагина (`common.data_dir`).
+
+- `state/<session>.json` — счётчики отказов; `state/<session>.warned.json` — выданные
+  однократные предупреждения; `state/<session>.snap.json` — снимок дерева текущей реплики.
+  Имя — `common._safe_name`. Запись атомарная (`common._atomic_write_json`, `snapshot.save`).
+  Файлы старше `STATE_TTL` (7 дней) удаляет `common.prune_state`.
+- `judge.log` — строка JSON на решение хука, только метаданные: содержимое — длиной и SHA-256
+  (`common.log_event`). От `LOG_MAX_BYTES` (1 МиБ) переименовывается в `judge.log.1`; ротация
+  и запись под `fcntl.flock` на `judge.log.lock`.
+
+Снимок в git-репозитории — `git ls-files -co --exclude-standard` (`snapshot._git_paths`). Файлы
+подмодуля добавляются отдельным вызовом в его каталоге: `ls-files --recurse-submodules` вместе с
+`-o` git не поддерживает («unsupported mode»). Подмодуль без своего `.git` — неинициализированный,
+пустой каталог — не обходится: git в нём отвечает за родительский репозиторий, и обход зациклился бы.
+
+Снимок связывает `UserPromptSubmit` и `Stop`: `judge_stop.changed_this_turn` сравнивает его с
+текущим деревом, только если совпали `prompt_id` и корень проекта. Корень (`common.project_root`)
+— вершина git для `CLAUDE_PROJECT_DIR`, без неё — для `cwd` входа хука; `cwd` меняется после `cd`
+агента, `CLAUDE_PROJECT_DIR` — нет.
+
+Класс изменённого файла (`common.path_kind`): расширение из `CODE_EXTS` или имя из `CODE_NAMES` —
+код в любом каталоге; затем документация по `common.is_doc_path`; иначе прочее. Каждое
+расширение с синтаксисом комментариев в `comments.py` входит в `CODE_EXTS` (тест
+`test_code_exts_cover_comment_families`).
+
+## Платформы
+
+Только POSIX: `common` импортирует `fcntl`, `run_judge` использует `os.killpg` и
+`start_new_session`. Зависимостей вне стандартной библиотеки Python нет.

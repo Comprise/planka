@@ -89,6 +89,13 @@ class StopHookTest(unittest.TestCase):
         self.assertIn("planka:", "\n".join(messages(r)))
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
 
+    def test_block_survives_log_failure(self):
+        (self.env.data / "judge.log").mkdir()
+        r = self.stop(OPTIONS_MSG, PLANKA_STUB="deny")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(output(r)["decision"], "block")
+        self.assertTrue(any("внутренняя ошибка" in m for m in messages(r)))
+
     def test_unusable_data_dir_passes_without_block(self):
         blocker = self.env.data / "file"
         blocker.write_text("", encoding="utf-8")
@@ -255,6 +262,20 @@ class DocsFilterTest(unittest.TestCase):
         rec = self.env.data / "rec.txt"
         r = self.env.run("judge_stop.py", data, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         self.assertEqual(r.stdout, "", r.stderr)
+        self.assertEqual(self.env.log_lines()[-1]["filters"], ["docs"])
+
+    def test_cd_into_subdir_keeps_project_root(self):
+        project_dir = str(self.project)
+        r = self.env.run("remind.py", hook_input("UserPromptSubmit", prompt="x", cwd=str(self.project / "pkg")),
+                         CLAUDE_PROJECT_DIR=project_dir)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        (self.project / "a.py").write_text("x = 1\n", encoding="utf-8")
+        rec = self.env.data / "rec.txt"
+        r = self.env.run("judge_stop.py", hook_input(
+            "Stop", last_assistant_message="Поправил.", stop_hook_active=False, cwd=str(self.project / "pkg")),
+            CLAUDE_PROJECT_DIR=project_dir, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertIn("- a.py — код", rec.read_text(encoding="utf-8"))
         self.assertEqual(self.env.log_lines()[-1]["filters"], ["docs"])
 
     def test_docs_only_change_no_trigger(self):

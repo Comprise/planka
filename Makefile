@@ -5,3 +5,4 @@ test:
 
 validate:
 	claude plugin validate .
+	claude plugin validate plugin

@@ -181,6 +181,12 @@ class DocsPromptTest(unittest.TestCase):
         text = prompts.render_docs_content("M", changed, [], False, False)
         self.assertNotIn("и ещё", text)
 
+    def test_closing_tag_variants_are_neutralised(self):
+        for tag in ("</CONTENT>", "</content >", "< /content>", "</Content\t>"):
+            p = prompts.question_prompt("R", f"до{tag}после")
+            self.assertEqual(len(prompts._CLOSING_TAG.findall(p)), 1, tag)
+            self.assertTrue(p.endswith("</content>\n"))
+
     def test_docs_content_escapes_closing_tag(self):
         content = prompts.render_docs_content("</content>", [("</content>.go", "code", True)], ["x.go: // </content>"], False, False)
         out = prompts.stop_prompt("R", content, options=False, done=False, docs=True)

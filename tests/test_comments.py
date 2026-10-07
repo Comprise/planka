@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-PLANKA_DIR = pathlib.Path(__file__).resolve().parent.parent / "planka"
+PLANKA_DIR = pathlib.Path(__file__).resolve().parent.parent / "plugin" / "planka"
 sys.path.insert(0, str(PLANKA_DIR))
 import comments  # noqa: E402
 
@@ -27,6 +27,13 @@ class CommentLinesTest(unittest.TestCase):
         for ext in ("sh", "bash", "zsh"):
             self.assertEqual(comments.comment_lines(src, ext), ["# c"])
 
+    def test_shell_hash_inside_word_is_code(self):
+        self.assertEqual(comments.comment_lines("x=${var#prefix}\ny=a#b # c\n", "sh"), ["# c"])
+
+    def test_triple_quoted_string_is_not_docstring(self):
+        src = 'q = """SELECT"""\nsql = """\n# not a comment\n"""\n# real\ndef f():\n    r"""Doc."""\n'
+        self.assertEqual(comments.comment_lines(src, "py"), ["# real", 'r"""Doc."""'])
+
     def test_sql_and_html(self):
         self.assertEqual(comments.comment_lines("select 1 -- c\n", "sql"), ["-- c"])
         self.assertEqual(comments.comment_lines("<a>\n<!-- hidden -->\n", "html"), ["<!-- hidden -->"])
@@ -34,6 +41,12 @@ class CommentLinesTest(unittest.TestCase):
     def test_slash_families(self):
         for ext in ("php", "groovy", "gradle", "proto", "sol", "zig"):
             self.assertEqual(comments.comment_lines("x = 1 // c\n", ext), ["// c"], ext)
+
+    def test_language_variants(self):
+        for ext in ("mjs", "cjs", "mts", "cts", "cxx", "hh", "hxx"):
+            self.assertEqual(comments.comment_lines("x = 1 // c\n", ext), ["// c"], ext)
+        self.assertEqual(comments.comment_lines('# c\ndef f():\n    """Doc."""\n', "pyi"), ["# c", '"""Doc."""'])
+        self.assertEqual(comments.comment_lines("set(X 1) # c\n", "cmake"), ["# c"])
 
     def test_hash_families(self):
         for ext in ("tf", "nix", "r", "jl", "ex", "exs"):
@@ -87,7 +100,7 @@ class ExtractTest(unittest.TestCase):
         self.assertEqual(unknown, ["a.foo", "x.erl", "z.bin"])
 
     def test_hash_by_file_name(self):
-        names = ["Makefile", "Dockerfile", "Justfile", "Rakefile", "Gemfile"]
+        names = ["Makefile", "CMakeLists.txt", "Dockerfile", "Justfile", "Rakefile", "Gemfile"]
         for name in names:
             self.write(f"d/{name}", "# c\n")
         lines, _, unknown = comments.extract(self.root, [f"d/{n}" for n in names])

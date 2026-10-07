@@ -10,7 +10,7 @@
     {
       "name": "planka",
       "description": "Философия работы: напоминание на каждом ходе и судья в точках выбора",
-      "source": "./",
+      "source": "./plugin",
       "category": "productivity"
     }
   ]
