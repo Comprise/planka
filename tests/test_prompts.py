@@ -75,5 +75,30 @@ class RenderQuestionsTest(unittest.TestCase):
         self.assertEqual(prompts.render_questions({}), "")
 
 
+class DonePromptTest(unittest.TestCase):
+    def test_done_prompt(self):
+        p = prompts.done_prompt("РУБРИКА", "СОДЕРЖИМОЕ")
+        self.assertIn("РУБРИКА", p)
+        self.assertIn("<content>\nСОДЕРЖИМОЕ\n</content>", p)
+        for needle in ["команда-доказательство", "CI-конфиг", "не проверено",
+                       "исходный падающий сценарий", "из вывода команды", "готов обсудить"]:
+            self.assertIn(needle, p)
+
+    def test_stop_prompt_combines(self):
+        p = prompts.stop_prompt("R", "C", options=True, done=True)
+        self.assertIn("самый правильный", p)
+        self.assertIn("команда-доказательство", p)
+        self.assertLess(p.index("самый правильный"), p.index("команда-доказательство"))
+        self.assertEqual(p.count("<content>"), 1)
+
+    def test_stop_prompt_single(self):
+        self.assertNotIn("команда-доказательство", prompts.stop_prompt("R", "C", options=True, done=False))
+        self.assertNotIn("самый правильный", prompts.stop_prompt("R", "C", options=False, done=True))
+
+    def test_stop_prompt_requires_a_filter(self):
+        with self.assertRaises(ValueError):
+            prompts.stop_prompt("R", "C", options=False, done=False)
+
+
 if __name__ == "__main__":
     unittest.main()
