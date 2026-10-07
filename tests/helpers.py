@@ -33,12 +33,15 @@ PHILOSOPHY = """# Философия работы
 ## Модули
 
 Каталог: {RULES}
+Язык комментариев: {COMMENT_LANG}; язык документации: {DOC_LANG}.
 """
 
 RULES = {
     "verification": "# Доказательство\n\n- Правило проверки.\n",
     "planning": "# Планирование\n\n- Правило планирования.\n",
     "subagents": "# Субагенты\n\n- Правило субагентов.\n",
+    "docs": "# Документация\n\n## Что сверяется с каждой правкой кода\n\n1. Правило документации.\n\n## Инициализация проекта без документации\n\n1. Правило инициализации.\n",
+    "comments": "# Комментарии\n\n- Язык: {COMMENT_LANG}.\n",
 }
 
 
@@ -51,6 +54,8 @@ class Env:
         self.data = pathlib.Path(self.tmp.name) / "data"
         self.root.mkdir()
         self.data.mkdir()
+        self.project = pathlib.Path(self.tmp.name) / "project"
+        self.project.mkdir()
         if philosophy is not None:
             (self.root / "philosophy.md").write_text(philosophy, encoding="utf-8")
         if rules is not None:
@@ -59,7 +64,7 @@ class Env:
                 (self.root / "rules" / f"{name}.md").write_text(text, encoding="utf-8")
 
     def environ(self, **extra):
-        env = {k: v for k, v in os.environ.items() if not k.startswith("PLANKA_")}
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("PLANKA_", "CLAUDE_PLUGIN_OPTION_"))}
         env.update({
             "CLAUDE_PLUGIN_ROOT": str(self.root),
             "CLAUDE_PLUGIN_DATA": str(self.data),
