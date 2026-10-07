@@ -156,7 +156,7 @@ class FenceTest(unittest.TestCase):
         self.assertEqual([(t.number, t.files) for t in planparse.parse_plan(plan)], [(1, ["a.py"])])
 
     def test_repo_plan_is_disjoint(self):
-        text = (REPO / "docs" / "superpowers" / "plans" / "2026-09-30-planka.md").read_text(encoding="utf-8")
+        text = (REPO / "tests" / "fixtures" / "plan-waves.md").read_text(encoding="utf-8")
         self.assertEqual(planparse.shared_files(planparse.parse_plan(text)), [])
 
 

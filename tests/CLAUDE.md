@@ -9,7 +9,7 @@ unittest плагина; запуск — `make test` из корня.
 - Настоящий `claude` не вызывается: `tests/stub` первый в `PATH`, ответ задаёт `PLANKA_STUB`.
 - Тест не зависит от окружения сессии, в которой запущен: `Env.environ` вычищает `PLANKA_*`,
   `CLAUDE_PLUGIN_OPTION_*` и `CLAUDE_PROJECT_DIR`; новая переменная, которую читает код, — туда же.
-- `../docs/superpowers/plans/2026-09-30-planka.md` — фикстура `test_planparse`.
+- `fixtures/` — входные данные тестов: `fixtures/plan-waves.md` — план с волнами для `test_planparse`.
 
 ## Читать перед правкой
 

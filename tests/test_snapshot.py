@@ -1,6 +1,8 @@
 import json
 import os
 import pathlib
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -28,7 +30,7 @@ class ScanTest(unittest.TestCase):
         self.write("a.py"); self.write("pkg/b.go"); self.write(".git/HEAD"); self.write("node_modules/x.js")
         self.write("build/out"); self.write(".superpowers/x")
         files = snapshot.scan(self.root)
-        self.assertEqual(sorted(files), ["a.py", "pkg/b.go"])
+        self.assertEqual(sorted(files), [".superpowers/x", "a.py", "pkg/b.go"])
         self.assertEqual(len(files["a.py"]), 2)
 
     def test_gitignore_names_and_exts(self):
@@ -77,6 +79,71 @@ class ScanTest(unittest.TestCase):
             self.assertIsNone(snapshot.scan(self.root))
         finally:
             snapshot.MAX_FILES = old
+
+
+@unittest.skipUnless(shutil.which("git"), "нет git")
+class GitScanTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, rel, text="x"):
+        p = self.root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+
+    def test_git_rules_are_exact(self):
+        self.write(".gitignore", "*.log\n!keep.log\nbuild-*/\n")
+        self.write("a.log"); self.write("keep.log"); self.write("build-x/out"); self.write("src/a.py")
+        self.write(".git/info/exclude", "local/\n"); self.write("local/x")
+        self.write(".superpowers/x")
+        self.assertEqual(sorted(snapshot.scan(self.root)), [".gitignore", ".superpowers/x", "keep.log", "src/a.py"])
+
+    def test_tracked_and_untracked_with_odd_names(self):
+        self.write("dir/a b.py"); self.write("кириллица.go")
+        subprocess.run(["git", "-C", str(self.root), "add", "dir/a b.py"], check=True)
+        self.assertEqual(sorted(snapshot.scan(self.root)), ["dir/a b.py", "кириллица.go"])
+
+    def test_deleted_tracked_file_absent(self):
+        self.write("gone.py")
+        subprocess.run(["git", "-C", str(self.root), "add", "gone.py"], check=True)
+        (self.root / "gone.py").unlink()
+        self.assertEqual(snapshot.scan(self.root), {})
+
+    def test_too_many_files_is_none(self):
+        old = snapshot.MAX_FILES
+        snapshot.MAX_FILES = 2
+        try:
+            self.write("a"); self.write("b"); self.write("c")
+            self.assertIsNone(snapshot.scan(self.root))
+        finally:
+            snapshot.MAX_FILES = old
+
+    def test_submodule_files_included(self):
+        lib = pathlib.Path(self.tmp.name + "-lib")
+        subprocess.run(["git", "init", "-q", str(lib)], check=True)
+        try:
+            (lib / "f.py").write_text("x", encoding="utf-8")
+            git = ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-c", "protocol.file.allow=always"]
+            subprocess.run([*git, "-C", str(lib), "add", "f.py"], check=True)
+            subprocess.run([*git, "-C", str(lib), "commit", "-qm", "i"], check=True)
+            subprocess.run([*git, "-C", str(self.root), "submodule", "add", "-q", str(lib), "sub"],
+                           check=True, capture_output=True)
+            (self.root / "sub" / "new.py").write_text("y", encoding="utf-8")
+            self.assertEqual(sorted(snapshot.scan(self.root)), [".gitmodules", "sub/f.py", "sub/new.py"])
+            subprocess.run([*git, "-C", str(self.root), "commit", "-qm", "s"], check=True)
+            clone = pathlib.Path(self.tmp.name + "-clone")
+            subprocess.run([*git, "clone", "-q", str(self.root), str(clone)], check=True, capture_output=True)
+            try:
+                self.assertEqual(sorted(snapshot.scan(clone)), [".gitmodules"])
+            finally:
+                shutil.rmtree(clone)
+        finally:
+            shutil.rmtree(lib)
 
 
 class SaveLoadDiffTest(unittest.TestCase):

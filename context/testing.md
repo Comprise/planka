@@ -10,6 +10,8 @@ CI нет; обе цели — в `Makefile`.
 ## Устройство тестов
 
 - Модульные тесты импортируют `planka/<модуль>.py` напрямую через `sys.path`.
+- Входные данные тестов — `tests/fixtures/`: `plan-waves.md` — план с волнами для `test_planparse`.
+- Тесты снимка в режиме git (`GitScanTest`) создают временный репозиторий и пропускаются без `git`.
 - Тесты хуков запускают скрипт подпроцессом: `tests.helpers.Env` создаёт временные
   `CLAUDE_PLUGIN_ROOT` (свои `philosophy.md` и `rules/` из `helpers.PHILOSOPHY` и
   `helpers.RULES`), `CLAUDE_PLUGIN_DATA` и каталог проекта; `Env.run` подаёт вход хука в stdin.

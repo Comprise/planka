@@ -36,7 +36,6 @@
 | `plugin/.claude-plugin/plugin.json` | манифест плагина |
 | `.claude-plugin/marketplace.json` | манифест маркетплейса |
 | `tests/` | unittest и заглушка `claude` |
-| `docs/superpowers/` | спеки и планы разработки |
 | `context/` | документация для агента |
 
 ## Документы `context/`

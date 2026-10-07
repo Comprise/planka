@@ -2,10 +2,12 @@
 import json
 import os
 import pathlib
+import subprocess
 import tempfile
 
+# Каталоги, которые обход вне git пропускает всегда.
 IGNORED_DIRS = frozenset({".git", "node_modules", "__pycache__", ".venv", "venv", "target", "build",
-                          "dist", ".dart_tool", ".superpowers", ".audit", ".data", ".idea", ".vscode"})
+                          "dist", ".dart_tool", ".data", ".idea", ".vscode"})
 # Порог по умолчанию; MAX_FILES — рабочий порог.
 DEFAULT_MAX_FILES = 50_000
 MAX_FILES = DEFAULT_MAX_FILES
@@ -32,12 +34,64 @@ def ignore_rules(directory):
     return names, exts
 
 
+def _git_ls(root, *args):
+    """Записи `git ls-files -z <args>` в root; None вне git или при сбое."""
+    try:
+        proc = subprocess.run(["git", "-C", str(root), "ls-files", "-z", *args], capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return [os.fsdecode(e) for e in proc.stdout.split(b"\0") if e]
+
+
+def _git_paths(root):
+    """Пути файлов рабочего дерева, которые git не игнорирует (отслеживаемые и новые), включая файлы
+    подмодулей; None вне git.
+
+    Подмодуль — запись с режимом 160000 в `ls-files -s` — обходится отдельным вызовом; подмодуль без
+    своего `.git` не обходится.
+    """
+    paths = _git_ls(root, "-co", "--exclude-standard")
+    if paths is None:
+        return None
+    for entry in _git_ls(root, "-s") or []:
+        meta, _, sub = entry.partition("\t")
+        if meta.startswith("160000 "):
+            if sub in paths:
+                paths.remove(sub)
+            if os.path.exists(os.path.join(root, sub, ".git")):
+                paths += [f"{sub}/{p}" for p in _git_paths(os.path.join(root, sub)) or []]
+    return paths
+
+
+def _stat_files(root, relpaths):
+    files = {}
+    for rel in relpaths:
+        full = os.path.join(root, rel)
+        try:
+            st = os.lstat(full)
+        except OSError:
+            continue
+        if not os.path.isfile(full) or os.path.islink(full):
+            continue
+        files[rel] = [st.st_size, st.st_mtime_ns]
+        if len(files) > MAX_FILES:
+            return None
+    return files
+
+
 def scan(root):
     """{путь: [size, mtime_ns]} для файлов под root; None, если их больше MAX_FILES.
 
-    Правила каталога — правила родителя плюс его собственный .gitignore; действуют на его поддерево.
+    В git-репозитории — файлы, которые git не игнорирует: правила .gitignore, .git/info/exclude и
+    глобального excludes точные. Вне git — обход каталогов: правила каталога — правила родителя плюс
+    его собственный .gitignore, упрощённо по ignore_rules; действуют на его поддерево.
     """
     root = pathlib.Path(root)
+    paths = _git_paths(root)
+    if paths is not None:
+        return _stat_files(root, paths)
     rules_by_dir = {}
     files = {}
     for dirpath, dirnames, filenames in os.walk(root):

@@ -21,7 +21,7 @@ planka — плагин Claude Code уровня пользователя: тр�
 | `planka/prompts.py` | системный промпт, схема ответа `JUDGE_SCHEMA`, вопросы судье по видам проверки, сборка содержимого |
 | `planka/planparse.py` | разбор плана на волны и задачи, владение файлами (`shared_files`) |
 | `planka/depcheck.py` | разбор команды Bash: добавляет ли она пакет (`dependency_add`), маркер `DEP_OK_MARKER` |
-| `planka/snapshot.py` | снимок дерева `{путь: [size, mtime_ns]}`, `.gitignore` упрощённо, порог `MAX_FILES` |
+| `planka/snapshot.py` | снимок дерева `{путь: [size, mtime_ns]}`: в git — файлы, которые git не игнорирует, с файлами подмодулей; вне git — обход с упрощённым `.gitignore`; порог `MAX_FILES` |
 | `planka/comments.py` | строки комментариев изменённых файлов для судьи документации (`extract`) |
 | `philosophy.md` | ядро правил; индекс «Модули» в конце |
 | `rules/*.md` | модули правил, по файлу на область |
@@ -79,6 +79,11 @@ planka — плагин Claude Code уровня пользователя: тр�
 - `judge.log` — строка JSON на решение хука, только метаданные: содержимое — длиной и SHA-256
   (`common.log_event`). От `LOG_MAX_BYTES` (1 МиБ) переименовывается в `judge.log.1`; ротация
   и запись под `fcntl.flock` на `judge.log.lock`.
+
+Снимок в git-репозитории — `git ls-files -co --exclude-standard` (`snapshot._git_paths`). Файлы
+подмодуля добавляются отдельным вызовом в его каталоге: `ls-files --recurse-submodules` вместе с
+`-o` git не поддерживает («unsupported mode»). Подмодуль без своего `.git` — неинициализированный,
+пустой каталог — не обходится: git в нём отвечает за родительский репозиторий, и обход зациклился бы.
 
 Снимок связывает `UserPromptSubmit` и `Stop`: `judge_stop.changed_this_turn` сравнивает его с
 текущим деревом, только если совпали `prompt_id` и корень проекта. Корень (`common.project_root`)
