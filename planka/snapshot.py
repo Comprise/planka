@@ -6,16 +6,19 @@ import tempfile
 
 IGNORED_DIRS = frozenset({".git", "node_modules", "__pycache__", ".venv", "venv", "target", "build",
                           "dist", ".dart_tool", ".superpowers", ".audit", ".data", ".idea", ".vscode"})
-# Порог по умолчанию; MAX_FILES — рабочее значение, его подменяют тесты.
+# Порог по умолчанию; MAX_FILES — рабочий порог.
 DEFAULT_MAX_FILES = 50_000
 MAX_FILES = DEFAULT_MAX_FILES
 
 
-def ignore_rules(root):
-    """Записи корневого .gitignore: имена без подстановочных знаков и расширения из «*.ext»."""
+def ignore_rules(directory):
+    """Записи .gitignore каталога: имена без подстановочных знаков и расширения из «*.ext».
+
+    Ведущий «/» не привязывает имя к каталогу: имя совпадает на любой глубине под каталогом файла.
+    """
     names, exts = set(), set()
     try:
-        lines = (root / ".gitignore").read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = (directory / ".gitignore").read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return names, exts
     for line in lines:
@@ -30,11 +33,19 @@ def ignore_rules(root):
 
 
 def scan(root):
-    """{путь: [size, mtime_ns]} для файлов под root; None, если их больше MAX_FILES."""
-    names, exts = ignore_rules(root)
-    skip = IGNORED_DIRS | names
+    """{путь: [size, mtime_ns]} для файлов под root; None, если их больше MAX_FILES.
+
+    Правила каталога — правила родителя плюс его собственный .gitignore; действуют на его поддерево.
+    """
+    root = pathlib.Path(root)
+    rules_by_dir = {}
     files = {}
     for dirpath, dirnames, filenames in os.walk(root):
+        parent = rules_by_dir.get(os.path.dirname(dirpath), (set(), set()))
+        own = ignore_rules(pathlib.Path(dirpath))
+        names, exts = parent[0] | own[0], parent[1] | own[1]
+        rules_by_dir[dirpath] = (names, exts)
+        skip = IGNORED_DIRS | names
         dirnames[:] = [d for d in dirnames if d not in skip and not os.path.islink(os.path.join(dirpath, d))]
         for name in filenames:
             if name in names or any(name.endswith("." + e) for e in exts):
@@ -82,6 +93,6 @@ def load(state_dir, session_id):
 
 
 def diff(old, new):
-    changed = {p for p in old.keys() ^ new.keys()}
+    changed = old.keys() ^ new.keys()
     changed |= {p for p in old.keys() & new.keys() if old[p] != new[p]}
     return sorted(changed)

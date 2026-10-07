@@ -44,6 +44,23 @@ class ScanTest(unittest.TestCase):
         self.write("a.min.js"); self.write("a.js")
         self.assertEqual(sorted(snapshot.scan(self.root)), [".gitignore", "a.js"])
 
+    def test_nested_gitignore_anchored_name(self):
+        self.write("sub/.gitignore", "/cache\n")
+        self.write("sub/cache/x"); self.write("cache/y"); self.write("sub/other/z")
+        self.assertEqual(sorted(snapshot.scan(self.root)),
+                         ["cache/y", "sub/.gitignore", "sub/other/z"])
+
+    def test_nested_gitignore_ext_only_in_own_subtree(self):
+        self.write("sub/.gitignore", "*.log\n")
+        self.write("sub/a.log"); self.write("sub/deep/b.log"); self.write("a.log")
+        self.assertEqual(sorted(snapshot.scan(self.root)), ["a.log", "sub/.gitignore"])
+
+    def test_root_rules_inherited_into_subdirs(self):
+        self.write(".gitignore", "*.log\nsecrets\n")
+        self.write("sub/.gitignore", "/cache\n")
+        self.write("sub/a.log"); self.write("sub/secrets/k"); self.write("sub/cache/x"); self.write("sub/ok")
+        self.assertEqual(sorted(snapshot.scan(self.root)), [".gitignore", "sub/.gitignore", "sub/ok"])
+
     def test_no_gitignore(self):
         self.assertEqual(snapshot.ignore_rules(self.root), (set(), set()))
 
