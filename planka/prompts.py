@@ -1,5 +1,8 @@
 """Промпты судьи и схема его ответа. Рубрика приходит из philosophy.md, здесь её нет."""
 
+MAX_LISTED = 100
+_KIND_LABELS = {"code": "код", "doc": "документация", "other": "прочее"}
+
 JUDGE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -94,9 +97,12 @@ def render_questions(tool_input):
 
 
 def render_docs_content(message, changed, comments, truncated, no_claude_md, unknown=()):
-    """Сообщение с изменёнными файлами и комментариями для судьи документации."""
+    """Сообщение с изменёнными файлами (путь, класс, существует ли) и комментариями для судьи документации."""
     parts = [message, "", "Изменённые файлы за ход:"]
-    parts += [f"- {path} — {'документация' if is_doc else 'код'}" for path, is_doc in changed]
+    parts += [f"- {path} — {_KIND_LABELS[kind]}{'' if exists else ', удалён'}"
+              for path, kind, exists in changed[:MAX_LISTED]]
+    if len(changed) > MAX_LISTED:
+        parts.append(f"- … и ещё {len(changed) - MAX_LISTED}")
     if comments:
         parts += ["", "Комментарии в изменённых файлах:"] + [f"- {c}" for c in comments]
         if truncated:

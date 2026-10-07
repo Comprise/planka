@@ -27,7 +27,8 @@ def claims_done(text):
 
 
 def changed_this_turn(data):
-    """Корень проекта и пути, изменившиеся со снимка текущей реплики, с пометкой документации; None без снимка."""
+    """Корень проекта и (путь, класс по common.path_kind, есть ли файл сейчас) со снимка текущей реплики;
+    None без снимка."""
     cwd = data.get("cwd")
     if not isinstance(cwd, str) or not cwd:
         return None
@@ -40,7 +41,7 @@ def changed_this_turn(data):
     now = snapshot.scan(root)
     if now is None:
         return None
-    return root, [(p, common.is_doc_path(p)) for p in snapshot.diff(snap["files"], now)]
+    return root, [(p, common.path_kind(p), (root / p).is_file()) for p in snapshot.diff(snap["files"], now)]
 
 
 def main():
@@ -53,10 +54,13 @@ def main():
     options = looks_like_options(message)
     done = claims_done(message)
     docs_info = changed_this_turn(data)
-    docs = bool(docs_info and any(not is_doc for _, is_doc in docs_info[1]))
+    docs = bool(docs_info and any(kind == "code" for _, kind, _ in docs_info[1]))
     if not (options or done or docs):
         return
     filters = [name for flag, name in ((options, "options"), (done, "done"), (docs, "docs")) if flag]
+    meta = {"filters": filters}
+    if docs:
+        meta["files"] = [p for p, _, _ in docs_info[1][:prompts.MAX_LISTED]]
     session = data.get("session_id", "")
     prompt_id = data.get("prompt_id", "")
     modules = []
@@ -67,12 +71,13 @@ def main():
     rubric = common.rubric(("Решения",) if options else (), tuple(modules))
     if rubric is None:
         # Предупреждение уже выдал common.rubric.
-        common.log_event("stop", session, verdict="skipped", error="нет раздела рубрики", filters=filters)
+        common.log_event("stop", session, verdict="skipped", error="нет раздела рубрики", **meta)
         return
     content = message
     if docs:
         root, changed = docs_info
-        lines, truncated, unknown = comments.extract(root, [p for p, is_doc in changed if not is_doc])
+        lines, truncated, unknown = comments.extract(
+            root, [p for p, kind, exists in changed if kind == "code" and exists])
         content = prompts.render_docs_content(message, changed, lines, truncated,
                                               not (root / "CLAUDE.md").exists(), unknown)
     started = time.monotonic()
@@ -82,20 +87,20 @@ def main():
     if verdict.error:
         common.warn(f"судья пропущен: {verdict.error}")
         common.log_event("stop", session, verdict="skipped", error=verdict.error,
-                         duration_ms=duration_ms, content=content, filters=filters)
+                         duration_ms=duration_ms, content=content, **meta)
         return
     if verdict.ok:
-        common.log_event("stop", session, verdict="ok", duration_ms=duration_ms, content=content, filters=filters)
+        common.log_event("stop", session, verdict="ok", duration_ms=duration_ms, content=content, **meta)
         return
     if common.deny_budget_exhausted(session, prompt_id, "stop"):
         common.warn("лимит отказов, пропущено без проверки")
         common.log_event("stop", session, verdict="budget", reason=verdict.reason,
-                         violated=verdict.violated, duration_ms=duration_ms, content=content, filters=filters)
+                         violated=verdict.violated, duration_ms=duration_ms, content=content, **meta)
         return
     violated = f" (нарушено: {', '.join(verdict.violated)})" if verdict.violated else ""
     reason = f"planka: {verdict.reason}{violated}"
     common.log_event("stop", session, verdict="deny", reason=verdict.reason,
-                     violated=verdict.violated, duration_ms=duration_ms, content=content, filters=filters)
+                     violated=verdict.violated, duration_ms=duration_ms, content=content, **meta)
     common.emit(common.block_output(reason))
 
 

@@ -31,6 +31,17 @@ class CommentLinesTest(unittest.TestCase):
         self.assertEqual(comments.comment_lines("select 1 -- c\n", "sql"), ["-- c"])
         self.assertEqual(comments.comment_lines("<a>\n<!-- hidden -->\n", "html"), ["<!-- hidden -->"])
 
+    def test_slash_families(self):
+        for ext in ("php", "groovy", "gradle", "proto", "sol", "zig"):
+            self.assertEqual(comments.comment_lines("x = 1 // c\n", ext), ["// c"], ext)
+
+    def test_hash_families(self):
+        for ext in ("tf", "nix", "r", "jl", "ex", "exs"):
+            self.assertEqual(comments.comment_lines("x = 1 # c\n", ext), ["# c"], ext)
+
+    def test_erl_has_no_family(self):
+        self.assertEqual(comments.comment_lines("% c\n", "erl"), [])
+
     def test_unknown_ext_is_empty(self):
         self.assertEqual(comments.comment_lines("// x\n# y\n", "bin"), [])
         self.assertEqual(comments.comment_lines("", "go"), [])
@@ -71,9 +82,17 @@ class ExtractTest(unittest.TestCase):
         self.write("z.bin", "// x\n")
         self.write("a.foo", "# y\n")
         self.write("b.py", "# two\n")
-        lines, truncated, unknown = comments.extract(self.root, ["z.bin", "b.py", "a.foo", "Dockerfile"])
+        lines, truncated, unknown = comments.extract(self.root, ["z.bin", "b.py", "a.foo", "x.erl"])
         self.assertEqual(lines, ["b.py: # two"])
-        self.assertEqual(unknown, ["Dockerfile", "a.foo", "z.bin"])
+        self.assertEqual(unknown, ["a.foo", "x.erl", "z.bin"])
+
+    def test_hash_by_file_name(self):
+        names = ["Makefile", "Dockerfile", "Justfile", "Rakefile", "Gemfile"]
+        for name in names:
+            self.write(f"d/{name}", "# c\n")
+        lines, _, unknown = comments.extract(self.root, [f"d/{n}" for n in names])
+        self.assertEqual(lines, [f"d/{n}: # c" for n in names])
+        self.assertEqual(unknown, [])
 
     def test_truncation(self):
         self.write("a.py", "".join(f"# line {i}\n" for i in range(500)))
