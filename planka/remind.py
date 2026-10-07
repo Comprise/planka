@@ -51,7 +51,7 @@ def main():
         s = common.settings()
         if not (s["comment_lang"] and s["doc_lang"]):
             common.warn_once(session, "lang",
-                             "задайте comment_lang и doc_lang: claude plugin configure planka@<маркетплейс> --values-stdin; id — в claude plugin list")
+                             "задайте comment_lang и doc_lang: claude plugin configure planka@planka --values-stdin")
     except Exception as e:
         common.warn(f"предупреждение о языке не записано: {e!r}")
     common.emit(common.context_output(text))

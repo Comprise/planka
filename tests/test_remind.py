@@ -76,7 +76,7 @@ class RemindTest(unittest.TestCase):
     def test_language_warning_once(self):
         r1 = self.prompt()
         r2 = self.prompt()
-        self.assertIn("comment_lang", "\n".join(messages(r1)))
+        self.assertIn("planka: задайте comment_lang и doc_lang: claude plugin configure planka@planka --values-stdin", messages(r1))
         self.assertNotIn("comment_lang", "\n".join(messages(r2)))
         r3 = self.prompt(CLAUDE_PLUGIN_OPTION_COMMENT_LANG="en", CLAUDE_PLUGIN_OPTION_DOC_LANG="en")
         ctx = output(r3)["hookSpecificOutput"]["additionalContext"]
