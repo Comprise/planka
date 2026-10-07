@@ -87,6 +87,24 @@ class RemindTest(unittest.TestCase):
         self.assertIn("50000", r.stderr)
         self.assertFalse((self.env.data / "state" / "sess-1.snap.json").exists())
 
+    def test_reminder_survives_unwritable_state(self):
+        (self.env.data / "state").write_text("файл вместо каталога", encoding="utf-8")
+        (self.env.project / "a.py").write_text("x\n", encoding="utf-8")
+        r = self.prompt()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(ctx.startswith("# Философия работы"))
+        self.assertTrue(ctx.endswith("Проект без документации: предложи автору инициализацию по rules/docs.md."))
+        self.assertIn("planka:", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertNotIn("внутренняя ошибка", r.stderr)
+
+    def test_reminder_survives_bad_test_limit(self):
+        r = self.prompt(PLANKA_TEST_MAX_FILES="не число")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("# Философия работы", r.stdout)
+        self.assertNotIn("внутренняя ошибка", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
