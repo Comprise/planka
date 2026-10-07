@@ -59,6 +59,7 @@ class StopHookTest(unittest.TestCase):
         self.assertEqual(out["decision"], "block")
         self.assertIn("нет варианта с причиной", out["reason"])
         self.assertIn("Решения 4", out["reason"])
+        self.assertTrue(out["reason"].startswith("planka: "))
 
     def test_judge_gets_message_and_rubric(self):
         rec = self.env.data / "rec.txt"
@@ -157,6 +158,7 @@ class DoneHookTest(unittest.TestCase):
         out = json.loads(r.stdout)
         self.assertEqual(out["decision"], "block")
         self.assertIn("нет команды-доказательства", out["reason"])
+        self.assertTrue(out["reason"].startswith("planka: "))
 
     def test_both_filters_one_call(self):
         rec = self.env.data / "rec.txt"

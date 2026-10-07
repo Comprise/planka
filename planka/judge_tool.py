@@ -51,8 +51,8 @@ def _judge_and_emit(hook, session, prompt_id, user_prompt, content):
         common.log_event(hook, session, verdict="budget", reason=verdict.reason,
                          violated=verdict.violated, duration_ms=duration_ms, content=content)
         return
-    reason = f"{verdict.reason} (нарушено: {', '.join(verdict.violated)})" if verdict.violated \
-        else verdict.reason
+    violated = f" (нарушено: {', '.join(verdict.violated)})" if verdict.violated else ""
+    reason = f"planka: {verdict.reason}{violated}"
     common.log_event(hook, session, verdict="deny", reason=verdict.reason,
                      violated=verdict.violated, duration_ms=duration_ms, content=content)
     common.emit(common.deny_output(reason))
@@ -90,7 +90,8 @@ def judge_plan(data):
                 common.warn("лимит отказов, пропущено без проверки")
                 common.log_event("plan", session, verdict="budget", reason=planparse.format_conflicts(conflicts))
                 return
-            reason = "в одной волне файл принадлежит нескольким задачам:\n" + planparse.format_conflicts(conflicts)
+            reason = ("planka: в одной волне файл принадлежит нескольким задачам:\n"
+                      + planparse.format_conflicts(conflicts))
             common.log_event("plan", session, verdict="deny-files", reason=reason, content=plan)
             common.emit(common.deny_output(reason))
             return
@@ -102,8 +103,8 @@ def judge_plan(data):
     _judge_and_emit("plan", session, prompt_id, prompts.plan_prompt(rubric, plan), plan)
 
 
-DEP_REASON = ("Новая зависимость — вопрос автору (ядро, «Границы»): назови пакет, зачем он и что "
-              "из stdlib или уже установленного задачу не закрывает; прочитай {rules}/dependencies.md. "
+DEP_REASON = ("planka: новая зависимость — вопрос автору (ядро, «Границы»): назови пакет, зачем он "
+              "и что из stdlib или уже установленного задачу не закрывает; прочитай {rules}/dependencies.md. "
               "После согласия автора повтори команду с префиксом {marker}. Команда: {command}")
 
 

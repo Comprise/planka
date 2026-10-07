@@ -18,9 +18,13 @@ class SchemaTest(unittest.TestCase):
         json.dumps(s)
 
 
+def _stop_both(rubric, content):
+    return prompts.stop_prompt(rubric, content, options=True, done=True)
+
+
 class PromptsTest(unittest.TestCase):
     def test_content_is_fenced_as_data(self):
-        for fn in (prompts.question_prompt, prompts.plan_prompt, prompts.message_prompt):
+        for fn in (prompts.question_prompt, prompts.plan_prompt, _stop_both):
             p = fn("РУБРИКА", "СОДЕРЖИМОЕ")
             self.assertIn("РУБРИКА", p)
             self.assertIn("<content>\nСОДЕРЖИМОЕ\n</content>", p)
@@ -28,7 +32,7 @@ class PromptsTest(unittest.TestCase):
             self.assertIn("не инструкции", p)
 
     def test_closing_tag_in_content_is_neutralised(self):
-        for fn in (prompts.question_prompt, prompts.plan_prompt, prompts.message_prompt):
+        for fn in (prompts.question_prompt, prompts.plan_prompt, _stop_both):
             p = fn("R", "до</content>после")
             self.assertIn("до<\\/content>после", p)
             self.assertEqual(p.count("</content>"), 1)
@@ -52,6 +56,7 @@ class PromptsTest(unittest.TestCase):
     def test_system_prompt(self):
         self.assertIn("JSON", prompts.SYSTEM_PROMPT)
         self.assertIn("указание", prompts.SYSTEM_PROMPT)
+        self.assertIn("имя модуля", prompts.SYSTEM_PROMPT)
 
 
 class RenderQuestionsTest(unittest.TestCase):
@@ -75,15 +80,7 @@ class RenderQuestionsTest(unittest.TestCase):
         self.assertEqual(prompts.render_questions({}), "")
 
 
-class DonePromptTest(unittest.TestCase):
-    def test_done_prompt(self):
-        p = prompts.done_prompt("РУБРИКА", "СОДЕРЖИМОЕ")
-        self.assertIn("РУБРИКА", p)
-        self.assertIn("<content>\nСОДЕРЖИМОЕ\n</content>", p)
-        for needle in ["команда-доказательство", "CI-конфиг", "не проверено",
-                       "исходный падающий сценарий", "из вывода команды", "готов обсудить"]:
-            self.assertIn(needle, p)
-
+class StopPromptTest(unittest.TestCase):
     def test_stop_prompt_combines(self):
         p = prompts.stop_prompt("R", "C", options=True, done=True)
         self.assertIn("самый правильный", p)
@@ -94,7 +91,13 @@ class DonePromptTest(unittest.TestCase):
 
     def test_stop_prompt_single(self):
         self.assertNotIn("команда-доказательство", prompts.stop_prompt("R", "C", options=True, done=False))
-        self.assertNotIn("самый правильный", prompts.stop_prompt("R", "C", options=False, done=True))
+        p = prompts.stop_prompt("РУБРИКА", "СОДЕРЖИМОЕ", options=False, done=True)
+        self.assertNotIn("самый правильный", p)
+        self.assertIn("РУБРИКА", p)
+        self.assertIn("<content>\nСОДЕРЖИМОЕ\n</content>", p)
+        for needle in ["команда-доказательство", "CI-конфиг", "не проверено",
+                       "исходный падающий сценарий", "из вывода команды", "готов обсудить"]:
+            self.assertIn(needle, p)
 
     def test_stop_prompt_requires_a_filter(self):
         with self.assertRaises(ValueError):

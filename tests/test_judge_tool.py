@@ -88,6 +88,7 @@ class QuestionTest(unittest.TestCase):
         self.assertEqual(out["hookEventName"], "PreToolUse")
         self.assertIn("рекомендован по трудозатратам", out["permissionDecisionReason"])
         self.assertIn("Решения 4", out["permissionDecisionReason"])
+        self.assertTrue(out["permissionDecisionReason"].startswith("planka: "))
 
     def test_judge_gets_rendered_options_and_rubric(self):
         rec = self.env.data / "rec.txt"
@@ -141,6 +142,7 @@ class PlanTest(unittest.TestCase):
         out = json.loads(r.stdout)["hookSpecificOutput"]
         self.assertEqual(out["permissionDecision"], "deny")
         self.assertIn("файл x.py принадлежит задачам 1 и 2 волны 1", out["permissionDecisionReason"])
+        self.assertTrue(out["permissionDecisionReason"].startswith("planka: "))
         self.assertFalse(rec.exists())
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "deny-files")
 
@@ -156,7 +158,9 @@ class PlanTest(unittest.TestCase):
 
     def test_plan_deny(self):
         r = self.exit_plan(self.with_plan(PLAN_CLEAN), PLANKA_STUB="deny", PLANKA_STUB_REASON="нет схождения после волны 1")
-        self.assertIn("нет схождения после волны 1", json.loads(r.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+        reason = json.loads(r.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("нет схождения после волны 1", reason)
+        self.assertTrue(reason.startswith("planka: "))
 
     def test_missing_transcript_passes_with_warning(self):
         r = self.exit_plan("/nonexistent/t.jsonl")
@@ -244,13 +248,17 @@ class BashTest(unittest.TestCase):
         rec = self.env.data / "rec.txt"
         r = self.bash("cd app && npm install left-pad", PLANKA_STUB_RECORD=str(rec))
         out = json.loads(r.stdout)["hookSpecificOutput"]
+        reason = out["permissionDecisionReason"]
         self.assertEqual(out["permissionDecision"], "deny")
-        self.assertIn("вопрос автору", out["permissionDecisionReason"])
-        self.assertIn("npm install left-pad", out["permissionDecisionReason"])
-        self.assertIn("PLANKA_DEP_OK=1", out["permissionDecisionReason"])
-        self.assertIn(str(self.env.root / "rules" / "dependencies.md"), out["permissionDecisionReason"])
+        self.assertTrue(reason.startswith("planka: "))
+        self.assertIn("вопрос автору", reason)
+        self.assertIn("Команда: npm install left-pad", reason)
+        self.assertNotIn("cd app &&", reason.split("Команда:")[1])
+        self.assertIn("PLANKA_DEP_OK=1", reason)
+        self.assertIn(str(self.env.root / "rules" / "dependencies.md"), reason)
         self.assertFalse(rec.exists())
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "deny-dep")
+        self.assertEqual(self.env.log_lines()[-1]["content"], "cd app && npm install left-pad")
 
     def test_marker_passes(self):
         r = self.bash("PLANKA_DEP_OK=1 npm install left-pad")

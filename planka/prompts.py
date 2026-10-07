@@ -13,7 +13,8 @@ JUDGE_SCHEMA = {
 SYSTEM_PROMPT = (
     "Ты судья решений инженерного агента. Тебе дают рубрику и проверяемое содержимое. "
     "Отвечай только JSON по схеме: ok — содержимое соответствует рубрике; violated — список "
-    "нарушенных пунктов вида «Решения 4»; reason — что именно исправить, как указание агенту, "
+    "нарушенных пунктов вида «Решения 4» или имя модуля и первые слова пункта, например "
+    "«verification: Шлюз»; reason — что именно исправить, как указание агенту, "
     "а не оценка: назови недостающий вариант, неверно рекомендованный вариант, файл или волну. "
     "Пусто, если ok. Не придирайся к стилю: нарушение — только то, что рубрика запрещает прямо."
 )
@@ -58,14 +59,6 @@ def question_prompt(rubric, content):
 
 def plan_prompt(rubric, content):
     return _wrap(rubric, _PLAN_CHECKS, content)
-
-
-def message_prompt(rubric, content):
-    return _wrap(rubric, _MESSAGE_CHECKS, content)
-
-
-def done_prompt(rubric, content):
-    return _wrap(rubric, _DONE_CHECKS, content)
 
 
 def stop_prompt(rubric, content, *, options, done):

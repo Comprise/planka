@@ -59,8 +59,8 @@ def main():
         common.log_event("stop", session, verdict="budget", reason=verdict.reason,
                          violated=verdict.violated, duration_ms=duration_ms, content=message, filters=filters)
         return
-    reason = f"{verdict.reason} (нарушено: {', '.join(verdict.violated)})" if verdict.violated \
-        else verdict.reason
+    violated = f" (нарушено: {', '.join(verdict.violated)})" if verdict.violated else ""
+    reason = f"planka: {verdict.reason}{violated}"
     common.log_event("stop", session, verdict="deny", reason=verdict.reason,
                      violated=verdict.violated, duration_ms=duration_ms, content=message, filters=filters)
     common.emit(common.block_output(reason))
