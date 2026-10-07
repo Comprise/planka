@@ -3,7 +3,7 @@ import json
 import sys
 import unittest
 
-from tests.helpers import Env, PLANKA_DIR, hook_input, messages, output
+from tests.helpers import RULES, Env, PLANKA_DIR, messages, output
 
 sys.path.insert(0, str(PLANKA_DIR))
 import judge_tool  # noqa: E402
@@ -24,44 +24,9 @@ PLAN_CONFLICT = """## Волна 1
 - Создать: `x.py`
 """
 
+NO_PLAN_PATH = "planka: план не найден: в транскрипте нет planFilePath"
+
 PLAN_CLEAN = PLAN_CONFLICT.replace("- Создать: `x.py`\n### Задача 2", "- Создать: `y.py`\n### Задача 2")
-
-
-class TranscriptTest(unittest.TestCase):
-    def setUp(self):
-        self.env = Env()
-
-    def tearDown(self):
-        self.env.close()
-
-    def write_transcript(self, lines):
-        p = self.env.data / "t.jsonl"
-        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return p
-
-    def test_last_plan_path_wins(self):
-        p = self.write_transcript([
-            json.dumps({"type": "attachment", "attachment": {"type": "plan_mode", "planFilePath": "/a.md"}}),
-            "garbage line",
-            json.dumps({"type": "user", "message": {"role": "user", "content": "x"}}),
-            json.dumps({"type": "attachment", "attachment": {"type": "plan_mode", "planFilePath": "/b.md"}}),
-        ])
-        self.assertEqual(str(judge_tool.plan_file_from_transcript(str(p))), "/b.md")
-
-    def test_malformed_entries_are_ignored(self):
-        p = self.write_transcript([
-            json.dumps({"type": "attachment", "attachment": {"planFilePath": "/a.md"}}),
-            json.dumps({"attachment": "x"}),
-            json.dumps({"attachment": {"planFilePath": 5}}),
-        ])
-        self.assertEqual(str(judge_tool.plan_file_from_transcript(str(p))), "/a.md")
-        self.assertIsNone(judge_tool.plan_file_from_transcript(None))
-        self.assertIsNone(judge_tool.plan_file_from_transcript(7))
-
-    def test_no_plan_entry(self):
-        p = self.write_transcript([json.dumps({"type": "user"})])
-        self.assertIsNone(judge_tool.plan_file_from_transcript(str(p)))
-        self.assertIsNone(judge_tool.plan_file_from_transcript("/nonexistent"))
 
 
 class QuestionTest(unittest.TestCase):
@@ -72,7 +37,7 @@ class QuestionTest(unittest.TestCase):
         self.env.close()
 
     def ask(self, **extra):
-        return self.env.run("judge_tool.py", hook_input(
+        return self.env.run("judge_tool.py", self.env.hook_input(
             "PreToolUse", tool_name="AskUserQuestion", tool_input=QUESTION_INPUT,
             tool_use_id="t1"), **extra)
 
@@ -100,12 +65,29 @@ class QuestionTest(unittest.TestCase):
         self.assertIn("1. Мьютекс (Recommended) — три строки", text)
         self.assertIn("2. Один писатель — перестроить владение", text)
 
-    def test_budget(self):
+    def test_session_model_from_transcript(self):
+        rec = self.env.data / "rec.txt"
+        t = self.env.data / "t.jsonl"
+        t.write_text(json.dumps({"type": "assistant", "message": {"model": "claude-opus-5-5"}}) + "\n",
+                     encoding="utf-8")
+        r = self.env.run("judge_tool.py", self.env.hook_input(
+            "PreToolUse", tool_name="AskUserQuestion", tool_input=QUESTION_INPUT, transcript_path=str(t)),
+            PLANKA_STUB_RECORD=str(rec), CLAUDE_PLUGIN_OPTION_JUDGE_MODEL="session")
+        self.assertEqual(r.stdout, "")
+        argv = rec.read_text(encoding="utf-8").split("ARGV\n", 1)[1].split("\nSTDIN\n", 1)[0].split("\n")
+        self.assertEqual(argv[argv.index("--model") + 1], "claude-opus-5-5")
+
+    def test_budget_checked_before_judge(self):
         for _ in range(2):
             self.assertEqual(output(self.ask(PLANKA_STUB="deny"))["hookSpecificOutput"]["permissionDecision"], "deny")
-        r = self.ask(PLANKA_STUB="deny")
+        rec = self.env.data / "rec.txt"
+        r = self.ask(PLANKA_STUB="deny", PLANKA_STUB_RECORD=str(rec))
         self.assertIsNone(output(r))
-        self.assertIn("лимит отказов", "\n".join(messages(r)))
+        self.assertEqual(messages(r), ["planka: лимит отказов, пропущено без проверки"])
+        self.assertFalse(rec.exists())
+        last = self.env.log_lines()[-1]
+        self.assertEqual(last["verdict"], "budget")
+        self.assertEqual(last["content_len"], len(judge_tool.prompts.render_questions(QUESTION_INPUT)))
 
     def test_deny_survives_log_failure(self):
         (self.env.data / "judge.log").mkdir()
@@ -114,14 +96,58 @@ class QuestionTest(unittest.TestCase):
         self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertTrue(any("внутренняя ошибка" in m for m in messages(r)))
 
-    def test_judge_failure_passes(self):
+    def test_judge_failure_passes_with_one_warning(self):
         r = self.ask(PLANKA_STUB="notlogged")
         self.assertIsNone(output(r))
-        self.assertIn("Not logged in", "\n".join(messages(r)))
+        self.assertEqual(messages(r), ["planka: судья пропущен: ошибка судьи: Not logged in · Please run /login"])
+        last = self.env.log_lines()[-1]
+        self.assertEqual((last["verdict"], last["error"]), ("skipped", "ошибка судьи"))
+        self.assertNotIn("Not logged in", json.dumps(last, ensure_ascii=False))
+
+    def test_empty_questions_pass_without_judge(self):
+        rec = self.env.data / "rec.txt"
+        for ti in ({"questions": []}, {}):
+            r = self.env.run("judge_tool.py", self.env.hook_input(
+                "PreToolUse", tool_name="AskUserQuestion", tool_input=ti), PLANKA_STUB="deny",
+                PLANKA_STUB_RECORD=str(rec))
+            self.assertEqual(r.stdout, "")
+        self.assertFalse(rec.exists())
+        self.assertEqual(self.env.log_lines(), [])
 
     def test_other_tool_passes_silently(self):
-        r = self.env.run("judge_tool.py", hook_input("PreToolUse", tool_name="Read", tool_input={}))
+        r = self.env.run("judge_tool.py", self.env.hook_input("PreToolUse", tool_name="Read", tool_input={}))
         self.assertEqual(r.stdout, "")
+        self.assertEqual(self.env.log_lines(), [])
+
+
+class InputGuardTest(unittest.TestCase):
+    def setUp(self):
+        self.env = Env()
+
+    def tearDown(self):
+        self.env.close()
+
+    def test_barrier_skips_dependency_check(self):
+        r = self.env.run("judge_tool.py", self.env.hook_input(
+            "PreToolUse", tool_name="Bash", tool_input={"command": "npm install x"}), PLANKA_JUDGE="1")
+        self.assertEqual(r.stdout, "")
+        self.assertEqual(self.env.log_lines(), [])
+
+    def test_barrier_skips_question_judge(self):
+        rec = self.env.data / "rec.txt"
+        r = self.env.run("judge_tool.py", self.env.hook_input(
+            "PreToolUse", tool_name="AskUserQuestion", tool_input=QUESTION_INPUT),
+            PLANKA_JUDGE="1", PLANKA_STUB="deny", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "")
+        self.assertFalse(rec.exists())
+        self.assertEqual(self.env.log_lines(), [])
+
+    def test_empty_or_garbage_stdin(self):
+        for stdin in ("", "   \n", "not json", "[1, 2]", '"x"'):
+            r = self.env.run("judge_tool.py", stdin)
+            self.assertEqual(r.returncode, 0, stdin)
+            self.assertEqual(r.stdout, "", stdin)
+            self.assertEqual(r.stderr, "", stdin)
         self.assertEqual(self.env.log_lines(), [])
 
 
@@ -136,12 +162,14 @@ class PlanTest(unittest.TestCase):
         plan = self.env.data / "plan.md"
         plan.write_text(text, encoding="utf-8")
         t = self.env.data / "t.jsonl"
-        t.write_text(json.dumps({"type": "attachment", "attachment": {
-            "type": "plan_mode", "planFilePath": str(plan)}}) + "\n", encoding="utf-8")
+        t.write_text(
+            json.dumps({"type": "assistant", "message": {"model": "claude-test-model"}}) + "\n"
+            + json.dumps({"type": "attachment", "attachment": {"type": "plan_mode", "planFilePath": str(plan)}}) + "\n",
+            encoding="utf-8")
         return str(t)
 
     def exit_plan(self, transcript, **extra):
-        return self.env.run("judge_tool.py", hook_input(
+        return self.env.run("judge_tool.py", self.env.hook_input(
             "PreToolUse", tool_name="ExitPlanMode", tool_input={}, transcript_path=transcript), **extra)
 
     def test_conflict_denied_without_judge(self):
@@ -182,14 +210,14 @@ class PlanTest(unittest.TestCase):
         r = self.exit_plan("/nonexistent/t.jsonl")
         self.assertEqual(r.returncode, 0)
         self.assertIsNone(output(r))
-        self.assertIn("planka:", "\n".join(messages(r)))
+        self.assertEqual(messages(r), [NO_PLAN_PATH])
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
 
     def test_null_transcript_path_passes_with_warning(self):
         r = self.exit_plan(None)
         self.assertEqual(r.returncode, 0)
         self.assertIsNone(output(r))
-        self.assertIn("planka:", "\n".join(messages(r)))
+        self.assertEqual(messages(r), [NO_PLAN_PATH])
         self.assertNotIn("Traceback", r.stderr)
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
 
@@ -199,7 +227,7 @@ class PlanTest(unittest.TestCase):
         r = self.exit_plan(str(t))
         self.assertEqual(r.returncode, 0)
         self.assertIsNone(output(r))
-        self.assertIn("planka:", "\n".join(messages(r)))
+        self.assertEqual(messages(r), [NO_PLAN_PATH])
         self.assertNotIn("Traceback", r.stderr)
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
 
@@ -217,7 +245,79 @@ class PlanTest(unittest.TestCase):
         (self.env.data / "plan.md").unlink()
         r = self.exit_plan(t)
         self.assertIsNone(output(r))
-        self.assertIn("planka:", "\n".join(messages(r)))
+        self.assertEqual(messages(r), [f"planka: план не найден: нет файла {self.env.data / 'plan.md'}"])
+
+    def test_plan_judge_gets_modules(self):
+        rec = self.env.data / "rec.txt"
+        r = self.exit_plan(self.with_plan(PLAN_CLEAN), PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        text = rec.read_text(encoding="utf-8")
+        for needle in ["## Решения", "## Планы", "# Планирование", "# Субагенты", "# Рефакторинг", "# Паттерны", "# Эвристики"]:
+            self.assertIn(needle, text)
+        self.assertLess(text.index("## Планы"), text.index("# Планирование"))
+
+    def test_plan_judge_skips_without_new_modules(self):
+        for name in ("refactoring", "design-patterns", "heuristics"):
+            with self.subTest(name=name):
+                path = self.env.root / "rules" / f"{name}.md"
+                path.unlink()
+                r = self.exit_plan(self.with_plan(PLAN_CLEAN))
+                self.assertIsNone(output(r))
+                self.assertEqual(messages(r), [f"planka: нет модуля правил {path}"])
+                path.write_text(RULES[name], encoding="utf-8")
+
+    def test_plan_budget_checked_before_judge(self):
+        t = self.with_plan(PLAN_CLEAN)
+        for _ in range(2):
+            r = self.exit_plan(t, PLANKA_STUB="deny")
+            self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny")
+        rec = self.env.data / "rec.txt"
+        r = self.exit_plan(t, PLANKA_STUB="deny", PLANKA_STUB_RECORD=str(rec))
+        self.assertIsNone(output(r))
+        self.assertEqual(messages(r), ["planka: лимит отказов, пропущено без проверки"])
+        self.assertFalse(rec.exists())
+        self.assertEqual(self.env.log_lines()[-1]["verdict"], "budget")
+
+    def test_plan_judge_failure_one_warning(self):
+        r = self.exit_plan(self.with_plan(PLAN_CLEAN), PLANKA_STUB="garbage")
+        self.assertIsNone(output(r))
+        self.assertEqual(len(messages(r)), 1, messages(r))
+        self.assertTrue(messages(r)[0].startswith("planka: судья пропущен: ответ судьи не JSON: "), messages(r))
+        self.assertIn("nonsense", messages(r)[0])
+        self.assertEqual(self.env.log_lines()[-1]["error"], "ответ судьи не JSON")
+
+    def test_plan_judge_skips_without_module(self):
+        (self.env.root / "rules" / "subagents.md").unlink()
+        r = self.exit_plan(self.with_plan(PLAN_CLEAN))
+        self.assertEqual(r.returncode, 0)
+        self.assertIsNone(output(r))
+        self.assertEqual(messages(r), [f"planka: нет модуля правил {self.env.root / 'rules' / 'subagents.md'}"])
+        self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
+
+    def test_files_conflict_budget(self):
+        t = self.with_plan(PLAN_CONFLICT)
+        for _ in range(2):
+            r = self.exit_plan(t)
+            self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertEqual(self.env.log_lines()[-1]["verdict"], "deny-files")
+        r = self.exit_plan(t)
+        self.assertIsNone(output(r))
+        self.assertEqual(messages(r), ["planka: лимит отказов, пропущено без проверки"])
+        last = self.env.log_lines()[-1]
+        self.assertEqual(last["verdict"], "budget")
+        self.assertEqual(last["content_len"], len(PLAN_CONFLICT))
+
+    def test_budget_key_is_prompt_and_hook(self):
+        for _ in range(2):
+            self.env.run("judge_tool.py", self.env.hook_input(
+                "PreToolUse", tool_name="AskUserQuestion", tool_input=QUESTION_INPUT), PLANKA_STUB="deny")
+        t = self.with_plan(PLAN_CONFLICT)
+        for _ in range(2):
+            self.assertEqual(output(self.exit_plan(t))["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIsNone(output(self.exit_plan(t)))
+        r = self.env.run("judge_tool.py", self.env.hook_input(
+            "PreToolUse", tool_name="ExitPlanMode", tool_input={}, transcript_path=t, prompt_id="p-2"))
+        self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny")
 
 
 class MissingRubricTest(unittest.TestCase):
@@ -230,14 +330,13 @@ class MissingRubricTest(unittest.TestCase):
     def check_skipped(self, r):
         self.assertEqual(r.returncode, 0)
         self.assertIsNone(output(r))
-        self.assertIn("planka:", "\n".join(messages(r)))
-        self.assertEqual("\n".join(messages(r)).count("planka:"), 1)
+        self.assertEqual(messages(r), ["planka: в philosophy.md нет раздела «Решения»"])
         last = self.env.log_lines()[-1]
         self.assertEqual(last["verdict"], "skipped")
         self.assertEqual(last["error"], "нет раздела рубрики")
 
     def test_question_without_section_is_logged(self):
-        self.check_skipped(self.env.run("judge_tool.py", hook_input(
+        self.check_skipped(self.env.run("judge_tool.py", self.env.hook_input(
             "PreToolUse", tool_name="AskUserQuestion", tool_input=QUESTION_INPUT)))
 
     def test_plan_without_section_is_logged(self):
@@ -245,7 +344,7 @@ class MissingRubricTest(unittest.TestCase):
         plan.write_text(PLAN_CLEAN, encoding="utf-8")
         t = self.env.data / "t.jsonl"
         t.write_text(json.dumps({"attachment": {"planFilePath": str(plan)}}) + "\n", encoding="utf-8")
-        self.check_skipped(self.env.run("judge_tool.py", hook_input(
+        self.check_skipped(self.env.run("judge_tool.py", self.env.hook_input(
             "PreToolUse", tool_name="ExitPlanMode", tool_input={}, transcript_path=str(t))))
 
 
@@ -257,7 +356,7 @@ class BashTest(unittest.TestCase):
         self.env.close()
 
     def bash(self, command, **extra):
-        return self.env.run("judge_tool.py", hook_input(
+        return self.env.run("judge_tool.py", self.env.hook_input(
             "PreToolUse", tool_name="Bash", tool_input={"command": command}, tool_use_id="b1"), **extra)
 
     def test_dependency_add_denied_without_judge(self):
@@ -270,7 +369,7 @@ class BashTest(unittest.TestCase):
         self.assertIn("вопрос автору", reason)
         self.assertIn("Команда: npm install left-pad", reason)
         self.assertNotIn("cd app &&", reason.split("Команда:")[1])
-        self.assertIn("PLANKA_DEP_OK=1", reason)
+        self.assertIn("cd app && PLANKA_DEP_OK=1 npm install", reason)
         self.assertIn(str(self.env.root / "rules" / "dependencies.md"), reason)
         self.assertFalse(rec.exists())
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "deny-dep")
@@ -320,46 +419,10 @@ class BashTest(unittest.TestCase):
 
     def test_missing_or_non_string_command_passes(self):
         for ti in ({}, {"command": None}, {"command": 5}):
-            r = self.env.run("judge_tool.py", hook_input("PreToolUse", tool_name="Bash", tool_input=ti))
+            r = self.env.run("judge_tool.py", self.env.hook_input("PreToolUse", tool_name="Bash", tool_input=ti))
             self.assertEqual(r.returncode, 0)
             self.assertEqual(r.stdout, "")
             self.assertNotIn("Traceback", r.stderr)
-
-
-class PlanRubricTest(unittest.TestCase):
-    def setUp(self):
-        self.env = Env()
-
-    def tearDown(self):
-        self.env.close()
-
-    def with_plan(self, text):
-        plan = self.env.data / "plan.md"
-        plan.write_text(text, encoding="utf-8")
-        t = self.env.data / "t.jsonl"
-        t.write_text(json.dumps({"type": "attachment", "attachment": {
-            "type": "plan_mode", "planFilePath": str(plan)}}) + "\n", encoding="utf-8")
-        return str(t)
-
-    def test_plan_judge_gets_modules(self):
-        rec = self.env.data / "rec.txt"
-        r = self.env.run("judge_tool.py", hook_input(
-            "PreToolUse", tool_name="ExitPlanMode", tool_input={}, transcript_path=self.with_plan(PLAN_CLEAN)),
-            PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
-        self.assertEqual(r.stdout, "", r.stderr)
-        text = rec.read_text(encoding="utf-8")
-        for needle in ["## Решения", "## Планы", "# Планирование", "# Субагенты"]:
-            self.assertIn(needle, text)
-        self.assertLess(text.index("## Планы"), text.index("# Планирование"))
-
-    def test_plan_judge_skips_without_module(self):
-        (self.env.root / "rules" / "subagents.md").unlink()
-        r = self.env.run("judge_tool.py", hook_input(
-            "PreToolUse", tool_name="ExitPlanMode", tool_input={}, transcript_path=self.with_plan(PLAN_CLEAN)))
-        self.assertEqual(r.returncode, 0)
-        self.assertIsNone(output(r))
-        self.assertIn("planka:", "\n".join(messages(r)))
-        self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
 
 
 if __name__ == "__main__":

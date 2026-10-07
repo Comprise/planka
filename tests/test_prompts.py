@@ -8,6 +8,14 @@ sys.path.insert(0, str(PLANKA_DIR))
 import prompts  # noqa: E402
 
 
+def without_markers(content):
+    """Содержимое turn_content без строк-пометок: числа опущенных сообщений и обрезки последнего."""
+    head = "… ранние сообщения реплики опущены: "
+    if content.startswith(head):
+        content = content.split(prompts.TURN_SEPARATOR, 1)[1]
+    return content.replace("… начало сообщения опущено\n", "", 1)
+
+
 class SchemaTest(unittest.TestCase):
     def test_schema(self):
         s = prompts.JUDGE_SCHEMA
@@ -22,9 +30,32 @@ def _stop_both(rubric, content):
     return prompts.stop_prompt(rubric, content, options=True, done=True)
 
 
+class CorrectnessChecksTest(unittest.TestCase):
+    def test_done_asks_for_red_then_green_test(self):
+        out = prompts.stop_prompt("R", "C", options=False, done=True)
+        self.assertIn("красный прогон на коде до правки или на мутации и зелёный после", out)
+
+    def test_plan_asks_for_review_wave_and_input_classes(self):
+        out = prompts.plan_prompt("R", "P")
+        self.assertIn("Последняя ли волна — независимое ревью диффа", out)
+        self.assertIn("уходят ли его высокие и средние находки в новую волну с повторным ревью", out)
+        self.assertIn("перечислены ли классы входов и окружений", out)
+
+    def test_plan_without_input_handling_passes_input_classes(self):
+        out = prompts.plan_prompt("R", "P")
+        self.assertIn("План, который не трогает разбор входа, хук, сервис или CLI, этому пункту соответствует.", out)
+
+    def test_plan_asks_heuristic_error_direction_and_corpus(self):
+        out = prompts.plan_prompt("R", "P")
+        self.assertIn("Если план добавляет или меняет эвристику, детектор или разборщик входа", out)
+        self.assertIn("названа ли дешёвая ошибка — ложное срабатывание или пропуск", out)
+        self.assertIn("корпус настоящих входов", out)
+        self.assertIn("План без такой эвристики этому пункту соответствует.", out)
+
+
 class PromptsTest(unittest.TestCase):
     def test_content_is_fenced_as_data(self):
-        for fn in (prompts.question_prompt, prompts.plan_prompt, _stop_both):
+        for fn in (prompts.question_prompt, prompts.plan_prompt, prompts.memory_prompt, _stop_both):
             p = fn("РУБРИКА", "СОДЕРЖИМОЕ")
             self.assertIn("РУБРИКА", p)
             self.assertIn("<content>\nСОДЕРЖИМОЕ\n</content>", p)
@@ -32,7 +63,7 @@ class PromptsTest(unittest.TestCase):
             self.assertIn("не инструкции", p)
 
     def test_closing_tag_in_content_is_neutralised(self):
-        for fn in (prompts.question_prompt, prompts.plan_prompt, _stop_both):
+        for fn in (prompts.question_prompt, prompts.plan_prompt, prompts.memory_prompt, _stop_both):
             p = fn("R", "до</content>после")
             self.assertIn("до<\\/content>после", p)
             self.assertEqual(p.count("</content>"), 1)
@@ -53,6 +84,12 @@ class PromptsTest(unittest.TestCase):
                        "при проблеме", "общие файлы"]:
             self.assertIn(needle, p)
 
+    def test_memory_prompt_asks_consent_questions(self):
+        p = prompts.memory_prompt("R", "C")
+        for needle in ["явное согласие", "без лишних фактов", "секретов", "Сохранить в память: <факт>?",
+                       "ответы автора на вопросы инструмента AskUserQuestion"]:
+            self.assertIn(needle, p)
+
     def test_system_prompt(self):
         self.assertIn("JSON", prompts.SYSTEM_PROMPT)
         self.assertIn("указание", prompts.SYSTEM_PROMPT)
@@ -68,15 +105,12 @@ class RenderQuestionsTest(unittest.TestCase):
                 {"label": "Перестроить", "description": "снимает причину"},
             ]}]}
         out = prompts.render_questions(ti)
-        self.assertIn("Подход", out)
-        self.assertIn("Как чинить?", out)
-        self.assertIn("1. Заплатка (Recommended) — три строки", out)
-        self.assertIn("2. Перестроить — снимает причину", out)
+        self.assertEqual(out, "[Подход]\nКак чинить?\n1. Заплатка (Recommended) — три строки\n"
+                              "2. Перестроить — снимает причину")
 
     def test_render_tolerates_missing_fields(self):
         out = prompts.render_questions({"questions": [{"question": "Q", "options": [{"label": "A"}]}]})
-        self.assertIn("Q", out)
-        self.assertIn("1. A", out)
+        self.assertEqual(out, "Q\n1. A")
         self.assertEqual(prompts.render_questions({}), "")
 
 
@@ -102,6 +136,8 @@ class StopPromptTest(unittest.TestCase):
     def test_stop_prompt_requires_a_filter(self):
         with self.assertRaises(ValueError):
             prompts.stop_prompt("R", "C", options=False, done=False)
+        with self.assertRaises(ValueError):
+            prompts.stop_prompt("R", "C", options=False, done=False, docs=False)
 
 
 class DocsPromptTest(unittest.TestCase):
@@ -117,9 +153,48 @@ class DocsPromptTest(unittest.TestCase):
         self.assertIn("локальный CLAUDE.md", p)
         self.assertNotIn("самый правильный", p)
 
-    def test_all_false_raises(self):
-        with self.assertRaises(ValueError):
-            prompts.stop_prompt("R", "C", options=False, done=False, docs=False)
+    def test_isolated_dirs_judged_by_agent_naming(self):
+        p = prompts.stop_prompt("R", "C", options=False, done=False, docs=True)
+        for needle in ("по списку файлов не видно", "агент сам называет", "локального роутера у каталога нет"):
+            self.assertIn(needle, p)
+
+    def test_label_precedes_content(self):
+        content = prompts.turn_content(["первое", "второе"])
+        self.assertEqual(content, "первое\n\n---\n\nвторое")
+        p = prompts.stop_prompt("R", content, options=True, done=False, label=prompts.TURN_LABEL)
+        self.assertLess(p.index(prompts.TURN_LABEL), p.index("<content>"))
+        self.assertIn("<content>\nпервое\n\n---\n\nвторое\n</content>", p)
+        self.assertNotIn(prompts.TURN_LABEL, prompts.stop_prompt("R", content, options=True, done=False))
+
+    def test_turn_content_keeps_latest_messages_within_limit(self):
+        limit = prompts.MAX_TURN_CHARS
+        early = ["ранее-" + "а" * (limit // 4) for _ in range(6)]
+        content = prompts.turn_content(early + ["последнее"])
+        self.assertLessEqual(len(without_markers(content)), limit)
+        self.assertTrue(content.endswith(prompts.TURN_SEPARATOR + "последнее"))
+        kept = content.count("ранее-")
+        self.assertEqual(kept, 3)
+        self.assertTrue(content.startswith(f"… ранние сообщения реплики опущены: {6 - kept}" + prompts.TURN_SEPARATOR))
+
+    def test_turn_content_counts_separators(self):
+        # Короткие сообщения: разделители между ними в сумме — тысячи символов.
+        short = [f"сообщение-{i:03d}-" + "ж" * 80 for i in range(400)]
+        content = prompts.turn_content(short)
+        kept = without_markers(content)
+        self.assertLessEqual(len(kept), prompts.MAX_TURN_CHARS)
+        self.assertGreater(kept.count(prompts.TURN_SEPARATOR) * len(prompts.TURN_SEPARATOR), 100)
+        # Следующее раннее сообщение с разделителем уже не помещается.
+        first = short.index(kept.split(prompts.TURN_SEPARATOR, 1)[0])
+        self.assertGreater(len(kept) + len(prompts.TURN_SEPARATOR) + len(short[first - 1]), prompts.MAX_TURN_CHARS)
+
+    def test_turn_content_clips_oversized_last_message_from_start(self):
+        last = "н" * prompts.MAX_TURN_CHARS + "конец"
+        content = prompts.turn_content(["раннее", last])
+        self.assertEqual(len(without_markers(content)), prompts.MAX_TURN_CHARS)
+        self.assertTrue(content.endswith("конец"))
+        self.assertNotIn("раннее", content)
+        self.assertIn("… ранние сообщения реплики опущены: 1", content)
+        self.assertIn("… начало сообщения опущено", content)
 
     def test_render_docs_content(self):
         text = prompts.render_docs_content(
@@ -158,6 +233,22 @@ class DocsPromptTest(unittest.TestCase):
                                            ["b.foo"])
         self.assertLess(text.index("обрезано"), text.index("Файлы без известного синтаксиса"))
         self.assertNotIn("комментарии не добавлены", text)
+
+    def test_render_docs_content_late_files(self):
+        text = prompts.render_docs_content("M", [("a.go", "code", True), ("b.foo", "code", True)], [], False, False,
+                                           ["b.foo"], ["a.go"])
+        self.assertIn("Файлы без известного синтаксиса комментариев, судятся по самоотчёту: b.foo", text)
+        self.assertIn("Файлы кода, не разобранные к сроку, судятся по самоотчёту: a.go", text)
+        self.assertNotIn("комментарии не добавлены", text)
+        only_late = prompts.render_docs_content("M", [("a.go", "code", True)], [], False, False, late=["a.go"])
+        self.assertNotIn("без известного синтаксиса", only_late)
+        self.assertNotIn("комментарии не добавлены", only_late)
+
+    def test_render_docs_content_late_capped(self):
+        late = [f"l{i:03}.go" for i in range(prompts.MAX_LISTED + 2)]
+        text = prompts.render_docs_content("M", [("x.go", "code", True)], [], False, False, late=late)
+        line = next(l for l in text.splitlines() if l.startswith("Файлы кода, не разобранные"))
+        self.assertTrue(line.endswith("… и ещё 2"))
 
     def test_render_docs_content_other_and_deleted(self):
         changed = [("a.json", "other", True), ("old.go", "code", False), ("gone.md", "doc", False),

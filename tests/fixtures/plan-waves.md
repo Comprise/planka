@@ -806,7 +806,7 @@ def run_judge(system_prompt, user_prompt, *, timeout=JUDGE_TIMEOUT):
                    reason=str(so.get("reason") or ""))
 
 
-def _atomic_write_json(path, obj):
+def atomic_write_json(path, obj):
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False)
@@ -825,7 +825,7 @@ def deny_budget_exhausted(session_id, prompt_id, hook):
     key = f"{prompt_id}:{hook}"
     before = int(state.get(key, 0))
     state[key] = before + 1
-    _atomic_write_json(path, state)
+    atomic_write_json(path, state)
     return before >= MAX_DENIES
 
 

@@ -1,4 +1,4 @@
-"""Общее для хуков planka: барьеры, вход, судья, счётчик отказов, журнал, форматы ответа."""
+"""Общее для хуков planka: барьеры, вход, транскрипт, судья, счётчик отказов, журнал, форматы ответа."""
 import ctypes
 import contextlib
 import dataclasses
@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import pathlib
+import shutil
 import signal
 import subprocess
 import sys
@@ -19,9 +20,10 @@ from prompts import JUDGE_SCHEMA
 MAX_DENIES = 2
 JUDGE_TIMEOUT = 60
 MAX_REASON = 2000
+MAX_DETAIL = 200
 STATE_TTL = 7 * 86400
 LOG_MAX_BYTES = 1_048_576
-DEFAULT_JUDGE_MODEL = "sonnet"
+SESSION_MODEL = "session"
 JUDGE_FLAGS = ["-p", "--setting-sources", "", "--strict-mcp-config",
                "--no-session-persistence", "--output-format", "json", "--tools", ""]
 
@@ -33,7 +35,7 @@ def barrier_active():
 
 def read_input():
     try:
-        raw = sys.stdin.read()
+        raw = sys.stdin.buffer.read().decode("utf-8")
         if not raw.strip():
             return None
         data = json.loads(raw)
@@ -73,7 +75,7 @@ def warn(msg):
 RULES_PLACEHOLDER = "{RULES}"
 COMMENT_LANG_PLACEHOLDER = "{COMMENT_LANG}"
 DOC_LANG_PLACEHOLDER = "{DOC_LANG}"
-UNSET_LANG = "не задан"
+DEFAULT_LANG = "ru"
 DOC_PATTERNS = ("README", "LICENSE")
 DOC_DIRS = ("context/", "docs/")
 CODE_EXTS = {
@@ -82,12 +84,13 @@ CODE_EXTS = {
     "py", "pyi", "sh", "bash", "zsh", "rb", "pl", "toml", "yaml", "yml", "mk", "makefile", "cmake", "cfg",
     "ini", "ps1",
     "sql", "lua", "hs",
-    "html", "xml", "vue", "svelte",
+    "html", "xml", "vue", "svelte", "css", "scss", "sass", "less",
     "php", "r", "jl", "ex", "exs", "erl", "clj", "fs", "vb", "nim", "zig", "sol", "proto", "gradle",
     "groovy", "tf", "nix", "el", "vim", "bat", "cmd",
 }
+# Манифесты по имени: остальные *.json и go.sum — прочее.
 CODE_NAMES = {"Makefile", "makefile", "GNUmakefile", "CMakeLists.txt", "Dockerfile", "Justfile", "Rakefile",
-              "Gemfile"}
+              "Gemfile", "package.json", "tsconfig.json", "jsconfig.json", "composer.json", "deno.json", "go.mod"}
 
 
 def rules_dir():
@@ -95,17 +98,17 @@ def rules_dir():
 
 
 def settings():
-    """Языки комментариев и документации из CLAUDE_PLUGIN_OPTION_*; пустое значение — None."""
-    return {"comment_lang": os.environ.get("CLAUDE_PLUGIN_OPTION_COMMENT_LANG") or None,
-            "doc_lang": os.environ.get("CLAUDE_PLUGIN_OPTION_DOC_LANG") or None}
+    """Языки комментариев и документации из CLAUDE_PLUGIN_OPTION_*; пустое значение — DEFAULT_LANG."""
+    return {"comment_lang": os.environ.get("CLAUDE_PLUGIN_OPTION_COMMENT_LANG") or DEFAULT_LANG,
+            "doc_lang": os.environ.get("CLAUDE_PLUGIN_OPTION_DOC_LANG") or DEFAULT_LANG}
 
 
 def substitute(text):
-    """Метки каталога модулей и языков заменяются значениями; незаданный язык — UNSET_LANG."""
+    """Метки каталога модулей и языков заменяются значениями."""
     s = settings()
     return (text.replace(RULES_PLACEHOLDER, str(rules_dir()))
-                .replace(COMMENT_LANG_PLACEHOLDER, s["comment_lang"] or UNSET_LANG)
-                .replace(DOC_LANG_PLACEHOLDER, s["doc_lang"] or UNSET_LANG))
+                .replace(COMMENT_LANG_PLACEHOLDER, s["comment_lang"])
+                .replace(DOC_LANG_PLACEHOLDER, s["doc_lang"]))
 
 
 def philosophy_text():
@@ -177,14 +180,35 @@ def philosophy_sections(*names):
 
 @dataclasses.dataclass
 class Verdict:
+    """Решение судьи. error — пропуск проверки: короткое описание без текста модели, для judge.log;
+    detail — фрагмент ответа судьи до 200 символов, только для пользователя (skip_message)."""
     ok: bool
     violated: list
     reason: str
-    error: str = None
+    error: str | None = None
+    detail: str | None = None
 
 
-def _skipped(error):
-    return Verdict(ok=True, violated=[], reason="", error=error)
+def _skipped(error, detail=None):
+    return Verdict(ok=True, violated=[], reason="", error=error, detail=detail[:MAX_DETAIL] if detail else None)
+
+
+def skip_message(verdict):
+    """Предупреждение о пропуске проверки по Verdict с error: описание и фрагмент ответа судьи, если он есть."""
+    msg = f"судья пропущен: {verdict.error}"
+    return f"{msg}: {verdict.detail}" if verdict.detail else msg
+
+
+def _kill_group(proc):
+    """SIGKILL группе процессов судьи (он лидер своей группы) и ожидание завершения до 5 с."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        proc.communicate(timeout=5)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        pass
 
 
 _PR_SET_PDEATHSIG = 1
@@ -200,52 +224,220 @@ def _die_with_hook(hook_pid):
     return set_signal
 
 
-def run_judge(system_prompt, user_prompt, *, timeout=JUDGE_TIMEOUT):
-    """Вложенный claude -p; любая ошибка — пропуск с описанием в error."""
-    model = os.environ.get("CLAUDE_PLUGIN_OPTION_JUDGE_MODEL") or DEFAULT_JUDGE_MODEL
+# Сторож судьи вне Linux: лидер группы судьи, запускает claude потомком и раз в WATCHDOG_POLL с сверяет
+# своего родителя с PID хука; хук умер — SIGKILL всей группе. Аргументы: PID хука, команда claude с путём.
+WATCHDOG_POLL = 0.5
+_WATCHDOG = f"""
+import os, signal, subprocess, sys
+hook = int(sys.argv[1])
+try:
+    proc = subprocess.Popen(sys.argv[2:])
+except OSError:
+    sys.exit(127)
+while True:
+    if os.getppid() != hook:
+        os.killpg(0, signal.SIGKILL)
+    try:
+        sys.exit(proc.wait(timeout={WATCHDOG_POLL}))
+    except subprocess.TimeoutExpired:
+        pass
+"""
+
+
+def _start_judge(cmd, platform, **popen_kwargs):
+    """Popen судьи лидером своей группы процессов, которая умирает вместе с хуком: на Linux — через
+    PR_SET_PDEATHSIG, на других платформах — через сторож _WATCHDOG. FileNotFoundError — нет cmd[0] в PATH
+    окружения popen_kwargs["env"]."""
+    hook_pid = os.getpid()
+    if platform.startswith("linux"):
+        return subprocess.Popen(cmd, start_new_session=True, preexec_fn=_die_with_hook(hook_pid), **popen_kwargs)
+    env = popen_kwargs.get("env") or os.environ
+    exe = shutil.which(cmd[0], path=env.get("PATH"))
+    if exe is None:
+        raise FileNotFoundError(cmd[0])
+    return subprocess.Popen([sys.executable, "-I", "-c", _WATCHDOG, str(hook_pid), exe, *cmd[1:]],
+                            start_new_session=True, **popen_kwargs)
+
+
+@dataclasses.dataclass
+class Transcript:
+    """Сведения из транскрипта сессии.
+
+    model — message.model последнего ответа ассистента основной ветки, кроме служебных моделей вида «<…>»;
+    plan_file — последний attachment.planFilePath; turn_messages — непустые тексты ответов ассистента основной
+    ветки после последней реплики автора, по порядку; author_turn — текст этой реплики и сообщений человека,
+    отправленных посреди хода после неё; author_answers —
+    тексты ответов на вызовы AskUserQuestion после неё; message_before_author — последнее непустое сообщение
+    ассистента до неё.
+    """
+    model: str | None = None
+    plan_file: pathlib.Path | None = None
+    turn_messages: list = dataclasses.field(default_factory=list)
+    author_turn: str = ""
+    author_answers: list = dataclasses.field(default_factory=list)
+    message_before_author: str = ""
+
+
+def _text_blocks(content):
+    """Тексты блоков type == "text" списка content; строка content — один текст."""
+    if isinstance(content, str):
+        return [content]
+    if not isinstance(content, list):
+        return []
+    return [b["text"] for b in content
+            if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)]
+
+
+def _result_text(content):
+    """Текст tool_result: строка как есть, блоки text через перевод строки."""
+    if isinstance(content, str):
+        return content
+    return "\n".join(_text_blocks(content))
+
+
+def _origin_kind(obj):
+    """origin.kind записи или вложения; нет origin — None."""
+    origin = obj.get("origin")
+    return origin.get("kind") if isinstance(origin, dict) else None
+
+
+def _is_author_turn(entry, msg, origin_seen):
+    """Реплика автора: запись user основной ветки, которую написал человек.
+
+    Записи isMeta — служебные вставки Claude Code (тело навыка, оговорки команд, сообщения peer), они приходят
+    и посреди реплики. С origin — только origin.kind == "human": task-notification и peer — не человек.
+    Без origin в транскрипте, где origin уже встречался, — локальные команды и их вывод; в транскрипте без
+    origin (origin_seen ложно) — запись с текстом без tool_result."""
+    if entry.get("isMeta"):
+        return False
+    if "origin" in entry:
+        return _origin_kind(entry) == "human"
+    if origin_seen:
+        return False
+    content = msg.get("content")
+    if isinstance(content, str):
+        return True
+    if not isinstance(content, list):
+        return False
+    kinds = {b.get("type") for b in content if isinstance(b, dict)}
+    return "text" in kinds and "tool_result" not in kinds
+
+
+def read_transcript(path):
+    """Transcript из файла JSONL path; нет пути, файла или ошибка чтения — пустой Transcript.
+    Строки не JSON и записи не словари пропускаются."""
+    out = Transcript()
+    if not isinstance(path, str) or not path:
+        return out
+    plan = None
+    asked = set()
+    origin_seen = False
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                att = entry.get("attachment")
+                p = att.get("planFilePath") if isinstance(att, dict) else None
+                if isinstance(p, str) and p:
+                    plan = p
+                # Сообщение человека посреди хода — вложение queued_command, оно дополняет реплику, не начинает новую.
+                if (isinstance(att, dict) and att.get("type") == "queued_command" and not entry.get("isSidechain")
+                        and not att.get("isMeta") and _origin_kind(att) == "human"):
+                    out.author_turn = "\n".join(t for t in (out.author_turn, *_text_blocks(att.get("prompt"))) if t)
+                origin_seen = origin_seen or "origin" in entry or isinstance(att, dict) and "origin" in att
+                msg = entry.get("message")
+                if entry.get("isSidechain") or not isinstance(msg, dict):
+                    continue
+                content = msg.get("content")
+                if entry.get("type") == "user" and _is_author_turn(entry, msg, origin_seen):
+                    if out.turn_messages:
+                        out.message_before_author = out.turn_messages[-1]
+                    out.author_turn = "\n".join(_text_blocks(content))
+                    out.author_answers, out.turn_messages = [], []
+                    asked.clear()
+                elif entry.get("type") == "user" and isinstance(content, list):
+                    out.author_answers += [_result_text(b.get("content")) for b in content
+                                           if isinstance(b, dict) and b.get("type") == "tool_result"
+                                           and b.get("tool_use_id") in asked]
+                elif entry.get("type") == "assistant":
+                    if isinstance(content, list):
+                        asked.update(b.get("id") for b in content if isinstance(b, dict)
+                                     and b.get("type") == "tool_use" and b.get("name") == "AskUserQuestion")
+                    model = msg.get("model")
+                    # Служебные ответы помечены моделью вида «<synthetic>»: --model её не примет.
+                    if isinstance(model, str) and model and not model.startswith("<"):
+                        out.model = model
+                    text = "".join(_text_blocks(content))
+                    if text.strip():
+                        out.turn_messages.append(text)
+    except OSError:
+        return Transcript()
+    out.plan_file = pathlib.Path(plan) if plan else None
+    return out
+
+
+def judge_model(data, transcript=None):
+    """Модель судьи из judge_model; «session» — модель сессии из transcript (None — транскрипт входа хука
+    читается здесь).
+
+    Модель сессии не найдена — None с предупреждением раз на сессию: судья идёт на модели claude по умолчанию.
+    """
+    model = os.environ.get("CLAUDE_PLUGIN_OPTION_JUDGE_MODEL") or SESSION_MODEL
+    if model != SESSION_MODEL:
+        return model
+    if transcript is None:
+        transcript = read_transcript(data.get("transcript_path"))
+    if transcript.model is None:
+        session_id = data.get("session_id")
+        warn_once(session_id if isinstance(session_id, str) else "", "session-model",
+                  "модель сессии не найдена в транскрипте, судья на модели claude по умолчанию")
+    return transcript.model
+
+
+def run_judge(system_prompt, user_prompt, model, *, timeout=JUDGE_TIMEOUT):
+    """Вложенный claude -p; model None — без --model; любая ошибка — пропуск с описанием в error."""
     cmd = ["claude", *JUDGE_FLAGS, "--json-schema", json.dumps(JUDGE_SCHEMA),
-           "--model", model, "--system-prompt", system_prompt]
+           *(["--model", model] if model else []), "--system-prompt", system_prompt]
     env = dict(os.environ, PLANKA_JUDGE="1")
     try:
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, encoding="utf-8",
-                                errors="replace", env=env, cwd=str(data_dir()),
-                                start_new_session=True,
-                                preexec_fn=_die_with_hook(os.getpid()) if sys.platform.startswith("linux") else None)
+        proc = _start_judge(cmd, sys.platform, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=env,
+                            cwd=str(data_dir()))
     except FileNotFoundError:
         return _skipped("claude не найден в PATH")
-    except OSError as e:
+    except (OSError, subprocess.SubprocessError) as e:
         return _skipped(f"claude не запущен: {e}")
     try:
         stdout, stderr = proc.communicate(user_prompt, timeout=timeout)
     except subprocess.TimeoutExpired:
-        # Судья — отдельная группа процессов: убивается вместе с потомками, иначе
-        # потомок держит stdout и communicate ждёт его до конца.
-        os.killpg(proc.pid, signal.SIGKILL)
-        try:
-            proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
+        _kill_group(proc)
         return _skipped(f"таймаут судьи {timeout} с")
     except (OSError, ValueError) as e:
-        os.killpg(proc.pid, signal.SIGKILL)
+        _kill_group(proc)
         return _skipped(f"обмен с claude не удался: {e}")
     line = next((l for l in stdout.splitlines() if l.startswith("{")), None)
     if line is None:
-        return _skipped(f"ответ судьи не JSON: {stdout[:200]!r} {stderr[:200]!r}")
+        return _skipped("ответ судьи не JSON", f"{stdout[:200]!r} {stderr[:200]!r}")
     try:
         result = json.loads(line)
     except json.JSONDecodeError:
-        return _skipped(f"ответ судьи не разобран: {line[:200]!r}")
+        return _skipped("ответ судьи не разобран", repr(line[:200]))
     if result.get("is_error"):
-        return _skipped(f"ошибка судьи: {result.get('result')}")
+        return _skipped("ошибка судьи", str(result.get("result"))[:200])
     so = result.get("structured_output")
     if not isinstance(so, dict) or "ok" not in so:
-        return _skipped(f"нет structured_output: {line[:200]!r}")
+        return _skipped("в ответе судьи нет structured_output", repr(line[:200]))
     reason = str(so.get("reason") or "")
     if len(reason) > MAX_REASON:
         reason = reason[:MAX_REASON - 1] + "…"
-    return Verdict(ok=bool(so["ok"]), violated=list(so.get("violated") or []), reason=reason)
+    violated = so.get("violated")
+    violated = [str(v) for v in violated] if isinstance(violated, list) else []
+    return Verdict(ok=bool(so["ok"]), violated=violated, reason=reason)
 
 
 def dumps(obj):
@@ -253,7 +445,7 @@ def dumps(obj):
     return json.dumps(obj, ensure_ascii=False).encode("utf-8", "backslashreplace").decode("utf-8")
 
 
-def _atomic_write_json(path, obj):
+def atomic_write_json(path, obj):
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -264,34 +456,57 @@ def _atomic_write_json(path, obj):
         raise
 
 
-def _safe_name(session_id):
+def safe_name(session_id):
     """Имя файла состояния из id сессии: только ASCII-буквы, цифры и «._-»."""
     safe = "".join(c if c.isalnum() and c.isascii() or c in "._-" else "_" for c in session_id)
     return safe or "unknown"
 
 
+def read_json(path, kind):
+    """Содержимое файла состояния; нет файла, битый JSON или значение не типа kind — пустой kind()."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return kind()
+    return value if type(value) is kind else kind()
+
+
 @contextlib.contextmanager
-def _state_lock(state_dir):
+def state_lock(state_dir):
     """Чтение и запись файлов состояния — под блокировкой state/.lock: параллельные хуки не теряют записи."""
     with open(state_dir / ".lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
 
 
+def _deny_count(state, key):
+    count = state.get(key, 0)
+    return count if isinstance(count, int) and not isinstance(count, bool) else 0
+
+
+def deny_budget_left(session_id, prompt_id, hook):
+    """True, если по этому ключу отказов меньше MAX_DENIES; счётчик не меняется. Сбой чтения — True."""
+    try:
+        state_dir = data_dir() / "state"
+        state_dir.mkdir(exist_ok=True)
+        with state_lock(state_dir):
+            state = read_json(state_dir / f"{safe_name(session_id)}.json", dict)
+    except OSError:
+        return True
+    return _deny_count(state, f"{prompt_id}:{hook}") < MAX_DENIES
+
+
 def deny_budget_exhausted(session_id, prompt_id, hook):
     """True, если по этому ключу уже было MAX_DENIES отказов; счётчик растёт при каждом вызове."""
     state_dir = data_dir() / "state"
     state_dir.mkdir(exist_ok=True)
-    path = state_dir / f"{_safe_name(session_id)}.json"
-    with _state_lock(state_dir):
-        try:
-            state = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            state = {}
+    path = state_dir / f"{safe_name(session_id)}.json"
+    with state_lock(state_dir):
+        state = read_json(path, dict)
         key = f"{prompt_id}:{hook}"
-        before = int(state.get(key, 0))
+        before = _deny_count(state, key)
         state[key] = before + 1
-        _atomic_write_json(path, state)
+        atomic_write_json(path, state)
     prune_state(state_dir)
     return before >= MAX_DENIES
 
@@ -305,9 +520,10 @@ def project_root(cwd):
     base = os.environ.get("CLAUDE_PROJECT_DIR") or cwd
     try:
         proc = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=base, capture_output=True,
-                              text=True, encoding="utf-8", errors="replace", timeout=5)
-        if proc.returncode == 0 and proc.stdout.strip():
-            return pathlib.Path(proc.stdout.strip())
+                              timeout=5)
+        top = proc.stdout.strip()
+        if proc.returncode == 0 and top:
+            return pathlib.Path(os.fsdecode(top))
     except (OSError, subprocess.SubprocessError):
         pass
     return pathlib.Path(base)
@@ -338,24 +554,21 @@ def warn_once(session_id, key, msg):
     """Предупреждение один раз на сессию и ключ; факт записан в state/<session>.warned.json."""
     state_dir = data_dir() / "state"
     state_dir.mkdir(exist_ok=True)
-    path = state_dir / f"{_safe_name(session_id)}.warned.json"
-    with _state_lock(state_dir):
-        try:
-            seen = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            seen = []
+    path = state_dir / f"{safe_name(session_id)}.warned.json"
+    with state_lock(state_dir):
+        seen = read_json(path, list)
         if key in seen:
             return False
         seen.append(key)
-        _atomic_write_json(path, seen)
+        atomic_write_json(path, seen)
     warn(msg)
     return True
 
 
 def prune_state(state_dir):
-    """Удаляет файлы состояния — счётчики, снимки, предупреждения — старше STATE_TTL."""
+    """Удаляет файлы состояния — счётчики, снимки, предупреждения — и брошенные .tmp-* старше STATE_TTL."""
     cutoff = time.time() - STATE_TTL
-    for p in state_dir.glob("*.json"):
+    for p in [*state_dir.glob("*.json"), *state_dir.glob(".tmp-*")]:
         try:
             if p.stat().st_mtime < cutoff:
                 p.unlink()
@@ -371,7 +584,6 @@ def log_event(hook, session_id, *, content=None, **fields):
         entry["content_len"] = len(content)
         entry["content_sha256"] = hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()
     path = data_dir() / "judge.log"
-    # Ротация и запись идут под блокировкой judge.log.lock.
     with open(path.with_name("judge.log.lock"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
@@ -415,5 +627,5 @@ def run_hook(main):
     if _messages:
         out["systemMessage"] = "\n".join(_messages)
     if out:
-        sys.stdout.write(dumps(out))
-        sys.stdout.flush()
+        sys.stdout.buffer.write(dumps(out).encode("utf-8"))
+        sys.stdout.buffer.flush()

@@ -21,6 +21,16 @@
             "timeout": 90
           }
         ]
+      },
+      {
+        "matcher": "^(Write|Edit|MultiEdit|NotebookEdit)$|^mcp__.*([Mm][Ee][Mm][Oo][Rr]|[Rr][Ee][Mm][Ee][Mm][Bb][Ee][Rr])",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/planka/guard_memory.py\"",
+            "timeout": 90
+          }
+        ]
       }
     ],
     "Stop": [
@@ -30,6 +40,30 @@
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/planka/judge_stop.py\"",
             "timeout": 120
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/planka/debug_watch.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/planka/debug_watch.py\"",
+            "timeout": 10
           }
         ]
       }

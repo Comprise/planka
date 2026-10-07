@@ -42,6 +42,11 @@ RULES = {
     "subagents": "# Субагенты\n\n- Правило субагентов.\n",
     "docs": "# Документация\n\n## Что сверяется с каждой правкой кода\n\n1. Правило документации.\n\n## Инициализация проекта без документации\n\n1. Правило инициализации.\n",
     "comments": "# Комментарии\n\n- Язык: {COMMENT_LANG}.\n",
+    "refactoring": "# Рефакторинг\n\nЧитай при рефакторинге.\n\n- Правило рефакторинга.\n",
+    "design-patterns": "# Паттерны\n\nЧитай при выборе паттерна.\n\n- Правило паттернов.\n",
+    "debugging": "# Лестница отладки\n\nЧитай, когда фикс не удался дважды.\n\n- Каталог: {RULES}.\n",
+    "heuristics": "# Эвристики\n\nЧитай при правке эвристики.\n\n- Правило эвристик.\n",
+    "memory": "# Гигиена памяти\n\nЧитай при работе с памятью.\n\n- Правило модуля памяти.\n",
 }
 
 
@@ -62,11 +67,18 @@ class Env:
             (self.root / "rules").mkdir()
             for name, text in rules.items():
                 (self.root / "rules" / f"{name}.md").write_text(text, encoding="utf-8")
+        self.transcript = pathlib.Path(self.tmp.name) / "transcript.jsonl"
+        self.transcript.write_text(
+            json.dumps({"type": "assistant", "message": {"model": "claude-test-model"}}) + "\n", encoding="utf-8")
 
     def environ(self, **extra):
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith(("PLANKA_", "CLAUDE_PLUGIN_OPTION_")) and k != "CLAUDE_PROJECT_DIR"}
+               if not k.startswith(("PLANKA_", "CLAUDE_PLUGIN_OPTION_"))
+               and k not in ("CLAUDE_PROJECT_DIR", "CLAUDE_CONFIG_DIR")}
+        home = pathlib.Path(self.tmp.name) / "home"
+        home.mkdir(exist_ok=True)
         env.update({
+            "HOME": str(home),
             "CLAUDE_PLUGIN_ROOT": str(self.root),
             "CLAUDE_PLUGIN_DATA": str(self.data),
             "PATH": f"{STUB_DIR}:{env.get('PATH', '')}",
@@ -83,6 +95,15 @@ class Env:
             input=stdin, capture_output=True, text=True,
             env=self.environ(**extra), timeout=30,
         )
+
+    def hook_input(self, event, **fields):
+        base = {
+            "session_id": "sess-1", "prompt_id": "p-1", "cwd": str(self.project),
+            "permission_mode": "default", "hook_event_name": event,
+            "transcript_path": str(self.transcript),
+        }
+        base.update(fields)
+        return base
 
     def log_lines(self):
         p = self.data / "judge.log"
@@ -110,12 +131,3 @@ def messages(r):
     msg = json.loads(r.stdout).get("systemMessage")
     return msg.splitlines() if msg else []
 
-
-def hook_input(event, **fields):
-    base = {
-        "session_id": "sess-1", "prompt_id": "p-1", "cwd": "/tmp",
-        "permission_mode": "default", "hook_event_name": event,
-        "transcript_path": "/nonexistent/transcript.jsonl",
-    }
-    base.update(fields)
-    return base
