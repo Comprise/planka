@@ -46,6 +46,14 @@ _DONE_CHECKS = """Проверь заявку о выполненной рабо
 5. Числа и подсчёты — из вывода команды, а не из головы?
 Сообщение, которое не заявляет о выполненной работе (например, «готов обсудить»), соответствует рубрике."""
 
+_DOCS_CHECKS = """Проверь сверку документации и комментариев по рубрике и ответь:
+1. Для каждого каталога с изменённым кодом — назван ли его локальный CLAUDE.md и сверен ли он?
+2. Названы ли документы context/ по изменённому механизму; обновлены они или сказано, почему ничего не устарело?
+3. Остаток правки записан в context/deferred/ или сказано, что остатка нет?
+4. Комментарии в изменённых файлах — на заданном языке или по правилу проектного CLAUDE.md; без истории; без пересказа очевидного; факт, а не обоснование?
+5. Если в корне нет CLAUDE.md — предложена ли автору инициализация?
+Отказ — указание: какой файл сверить или какую строку комментария переписать."""
+
 
 def _wrap(rubric, checks, content):
     # Закрывающий тег внутри содержимого экранируется, иначе он закончил бы блок данных раньше.
@@ -61,9 +69,9 @@ def plan_prompt(rubric, content):
     return _wrap(rubric, _PLAN_CHECKS, content)
 
 
-def stop_prompt(rubric, content, *, options, done):
-    """Промпт судьи на Stop: вопросы по совпавшим фильтрам в порядке options, done."""
-    checks = [c for flag, c in ((options, _MESSAGE_CHECKS), (done, _DONE_CHECKS)) if flag]
+def stop_prompt(rubric, content, *, options, done, docs=False):
+    """Промпт судьи на Stop: вопросы по совпавшим фильтрам в порядке options, done, docs."""
+    checks = [c for flag, c in ((options, _MESSAGE_CHECKS), (done, _DONE_CHECKS), (docs, _DOCS_CHECKS)) if flag]
     if not checks:
         raise ValueError("ни один фильтр Stop не совпал")
     return _wrap(rubric, "\n\n".join(checks), content)
@@ -83,3 +91,18 @@ def render_questions(tool_input):
             out.append(f"{i}. {label} — {desc}" if desc else f"{i}. {label}")
         out.append("")
     return "\n".join(out).strip()
+
+
+def render_docs_content(message, changed, comments, truncated, no_claude_md):
+    """Сообщение с изменёнными файлами и комментариями для судьи документации."""
+    parts = [message, "", "Изменённые файлы за ход:"]
+    parts += [f"- {path} — {'документация' if is_doc else 'код'}" for path, is_doc in changed]
+    if comments:
+        parts += ["", "Комментарии в изменённых файлах:"] + [f"- {c}" for c in comments]
+        if truncated:
+            parts.append("- … обрезано")
+    else:
+        parts += ["", "Комментарии в изменённых файлах: нет"]
+    if no_claude_md:
+        parts += ["", "В корне проекта нет CLAUDE.md."]
+    return "\n".join(parts)
