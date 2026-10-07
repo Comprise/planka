@@ -96,7 +96,7 @@ def judge_plan(data):
             return
     rubric = common.rubric(("Решения", "Планы"), ("planning", "subagents"))
     if rubric is None:
-        # Предупреждение уже выдал philosophy_sections.
+        # Предупреждение уже выдал common.rubric.
         common.log_event("plan", session, verdict="skipped", error="нет раздела рубрики")
         return
     _judge_and_emit("plan", session, prompt_id, prompts.plan_prompt(rubric, plan), plan)
