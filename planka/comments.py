@@ -94,6 +94,7 @@ def _git(root, *args):
     return proc.stdout if proc.returncode == 0 else None
 
 
+_OCTAL = re.compile(r"[0-7]{3}")
 _ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
 
 
@@ -108,11 +109,15 @@ def _unquote(path):
         if c != "\\" or i + 1 == len(body):
             out += c.encode("utf-8")
             i += 1
-        elif body[i + 1:i + 4].isdigit() and all(d in "01234567" for d in body[i + 1:i + 4]) and len(body[i + 1:i + 4]) == 3:
+        elif _OCTAL.fullmatch(body[i + 1:i + 4]):
             out.append(int(body[i + 1:i + 4], 8) & 0xFF)
             i += 4
+        elif body[i + 1] in _ESCAPES:
+            out.append(_ESCAPES[body[i + 1]])
+            i += 2
         else:
-            out.append(_ESCAPES.get(body[i + 1], ord(body[i + 1])))
+            # Неизвестный escape берётся буквально, вместе с обратной косой.
+            out += body[i:i + 2].encode("utf-8")
             i += 2
     return out.decode("utf-8", errors="replace")
 
