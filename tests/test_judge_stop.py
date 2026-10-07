@@ -14,7 +14,7 @@ OPTIONS_MSG = """Есть два подхода:
 
 Какой берём?"""
 
-PLAIN_MSG = "Готово, тесты зелёные."
+PLAIN_MSG = "Смотрю, что сломалось."
 
 
 class FilterTest(unittest.TestCase):
@@ -112,6 +112,69 @@ class MissingRubricTest(unittest.TestCase):
             self.assertEqual(last["error"], "нет раздела рубрики")
         finally:
             env.close()
+
+
+DONE_MSG = "Готово: тесты зелёные, 82/82."
+BOTH_MSG = OPTIONS_MSG + "\n\nПервый вариант уже сделан."
+
+
+class DoneFilterTest(unittest.TestCase):
+    def test_filter(self):
+        self.assertTrue(judge_stop.claims_done(DONE_MSG))
+        self.assertTrue(judge_stop.claims_done("Fixed, all tests passing."))
+        self.assertTrue(judge_stop.claims_done("Исправлено."))
+        self.assertFalse(judge_stop.claims_done("Готовлю план."))
+        self.assertFalse(judge_stop.claims_done("Смотрю, что сломалось."))
+        self.assertFalse(judge_stop.claims_done(""))
+        self.assertFalse(judge_stop.claims_done(None))
+
+
+class DoneHookTest(unittest.TestCase):
+    def setUp(self):
+        self.env = Env()
+
+    def tearDown(self):
+        self.env.close()
+
+    def stop(self, msg, **extra):
+        return self.env.run("judge_stop.py",
+                            hook_input("Stop", last_assistant_message=msg, stop_hook_active=False), **extra)
+
+    def test_done_judged_with_verification_module(self):
+        rec = self.env.data / "rec.txt"
+        r = self.stop(DONE_MSG, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        text = rec.read_text(encoding="utf-8")
+        self.assertIn("# Доказательство", text)
+        self.assertNotIn("## Решения", text)
+        self.assertIn("команда-доказательство", text)
+        self.assertEqual(self.env.log_lines()[-1]["filters"], ["done"])
+
+    def test_done_denied_blocks(self):
+        r = self.stop(DONE_MSG, PLANKA_STUB="deny", PLANKA_STUB_REASON="нет команды-доказательства")
+        out = json.loads(r.stdout)
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("нет команды-доказательства", out["reason"])
+
+    def test_both_filters_one_call(self):
+        rec = self.env.data / "rec.txt"
+        r = self.stop(BOTH_MSG, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        text = rec.read_text(encoding="utf-8")
+        self.assertIn("## Решения", text)
+        self.assertIn("# Доказательство", text)
+        self.assertIn("самый правильный", text)
+        self.assertIn("команда-доказательство", text)
+        self.assertEqual(text.count("<content>"), 1)
+        self.assertEqual(self.env.log_lines()[-1]["filters"], ["options", "done"])
+
+    def test_done_without_module_skips(self):
+        (self.env.root / "rules" / "verification.md").unlink()
+        r = self.stop(DONE_MSG)
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("planka:", r.stderr)
+        self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
 
 
 if __name__ == "__main__":
