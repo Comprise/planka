@@ -8,7 +8,7 @@ import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 STUB_DIR = REPO / "tests" / "stub"
-PLANKA_DIR = REPO / "planka"
+PLANKA_DIR = REPO / "plugin" / "planka"
 
 PHILOSOPHY = """# Философия работы
 

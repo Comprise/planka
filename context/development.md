@@ -16,13 +16,13 @@ claude plugin install planka@planka
 ## Код
 
 - Только стандартная библиотека Python; новый пакет — вопрос автору.
-- Новая точка входа хука — регистрация в `hooks/hooks.json`, тело `main()` через
+- Новая точка входа хука — регистрация в `plugin/hooks/hooks.json`, тело `main()` через
   `common.run_hook(main)`, первой строкой `main` — `common.barrier_active()`.
 - Сообщение пользователю — только `common.warn` / `common.warn_once`; `print` и stderr в хуках
   не используются.
-- Новая настройка — `userConfig` в `.claude-plugin/plugin.json`; хук читает её из
+- Новая настройка — `userConfig` в `plugin/.claude-plugin/plugin.json`; хук читает её из
   `CLAUDE_PLUGIN_OPTION_<ИМЯ>`.
-- Комментарии в коде — на русском, по `rules/comments.md`.
+- Комментарии в коде — на русском, по `plugin/rules/comments.md`.
 
 ## Документация
 

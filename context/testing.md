@@ -2,7 +2,7 @@
 
 ```bash
 make test        # python3 -m unittest discover -s tests -t . -v
-make validate    # claude plugin validate .
+make validate    # claude plugin validate . и plugin: маркетплейс и плагин
 ```
 
 CI нет; обе цели — в `Makefile`.
@@ -29,7 +29,7 @@ CI нет; обе цели — в `Makefile`.
 
 ## Что тестами не покрыто
 
-- Реальные `philosophy.md` и `rules/*.md`: тесты берут свои тексты, поэтому переименование
+- Реальные `plugin/philosophy.md` и `plugin/rules/*.md`: тесты берут свои тексты, поэтому переименование
   раздела или модуля из контракта (`context/architecture.md`, «Контракт кода с текстами
   правил») тесты не ловят.
 - Живой `claude`: вызов судьи и показ `systemMessage` проверяются только вручную.

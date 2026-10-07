@@ -3,7 +3,7 @@ import sys
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-PLANKA_DIR = REPO / "planka"
+PLANKA_DIR = REPO / "plugin" / "planka"
 sys.path.insert(0, str(PLANKA_DIR))
 import planparse  # noqa: E402
 

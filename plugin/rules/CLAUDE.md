@@ -6,9 +6,9 @@
 
 - Модуль начинается с заголовка и строки условия «Читай …».
 - Имя файла — контракт с кодом: переименование — правка вызовов `common.rubric` и
-  `common.rule_texts`, индекса в `philosophy.md` и `README.md`.
+  `common.rule_texts`, индекса в `../philosophy.md` и `../../README.md`.
 - Метки `{RULES}`, `{COMMENT_LANG}`, `{DOC_LANG}` подставляются при чтении; других меток нет.
 
 ## Читать перед правкой
 
-- `../context/architecture.md`, «Контракт кода с текстами правил»
+- `../../context/architecture.md`, «Контракт кода с текстами правил»

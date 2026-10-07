@@ -1,9 +1,9 @@
 # Модули без хука
 
-**Что не так.** Модули `rules/debugging.md`, `rules/memory.md`, `rules/refactoring.md`,
-`rules/design-patterns.md` не входят ни в одну рубрику судьи: их нет среди имён, которые
+**Что не так.** Модули `plugin/rules/debugging.md`, `plugin/rules/memory.md`, `plugin/rules/refactoring.md`,
+`plugin/rules/design-patterns.md` не входят ни в одну рубрику судьи: их нет среди имён, которые
 передают `common.rubric` в `judge_tool.judge_plan` и `judge_stop.main`. Действуют, только если
-агент сам открыл модуль по индексу «Модули» в `philosophy.md`.
+агент сам открыл модуль по индексу «Модули» в `plugin/philosophy.md`.
 
 **Чем доказано.** Чтением: `common.rule_texts` вызывается только с `planning`, `subagents`,
 `verification`, `docs`, `comments`.

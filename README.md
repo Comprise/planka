@@ -41,7 +41,7 @@ claude plugin configure planka@planka --values-stdin <<< '{"comment_lang":"en+ru
 ## Настройки
 
 Задаются через `claude plugin configure <id>`; текущие значения — `claude plugin configure <id> --json`.
-Список и умолчания — `userConfig` в `.claude-plugin/plugin.json`.
+Список и умолчания — `userConfig` в `plugin/.claude-plugin/plugin.json`.
 
 | Настройка | Значения | Действие |
 | --- | --- | --- |
@@ -56,6 +56,8 @@ claude plugin configure planka@planka --values-stdin <<< '{"comment_lang":"en+ru
 хука; stderr хуки не пишут.
 
 ## Как это работает
+
+Плагин — каталог `plugin/` репозитория; пути ниже — от него.
 
 Правила — это ядро `philosophy.md` и модули `rules/*.md` (по файлу на область, каждый начинается
 с условия «читай, когда»), среди них `docs.md` (документация проекта) и `comments.md` (комментарии
@@ -201,5 +203,5 @@ stdlib или установленного не закрывает; прочит
 
 ```bash
 make test        # unittest, claude подменяется tests/stub/claude
-make validate    # claude plugin validate .
+make validate    # claude plugin validate . и plugin: маркетплейс и плагин
 ```

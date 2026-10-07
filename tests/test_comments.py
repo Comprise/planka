@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-PLANKA_DIR = pathlib.Path(__file__).resolve().parent.parent / "planka"
+PLANKA_DIR = pathlib.Path(__file__).resolve().parent.parent / "plugin" / "planka"
 sys.path.insert(0, str(PLANKA_DIR))
 import comments  # noqa: E402
 

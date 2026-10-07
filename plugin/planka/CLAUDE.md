@@ -11,6 +11,6 @@
 
 ## Читать перед правкой
 
-- `../context/architecture.md`
-- `../context/testing.md`
-- `../context/development.md`, «Код»
+- `../../context/architecture.md`
+- `../../context/testing.md`
+- `../../context/development.md`, «Код»

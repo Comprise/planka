@@ -5,6 +5,10 @@ planka — плагин Claude Code уровня пользователя: тр�
 вложенного судью-модель или детерминированные проверки. Пользовательское описание поведения —
 `README.md`, разделы «Как это работает» и «Известные ограничения».
 
+Плагин — каталог `plugin/`: маркетплейс отдаёт пользователям только его (`"source": "./plugin"` в
+`.claude-plugin/marketplace.json`). Пути ниже, кроме `.claude-plugin/marketplace.json`, — от
+`plugin/`, он же `CLAUDE_PLUGIN_ROOT` хуков.
+
 ## Компоненты
 
 | Файл | Роль |
@@ -22,7 +26,7 @@ planka — плагин Claude Code уровня пользователя: тр�
 | `philosophy.md` | ядро правил; индекс «Модули» в конце |
 | `rules/*.md` | модули правил, по файлу на область |
 | `.claude-plugin/plugin.json` | манифест и `userConfig`: `judge_model`, `comment_lang`, `doc_lang` |
-| `.claude-plugin/marketplace.json` | маркетплейс `planka`, источник плагина — корень репозитория |
+| `.claude-plugin/marketplace.json` | маркетплейс `planka` в корне репозитория, источник плагина — `./plugin` |
 
 ## Контракт кода с текстами правил
 

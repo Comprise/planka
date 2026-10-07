@@ -1,6 +1,6 @@
 # planka
 
-Плагин Claude Code: хуки подмешивают правила `philosophy.md` и `rules/*.md` в контекст агента и
+Плагин Claude Code: хуки подмешивают правила `plugin/philosophy.md` и `plugin/rules/*.md` в контекст агента и
 отклоняют его действия через судью-модель или детерминированные проверки. Пользовательское
 описание — `README.md`.
 
@@ -16,7 +16,9 @@
 
 ## Критические инварианты
 
-- Имена разделов `## Решения` и `## Планы` в `philosophy.md` и имена файлов `rules/*.md` —
+- Пользователям уходит только `plugin/`: файлы разработки — тесты, документация, настройки
+  инструментов — лежат вне него.
+- Имена разделов `## Решения` и `## Планы` в `plugin/philosophy.md` и имена файлов `plugin/rules/*.md` —
   контракт с кодом; тесты его не проверяют. См. `context/architecture.md`, «Контракт кода с
   текстами правил».
 - Метки `{RULES}`, `{COMMENT_LANG}`, `{DOC_LANG}` в правилах подставляет `common.substitute`.
@@ -26,11 +28,13 @@
 
 | Путь | Что |
 | --- | --- |
-| `planka/` | код хуков |
-| `rules/` | модули правил |
-| `philosophy.md` | ядро правил |
-| `hooks/hooks.json` | регистрация хуков |
-| `.claude-plugin/` | манифест плагина и маркетплейса |
+| `plugin/` | плагин целиком — только он уходит пользователям (`"source": "./plugin"`) |
+| `plugin/planka/` | код хуков |
+| `plugin/rules/` | модули правил |
+| `plugin/philosophy.md` | ядро правил |
+| `plugin/hooks/hooks.json` | регистрация хуков |
+| `plugin/.claude-plugin/plugin.json` | манифест плагина |
+| `.claude-plugin/marketplace.json` | манифест маркетплейса |
 | `tests/` | unittest и заглушка `claude` |
 | `docs/superpowers/` | спеки и планы разработки |
 | `context/` | документация для агента |
@@ -46,13 +50,13 @@
 
 Минимальные наборы:
 
-- Правка хука или `planka/*.py` — `context/architecture.md`, `context/testing.md`.
-- Правка `philosophy.md` или `rules/` — `context/architecture.md`, «Контракт кода с текстами правил».
+- Правка хука или `plugin/planka/*.py` — `context/architecture.md`, `context/testing.md`.
+- Правка `plugin/philosophy.md` или `plugin/rules/` — `context/architecture.md`, «Контракт кода с текстами правил».
 - Новая настройка, хук или пакет — `context/development.md`.
 
 ## Ведение документации
 
-По `rules/docs.md`: каждая правка кода сверяет `context/`, этот файл и локальный `CLAUDE.md`
+По `plugin/rules/docs.md`: каждая правка кода сверяет `context/`, этот файл и локальный `CLAUDE.md`
 правленного каталога, `README.md` и комментарии; остаток — запись в `context/deferred/`.
 
 <!-- code-review-graph MCP tools -->
