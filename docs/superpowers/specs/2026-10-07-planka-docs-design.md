@@ -30,6 +30,11 @@
 - Судья комментариев видит сами комментарии из изменённых файлов, а не самоотчёт.
 - «Границы» получают оговорку: ведение документации проекта по `rules/docs.md` — часть каждой
   правки, не нарушение запрета править `CLAUDE.md`.
+- Пользовательских переменных окружения нет: модель судьи — настройка `judge_model` (умолчание
+  `sonnet`); выключение — `claude plugin disable`, собственный выключатель `PLANKA_OFF` снят как
+  второй источник состояния «включён». `PLANKA_JUDGE` остаётся служебной меткой вложенного вызова.
+- Публикация: `.claude-plugin/marketplace.json` (маркетплейс `planka`, плагин `planka`,
+  `source: ./`) для установки из `github.com/Comprise/planka`.
 
 ## 3. Тексты
 
@@ -41,7 +46,8 @@
 настройки в ядре и в тексте модулей, когда их читает судья (`common.rule_texts`). Агент, открывший
 модуль с диска, видит метку; значения ему даёт строка индекса ядра. Незаданная настройка
 подставляется как «не задан» и даёт строку `planka: задайте comment_lang и doc_lang: claude plugin
-configure planka --values-stdin` в stderr один раз на сессию.
+configure planka@<маркетплейс> --values-stdin; id — в claude plugin list` в stderr один раз на
+сессию: короткий id без маркетплейса команда `claude plugin configure` не принимает.
 
 ## 4. Настройки
 
@@ -49,12 +55,14 @@ configure planka --values-stdin` в stderr один раз на сессию.
 
 ```json
 {
+  "judge_model": {"type": "string", "title": "Модель судьи", "default": "sonnet"},
   "comment_lang": {"type": "string", "title": "Язык комментариев", "options": ["en", "ru", "en+ru"], "required": true},
   "doc_lang": {"type": "string", "title": "Язык документации", "options": ["en", "ru"], "required": true}
 }
 ```
 
-Хуки читают `CLAUDE_PLUGIN_OPTION_COMMENT_LANG` и `CLAUDE_PLUGIN_OPTION_DOC_LANG`. Проектный
+Хуки читают `CLAUDE_PLUGIN_OPTION_JUDGE_MODEL`, `CLAUDE_PLUGIN_OPTION_COMMENT_LANG` и
+`CLAUDE_PLUGIN_OPTION_DOC_LANG`. Проектный
 `CLAUDE.md` конкретнее настройки и побеждает: модуль комментариев говорит это прямо. Поле с
 `options` требует Claude Code ≥ 2.1.271; у автора 2.1.292.
 
@@ -106,6 +114,7 @@ philosophy.md                — оговорка в «Границах», ин�
 rules/docs.md                — новый
 rules/comments.md            — новый
 .claude-plugin/plugin.json   — userConfig
+.claude-plugin/marketplace.json — манифест маркетплейса
 planka/common.py             — настройки, подстановка меток, корень проекта, классификация файлов
 planka/snapshot.py           — обход, исключения, запись и сравнение снимка
 planka/comments.py           — извлечение строк комментариев
