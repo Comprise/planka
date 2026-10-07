@@ -89,7 +89,8 @@ class DonePromptTest(unittest.TestCase):
         self.assertIn("самый правильный", p)
         self.assertIn("команда-доказательство", p)
         self.assertLess(p.index("самый правильный"), p.index("команда-доказательство"))
-        self.assertEqual(p.count("<content>"), 1)
+        self.assertEqual(p.count("\n<content>\n"), 1)
+        self.assertEqual(p.count("\n</content>\n"), 1)
 
     def test_stop_prompt_single(self):
         self.assertNotIn("команда-доказательство", prompts.stop_prompt("R", "C", options=True, done=False))

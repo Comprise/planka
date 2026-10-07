@@ -167,7 +167,8 @@ class DoneHookTest(unittest.TestCase):
         self.assertIn("# Доказательство", text)
         self.assertIn("самый правильный", text)
         self.assertIn("команда-доказательство", text)
-        self.assertEqual(text.count("<content>"), 1)
+        self.assertEqual(text.count("\n<content>\n"), 1)
+        self.assertEqual(text.count("\n</content>\n"), 1)
         self.assertEqual(self.env.log_lines()[-1]["filters"], ["options", "done"])
 
     def test_done_without_module_skips(self):
