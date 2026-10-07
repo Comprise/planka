@@ -54,10 +54,38 @@
 - Правка `plugin/philosophy.md` или `plugin/rules/` — `context/architecture.md`, «Контракт кода с текстами правил».
 - Новая настройка, хук или пакет — `context/development.md`.
 
+## `plugin/planka/`
+
+Код хуков: точки входа `remind.py`, `judge_tool.py`, `judge_stop.py`, остальное — их модули.
+
+Инварианты:
+
+- Модули импортируют друг друга по имени (`import common`), без пакета.
+- Точка входа: `common.run_hook(main)`; `main` начинается с `common.barrier_active()`.
+- Вывод — только через `common.emit` и `common.warn`; `print` и stderr не используются.
+- Запись файлов состояния — атомарная, через временный файл и `os.replace`.
+
+Читать перед правкой: `context/architecture.md`, `context/testing.md`,
+`context/development.md` («Код»).
+
+## `plugin/rules/`
+
+Модули правил: по файлу на область, индекс — раздел «Модули» в `plugin/philosophy.md`.
+
+Инварианты:
+
+- Модуль начинается с заголовка и строки условия «Читай …».
+- Имя файла — контракт с кодом: переименование — правка вызовов `common.rubric` и
+  `common.rule_texts`, индекса в `plugin/philosophy.md` и `README.md`.
+- Метки `{RULES}`, `{COMMENT_LANG}`, `{DOC_LANG}` подставляются при чтении; других меток нет.
+
+Читать перед правкой: `context/architecture.md`, «Контракт кода с текстами правил».
+
 ## Ведение документации
 
-По `plugin/rules/docs.md`: каждая правка кода сверяет `context/`, этот файл и локальный `CLAUDE.md`
-правленного каталога, `README.md` и комментарии; остаток — запись в `context/deferred/`.
+По `plugin/rules/docs.md`: каждая правка кода сверяет `context/`, этот файл (для `plugin/` — его
+разделы выше) и локальный `CLAUDE.md` правленного каталога, `README.md` и комментарии; остаток —
+запись в `context/deferred/`.
 
 <!-- code-review-graph MCP tools -->
 ## MCP Tools: code-review-graph
