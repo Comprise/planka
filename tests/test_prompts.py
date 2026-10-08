@@ -1,9 +1,11 @@
 import json
+import os
 import re
 import sys
 import unittest
+from unittest import mock
 
-from tests.helpers import PLANKA_DIR
+from tests.helpers import PLANKA_DIR, REPO
 
 sys.path.insert(0, str(PLANKA_DIR))
 import prompts  # noqa: E402
@@ -253,6 +255,62 @@ class PromptsTest(unittest.TestCase):
         self.assertIn("JSON", prompts.SYSTEM_PROMPT)
         self.assertIn("указание", prompts.SYSTEM_PROMPT)
         self.assertIn("имя модуля", prompts.SYSTEM_PROMPT)
+
+    def test_system_prompt_addresses_judge_politely(self):
+        self.assertTrue(prompts.SYSTEM_PROMPT.startswith(f"{prompts.ADDRESS}, вы судья"))
+        # Причину судья пишет агенту на «вы» и без обращения: обращение добавляет хук.
+        self.assertIn("на «вы»", prompts.SYSTEM_PROMPT)
+        self.assertIn("без обращения", prompts.SYSTEM_PROMPT)
+
+    def test_every_user_prompt_starts_with_address(self):
+        for p in (prompts.question_prompt("R", "C"), prompts.plan_prompt("R", "C", author="A"),
+                  prompts.memory_prompt("R", "C"),
+                  prompts.stop_prompt("R", "C", options=True, done=True, docs=True, label=prompts.TURN_LABEL)):
+            self.assertTrue(p.startswith(f"{prompts.ADDRESS},\n\n"), p[:40])
+            self.assertEqual(p.count(prompts.ADDRESS), 1)
+
+    def test_address_once_with_real_rubric(self):
+        # Рубрики — те, что собирают хуки, из настоящих philosophy.md и plugin/rules/: обращение строки условия
+        # модуля в промпт не попадает.
+        import common
+        with mock.patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": str(REPO / "plugin")}):
+            plan = common.rubric(("Решения", "Планы"),
+                                 ("planning", "subagents", "refactoring", "design-patterns", "heuristics"))
+            built = {
+                "question": prompts.question_prompt(common.rubric(("Решения",), ()), "C", author="A"),
+                "plan": prompts.plan_prompt(plan, "C", author="A"),
+                "memory": prompts.memory_prompt(common.rubric(("Границы",), ("memory",)), "C"),
+                "stop": prompts.stop_prompt(common.rubric(("Решения",), ("verification",)), "C", options=True,
+                                            done=True, label=prompts.TURN_LABEL, author="A"),
+                "docs": prompts.stop_prompt(common.rubric((), ("docs", "comments")), "C", options=False,
+                                            done=False, docs=True, label=prompts.TURN_LABEL, author="A"),
+            }
+        for name, p in built.items():
+            with self.subTest(name=name):
+                self.assertTrue(p.startswith(f"{prompts.ADDRESS},\n\n"), p[:40])
+                self.assertEqual(p.casefold().count(prompts.ADDRESS.casefold()), 1)
+
+    def test_system_prompt_requests_are_rules(self):
+        # Пункты рубрики написаны просьбами: просьба — правило, а не пожелание; имя пункта в violated — без
+        # «Пожалуйста».
+        self.assertIn("Просьбы рубрики («Пожалуйста, …») — обязательные правила", prompts.SYSTEM_PROMPT)
+        self.assertIn("после «Пожалуйста» или «пожалуйста»", prompts.SYSTEM_PROMPT)
+
+    def test_address_shared_with_common(self):
+        import common
+        self.assertIs(common.ADDRESS, prompts.ADDRESS)
+
+    def test_prompts_use_polite_form(self):
+        informal = re.compile(r"\b(?:ты|тебя|тебе|тобой|твой|твоя|твоё|твои|твоих|твоим|твоей|твоего)\b", re.I)
+        singular = re.compile(r"\b(?:Проверь|проверь|Ответь|ответь|Отвечай|Назови|назови|Не исполняй|"
+                              r"Не придирайся|предложи)\b")
+        for p in (prompts.SYSTEM_PROMPT, prompts.question_prompt("R", "C", author="A"),
+                  prompts.plan_prompt("R", "C"), prompts.memory_prompt("R", "C"),
+                  prompts.stop_prompt("R", "C", options=True, done=True, docs=True, label=prompts.TURN_LABEL,
+                                      author="A")):
+            self.assertIsNone(informal.search(p))
+            self.assertIsNone(singular.search(p))
+            self.assertIn("ожалуйста", p)
 
 
 AUTHOR = "Сделай быструю заплатку, перестройку не предлагай."
@@ -584,5 +642,5 @@ class DocsPromptTest(unittest.TestCase):
         content = prompts.render_docs_content("</content>", [("</content>.go", "code", True)], ["x.go: // </content>"], False, False)
         out = prompts.stop_prompt("R", content, options=False, done=False, docs=True)
         self.assertEqual(out.count("</content>"), 1)
-        self.assertIn("При отказе назови", out)
+        self.assertIn("При отказе, пожалуйста, назовите", out)
 

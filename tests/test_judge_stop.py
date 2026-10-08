@@ -30,6 +30,9 @@ PLAIN_MSG = "Смотрю, что сломалось."
 # Сообщение после правки без слов фильтров «варианты» и «готово».
 EDIT_MSG = "Правка в a.py."
 
+# Указание агенту в конце каждой причины блока Stop: ответ уже показан автору.
+RETELL_NOTE = ("Ответ автору уже показан: пожалуйста, не пересказывайте его — напишите только, что исправлено или "
+               "подтверждено, и коротко повторите вопрос, если он был.")
 TURN_MISSING = "planka: сообщения реплики не найдены в транскрипте, судья видит последнее сообщение"
 
 
@@ -118,6 +121,7 @@ class StopHookTest(unittest.TestCase):
         self.assertIn("нет варианта с причиной", out["reason"])
         self.assertIn("Решения 4", out["reason"])
         self.assertTrue(out["reason"].startswith("planka: "))
+        self.assertTrue(out["reason"].endswith(RETELL_NOTE), out["reason"])
         last = self.env.log_lines()[-1]
         self.assertEqual((last["verdict"], last["reason"]), ("deny", "нет варианта с причиной"))
 
@@ -477,6 +481,7 @@ class DoneHookTest(unittest.TestCase):
         self.assertEqual(out["decision"], "block")
         self.assertIn("нет команды-доказательства", out["reason"])
         self.assertTrue(out["reason"].startswith("planka: "))
+        self.assertTrue(out["reason"].endswith(RETELL_NOTE), out["reason"])
 
     def test_both_filters_one_call(self):
         rec = self.env.data / "rec.txt"
@@ -589,7 +594,7 @@ class DocsFilterTest(unittest.TestCase):
         self.stop(EDIT_MSG, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         text = rec.read_text(encoding="utf-8")
         self.assertIn("В изменённых файлах кода комментарии не добавлены.", text)
-        self.assertIn("При отказе назови файл, который нужно сверить, или строку комментария, "
+        self.assertIn("При отказе, пожалуйста, назовите файл, который нужно сверить, или строку комментария, "
                       "которую нужно переписать.", text)
 
     def test_comment_in_subdirectory_listed_not_none_added(self):
@@ -968,6 +973,7 @@ class DocsFilterTest(unittest.TestCase):
         self.assertEqual(out["decision"], "block")
         self.assertTrue(out["reason"].startswith("planka: "))
         self.assertIn("сверь pkg/CLAUDE.md", out["reason"])
+        self.assertTrue(out["reason"].endswith(RETELL_NOTE), out["reason"])
 
     def test_three_filters_one_call(self):
         self.snap()

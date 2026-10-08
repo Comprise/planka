@@ -51,7 +51,7 @@ EXIT_LINE = re.compile(r"Exit code (\d+)")
 # Открытие heredoc: «<<» или «<<-», терминатор — слово, возможно в кавычках (here-string «<<<» не подходит).
 HEREDOC = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]*)'|\"([^\"\n]*)\"|\\?([A-Za-z0-9_.-]+))")
 
-LINE = "Команда `{command}` упала {ordinal} раз подряд — дальше по модулю {rules}/debugging.md."
+LINE = "Команда `{command}` упала {ordinal} раз подряд — дальше, пожалуйста, по модулю {rules}/debugging.md."
 
 
 def command_key(command, agent_id=""):
@@ -340,7 +340,7 @@ def main():
     if n is None:
         return
     line = LINE.format(command=_shown(norm), ordinal=_ordinal(n), rules=common.rules_dir())
-    common.emit({"hookSpecificOutput": {"hookEventName": event, "additionalContext": f"{line}\n\n{text}"}})
+    common.emit(common.context_output(f"{line}\n\n{text}", event))
 
 
 if __name__ == "__main__":

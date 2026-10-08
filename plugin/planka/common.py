@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import signal
 import subprocess
@@ -18,7 +19,7 @@ try:
 except ImportError:  # не POSIX: run_hook отвечает предупреждением и не вызывает хук
     fcntl = None
 
-from prompts import JUDGE_SCHEMA, STEP_ERROR, STEP_OUTPUT, STEP_REJECTED, Step
+from prompts import ADDRESS, JUDGE_SCHEMA, STEP_ERROR, STEP_OUTPUT, STEP_REJECTED, Step
 
 MAX_DENIES = 2
 JUDGE_TIMEOUT = 60
@@ -136,13 +137,26 @@ def philosophy_text():
     return substitute(text)
 
 
+# Обращение в строке условия модуля («Читайте, мой дорогой друг, …») — для агента, который читает модуль файлом.
+# Текст модуля от rule_texts встаёт в сообщение, которое уже начинается обращением (context_output, промпт судьи).
+_MODULE_ADDRESS = f", {ADDRESS[0].lower()}{ADDRESS[1:]},"
+
+
+def _without_address(text):
+    """Модуль без обращения _MODULE_ADDRESS в строке условия (третья строка, начинается с «Читайте»)."""
+    lines = text.split("\n", 3)
+    if len(lines) > 2 and lines[2].startswith("Читайте"):
+        lines[2] = lines[2].replace(_MODULE_ADDRESS, ",", 1)
+    return "\n".join(lines)
+
+
 def rule_texts(*names):
-    """Модули rules/<name>.md в порядке names; None, если хоть одного нет."""
+    """Модули rules/<name>.md в порядке names, без обращения в строке условия; None, если хоть одного нет."""
     out = []
     for name in names:
         p = rules_dir() / f"{name}.md"
         try:
-            out.append(substitute(p.read_text(encoding="utf-8").strip()))
+            out.append(substitute(_without_address(p.read_text(encoding="utf-8").strip())))
         except OSError:
             warn(f"нет модуля правил {p}")
             return None
@@ -809,18 +823,72 @@ def log_event(hook, session_id, *, content=None, **fields):
             f.write(dumps(entry) + "\n")
 
 
+# Обращение к модели ADDRESS (из prompts — общее с промптами судьи) в начале каждого её сообщения от хука
+# добавляют только deny_output, block_output и context_output: в текстах причин его нет — иначе оно задвоится.
+REASON_PREFIX = "planka: "
+
+
+def _is_cyrillic(ch):
+    return "А" <= ch <= "я" or ch in "Ёё"
+
+
+def _section_names():
+    """Первые слова имён разделов «## …» ядра. Файл не прочитан — пусто без предупреждения: от имён зависит только регистр
+    первой буквы причины, а о недоступном ядре предупреждают хуки, которые его читают."""
+    try:
+        text = (plugin_root() / "philosophy.md").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return set()
+    return {line[3:].split()[0] for line in text.splitlines() if line.startswith("## ") and line[3:].split()}
+
+
+def _lower_first_word(text):
+    """text со строчной первой буквой, если первое слово — обычное русское слово с заглавной: аббревиатура
+    («МКС»), латиница (имя или код: «Python», «PreToolUse», имя модуля «verification»), имя раздела ядра
+    («Решения 4» — ссылка на пункт) и текст не с буквы (`код`, «Решения») не меняются."""
+    n = 0
+    while n < len(text) and text[n].isalpha():
+        n += 1
+    word = text[:n]
+    if (word and all(map(_is_cyrillic, word)) and word[0].isupper() and word[1:] == word[1:].lower()
+            and word not in _section_names()):
+        return word[0].lower() + text[1:]
+    return text
+
+
+# Обращение в начале причины: за ним не буква и не цифра («Мой дорогой другой» — не обращение).
+_ADDRESS_START = re.compile(re.escape(ADDRESS) + r"(?!\w)", re.IGNORECASE)
+
+
+def _addressed(text):
+    """Причина отказа или блока с обращением: после префикса REASON_PREFIX, если он есть, иначе в начале.
+    Пустая причина — одно обращение; причина со скобки (пустой reason судьи, за ним « (нарушено: …)») — скобка
+    через пробел после обращения, без запятой."""
+    prefix = REASON_PREFIX if text.startswith(REASON_PREFIX) else ""
+    body = text[len(prefix):].lstrip()
+    if _ADDRESS_START.match(body):
+        return f"{prefix}{body}"
+    if not body:
+        return f"{prefix}{ADDRESS}"
+    if body.startswith("("):
+        return f"{prefix}{ADDRESS} {body}"
+    return f"{prefix}{ADDRESS}, {_lower_first_word(body)}"
+
+
 def deny_output(reason):
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse", "permissionDecision": "deny",
-        "permissionDecisionReason": reason}}
+        "permissionDecisionReason": _addressed(reason)}}
 
 
 def block_output(reason):
-    return {"decision": "block", "reason": reason}
+    return {"decision": "block", "reason": _addressed(reason)}
 
 
-def context_output(text):
-    return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}}
+def context_output(text, event="UserPromptSubmit"):
+    if not _ADDRESS_START.match(text):
+        text = f"{ADDRESS},\n\n{text}"
+    return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}
 
 
 def emit(obj):

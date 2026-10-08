@@ -15,7 +15,7 @@ import time
 import unittest
 from unittest import mock
 
-from tests.helpers import Env, PLANKA_DIR
+from tests.helpers import Env, PLANKA_DIR, REPO
 
 sys.path.insert(0, str(PLANKA_DIR))
 import common  # noqa: E402
@@ -158,6 +158,19 @@ class RulesTest(unittest.TestCase):
         common._reset()
         self.assertIsNone(common.rubric(("Решения",), ("nope",)))
         self.assertIsNone(common.rubric(("Нет такого",), ("planning",)))
+
+    def test_rule_texts_without_address(self):
+        # Модуль вставляется в сообщение, которое уже начинается обращением (context_output, промпт судьи):
+        # обращение строки условия снимается. Тексты — настоящие модули.
+        address = f", {common.ADDRESS[0].lower()}{common.ADDRESS[1:]},"
+        with mock.patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": str(REPO / "plugin")}):
+            names = sorted(p.stem for p in (REPO / "plugin" / "rules").glob("*.md"))
+            for name in names:
+                with self.subTest(name=name):
+                    self.assertIn(address, (REPO / "plugin" / "rules" / f"{name}.md").read_text(encoding="utf-8"))
+                    text = common.rule_texts(name)
+                    self.assertNotIn(common.ADDRESS.casefold(), text.casefold())
+                    self.assertTrue(text.split("\n")[2].startswith("Читайте, пожалуйста,"), text[:120])
 
     def test_rules_dir_missing_is_none(self):
         shutil.rmtree(self.env.root / "rules")
@@ -1158,7 +1171,7 @@ class RunHookTest(unittest.TestCase):
 
     def test_output_without_warnings(self):
         out, _ = run_captured(lambda: common.emit(common.block_output("r")))
-        self.assertEqual(json.loads(out), {"decision": "block", "reason": "r"})
+        self.assertEqual(json.loads(out), {"decision": "block", "reason": "Мой дорогой друг, r"})
 
     def test_state_reset_between_runs(self):
         def first():
@@ -1201,7 +1214,8 @@ class RunHookEncodingTest(unittest.TestCase):
                            capture_output=True, env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stderr, b"")
-        self.assertEqual(json.loads(r.stdout.decode("utf-8"))["hookSpecificOutput"]["additionalContext"], "привет ✓")
+        self.assertEqual(json.loads(r.stdout.decode("utf-8"))["hookSpecificOutput"]["additionalContext"],
+                         "Мой дорогой друг,\n\nпривет ✓")
 
 
 # Хук в подпроцессе: судья с русским промптом через сторож, корень проекта и транскрипт по путям с кириллицей
@@ -1274,11 +1288,74 @@ class OutputsTest(unittest.TestCase):
         d = common.deny_output("r")
         self.assertEqual(d["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(d["hookSpecificOutput"]["hookEventName"], "PreToolUse")
-        self.assertEqual(d["hookSpecificOutput"]["permissionDecisionReason"], "r")
-        self.assertEqual(common.block_output("r"), {"decision": "block", "reason": "r"})
+        self.assertEqual(d["hookSpecificOutput"]["permissionDecisionReason"], "Мой дорогой друг, r")
+        self.assertEqual(common.block_output("r"), {"decision": "block", "reason": "Мой дорогой друг, r"})
         c = common.context_output("t")
         self.assertEqual(c["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit")
-        self.assertEqual(c["hookSpecificOutput"]["additionalContext"], "t")
+        self.assertEqual(c["hookSpecificOutput"]["additionalContext"], "Мой дорогой друг,\n\nt")
+
+    def reasons(self, text):
+        return (common.deny_output(text)["hookSpecificOutput"]["permissionDecisionReason"],
+                common.block_output(text)["reason"])
+
+    def test_address_after_prefix(self):
+        for text, want in (
+                ("planka: Новая зависимость — вопрос автору.", "planka: Мой дорогой друг, новая зависимость — вопрос автору."),
+                ("planka: в одной волне файл", "planka: Мой дорогой друг, в одной волне файл"),
+                ("planka: В одной волне", "planka: Мой дорогой друг, в одной волне"),
+                ("Правка вне задачи.", "Мой дорогой друг, правка вне задачи."),
+                ("planka: ", "planka: Мой дорогой друг"),
+                ("", "Мой дорогой друг")):
+            with self.subTest(text=text):
+                self.assertEqual(self.reasons(text), (want, want))
+
+    def test_empty_judge_reason_with_violated(self):
+        # Хуки склеивают f"planka: {reason}{violated}", violated — « (нарушено: …)»: при пустой причине скобка
+        # идёт сразу за обращением.
+        want = "planka: Мой дорогой друг (нарушено: Решения 4)"
+        self.assertEqual(self.reasons("planka:  (нарушено: Решения 4)"), (want, want))
+
+    def test_address_with_word_boundary(self):
+        # «Мой дорогой другой» — не обращение: оно ставится, первое слово понижается.
+        want = "planka: Мой дорогой друг, мой дорогой другой текст."
+        self.assertEqual(self.reasons("planka: Мой дорогой другой текст."), (want, want))
+        self.assertEqual(common.context_output("Мой дорогой другой текст.")["hookSpecificOutput"]["additionalContext"],
+                         "Мой дорогой друг,\n\nМой дорогой другой текст.")
+
+    def test_section_names_keep_case(self):
+        # Имена разделов ядра — из заголовков «## …» настоящего philosophy.md.
+        with mock.patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": str(REPO / "plugin")}):
+            for body in ("Решения 4 нарушены.", "Планы 2: нет волн.", "Границы 1 нарушены.", "Поведение 3."):
+                with self.subTest(body=body):
+                    want = "planka: Мой дорогой друг, " + body
+                    self.assertEqual(self.reasons("planka: " + body), (want, want))
+
+    def test_names_and_code_keep_case(self):
+        # Аббревиатура, имя из заглавных, имя латиницей и код в обратных кавычках — не обычное слово.
+        for body in ("API не вызывается.", "README не сверен.", "PreToolUse отклонён.", "Python не нужен.",
+                     "`Makefile` не тронут.", "«Решения» нарушены.", "X — имя переменной.", "МКС — аббревиатура."):
+            with self.subTest(body=body):
+                want = "planka: Мой дорогой друг, " + body
+                self.assertEqual(self.reasons("planka: " + body), (want, want))
+
+    def test_address_not_doubled(self):
+        for text in ("planka: Мой дорогой друг, правка вне задачи.", "planka: мой дорогой друг, правка вне задачи.",
+                     "Мой дорогой друг, правка вне задачи."):
+            with self.subTest(text=text):
+                self.assertEqual(self.reasons(text), (text, text))
+        for text, want in (("planka:  Мой дорогой друг, правка.", "planka: Мой дорогой друг, правка."),
+                           ("planka: \nМой дорогой друг, правка.", "planka: Мой дорогой друг, правка."),
+                           (" Мой дорогой друг, правка.", "Мой дорогой друг, правка.")):
+            with self.subTest(text=text):
+                self.assertEqual(self.reasons(text), (want, want))
+        for text in ("Мой дорогой друг,\n\nЯдро.", "Мой дорогой друг, ядро."):
+            with self.subTest(text=text):
+                self.assertEqual(common.context_output(text)["hookSpecificOutput"]["additionalContext"], text)
+
+    def test_context_keeps_text(self):
+        text = "# Философия работы\n\nТекст."
+        self.assertEqual(common.context_output(text)["hookSpecificOutput"]["additionalContext"],
+                         "Мой дорогой друг,\n\n" + text)
 
 
 class LogTest(unittest.TestCase):

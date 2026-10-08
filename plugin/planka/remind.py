@@ -11,7 +11,7 @@ import snapshot
 # снимка; запись готового файла — в оставшемся запасе.
 SNAPSHOT_BUDGET = 7
 
-NO_DOCS_LINE = "Проект без документации: предложи автору инициализацию по {RULES}/docs.md."
+NO_DOCS_LINE = "Проект без документации: пожалуйста, предложите автору инициализацию по {RULES}/docs.md."
 
 # Предел одной строки additionalContext: длиннее Claude Code сохраняет в файл и отдаёт агенту путь и первые
 # 2 000 символов, каждую строку меряя отдельно (code.claude.com/docs/en/hooks.md, «capped at 10,000 characters»).
@@ -57,8 +57,8 @@ def split_core(text, n):
 
 
 def core_parts(text):
-    """Тексты additionalContext частей ядра text по порядку; пустая строка — части нечего отдать. Первая часть
-    начинается заголовком ядра, следующие — заголовком CONTINUATION."""
+    """Тексты частей ядра text по порядку, без обращения common.context_output; пустая строка — части нечего
+    отдать. Первая часть начинается заголовком ядра, следующие — заголовком CONTINUATION."""
     out = []
     for k, part in enumerate(split_core(text, PARTS), 1):
         body = part.rstrip()
@@ -121,9 +121,11 @@ def main(args=()):
         text = remind_project(data, text, deadline)
     if not text:
         return
-    if len(text) > CONTEXT_LIMIT:
+    out = common.context_output(text)
+    # Предел меряет то, что уходит агенту, — вместе с обращением, которое добавляет context_output.
+    if len(out["hookSpecificOutput"]["additionalContext"]) > CONTEXT_LIMIT:
         common.warn(f"часть {part} ядра длиннее {CONTEXT_LIMIT} символов: Claude Code отдаст агенту только её начало")
-    common.emit(common.context_output(text))
+    common.emit(out)
 
 
 def remind_project(data, text, deadline):

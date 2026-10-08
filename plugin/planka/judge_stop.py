@@ -36,6 +36,11 @@ def claims_done(text):
     return bool(_DONE.search(text or ""))
 
 
+# Конец каждой причины блока Stop: ответ агента показан автору до хука, а после блока агент пишет новое сообщение.
+RETELL_NOTE = ("Ответ автору уже показан: пожалуйста, не пересказывайте его — напишите только, что исправлено или "
+               "подтверждено, и коротко повторите вопрос, если он был.")
+
+
 # Сроки на Stop: таймаут хука в hooks.json — 120 с; git rev-parse — до common.GIT_ROOT_TIMEOUT, сверка со
 # снимком — до SNAPSHOT_BUDGET, строки комментариев — до COMMENTS_BUDGET, судья — до JUDGE_TIMEOUT + KILL_WAIT.
 # Сумму против таймаута проверяет tests/test_contract.py (TimeoutsTest).
@@ -193,7 +198,7 @@ def judge(data, blocked=None):
         return False
     violated = f" (нарушено: {', '.join(verdict.violated)})" if verdict.violated else ""
     # Ответ запоминается до записи журнала: сбой записи не отменяет отказ.
-    common.emit(common.block_output(f"planka: {verdict.reason}{violated}"))
+    common.emit(common.block_output(f"planka: {verdict.reason}{violated}\n\n{RETELL_NOTE}"))
     if blocked is not None:
         blocked.append(True)
     common.log_event("stop", session, verdict="deny", **log)

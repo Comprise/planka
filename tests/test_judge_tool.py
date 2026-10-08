@@ -1018,7 +1018,7 @@ class ManifestBashTest(unittest.TestCase):
             self.assertIn(name, reason)
         # Текст не велит откатывать вслепую: команда могла вернуть работу автора.
         self.assertNotIn("Откати", reason)
-        self.assertIn("откатывай только свою правку", reason)
+        self.assertIn("пожалуйста, откатывайте только свою правку", reason)
         last = self.env.log_lines()[-1]
         self.assertEqual((last["hook"], last["verdict"]), ("manifest", "block-dep"))
         self.assertIsInstance(last["manifests"], int)

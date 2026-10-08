@@ -16,6 +16,9 @@ import common  # noqa: E402
 import remind  # noqa: E402
 import snapshot  # noqa: E402
 
+# Обращение, которое common.context_output ставит перед каждой частью ядра.
+ADDRESS = "Мой дорогой друг,\n\n"
+
 
 class RemindTest(unittest.TestCase):
     def setUp(self):
@@ -44,8 +47,12 @@ class RemindTest(unittest.TestCase):
         return PHILOSOPHY.replace("{RULES}", str(self.env.root / "rules")) \
             .replace("{COMMENT_LANG}", "ru").replace("{DOC_LANG}", "ru")
 
+    def no_docs(self):
+        rules = self.env.root / "rules"
+        return f"Проект без документации: пожалуйста, предложите автору инициализацию по {rules}/docs.md."
+
     def test_parts_cover_philosophy(self):
-        no_docs = f"Проект без документации: предложи автору инициализацию по {self.env.root / 'rules'}/docs.md."
+        no_docs = self.no_docs()
         parts = remind.split_core(self.expected_core(), remind.PARTS)
         contexts = []
         for k in range(1, remind.PARTS + 1):
@@ -55,9 +62,9 @@ class RemindTest(unittest.TestCase):
             out = output(r)["hookSpecificOutput"]
             self.assertEqual(out["hookEventName"], "UserPromptSubmit")
             contexts.append(out["additionalContext"])
-        self.assertEqual(contexts[0], parts[0].rstrip() + "\n\n" + no_docs)
+        self.assertEqual(contexts[0], ADDRESS + parts[0].rstrip() + "\n\n" + no_docs)
         for k in range(2, remind.PARTS + 1):
-            self.assertEqual(contexts[k - 1],
+            self.assertEqual(contexts[k - 1], ADDRESS +
                              remind.CONTINUATION.format(k=k, n=remind.PARTS) + "\n\n" + parts[k - 1].rstrip())
         self.assertEqual("".join(parts), self.expected_core())
         self.assertTrue(all(p.strip() for p in parts))
@@ -74,7 +81,7 @@ class RemindTest(unittest.TestCase):
     def test_no_argument_is_first_part(self):
         r = self.env.run("remind.py", self.env.hook_input("UserPromptSubmit", prompt="привет"))
         ctx = output(r)["hookSpecificOutput"]["additionalContext"]
-        self.assertTrue(ctx.startswith("# Философия работы"))
+        self.assertTrue(ctx.startswith(ADDRESS + "# Философия работы"))
         self.assertTrue((self.env.data / "state" / "sess-1.snap.json").exists())
 
     def test_later_part_takes_no_snapshot_and_no_docs_line(self):
@@ -82,7 +89,7 @@ class RemindTest(unittest.TestCase):
         r = self.run_part("2")
         self.assertEqual(messages(r), [])
         ctx = output(r)["hookSpecificOutput"]["additionalContext"]
-        self.assertTrue(ctx.startswith(remind.CONTINUATION.format(k=2, n=remind.PARTS)))
+        self.assertTrue(ctx.startswith(ADDRESS + remind.CONTINUATION.format(k=2, n=remind.PARTS)))
         self.assertNotIn("Проект без документации", ctx)
         self.assertFalse((self.env.data / "state").exists())
 
@@ -95,8 +102,18 @@ class RemindTest(unittest.TestCase):
 
     def test_part_over_limit_warned_and_emitted(self):
         msgs, out = self.run_in_process(mock.patch.object(remind, "CONTEXT_LIMIT", 10))
-        self.assertTrue(out["additionalContext"].startswith("# Философия работы"))
+        self.assertTrue(out["additionalContext"].startswith(ADDRESS + "# Философия работы"))
         self.assertEqual(msgs, ["planka: часть 1 ядра длиннее 10 символов: Claude Code отдаст агенту только её начало"])
+
+    def test_part_limit_counts_address(self):
+        # Предел меряет то, что уходит агенту: часть с обращением, а не текст до него.
+        sent = len(self.run_in_process()[1]["additionalContext"])
+        msgs, out = self.run_in_process(mock.patch.object(remind, "CONTEXT_LIMIT", sent - 1))
+        self.assertEqual(len(out["additionalContext"]), sent)
+        self.assertEqual(msgs, [f"planka: часть 1 ядра длиннее {sent - 1} символов: Claude Code отдаст агенту только "
+                                "её начало"])
+        msgs, _ = self.run_in_process(mock.patch.object(remind, "CONTEXT_LIMIT", sent))
+        self.assertEqual(msgs, [])
 
     def test_barrier(self):
         (self.env.project / "a.py").write_text("x\n", encoding="utf-8")
@@ -137,7 +154,7 @@ class RemindTest(unittest.TestCase):
     def test_no_claude_md_line(self):
         r = self.prompt()
         ctx = output(r)["hookSpecificOutput"]["additionalContext"]
-        self.assertTrue(ctx.endswith(f"Проект без документации: предложи автору инициализацию по {self.env.root / 'rules'}/docs.md."))
+        self.assertTrue(ctx.endswith(self.no_docs()))
 
     def test_claude_md_present_no_line(self):
         (self.env.project / "CLAUDE.md").write_text("# x\n", encoding="utf-8")
@@ -286,8 +303,8 @@ class RemindTest(unittest.TestCase):
         r = self.prompt()
         self.assertEqual(r.returncode, 0, r.stderr)
         ctx = output(r)["hookSpecificOutput"]["additionalContext"]
-        self.assertTrue(ctx.startswith("# Философия работы"))
-        self.assertTrue(ctx.endswith(f"Проект без документации: предложи автору инициализацию по {self.env.root / 'rules'}/docs.md."))
+        self.assertTrue(ctx.startswith(ADDRESS + "# Философия работы"))
+        self.assertTrue(ctx.endswith(self.no_docs()))
         msgs = messages(r)
         self.assertEqual(len(msgs), 1, msgs)
         self.assertTrue(msgs[0].startswith("planka: снимок дерева не записан: "), msgs)

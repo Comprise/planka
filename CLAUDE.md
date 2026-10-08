@@ -84,6 +84,10 @@
 - Точка входа: `common.run_hook(main)` (`remind.py` передаёт аргументы: `run_hook(lambda: main(sys.argv[1:]))`);
   `main` начинается с `common.barrier_active()`.
 - Вывод — только через `common.emit` и `common.warn`; `print` и stderr не используются.
+- Текст для модели (агента и судьи) — на «вы», с «пожалуйста» в просьбах (`tests/test_contract.py`,
+  `PoliteFormTest`). Причина отказа, блока и контекст агенту — только через `common.deny_output`,
+  `block_output`, `context_output`: они ставят обращение `prompts.ADDRESS`, в текстах причин его нет.
+  `ADDRESS` живёт в `prompts.py`: `common` импортирует `prompts`, обратный импорт дал бы цикл.
 - Отказ запоминается через `common.emit` до записи журнала: сбой записи не отменяет отказ.
 - Запись файлов состояния — атомарная, через `common.atomic_write_json` (временный файл и
   `os.replace`); чтение и запись счётчиков, предупреждений, неудач команд, снимков манифестов, неудач снимка
@@ -101,7 +105,8 @@
 
 Инварианты:
 
-- Модуль начинается с заголовка и строки условия «Читай …».
+- Модуль начинается с заголовка и строки условия «Читайте, мой дорогой друг, …».
+- Текст модуля — на «вы», с «пожалуйста» в просьбах (`PoliteFormTest` в `tests/test_contract.py`).
 - Имя файла — контракт с кодом: переименование — правка вызовов `common.rubric` и
   `common.rule_texts` в `judge_tool.py`, `judge_stop.py`, `guard_memory.py`, `debug_watch.py`
   (`MODULE`), ссылок `judge_tool.DEP_REASON`, `MANIFEST_REASON`, `COMMAND_REASON`, `MODULES` в

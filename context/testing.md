@@ -29,6 +29,14 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
   контракт с настоящими текстами правил; `tests/test_hostile_git.py` — git-код нескольких модулей под чужим
   git-конфигом.
 - Модульные тесты импортируют `planka/<модуль>.py` напрямую через `sys.path`.
+- Обращение к модели: место и регистр обращения `prompts.ADDRESS` в причине и контексте, без задвоения —
+  `OutputsTest` в `tests/test_common.py`; промпты судьи с обращением и на «вы», `common.ADDRESS` — тот же объект,
+  что `prompts.ADDRESS`, — `tests/test_prompts.py`; конец причины блока `Stop` — `judge_stop.RETELL_NOTE`, копией
+  текста в `tests/test_judge_stop.py` (`StopHookTest`, `DoneHookTest`, `DocsFilterTest`). Ожидаемый ответ хука в тестах
+  хуков включает обращение. Однократность обращения — на настоящих текстах `plugin/`:
+  `test_prompts.test_address_once_with_real_rubric` (рубрики хуков через `common.rubric`),
+  `test_debug_watch.test_real_module_address_once` (настоящий `debugging.md`),
+  `test_common.test_rule_texts_without_address` (все модули).
 - `tests/__init__.py` изолирует процесс тестов от git-настроек и окружения машины: все переменные
   `GIT_*` и `CLAUDE_PROJECT_DIR` сняты; глобальный и системный конфиг и системные атрибуты git не
   читаются (`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_NOSYSTEM`, `GIT_ATTR_NOSYSTEM`); `XDG_CONFIG_HOME` — пустой
@@ -198,8 +206,10 @@ PID процесса. Ответ с текстом собирает `python3` с
   `test_slow_git_keeps_reminder` (подложный `git status` спит 5 с и затем оставляет метку, срок снимка подменён на
   1 с; метки нет — git прерван по сроку, время не замеряется) и сбой снимка —
   `remind.main` через `RemindTest.run_in_process` (обёртка над
-  `helpers.run_in_process`); снимок walk без предела числа файлов, независимый от порядка readdir, проверка срока
-  в `_walk_dirs`, имена не в UTF-8 и отказ `load` прошлому формату и повреждённым блокам — `WalkCaptureTest`,
+  `helpers.run_in_process`); предел части вместе с обращением — `RemindTest.test_part_limit_counts_address`
+  (`CONTEXT_LIMIT` подменён длиной ушедшего текста без единицы и ею самой); снимок walk без предела числа файлов,
+  независимый от порядка readdir, проверка срока в `_walk_dirs`, имена не в UTF-8 и отказ `load` прошлому формату и
+  повреждённым блокам — `WalkCaptureTest`,
   `ChangedSinceWalkTest`, `StoreLoadDiffTest` в `tests/test_snapshot.py`;
 - перепривязка и отметка снимка (снимок другой версии формата или без поля `format` не перепривязывается —
   `test_other_format_not_carried_over`), неудачи снимка — `SnapshotStateTest` в `tests/test_snapshot.py`; прерванная
@@ -268,11 +278,18 @@ PID процесса. Ответ с текстом собирает `python3` с
 - Тесты хуков берут свои тексты правил (`helpers.PHILOSOPHY`, `helpers.RULES`); настоящие
   `plugin/philosophy.md` и `plugin/rules/*.md` проверяет только `tests/test_contract.py`: разделы и
   модули, которые код берёт по имени (ручные `SECTIONS`, `MODULES` и имена, выведенные из кода, —
-  `test_names_taken_by_code_exist`), заголовок и строка условия «Читай» каждого модуля, только
-  известные метки (без учёта регистра), ссылки `{RULES}/<имя>.md` в правилах и коде, согласие правил с
-  вопросами судьи (`RulesMatchJudgeTest`), разбор форм вызова сборщиком (`CodeNamesTest`), части ядра
-  (`CorePartsTest`: каждая с путём `{RULES}` в 200 символов и строкой `NO_DOCS_LINE` не длиннее
-  `remind.CONTEXT_LIMIT`, склейка частей — ядро, хук на каждый номер части в `hooks/hooks.json`), пункты
+  `test_names_taken_by_code_exist`), заголовок и строка условия «Читайте, мой дорогой друг,» каждого модуля,
+  только известные метки (без учёта регистра), ссылки `{RULES}/<имя>.md` в правилах и коде, согласие правил с
+  вопросами судьи (`RulesMatchJudgeTest`), разбор форм вызова сборщиком (`CodeNamesTest`), форма «вы»
+  (`PoliteFormTest`: нет «ты» и повелительного ед. числа в ядре, модулях, литералах `prompts.py` и текстах хуков,
+  которые сборщик `_hook_texts` выводит из кода по аргументам `deny_output`, `block_output`, `context_output`;
+  повелительное ед. числа ловится по форме слова на месте указания (`IMPERATIVE_PLACE`, не-глаголы на этом месте —
+  `IMPERATIVE_EXCEPT`) и списком `SINGULAR_IMPERATIVES` в любом месте, в середине предложения вне списка — нет;
+  «пожалуйста» в ядре, каждом модуле и каждом предложении текста хука с повелительным мн. числа; баланс «» в блоке
+  ядра и модулей; промпты судьи, которые зовут хуки, начинаются обращением; ответ хука собирается только в
+  `common.py`), части ядра (`CorePartsTest`: каждая с путём `{RULES}` в 200 символов, строкой
+  `NO_DOCS_LINE` и обращением `context_output` не длиннее `remind.CONTEXT_LIMIT`, склейка частей — ядро, хук на
+  каждый номер части в `hooks/hooks.json`), пункты
   «Решения» 7 и «Планы» 9, полнота индекса «Модули», метки языков. Там же
   `TimeoutsTest`: сроки внутри хуков против таймаутов `hooks/hooks.json`
   (`context/architecture.md`, «Сроки»), в сумме — `common.GIT_ROOT_TIMEOUT`, `guard_memory.CHECK_IGNORE_TIMEOUT` и сроки

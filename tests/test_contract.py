@@ -144,6 +144,193 @@ def _code_names(sources=None):
     return found["sections"], found["modules"], unresolved
 
 
+# Обращение к модели на «ты»: местоимения и глаголы 2-го лица ед. числа («знаешь»; «лишь» — частица).
+INFORMAL = re.compile(r"(?<![\w-])(?:ты|тебя|тебе|тобой|твой|твоя|твоё|твои|твоих|твоим|твоей|твоего|твою|"
+                      r"[а-яё]+(?:ешь|ёшь|ишь)(?:ся)?)(?![\w-])", re.IGNORECASE)
+INFORMAL_EXCEPT = {"лишь"}
+# Повелительное ед. числа из текстов для модели версии 0.6.5 (ядро, модули, промпты судьи, причины отказа): ловит
+# эти формы в любом месте предложения, в том числе там, где их не видит IMPERATIVE_PLACE.
+SINGULAR_IMPERATIVES = (
+    "бери", "включай", "возрази", "выбери", "выбирай", "выводи", "выдели", "выдумывай", "выполняй", "говори",
+    "гоняй", "давай", "делай", "делегируй", "держи", "держись", "добавляй", "добавь", "закрепляй", "заменяй",
+    "замкни", "запиши", "запускай", "запусти", "зафиксируй", "заявляй", "зеркаль", "исполняй", "используй",
+    "коммить", "комментируй", "лечи", "меняй", "назови", "называй", "найди", "начинай", "обновляй", "объясни",
+    "остановись", "отвергай", "отвечай", "ответь", "откатывай", "переверни", "передавай", "перезаписывай",
+    "переписывай", "перепиши", "перепроверь", "перепрогони", "перечитай", "печатай", "пиши", "планируй",
+    "повтори", "повторяй", "подразумевай", "подтверди", "покажи", "помечай", "правь", "предложи",
+    "предпочитай", "придирайся", "принимай", "проверь", "проверяй", "проводи", "проговаривай", "прогони",
+    "проси", "прочитай", "прячь", "разведай", "разверни", "раздели", "разреши", "реализуй", "сведи", "сделай",
+    "скажи", "сканируй", "следуй", "снижай", "собери", "соглашайся", "сообщи", "спрашивай", "спроси", "сравни",
+    "ставь", "трассируй", "уважай", "удаляй", "улучши", "утверждай", "форматируй", "храни", "цитируй", "чини",
+    "читай",
+)
+IMPERATIVE = re.compile(r"(?<![\w-])(?:%s)(?![\w-])" % "|".join(SINGULAR_IMPERATIVES), re.IGNORECASE)
+# Повелительное ед. числа по форме: окончание -й, -ь, -и (возвратное -йся, -ься, -ись) там, где стоит указание, —
+# в начале предложения, строки или пункта списка, после «.», «!», «?», «:», «;», «,», «—», после «не» и «и» и рядом
+# с «пожалуйста». Существительные и прилагательные с теми же окончаниями отсекают NOT_IMPERATIVE и
+# IMPERATIVE_EXCEPT.
+_IMPERATIVE_FORM = r"[а-яё]+(?:[йьи]|йся|ься|ись)"
+IMPERATIVE_PLACE = re.compile(
+    r"(?:(?:^|[.!?:;,—])\s*(?:(?:[-*]|\d+\.)[ \t]+)?|(?<![\w-])(?:не|и|пожалуйста,?)\s+)"
+    r"(?P<after>" + _IMPERATIVE_FORM + r")(?![\w-])"
+    r"|(?<![\w-])(?P<before>" + _IMPERATIVE_FORM + r")(?=,?\s+пожалуйста(?![\w-]))",
+    re.IGNORECASE | re.MULTILINE)
+# Окончания, которых у повелительного нет (или есть у редких глаголов вне текстов плагина — «пей», «пеки»):
+# прилагательные и местоимения -ый/-ий/-ой/-ей, инфинитив -ть/-ться/-чь/-сти/-зти/-йти/-дти, мн. ч. повелительного
+# -тесь, прошедшее -ось/-ась, существительные -ии, -тель, -ки, творительный мн. ч. -ами/-ями/-ыми.
+NOT_IMPERATIVE = re.compile(r"(?:[ыиое]й|ть|ться|чь|[сзйд]ти|тесь|[оа]сь|ии|тель|ки|[аяы]ми)$", re.IGNORECASE)
+# Не глаголы, которые в текстах версии 0.6.5 стоят на месте указания (IMPERATIVE_PLACE) и не отсекаются
+# NOT_IMPERATIVE: служебные слова и существительные. Новое такое слово в тексте — сюда.
+IMPERATIVE_EXCEPT = {
+    "весь", "внутри", "если", "или", "ни", "они", "при", "ради", "три",
+    "дубли", "задачи", "запись", "ключи", "конфиги", "логи", "локаль", "модули", "модуль", "перечень",
+    "пути", "разборщики", "стиль", "флаги", "хэши", "цель",
+    "разошлись",
+}
+# Просьба во мн. ч. повелительного (-йте, -ьте, -ите и возвратные): предложение с ней в тексте хука несёт
+# «пожалуйста». -ите совпадает и с настоящим временем («вы видите»): в текстах хуков его нет.
+PLURAL_IMPERATIVE = re.compile(r"(?<![\w-])[а-яё]+(?:[йь]те|ите)(?:сь)?(?![\w-])", re.IGNORECASE)
+# Функции common, которые отдают текст модели; обращение к ней добавляют они сами.
+EMITTERS = {"deny_output", "block_output", "context_output"}
+# Начало блока разметки: пустая строка, заголовок, пункт списка. Цитата и код в обратных кавычках не переходят
+# его границу: незакрытая «ёлочка» иначе спрятала бы от проверки весь остаток текста.
+BLOCK_START = re.compile(r"\n(?=[ \t]*(?:\n|#|[-*][ \t]|\d+\.[ \t]))")
+
+
+def _unquoted_block(block):
+    block = re.sub(r"`[^`]*`", " ", block)
+    out, depth = [], 0
+    for ch in block:
+        if ch == "«":
+            depth += 1
+        elif ch == "»" and depth:
+            depth -= 1
+        elif not depth:
+            out.append(ch)
+    return "".join(out)
+
+
+def _unquoted(text):
+    """text без кода в обратных кавычках и цитат в «ёлочках» (с вложенными): там слова — чужие, не обращение
+    к модели. Цитата и строчный код кончаются на границе блока (BLOCK_START)."""
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    return "\n".join(_unquoted_block(b) for b in BLOCK_START.split(text))
+
+
+def _unbalanced_quotes(text):
+    """Блоки text вне блоков кода, где «ёлочка» не закрыта или закрыта без открытия."""
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    out = []
+    for block in BLOCK_START.split(text):
+        depth, broken = 0, False
+        for ch in re.sub(r"`[^`]*`", " ", block):
+            if ch == "«":
+                depth += 1
+            elif ch == "»":
+                depth -= 1
+                broken = broken or depth < 0
+        if depth or broken:
+            out.append(block.strip()[:80])
+    return out
+
+
+def _informal_words(text):
+    """Слова обращения на «ты» и повелительного ед. числа в text вне кода и цитат."""
+    text = _unquoted(text)
+    found = {m.start(): m.group(0) for m in INFORMAL.finditer(text) if m.group(0).lower() not in INFORMAL_EXCEPT}
+    found.update({m.start(): m.group(0) for m in IMPERATIVE.finditer(text)})
+    for m in IMPERATIVE_PLACE.finditer(text):
+        name = "after" if m.group("after") else "before"
+        word = m.group(name)
+        if not NOT_IMPERATIVE.search(word) and word.lower() not in IMPERATIVE_EXCEPT:
+            found[m.start(name)] = word
+    return [found[k] for k in sorted(found)]
+
+
+def _sentences_without_please(text):
+    """Предложения text вне кода и цитат с повелительным мн. ч. и без «пожалуйста». Перенос строки внутри
+    абзаца предложение не кончает."""
+    out = []
+    for sentence in re.split(r"(?<=[.!?])\s+|" + BLOCK_START.pattern, _unquoted(text)):
+        if PLURAL_IMPERATIVE.search(sentence) and "пожалуйста" not in sentence.lower():
+            out.append(sentence.strip())
+    return out
+
+
+def _module_trees(planka_dir):
+    """{имя модуля: (дерево, присваивания _assigned, {имя функции: FunctionDef})} plugin/planka/*.py."""
+    out = {}
+    for path in sorted(planka_dir.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        out[path.stem] = (tree, _assigned(tree), funcs)
+    return out
+
+
+def _flow_strings(expr, mod, modules, seen):
+    """Строки, из которых может сложиться значение expr в модуле mod: литералы и части f-строк, значения имён
+    (рекурсивно), константы других модулей плагина (`depcheck.X`), возвращаемое функциями плагина, которые expr
+    зовёт. Лишнее (ключи словарей, аргументы git) проверке не мешает: в нём нет русских слов."""
+    found = set()
+    for node in ast.walk(expr):
+        target = None
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            found.add(node.value)
+        elif isinstance(node, ast.Name):
+            target = (mod, node.id)
+        elif (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+              and node.value.id in modules):
+            target = (node.value.id, node.attr)
+        if target is None or target in seen:
+            continue
+        seen.add(target)
+        tmod, name = target
+        _, values, funcs = modules[tmod]
+        for value in values.get(name, ()):
+            found |= _flow_strings(value, tmod, modules, seen)
+        if name in funcs:
+            for ret in ast.walk(funcs[name]):
+                if isinstance(ret, ast.Return) and ret.value is not None:
+                    found |= _flow_strings(ret.value, tmod, modules, seen)
+    return found
+
+
+def _hook_texts(planka_dir=PLANKA_DIR):
+    """{"модуль.py": {строка, ...}}: русский текст, который хуки отдают модели через EMITTERS, выведенный из
+    кода по потоку значений аргументов (_flow_strings)."""
+    modules = _module_trees(planka_dir)
+    out = {}
+    for mod, (tree, _, _) in modules.items():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and _callee(node.func) in EMITTERS and node.args:
+                strings = set()
+                for arg in node.args:
+                    strings |= _flow_strings(arg, mod, modules, set())
+                out.setdefault(f"{mod}.py", set()).update(s for s in strings if re.search("[а-яё]", s, re.I))
+    return out
+
+
+def _prompt_strings(planka_dir=PLANKA_DIR):
+    """Строковые литералы prompts.py, кроме докстрингов: всё, из чего складываются промпты судьи."""
+    tree = ast.parse((planka_dir / "prompts.py").read_text(encoding="utf-8"))
+    docstrings = {id(n.body[0].value) for n in ast.walk(tree)
+                  if isinstance(n, (ast.Module, ast.FunctionDef, ast.ClassDef)) and n.body
+                  and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant)}
+    return {n.value for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docstrings}
+
+
+def _informal_texts(plugin_dir=PLUGIN):
+    """["источник: слово"] обращений на «ты» и повелительного ед. числа в текстах для модели: ядро, модули,
+    промпты судьи, тексты хуков."""
+    texts = [("philosophy.md", (plugin_dir / "philosophy.md").read_text(encoding="utf-8"))]
+    texts += [(f"rules/{p.name}", p.read_text(encoding="utf-8")) for p in sorted((plugin_dir / "rules").glob("*.md"))]
+    planka_dir = plugin_dir / "planka"
+    texts += [("prompts.py", s) for s in sorted(_prompt_strings(planka_dir))]
+    texts += [(name, s) for name, strings in sorted(_hook_texts(planka_dir).items()) for s in sorted(strings)]
+    return [f"{name}: {word}" for name, text in texts for word in _informal_words(text)]
+
+
 def _hook_timeouts():
     """{файл хука: [timeout, ...]} из plugin/hooks/hooks.json."""
     hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text(encoding="utf-8"))["hooks"]
@@ -182,7 +369,10 @@ class CorePartsTest(unittest.TestCase):
         self.assertEqual(len(contexts), remind.PARTS)
         contexts[0] += "\n\n" + remind.NO_DOCS_LINE.replace("{RULES}", rules)
         for k, ctx in enumerate(contexts, 1):
-            self.assertLessEqual(len(ctx), remind.CONTEXT_LIMIT, f"часть {k}")
+            # Мерится то, что уходит агенту: с обращением, которое добавляет context_output.
+            sent = common.context_output(ctx)["hookSpecificOutput"]["additionalContext"]
+            self.assertTrue(sent.startswith(common.ADDRESS))
+            self.assertLessEqual(len(sent), remind.CONTEXT_LIMIT, f"часть {k}")
 
     def test_parts_keep_every_section_once(self):
         parts = remind.split_core(self.core, remind.PARTS)
@@ -231,7 +421,8 @@ class ContractTest(unittest.TestCase):
             lines = path.read_text(encoding="utf-8").splitlines()
             self.assertTrue(lines[0].startswith("# "), path.name)
             self.assertEqual(lines[1], "", path.name)
-            self.assertTrue(lines[2].startswith("Читай"), path.name)
+            self.assertTrue(lines[2].startswith(f"Читайте, {common.ADDRESS[0].lower()}{common.ADDRESS[1:]},"),
+                            path.name)
 
     def test_only_known_marks(self):
         # Метка в другом регистре common.substitute не подставляет.
@@ -273,6 +464,115 @@ class ContractTest(unittest.TestCase):
         self.assertIn("{COMMENT_LANG}", (PLUGIN / "rules" / "comments.md").read_text(encoding="utf-8"))
         self.assertIn("{DOC_LANG}", (PLUGIN / "rules" / "docs.md").read_text(encoding="utf-8"))
         self.assertIn("{RULES}", self.core)
+
+
+class PoliteFormTest(unittest.TestCase):
+    """Всё, что плагин пишет модели, — на «вы» и с «пожалуйста»; обращение common.ADDRESS ставят EMITTERS и
+    промпты судьи (EMITTERS проверяет test_common)."""
+
+    def test_no_informal_address(self):
+        found = _informal_texts()
+        if found:
+            self.fail("обращение на «ты» или повелительное ед. числа:\n" + "\n".join(found))
+
+    def test_please_in_core_and_every_module(self):
+        for name, text in _rule_texts().items():
+            self.assertTrue("пожалуйста" in text.lower(), name)
+
+    def test_hook_texts_found_by_code(self):
+        # Сборщик видит каждый известный текст хука: пропуск — сбой разбора, а не отсутствие текста.
+        import debug_watch
+        import depcheck
+        import judge_tool
+        texts = set().union(*_hook_texts().values())
+        known = (judge_tool.DEP_REASON, judge_tool.DEP_DOUBT_REASON, judge_tool.MANIFEST_REASON,
+                 judge_tool.COMMAND_REASON, remind.NO_DOCS_LINE, remind.CONTINUATION, debug_watch.LINE,
+                 depcheck._WHY_FLAG, depcheck._WHY_NAME)
+        for text in known:
+            self.assertIn(text, texts)
+
+    def test_judge_prompts_start_with_address(self):
+        # Промпты, которые хуки отдают судье: prompts.SYSTEM_PROMPT и функции prompts.*_prompt из кода хуков.
+        used = set()
+        for path in PLANKA_DIR.glob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                        and node.value.id == "prompts" and node.attr.lower().endswith("_prompt")):
+                    used.add(node.attr)
+        self.assertGreaterEqual(used, {"SYSTEM_PROMPT", "question_prompt", "plan_prompt", "memory_prompt",
+                                       "stop_prompt"})
+        for name in sorted(used):
+            value = getattr(prompts, name)
+            if callable(value):
+                params = inspect.signature(value).parameters.values()
+                args = ["x" for p in params if p.kind is p.POSITIONAL_OR_KEYWORD and p.default is p.empty]
+                kwargs = {p.name: True for p in params if p.kind is p.KEYWORD_ONLY and p.default is p.empty}
+                value = value(*args, **kwargs)
+            self.assertTrue(value.startswith(common.ADDRESS), name)
+
+    def test_informal_words_found(self):
+        cases = {
+            "Спроси автора.": ["Спроси"],
+            "Пожалуйста, не правь чужое и прочитай модуль.": ["правь", "прочитай"],
+            "Если ты знаешь ответ, твоя очередь.": ["ты", "твоя", "знаешь"],
+            "Спросите автора, пожалуйста; читайте модуль лишь раз.": [],
+            "Цитата «не правь» и код `читай` — не обращение.": [],
+            "Вложенная «цитата «спроси» внутри» тоже.": [],
+            # Формы вне SINGULAR_IMPERATIVES — по месту указания.
+            "Сверь файл. Откати правку.\n- Поставь маркер.": ["Сверь", "Откати", "Поставь"],
+            "Не трогай тест; поставь маркер — и уходи.": ["трогай", "поставь", "уходи"],
+            "Дальше иди, пожалуйста, по модулю; пожалуйста, вернись.": ["иди", "вернись"],
+            # Не глаголы на месте указания: окончания NOT_IMPERATIVE и слова IMPERATIVE_EXCEPT.
+            "Новый модуль. Правки, ключи и пути — если есть; мой дорогой друг, держитесь.": [],
+            # Незакрытая «ёлочка» прячет только свой блок.
+            "Это «незакрытая цитата.\n## Границы\nСпроси автора.": ["Спроси"],
+            "Это «незакрытая цитата.\n\nСпроси автора.": ["Спроси"],
+        }
+        for text, words in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(sorted(_informal_words(text)), sorted(words))
+
+    def test_rule_quotes_balanced(self):
+        # Незакрытая «ёлочка» прячет от test_no_informal_address остаток блока.
+        for name, text in _rule_texts().items():
+            self.assertEqual(_unbalanced_quotes(text), [], name)
+
+    def test_unbalanced_quotes_found(self):
+        self.assertEqual(_unbalanced_quotes("«а» и «б «в»»\n\n`«` код"), [])
+        self.assertEqual(len(_unbalanced_quotes("Это «незакрытая.\n## Границы\nа»\n\nи » лишняя")), 3)
+
+    def test_hook_requests_say_please(self):
+        found = [f"{name}: {s}" for name, strings in sorted(_hook_texts().items()) for text in sorted(strings)
+                 for s in _sentences_without_please(text)]
+        if found:
+            self.fail("просьба без «пожалуйста»:\n" + "\n".join(found))
+
+    def test_sentences_without_please_found(self):
+        text = ("Пожалуйста, назовите пакет и\nповторите команду. Прочитайте модуль.\n- Спросите автора, "
+                "пожалуйста.\n- Остановитесь.\n\nГраница задачи — то, что поставлено.")
+        self.assertEqual(_sentences_without_please(text), ["Прочитайте модуль.", "- Остановитесь."])
+
+    def test_hook_answer_built_only_in_common(self):
+        # Ответ хука собирают common.deny_output, block_output, context_output: обращение к модели ставят они, и
+        # ответ в обход них ушёл бы без него. Чтение готового ответа (out["hookSpecificOutput"]) — не сборка.
+        keys = ("hookSpecificOutput", "permissionDecision", '"decision"')
+        found = []
+        for path in sorted(PLANKA_DIR.glob("*.py")):
+            if path.name == "common.py":
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            loads = {id(n.slice) for n in ast.walk(tree)
+                     if isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Load)}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in loads:
+                    value = node.value
+                elif isinstance(node, ast.keyword) and node.arg:
+                    value = node.arg
+                else:
+                    continue
+                if value == "decision" or any(k in value for k in keys):
+                    found.append(f"{path.name}:{node.lineno}: {value[:60]}")
+        self.assertEqual(found, [])
 
 
 class CodeNamesTest(unittest.TestCase):

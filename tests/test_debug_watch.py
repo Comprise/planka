@@ -6,9 +6,10 @@ import sys
 import time
 import unittest
 
-from tests.helpers import PLANKA_DIR, RULES, Env, assert_linear, messages, output
+from tests.helpers import PLANKA_DIR, REPO, RULES, Env, assert_linear, messages, output
 
 sys.path.insert(0, str(PLANKA_DIR))
+import common  # noqa: E402
 import debug_watch  # noqa: E402
 
 # Корпус поля error события PostToolUseFailure на Bash; источник — поле source каждой строки.
@@ -19,7 +20,7 @@ def corpus():
     with CORPUS.open(encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
 
-DEBUGGING = "# Лестница отладки\n\nЧитай, когда фикс не удался дважды.\n\n- Каталог: {RULES}.\n"
+DEBUGGING = "# Лестница отладки\n\nЧитайте, мой дорогой друг, когда фикс не удался дважды.\n\n- Каталог: {RULES}.\n"
 
 
 class DebugWatchTest(unittest.TestCase):
@@ -63,10 +64,22 @@ class DebugWatchTest(unittest.TestCase):
         ctx = self.context(self.failure())
         rules = self.env.root / "rules"
         self.assertTrue(ctx.startswith(
-            f"Команда `make test` упала второй раз подряд — дальше по модулю {rules}/debugging.md.\n\n"))
+            f"{common.ADDRESS},\n\nКоманда `make test` упала второй раз подряд — дальше, пожалуйста, по модулю "
+            f"{rules}/debugging.md.\n\n"))
         self.assertIn("# Лестница отладки", ctx)
         self.assertIn(f"Каталог: {rules}.", ctx)
         self.assertNotIn("{RULES}", ctx)
+
+    def test_real_module_address_once(self):
+        # Настоящий debugging.md: обращение строки условия снято, остаётся одно — от context_output.
+        real = (REPO / "plugin" / "rules" / "debugging.md").read_text(encoding="utf-8")
+        self.env.close()
+        self.env = Env(rules=dict(RULES, debugging=real))
+        self.failure()
+        ctx = self.context(self.failure())
+        self.assertIn("# Лестница отладки", ctx)
+        self.assertIn("Читайте, пожалуйста,", ctx)
+        self.assertEqual(ctx.casefold().count(common.ADDRESS.casefold()), 1)
 
     def test_whitespace_normalized(self):
         self.failure("  make   test ")
@@ -252,7 +265,7 @@ class DebugWatchTest(unittest.TestCase):
         command = "make " + "x" * 300
         self.failure(command)
         ctx = self.context(self.failure(command))
-        first = ctx.split("\n", 1)[0]
+        first = ctx.removeprefix(f"{common.ADDRESS},\n\n").split("\n", 1)[0]
         self.assertIn("`" + command[:debug_watch.MAX_SHOWN_COMMAND - 1] + "…`", first)
         self.assertNotIn("x" * debug_watch.MAX_SHOWN_COMMAND, first)
 

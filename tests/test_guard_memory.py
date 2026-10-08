@@ -74,7 +74,7 @@ class MemoryHookTest(unittest.TestCase):
         r = self.write_mem(PLANKA_STUB="deny", PLANKA_STUB_REASON="автор не согласился")
         out = output(r)["hookSpecificOutput"]
         self.assertEqual(out["permissionDecision"], "deny")
-        self.assertTrue(out["permissionDecisionReason"].startswith("planka: автор не согласился"))
+        self.assertTrue(out["permissionDecisionReason"].startswith("planka: Мой дорогой друг, автор не согласился"))
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "deny")
 
     def test_non_memory_paths_pass_silently(self):
