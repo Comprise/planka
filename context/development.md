@@ -15,19 +15,26 @@ planka@planka` с перезапуском сессии (`README.md`, «Уста
 `python3 "${CLAUDE_PLUGIN_ROOT}/planka/<скрипт>.py"`; модули `planka/` импортируют друг друга
 по имени (`import common`), каталог скрипта — первый в `sys.path`.
 
-Точки входа: `remind.py` (`UserPromptSubmit`), `judge_tool.py` и `guard_memory.py` (`PreToolUse`),
-`judge_stop.py` (`Stop`), `debug_watch.py` (`PostToolUse`, `PostToolUseFailure`).
+Точки входа: `remind.py` (`UserPromptSubmit`), `judge_tool.py` (`PreToolUse`; на `Bash` ещё
+`PostToolUse`, `PostToolUseFailure`), `guard_memory.py` (`PreToolUse`), `judge_stop.py` (`Stop`),
+`debug_watch.py` (`PostToolUse`, `PostToolUseFailure`). Один скрипт на нескольких событиях различает их
+по `hook_event_name` входа (`judge_tool.POST_EVENTS`).
 
 ## Код
 
-- Только стандартная библиотека Python; новый пакет — вопрос автору.
+- Только стандартная библиотека Python 3.11+ (`tomllib` в `manifests.py`); новый пакет — вопрос автору.
 - Новая точка входа хука — регистрация в `plugin/hooks/hooks.json` с таймаутом, тело `main()` через
   `common.run_hook(main)`, первой строкой `main` — `common.barrier_active()`; тесты — подпроцессом
   через `tests.helpers.Env` (`context/testing.md`); строка в таблицах хуков `README.md`, «Как это
   работает», и `context/architecture.md`, «Компоненты».
 - Хук, который берёт раздел ядра или модуль правил по имени, добавляет это имя в
   `tests/test_contract.py` (`SECTIONS`, `MODULES`) и в `context/architecture.md`, «Контракт кода с
-  текстами правил».
+  текстами правил». Имя из вызова `common.rubric`, `common.philosophy_sections`, `common.rule_texts`
+  или константы `MODULE` тест находит в коде и сам (`test_names_taken_by_code_exist`); ручной список —
+  обратная проверка, что код имя ещё берёт. Имя, переданное иначе (переменной из другого места,
+  текстом причины, как `dependencies` в `judge_tool.DEP_REASON`), тест в коде не видит.
+- Новый срок внутри хука (бюджет, таймаут вызова) — в сумму `TimeoutsTest` в `tests/test_contract.py`
+  и в `context/architecture.md`, «Сроки»: сумма сроков хука меньше его `timeout` в `hooks/hooks.json`.
 - Хук с судьёй: лимит отказов до вызова судьи (`common.deny_budget_left`) и при отказе
   (`common.deny_budget_exhausted`); ошибка судьи — `common.skip_message` пользователю,
   `Verdict.error` в журнал.

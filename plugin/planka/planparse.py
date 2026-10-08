@@ -2,8 +2,8 @@
 import dataclasses
 import re
 
-# Заголовок ATX: уровень — число `#`; закрывающие `#` отбрасываются.
-_ATX = re.compile(r"^\s{0,3}(#{1,6})\s*(.*?)(?:\s+#+)?\s*$")
+# Заголовок ATX: уровень — число `#`; остаток строки разбирает _atx_text, закрывающие `#` отбрасываются.
+_ATX = re.compile(r"^\s{0,3}(#{1,6})(.*)$")
 # Подчёркивание setext: `===` — уровень 1, `---` — уровень 2.
 _SETEXT = re.compile(r"^\s{0,3}(=+|-+)\s*$")
 # Уровень строки целиком жирным (`**Волна 1**`): глубже любого ATX.
@@ -24,19 +24,25 @@ _SEP = re.compile(r"[\s,;]*")
 _NOTE = re.compile(r"\(([^()]*)\)")
 _SPAN = re.compile(r"`([^`]+)`")
 _DASH = re.compile(r"\s*[—–-]\s*")
-_TRAILING_PAREN = re.compile(r"\s*\(([^()]*)\)\s*$")
 # Пометка чтения: текст пометки начинается с неё, дальше конец, знак `,;:.` или тире через пробел;
-# «чтение конфига», «read-write», «readme» пометкой не считаются.
+# «чтение конфига», «read-write», «readme», «reference implementation» пометкой не считаются.
+# Непонятная пометка («новый», «добавить X») путь владением оставляет.
 _READ_NOTE = re.compile(
     r"[\s*_]*(?:только\s+(?:для\s+)?чтени[еяю]|только\s+читать|чтение|читать|"
-    r"не\s+(?:трогать|менять|изменять|править)|read[\s-]?only|read|"
+    r"не\s+(?:трогать|менять|изменять|править)|без\s+изменени[йя]|не\s+изменя(?:ется|ются)|"
+    r"только\s+импорт|только\s+для\s+справки|для\s+справки|справочно|справка|контекст|"
+    r"read[\s-]?only|read(?:ing|\s+access)?|(?:no|without)\s+changes?|unchanged|"
+    r"reference(?:\s+only)?|context(?:\s+only)?|imports?\s+only|import|"
     r"(?:do\s+not|don['’]t)\s+(?:modify|edit|touch|change))"
     r"[\s*_]*(?:$|[,;:.]|\s+[—–-])", re.IGNORECASE)
 _FENCE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
 # Пункт целиком из путей: `…` или слова с `.` или `/` через пробелы, запятые и пометки в скобках; `…` с
-# пробелом путём не станет в _paths.
-_PATH_WORD = r"(?:`[^`]+`|[^`\s,;()]*[./][^`\s,;()]*)"
-_WHOLE_PATH = re.compile(rf"{_PATH_WORD}(?:(?:[\s,;]|\([^()]*\))+{_PATH_WORD})*(?:\s*\([^()]*\))?[\s.,;]*")
+# пробелом путём не станет в _paths. _is_whole_path разбирает пункт за время, линейное по его длине.
+_PATH_WORD = re.compile(r"[^`\s,;()]+")
+_TAIL_NOTE = re.compile(r"\s*\([^()]*\)")
+_SEP_RUN = re.compile(r"(?:[\s,;]+|\([^()]*\))+")
+# Связка серии путей: «и»/«and»/«или»/«or»/`+`/`&` перед следующим путём в кавычках.
+_CONN = re.compile(r"(?:и|and|или|or|[+&])\s*(?=`)", re.IGNORECASE)
 
 
 @dataclasses.dataclass
@@ -49,6 +55,48 @@ class PlanTask:
     files: list
 
 
+def _path_word_end(text, pos):
+    """Конец пути `…` или слова с `.`/`/`, начатого в pos; None, если пути там нет."""
+    if span := _SPAN.match(text, pos):
+        return span.end()
+    word = _PATH_WORD.match(text, pos)
+    if word and ("." in word.group() or "/" in word.group()):
+        return word.end()
+    return None
+
+
+def _is_whole_path(item):
+    """Пункт целиком из путей: пути через пробелы, запятые и пометки в скобках, в конце — одна пометка."""
+    pos = _path_word_end(item, 0)
+    if pos is None:
+        return False
+    while True:
+        sep = _SEP_RUN.match(item, pos)
+        nxt = _path_word_end(item, sep.end()) if sep else None
+        if nxt is None:
+            note = _TAIL_NOTE.match(item, pos)
+            return all(c.isspace() or c in ".,;" for c in item[note.end() if note else pos:])
+        pos = nxt
+
+
+def _atx_text(rest):
+    """Текст заголовка ATX: без пробелов по краям и закрывающих `#`, отделённых пробелом."""
+    text = rest.strip()
+    bare = text.rstrip("#")
+    if bare != text and (not bare or bare[-1].isspace()):
+        return bare.rstrip()
+    return text
+
+
+def _trailing_note(text):
+    """(текст без пометки в скобках в конце, текст пометки) или (text, None)."""
+    body = text.rstrip()
+    start = body.rfind("(")
+    if body.endswith(")") and start >= 0 and ")" not in body[start + 1:-1]:
+        return body[:start], body[start + 1:-1]
+    return text, None
+
+
 def _lines_suffix_stripped(path):
     """Путь без суффикса строк `:10-20` и ведущих `./`."""
     path = re.sub(r":\d+(?:-\d+)?$", "", path).strip()
@@ -57,8 +105,10 @@ def _lines_suffix_stripped(path):
     return path
 
 
-def _paths(fragment):
-    """Пути строки файлов: ведущая серия `…` через пробелы, запятые и пометки в скобках, а без
+def _split(fragment):
+    """(пути, остаток) строки файлов; остаток — текст после серии путей в кавычках, иначе пустой.
+
+    Пути строки файлов: ведущая серия `…` через пробелы, запятые и пометки в скобках, а без
     кавычек — токены без пробелов через запятую; описание, путь с пробелом и маркер
     «нет»/«none»/«empty»/«—» путём не считаются.
 
@@ -73,6 +123,8 @@ def _paths(fragment):
         out, pos, last = [], 0, None
         while True:
             pos = _SEP.match(text, pos).end()
+            if conn := _CONN.match(text, pos):
+                pos = conn.end()
             if note := _NOTE.match(text, pos):
                 if check_read and last is not None and _READ_NOTE.match(note.group(1)):
                     out[last] = ""
@@ -88,19 +140,32 @@ def _paths(fragment):
         dash = _DASH.match(text, pos)
         if check_read and last is not None and dash and _READ_NOTE.match(text, dash.end()):
             out[last] = ""
-        return [p for p in out if p]
-    trailing = _TRAILING_PAREN.search(text)
-    read_last = check_read and trailing is not None and _READ_NOTE.match(trailing.group(1))
-    text = _TRAILING_PAREN.sub("", text).strip().strip("*_").strip().rstrip(".;").strip()
+        return [p for p in out if p], text[pos:]
+    text, note = _trailing_note(text)
+    read_last = check_read and note is not None and _READ_NOTE.match(note)
+    text = text.strip().strip("*_").strip().rstrip(".;").strip()
     first = text.split()[0].lower().strip(".,;:*_") if text else ""
     if first in _NO_FILES:
-        return []
+        return [], ""
     parts = [p.strip() for p in text.split(",")]
     if not all(p and not any(c.isspace() for c in p) for p in parts):
-        return []
+        return [], ""
     if read_last:
         parts.pop()
-    return [_lines_suffix_stripped(p) for p in parts]
+    return [_lines_suffix_stripped(p) for p in parts], ""
+
+
+def _paths(fragment):
+    """Пути строки файлов; см. _split."""
+    return _split(fragment)[0]
+
+
+def _continues_description(tail):
+    """Остаток после путей — законченное предложение, а не конец строки, не пояснение после тире и не
+    незаконченный хвост («for tests»)."""
+    tail = tail.strip()
+    body = tail.rstrip(".!?;,").strip()
+    return bool(body) and tail[-1] in ".!?" and not _DASH.match(body)
 
 
 def _structure_lines(text):
@@ -152,7 +217,7 @@ def _heading(lines, i):
     line = lines[i]
     m = _ATX.match(line)
     if m:
-        return len(m.group(1)), _unbold(m.group(2)), 1
+        return len(m.group(1)), _unbold(_atx_text(m.group(2))), 1
     stripped = line.strip()
     if not stripped or _ITEM.match(line):
         return None
@@ -175,8 +240,8 @@ def parse_plan(text):
     tasks = []
     wave, wave_level = None, None
     current = None
-    collecting, blank = False, False
-    lines = list(_structure_lines(text))
+    collecting, blank, head_seen = False, False, False
+    lines = list(_structure_lines(text.removeprefix("\ufeff")))
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -188,7 +253,7 @@ def parse_plan(text):
         if heading:
             level, title, size = heading
             i += size
-            current, collecting = None, False
+            current, collecting, head_seen = None, False, False
             if m := _WAVE.match(title):
                 wave, wave_level = int(m.group(1)), level
             elif m := _TASK.match(title):
@@ -206,7 +271,7 @@ def parse_plan(text):
             item = _ITEM.match(line)
             # Пункт без префикса — владение, только если он целиком из путей; иной пункт сразу под списком
             # пропускается, после пустой строки — заканчивает список.
-            owned = item and (_PREFIX.match(item.group(1).strip()) or _WHOLE_PATH.fullmatch(item.group(1).strip()))
+            owned = item and (_PREFIX.match(item.group(1).strip()) or _is_whole_path(item.group(1).strip()))
             if owned or item and not blank:
                 if owned:
                     current.files.extend(_paths(item.group(1)))
@@ -217,8 +282,12 @@ def parse_plan(text):
         # Строка файлов — отдельной строкой или пунктом списка (`- **Файлы:** …`).
         m = _FILES_HEAD.match(_ITEM_MARK.sub("", line.strip(), 1)) if current is not None else None
         if m:
-            current.files.extend(_paths(m.group(1)))
-            collecting, blank = True, False
+            paths, tail = _split(m.group(1))
+            # Повторная строка файлов, за путями которой идёт предложение, — описание задачи.
+            if not (head_seen and _continues_description(tail)):
+                current.files.extend(paths)
+                collecting, blank = True, False
+            head_seen = True
         i += 1
     tasks = [t for t in tasks if t.files]
     return tasks or None

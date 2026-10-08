@@ -81,10 +81,29 @@ class WalkCaptureTest(unittest.TestCase):
         os.symlink(self.root / "real", self.root / "link")
         self.assertEqual(sorted(walk_files(self.root)), ["real/f"])
 
+    def test_symlink_to_file_not_in_walk_snapshot(self):
+        self.write("real.py")
+        os.symlink(self.root / "real.py", self.root / "link.py")
+        self.assertEqual(sorted(walk_files(self.root)), ["real.py"])
+
     def test_walk_deadline_passed(self):
         self.write("a")
+        with mock.patch.object(snapshot, "_git_state", return_value=None):
+            with self.assertRaises(TimeoutError):
+                snapshot.capture(self.root, time.monotonic() - 1)
+
+    def test_walk_paths_obeys_deadline(self):
+        self.write("a")
         with self.assertRaises(TimeoutError):
-            snapshot.capture(self.root, time.monotonic() - 1)
+            snapshot._walk_paths(self.root, time.monotonic() - 1)
+
+    def test_truncated_walk_is_too_many_even_if_few_regular_files(self):
+        for i in range(6):
+            os.symlink(self.root / "nowhere", self.root / f"l{i}")
+        self.write("z/a.py")
+        with mock.patch.object(snapshot, "MAX_FILES", 5):
+            with self.assertRaises(snapshot.TooManyFiles):
+                snapshot.capture(self.root)
 
     def test_non_utf8_name(self):
         name = b"bad\xff.py"
@@ -180,6 +199,34 @@ class GitCaptureTest(unittest.TestCase):
         self.write("nested/x.log")
         self.assertEqual(sorted(self.dirty()),
                          ["nested/.gitignore", "nested/a.py", "nested/deep/b.py", "top.py"])
+
+    def test_merge_conflict_path(self):
+        self.write("a.py", "base\n")
+        subprocess.run([*GIT_ENV, "-C", str(self.root), "add", "."], check=True)
+        subprocess.run([*GIT_ENV, "-C", str(self.root), "commit", "-qm", "i"], check=True)
+        base = subprocess.run(["git", "-C", str(self.root), "branch", "--show-current"], capture_output=True,
+                              text=True, check=True).stdout.strip()
+        for branch in ("other", base):
+            if branch == "other":
+                subprocess.run(["git", "-C", str(self.root), "checkout", "-qb", "other"], check=True)
+            else:
+                subprocess.run(["git", "-C", str(self.root), "checkout", "-q", base], check=True)
+            self.write("a.py", f"{branch}\n")
+            subprocess.run([*GIT_ENV, "-C", str(self.root), "commit", "-qam", branch], check=True)
+        merge = subprocess.run([*GIT_ENV, "-C", str(self.root), "merge", "other"], capture_output=True)
+        self.assertNotEqual(merge.returncode, 0)
+        self.assertEqual(list(self.dirty()), ["a.py"])
+
+    def test_nested_repo_without_working_git_walked(self):
+        self.write("nested/a.py")
+        subprocess.run(["git", "init", "-q", str(self.root / "nested")], check=True)
+        real = snapshot._status
+
+        def status(root, deadline):
+            return None if os.path.basename(str(root)) == "nested" else real(root, deadline)
+
+        with mock.patch.object(snapshot, "_status", side_effect=status):
+            self.assertEqual(list(self.dirty()), ["nested/a.py"])
 
     def test_stat_phase_obeys_deadline(self):
         self.write("a")
@@ -389,6 +436,21 @@ class ChangedSinceGitTest(unittest.TestCase):
         self.write("nested/new.py"); self.write("nested/y.log")
         self.assertEqual(snapshot.changed_since(self.root, snap), [("nested/new.py", True)])
 
+    def test_nested_repo_walk_too_many_is_undetermined(self):
+        self.git("init", "-q", str(self.root / "nested"))
+        snap = self.roundtrip()
+        for name in ("a.py", "b.py", "c.py"):
+            self.write(f"nested/{name}")
+        real = snapshot._status
+
+        def status(root, deadline):
+            return None if os.path.basename(str(root)) == "nested" else real(root, deadline)
+
+        with mock.patch.object(snapshot, "_status", side_effect=status), \
+                mock.patch.object(snapshot, "MAX_FILES", 2):
+            self.assertIsNone(snapshot.changed_since(self.root, snap))
+        self.assertEqual(common._messages, ["planka: сверка документации не проверена: дерево больше 2 файлов"])
+
     def test_new_nested_repo_all_files(self):
         snap = self.roundtrip()
         self.write("vendor/k.py")
@@ -425,6 +487,22 @@ class ChangedSinceGitTest(unittest.TestCase):
             snapshot.capture(self.root, time.monotonic() - 1)
         with self.assertRaises(TimeoutError):
             snapshot.changed_since(self.root, snap, time.monotonic() - 1)
+
+    def test_unreachable_base_is_undetermined(self):
+        snap = self.roundtrip()
+        snap["repos"][""] = "0" * 40
+        self.assertIsNone(snapshot.changed_since(self.root, snap))
+        self.assertEqual(common._messages,
+                         ["planka: сверка документации не проверена: git не отдал изменения против снимка "
+                          "в репозитории ."])
+
+    def test_changed_since_stat_phase_obeys_deadline(self):
+        head = snapshot.capture(self.root)["head"]
+        snap = {"mode": "git", "repos": {"": head}, "dirty": {"a.py": None}}
+        state = {"": {"head": head, "dirty": []}}
+        with mock.patch.object(snapshot, "_git_state", return_value=state):
+            with self.assertRaises(TimeoutError):
+                snapshot.changed_since(self.root, snap, time.monotonic() - 1)
 
     def test_one_ls_files_per_repo(self):
         self.make_submodule()
@@ -465,6 +543,29 @@ class ChangedSinceWalkTest(unittest.TestCase):
         with mock.patch.object(snapshot, "MAX_FILES", 0):
             with self.assertRaises(snapshot.TooManyFiles):
                 snapshot.capture(self.root)
+
+    def test_walk_deadline_in_changed_since(self):
+        snap = snapshot.capture(self.root)
+        with mock.patch.object(snapshot, "_git_state", return_value=None):
+            with self.assertRaises(TimeoutError):
+                snapshot.changed_since(self.root, snap, time.monotonic() - 1)
+
+    def test_walk_stat_phase_deadline_in_changed_since(self):
+        snap = snapshot.capture(self.root)
+        with mock.patch.object(snapshot, "_git_state", return_value=None), \
+                mock.patch.object(snapshot, "_walk_paths", return_value=["a.py"]):
+            with self.assertRaises(TimeoutError):
+                snapshot.changed_since(self.root, snap, time.monotonic() - 1)
+
+    def test_walk_truncated_is_undetermined(self):
+        snap = snapshot.capture(self.root)
+        for i in range(6):
+            os.symlink(self.root / "nowhere", self.root / f"l{i}")
+        (self.root / "z").mkdir()
+        (self.root / "z" / "a.py").write_text("x", encoding="utf-8")
+        with mock.patch.object(snapshot, "MAX_FILES", 5):
+            self.assertIsNone(snapshot.changed_since(self.root, snap))
+        self.assertEqual(common._messages, ["planka: сверка документации не проверена: дерево больше 5 файлов"])
 
     @unittest.skipUnless(shutil.which("git"), "нет git")
     def test_git_init_during_turn_is_undetermined(self):
@@ -519,6 +620,11 @@ class StoreLoadDiffTest(unittest.TestCase):
         snapshot.store(self.state, "y", "p", self.root, {"mode": "other", "files": {}})
         self.assertIsNone(snapshot.load(self.state, "y"))
 
+    def test_git_snapshot_without_root_repo_rejected(self):
+        snapshot.store(self.state, "n", "p", self.root, {"mode": "git", "head": None, "sub_heads": {},
+                                                         "repos": {"sub": "abc"}, "dirty": {}})
+        self.assertIsNone(snapshot.load(self.state, "n"))
+
     def test_load_missing_or_garbage(self):
         self.assertIsNone(snapshot.load(self.state, "none"))
         (self.state / "bad.snap.json").write_text("{", encoding="utf-8")
@@ -532,7 +638,3 @@ class StoreLoadDiffTest(unittest.TestCase):
         old = {"a": [1, 1], "b": [1, 1], "c": [1, 1]}
         new = {"a": [1, 1], "b": [2, 1], "d": [1, 1]}
         self.assertEqual(snapshot.diff(old, new), ["b", "c", "d"])
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -1,12 +1,20 @@
 import hashlib
 import json
+import os
+import shutil
+import subprocess
 import sys
+import time
 import unittest
+from unittest import mock
 
-from tests.helpers import RULES, Env, PLANKA_DIR, messages, output
+from tests.helpers import (RULES, Env, PLANKA_DIR, assert_not_logged, author_block, fill_budget, messages, output,
+                           run_in_process)
 
 sys.path.insert(0, str(PLANKA_DIR))
+import common  # noqa: E402
 import judge_tool  # noqa: E402
+import manifest_watch  # noqa: E402
 
 QUESTION_INPUT = {"questions": [{
     "question": "Как чинить гонку?", "header": "Подход", "multiSelect": False,
@@ -25,6 +33,24 @@ PLAN_CONFLICT = """## Волна 1
 """
 
 NO_PLAN_PATH = "planka: план не найден: в транскрипте нет planFilePath"
+
+AUTHOR_TURN = "Нужна быстрая заплатка гонки, перестройку владения не предлагай."
+AUTHOR_ANSWER = 'User has answered your questions: "Чинить сейчас?"="Да, сегодня".'
+
+
+def author_entries(model="claude-test-model"):
+    """Записи транскрипта: реплика автора, вопрос AskUserQuestion агента и ответ автора на него.
+
+    Форма — Claude Code без origin: реплика — строка content, ответ — tool_result с текстом
+    «User has answered your questions: …»."""
+    return [
+        {"type": "user", "message": {"role": "user", "content": AUTHOR_TURN}},
+        {"type": "assistant", "message": {"model": model, "content": [
+            {"type": "tool_use", "id": "q1", "name": "AskUserQuestion", "input": {}}]}},
+        {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "q1", "content": AUTHOR_ANSWER}]}},
+    ]
+
 
 PLAN_CLEAN = PLAN_CONFLICT.replace("- Создать: `x.py`\n### Задача 2", "- Создать: `y.py`\n### Задача 2")
 
@@ -64,6 +90,29 @@ class QuestionTest(unittest.TestCase):
         self.assertNotIn("## Планы", text)
         self.assertIn("1. Мьютекс (Recommended) — три строки", text)
         self.assertIn("2. Один писатель — перестроить владение", text)
+
+    def test_judge_gets_author_turn_not_logged(self):
+        self.env.transcript.write_text("".join(json.dumps(e) + "\n" for e in author_entries()), encoding="utf-8")
+        rec = self.env.data / "rec.txt"
+        r = self.ask(PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertEqual(author_block(rec), "Реплика автора текущего хода:\n" + AUTHOR_TURN + "\n\n"
+                                            "Ответы автора на AskUserQuestion после неё:\n" + AUTHOR_ANSWER)
+        self.assertIn("Явная просьба автора в <author> побеждает рубрику", rec.read_text(encoding="utf-8"))
+        last = self.env.log_lines()[-1]
+        self.assertEqual(last["content_len"], len(judge_tool.prompts.render_questions(QUESTION_INPUT)))
+        assert_not_logged(self, self.env, AUTHOR_TURN, "быстрая заплатка", "Да, сегодня", "Мьютекс")
+
+    def test_budget_reached_at_deny_time_passes(self):
+        # Параллельный вызов исчерпал лимит между проверкой до судьи и отказом.
+        fill_budget(self.env, "question")
+        with mock.patch.object(common, "deny_budget_left", return_value=True):
+            out = run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                "PreToolUse", tool_name="AskUserQuestion", tool_input=QUESTION_INPUT), PLANKA_STUB="deny")
+        self.assertEqual(out, {"systemMessage": "planka: лимит отказов, пропущено без проверки"})
+        last = self.env.log_lines()[-1]
+        self.assertEqual(last["verdict"], "budget")
+        self.assertEqual(last["reason"], "в списке нет варианта, снимающего причину")
 
     def test_session_model_from_transcript(self):
         rec = self.env.data / "rec.txt"
@@ -158,15 +207,35 @@ class PlanTest(unittest.TestCase):
     def tearDown(self):
         self.env.close()
 
-    def with_plan(self, text):
+    def with_plan(self, text, author=False):
+        """Транскрипт с путём к плану text; author — перед ним реплика автора и ответ на AskUserQuestion."""
         plan = self.env.data / "plan.md"
         plan.write_text(text, encoding="utf-8")
         t = self.env.data / "t.jsonl"
-        t.write_text(
-            json.dumps({"type": "assistant", "message": {"model": "claude-test-model"}}) + "\n"
-            + json.dumps({"type": "attachment", "attachment": {"type": "plan_mode", "planFilePath": str(plan)}}) + "\n",
-            encoding="utf-8")
+        entries = author_entries() if author else [{"type": "assistant", "message": {"model": "claude-test-model"}}]
+        entries.append({"type": "attachment", "attachment": {"type": "plan_mode", "planFilePath": str(plan)}})
+        t.write_text("".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8")
         return str(t)
+
+    def test_plan_judge_gets_author_turn_not_logged(self):
+        rec = self.env.data / "rec.txt"
+        r = self.exit_plan(self.with_plan(PLAN_CLEAN, author=True), PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        block = author_block(rec)
+        self.assertIn(AUTHOR_TURN, block)
+        self.assertIn(AUTHOR_ANSWER, block)
+        self.assertNotIn("Задача 2: B", block)
+        self.assertEqual(self.env.log_lines()[-1]["content_len"], len(PLAN_CLEAN))
+        assert_not_logged(self, self.env, AUTHOR_TURN, "Да, сегодня", "Задача 2: B")
+
+    def test_plan_budget_reached_at_deny_time_passes(self):
+        fill_budget(self.env, "plan")
+        t = self.with_plan(PLAN_CLEAN)
+        with mock.patch.object(common, "deny_budget_left", return_value=True):
+            out = run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                "PreToolUse", tool_name="ExitPlanMode", tool_input={}, transcript_path=t), PLANKA_STUB="deny")
+        self.assertEqual(out, {"systemMessage": "planka: лимит отказов, пропущено без проверки"})
+        self.assertEqual(self.env.log_lines()[-1]["verdict"], "budget")
 
     def exit_plan(self, transcript, **extra):
         return self.env.run("judge_tool.py", self.env.hook_input(
@@ -246,6 +315,23 @@ class PlanTest(unittest.TestCase):
         r = self.exit_plan(t)
         self.assertIsNone(output(r))
         self.assertEqual(messages(r), [f"planka: план не найден: нет файла {self.env.data / 'plan.md'}"])
+
+    def test_unreadable_plan_passes_with_warning(self):
+        # Каталог вместо файла — OSError, NUL в пути из транскрипта — ValueError: пропуск, не внутренняя ошибка.
+        for path in (self.env.data, str(self.env.data / "plan.md") + "\0x"):
+            with self.subTest(path=path):
+                t = self.env.data / "t.jsonl"
+                t.write_text(json.dumps({"attachment": {"type": "plan_mode", "planFilePath": str(path)}}) + "\n",
+                             encoding="utf-8")
+                r = self.exit_plan(str(t), PLANKA_STUB="deny")
+                self.assertEqual(r.returncode, 0)
+                self.assertIsNone(output(r))
+                msgs = messages(r)
+                self.assertEqual(len(msgs), 1, msgs)
+                self.assertTrue(msgs[0].startswith(f"planka: план не прочитан: {path}: "), msgs)
+                last = self.env.log_lines()[-1]
+                self.assertEqual(last["verdict"], "skipped")
+                self.assertTrue(last["error"].startswith("план не прочитан"), last)
 
     def test_plan_judge_gets_modules(self):
         rec = self.env.data / "rec.txt"
@@ -425,5 +511,838 @@ class BashTest(unittest.TestCase):
             self.assertNotIn("Traceback", r.stderr)
 
 
-if __name__ == "__main__":
-    unittest.main()
+
+# Манифесты по форме настоящих файлов корпуса tests/fixtures/manifests (npm, pyproject PEP 621, requirements).
+PACKAGE_JSON = """{
+  "name": "app",
+  "version": "1.0.0",
+  "scripts": {"test": "jest"},
+  "dependencies": {"react": "^18.2.0"},
+  "devDependencies": {"jest": "^29.0.0"}
+}
+"""
+PYPROJECT = """[project]
+name = "app"
+version = "0.1.0"
+dependencies = ["httpx>=0.27"]
+"""
+REQUIREMENTS = "httpx==0.27.0\nrich>=13\n"
+SECRET_NAME = "lodash-secret-name"
+
+
+class ManifestEditTest(unittest.TestCase):
+    """PreToolUse на Write, Edit, MultiEdit: новое имя зависимости в манифесте отклоняется."""
+
+    def setUp(self):
+        self.env = Env()
+
+    def tearDown(self):
+        self.env.close()
+
+    def write(self, rel, text):
+        p = self.env.project / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def tool(self, tool, tool_input, **extra):
+        return self.env.run("judge_tool.py", self.env.hook_input(
+            "PreToolUse", tool_name=tool, tool_input=tool_input, tool_use_id="e1"), **extra)
+
+    def edit(self, rel, old, new, **fields):
+        return self.tool("Edit", {"file_path": str(self.env.project / rel), "old_string": old, "new_string": new,
+                                  "replace_all": False, **fields})
+
+    def assert_denied(self, r, *names):
+        out = output(r)["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        reason = out["permissionDecisionReason"]
+        self.assertTrue(reason.startswith("planka: "), reason)
+        self.assertIn("вопрос автору", reason)
+        self.assertIn(str(self.env.root / "rules" / "dependencies.md"), reason)
+        self.assertIn("PLANKA_DEP_OK=1", reason)
+        for name in names:
+            self.assertIn(name, reason)
+        last = self.env.log_lines()[-1]
+        self.assertEqual((last["hook"], last["verdict"]), ("manifest", "deny-dep"))
+        return reason
+
+    def assert_silent(self, r):
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, "", r.stderr)
+
+    def test_edit_package_json_new_dependency_denied(self):
+        self.write("package.json", PACKAGE_JSON)
+        r = self.edit("package.json", '"react": "^18.2.0"', f'"react": "^18.2.0", "{SECRET_NAME}": "^4.17.21"')
+        reason = self.assert_denied(r, SECRET_NAME)
+        self.assertIn(str(self.env.project / "package.json"), reason)
+        assert_not_logged(self, self.env, SECRET_NAME)
+
+    def test_write_pyproject_new_dependency_denied(self):
+        self.write("pyproject.toml", PYPROJECT)
+        r = self.tool("Write", {"file_path": str(self.env.project / "pyproject.toml"),
+                                "content": PYPROJECT.replace('["httpx>=0.27"]', '["httpx>=0.27", "Requests>=2"]')})
+        self.assert_denied(r, "requests")
+
+    def test_multiedit_requirements_denied(self):
+        self.write("requirements.txt", REQUIREMENTS)
+        r = self.tool("MultiEdit", {"file_path": str(self.env.project / "requirements.txt"), "edits": [
+            {"old_string": "rich>=13", "new_string": "rich>=14"},
+            {"old_string": "rich>=14\n", "new_string": "rich>=14\nflask\n"}]})
+        self.assert_denied(r, "flask")
+
+    def test_write_new_requirements_file_denied(self):
+        r = self.tool("Write", {"file_path": str(self.env.project / "requirements-dev.txt"), "content": "pytest\n"})
+        self.assert_denied(r, "pytest")
+
+    def test_relative_path_from_cwd(self):
+        self.write("app/package.json", PACKAGE_JSON)
+        r = self.env.run("judge_tool.py", self.env.hook_input(
+            "PreToolUse", tool_name="Edit", cwd=str(self.env.project / "app"), tool_input={
+                "file_path": "package.json", "old_string": '"jest": "^29.0.0"',
+                "new_string": '"jest": "^29.0.0", "vitest": "^1"'}))
+        self.assert_denied(r, "vitest")
+
+    def test_replace_all(self):
+        self.write("requirements.txt", "rich\n# rich\n")
+        r = self.edit("requirements.txt", "rich", "flask", replace_all=True)
+        self.assert_denied(r, "flask")
+
+    def test_no_new_name_passes(self):
+        cases = [
+            ("package.json", PACKAGE_JSON, '"react": "^18.2.0"', '"react": "^19.0.0"'),
+            ("package.json", PACKAGE_JSON, '"test": "jest"', '"test": "jest --ci", "lint": "eslint ."'),
+            ("package.json", PACKAGE_JSON, ',\n  "devDependencies": {"jest": "^29.0.0"}', ""),
+            ("pyproject.toml", PYPROJECT, 'version = "0.1.0"', 'version = "0.2.0"'),
+            ("requirements.txt", REQUIREMENTS, "rich>=13\n", ""),
+            ("requirements.txt", REQUIREMENTS, "httpx==0.27.0", "HTTPX==0.28.1"),
+            ("README.md", "lodash\n", "lodash", "lodash express"),
+        ]
+        for rel, text, old, new in cases:
+            with self.subTest(rel=rel, new=new):
+                self.write(rel, text)
+                self.assert_silent(self.edit(rel, old, new))
+        self.assertEqual(self.env.log_lines(), [])
+
+    GO_MOD = ("module example.com/app\n\ngo 1.22\n\nrequire github.com/a/one v1.0.0\n\n"
+              "require golang.org/x/text v0.14.0 // indirect\n")
+    PIP_COMPILE = ("#\n# This file is autogenerated by pip-compile with Python 3.11\n#\nidna==3.7\n    # via requests\n"
+                   "requests==2.32.3\n    # via -r requirements.in\n")
+
+    def test_transitive_becoming_direct_passes(self):
+        # `go mod tidy` после импорта снимает `// indirect`; снятый заголовок оставляет пакеты, что уже были.
+        self.write("go.mod", self.GO_MOD)
+        self.assert_silent(self.edit("go.mod", " // indirect", ""))
+        self.write("requirements.txt", self.PIP_COMPILE)
+        self.assert_silent(self.tool("Write", {"file_path": str(self.env.project / "requirements.txt"),
+                                               "content": "idna==3.7\nrequests==2.32.3\n"}))
+        r = self.tool("Write", {"file_path": str(self.env.project / "requirements.txt"),
+                                "content": "idna==3.7\nrequests==2.32.3\nflask\n"})
+        self.assert_denied(r, "flask")
+
+    def test_crlf_manifest_matched_like_tool(self):
+        # Инструмент сопоставляет old_string с текстом, где CRLF приведены к LF.
+        self.env.project.joinpath("package.json").write_bytes(PACKAGE_JSON.replace("\n", "\r\n").encode())
+        r = self.edit("package.json", '"react": "^18.2.0"},\n  "devDependencies"',
+                      '"react": "^18.2.0", "axios": "^1"},\n  "devDependencies"')
+        self.assert_denied(r, "axios")
+        self.write("requirements.txt", REQUIREMENTS.replace("\n", "\r\n"))
+        r = self.tool("MultiEdit", {"file_path": str(self.env.project / "requirements.txt"), "edits": [
+            {"old_string": "httpx==0.27.0\nrich>=13\n", "new_string": "httpx==0.27.0\nrich>=13\nflask\n"}]})
+        self.assert_denied(r, "flask")
+
+    def test_installed_packages_dirs_not_watched(self):
+        for rel in (".venv/lib/python3.12/site-packages/pandas/pyproject.toml",
+                    "env/lib/python3.12/site-packages/pandas/pyproject.toml",
+                    "vendor/guzzlehttp/guzzle/composer.json", "target/debug/build/x/Cargo.toml"):
+            with self.subTest(rel):
+                kind_file = rel.rsplit("/", 1)[-1]
+                content = {"pyproject.toml": '[project]\ndependencies = ["numpy"]\n',
+                           "composer.json": '{"require": {"psr/http-message": "^1"}}',
+                           "Cargo.toml": '[dependencies]\nserde = "1"\n'}[kind_file]
+                self.assert_silent(self.tool("Write", {"file_path": str(self.env.project / rel), "content": content}))
+
+    def test_workspace_member_not_external(self):
+        # npm workspaces: имя пакета самого проекта — не внешняя зависимость.
+        self.write("package.json", '{"name": "root", "workspaces": ["packages/*"], "dependencies": {}}')
+        self.write("packages/utils/package.json", '{"name": "@acme/utils", "version": "1.0.0"}')
+        r = self.edit("package.json", '"dependencies": {}', '"dependencies": {"@acme/utils": "*"}')
+        self.assert_silent(r)
+        r = self.edit("package.json", '"dependencies": {}', '"dependencies": {"@acme/utils": "*", "axios": "^1"}')
+        reason = self.assert_denied(r, "axios")
+        self.assertNotIn("@acme/utils", reason)
+
+    def test_name_declared_in_other_manifest_not_new(self):
+        # Имя, уже объявленное в другом манифесте того же вида, — не новое для проекта.
+        self.write("requirements.txt", REQUIREMENTS)
+        r = self.tool("Write", {"file_path": str(self.env.project / "svc" / "requirements.txt"),
+                                "content": "httpx==0.27.0\n"})
+        self.assert_silent(r)
+        # Имя из манифеста другого вида не засчитывается.
+        r = self.tool("Write", {"file_path": str(self.env.project / "svc" / "package.json"),
+                                "content": '{"dependencies": {"httpx": "1"}}'})
+        self.assert_denied(r, "httpx")
+
+    def test_project_scan_failure_warns(self):
+        self.write("requirements.txt", REQUIREMENTS)
+        with mock.patch.object(manifest_watch, "MAX_MANIFESTS", 0):
+            out = run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                "PreToolUse", tool_name="Edit", tool_input={
+                    "file_path": str(self.env.project / "requirements.txt"), "old_string": "rich>=13",
+                    "new_string": "rich>=13\nflask"}))
+        self.assertEqual(set(out), {"systemMessage"})
+        self.assertIn("манифестов больше 0", out["systemMessage"])
+        last = self.env.log_lines()[-1]
+        self.assertEqual((last["hook"], last["verdict"]), ("manifest", "skipped"))
+
+    def test_large_manifest_warns(self):
+        self.write("requirements.txt", REQUIREMENTS)
+        with mock.patch.object(manifest_watch, "MAX_MANIFEST_BYTES", len(REQUIREMENTS) - 1):
+            out = run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                "PreToolUse", tool_name="Edit", tool_input={
+                    "file_path": str(self.env.project / "requirements.txt"), "old_string": "rich>=13",
+                    "new_string": "rich>=13\nflask"}))
+        self.assertIn(f"больше {len(REQUIREMENTS) - 1} байт", out["systemMessage"])
+
+    def test_same_registry_other_kind_not_new(self):
+        # requirements и pyproject — один реестр PyPI: перенос зависимостей между ними не новые имена.
+        self.write("requirements.txt", REQUIREMENTS)
+        r = self.tool("Write", {"file_path": str(self.env.project / "pyproject.toml"),
+                                "content": '[project]\nname = "app"\ndependencies = ["HTTPX>=0.27", "rich"]\n'})
+        self.assert_silent(r)
+
+    def test_standard_build_backend_not_new(self):
+        # `uv init --lib` и setuptools: бэкенд сборки — не новая зависимость; другой пакет в requires — новая.
+        for requires, backend in (('["uv_build>=0.8.3,<0.9.0"]', "uv_build"), ('["setuptools>=61", "wheel"]',
+                                                                                "setuptools.build_meta")):
+            with self.subTest(requires):
+                content = (f'[project]\nname = "lib"\nversion = "0.1.0"\ndependencies = []\n\n'
+                           f'[build-system]\nrequires = {requires}\nbuild-backend = "{backend}"\n')
+                self.assert_silent(self.tool("Write", {"file_path": str(self.env.project / "pyproject.toml"),
+                                                       "content": content}))
+        r = self.tool("Write", {"file_path": str(self.env.project / "pyproject.toml"),
+                                "content": '[build-system]\nrequires = ["evil-backend"]\nbuild-backend = "evil"\n'})
+        self.assert_denied(r, "evil-backend")
+
+    def test_empty_old_string_fills_empty_file(self):
+        self.write("requirements.txt", "")
+        self.assert_denied(self.edit("requirements.txt", "", "flask\n"), "flask")
+
+    def test_edit_that_tool_rejects_passes(self):
+        # old_string не найден или неоднозначен без replace_all — инструмент сам упадёт.
+        self.write("requirements.txt", "rich\nrich\n")
+        self.assert_silent(self.edit("requirements.txt", "absent", "flask"))
+        self.assert_silent(self.edit("requirements.txt", "rich", "flask"))
+        self.assert_silent(self.tool("MultiEdit", {"file_path": str(self.env.project / "requirements.txt"),
+                                                   "edits": [{"old_string": "absent", "new_string": "flask"}]}))
+
+    def test_broken_json_warns(self):
+        self.write("package.json", PACKAGE_JSON)
+        r = self.tool("Write", {"file_path": str(self.env.project / "package.json"),
+                                "content": '{"dependencies": {"left-pad": "1"'})
+        self.assertIsNone(output(r))
+        msgs = messages(r)
+        self.assertEqual(len(msgs), 1, msgs)
+        self.assertIn("не разобран", msgs[0])
+        self.assertIn("package.json", msgs[0])
+        last = self.env.log_lines()[-1]
+        self.assertEqual((last["hook"], last["verdict"]), ("manifest", "skipped"))
+        assert_not_logged(self, self.env, "left-pad")
+
+    def test_broken_old_without_git_warns(self):
+        self.write("package.json", "{broken")
+        r = self.tool("Write", {"file_path": str(self.env.project / "package.json"), "content": PACKAGE_JSON})
+        self.assertIsNone(output(r))
+        self.assertEqual(len(messages(r)), 1, messages(r))
+        self.assertIn("не разобран", messages(r)[0])
+
+    def test_fixture_manifest_passes(self):
+        r = self.tool("Write", {"file_path": str(self.env.project / "tests" / "fixtures" / "x" / "package.json"),
+                                "content": PACKAGE_JSON})
+        self.assert_silent(r)
+
+    def test_not_limited_by_budget(self):
+        self.write("requirements.txt", REQUIREMENTS)
+        fill_budget(self.env, "manifest")
+        for _ in range(3):
+            r = self.edit("requirements.txt", "rich>=13", "rich>=13\nflask")
+            self.assert_denied(r, "flask")
+
+    def test_deny_survives_log_failure(self):
+        self.write("requirements.txt", REQUIREMENTS)
+        (self.env.data / "judge.log").mkdir()
+        r = self.edit("requirements.txt", "rich>=13", "rich>=13\nflask")
+        self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertTrue(any("внутренняя ошибка" in m for m in messages(r)))
+
+    def test_barrier(self):
+        self.write("requirements.txt", REQUIREMENTS)
+        r = self.env.run("judge_tool.py", self.env.hook_input(
+            "PreToolUse", tool_name="Edit", tool_input={
+                "file_path": str(self.env.project / "requirements.txt"), "old_string": "rich>=13",
+                "new_string": "flask"}), PLANKA_JUDGE="1")
+        self.assert_silent(r)
+        self.assertEqual(self.env.log_lines(), [])
+
+    def test_garbage_tool_input_passes(self):
+        for ti in ({}, {"file_path": None}, {"file_path": str(self.env.project / "requirements.txt"),
+                                               "content": 5}, {"file_path": "a\0/requirements.txt"}):
+            with self.subTest(ti=ti):
+                self.assert_silent(self.tool("Write", ti))
+        self.assert_silent(self.tool("MultiEdit", {"file_path": str(self.env.project / "requirements.txt"),
+                                                   "edits": "x"}))
+
+
+@unittest.skipUnless(shutil.which("git"), "нет git")
+class ManifestEditGitTest(unittest.TestCase):
+    """Версия манифеста в HEAD — тоже база: имя оттуда не новое."""
+
+    def setUp(self):
+        self.env = Env()
+        self.p = self.env.project
+        git("init", "-q", cwd=self.p)
+        (self.p / "package.json").write_text(PACKAGE_JSON, encoding="utf-8")
+        git("add", ".", cwd=self.p)
+        git("commit", "-qm", "i", cwd=self.p)
+
+    def tearDown(self):
+        self.env.close()
+
+    def write_tool(self, content):
+        return self.env.run("judge_tool.py", self.env.hook_input(
+            "PreToolUse", tool_name="Write", tool_input={"file_path": str(self.p / "package.json"),
+                                                         "content": content}))
+
+    def test_broken_old_compared_with_head(self):
+        (self.p / "package.json").write_text("{broken", encoding="utf-8")
+        r = self.write_tool(PACKAGE_JSON)
+        self.assertEqual(r.stdout, "", r.stderr)
+        r = self.write_tool(PACKAGE_JSON.replace('"react": "^18.2.0"', '"react": "^18.2.0", "axios": "^1"'))
+        self.assertIn("axios", output(r)["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_restore_from_head_passes(self):
+        (self.p / "package.json").unlink()
+        self.assertEqual(self.write_tool(PACKAGE_JSON).stdout, "")
+        (self.p / "package.json").write_text(PACKAGE_JSON.replace(',\n  "devDependencies": {"jest": "^29.0.0"}', ""),
+                                             encoding="utf-8")
+        self.assertEqual(self.write_tool(PACKAGE_JSON).stdout, "")
+
+
+def git(*args, cwd):
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args], cwd=cwd, check=True,
+                   capture_output=True)
+
+
+class ManifestBashTest(unittest.TestCase):
+    """Bash: снимок имён манифестов в PreToolUse, сравнение в PostToolUse и PostToolUseFailure."""
+
+    use_git = False
+
+    def setUp(self):
+        self.env = Env()
+        self.p = self.env.project
+        (self.p / "requirements.txt").write_text(REQUIREMENTS, encoding="utf-8")
+        (self.p / "web").mkdir()
+        (self.p / "web" / "package.json").write_text(PACKAGE_JSON, encoding="utf-8")
+        if self.use_git:
+            git("init", "-q", cwd=self.p)
+            git("add", ".", cwd=self.p)
+            git("commit", "-qm", "i", cwd=self.p)
+
+    def tearDown(self):
+        self.env.close()
+
+    def state(self):
+        p = self.env.data / "state" / "sess-1.manifests.json"
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+
+    def run_command(self, command, event="PostToolUse", tool_use_id="b1", effect=None, post_cwd=None, **extra):
+        """Pre, сама команда (или effect вместо неё — для менеджеров, которых нет на машине) в каталоге
+        проекта, Post с cwd post_cwd (по умолчанию проект); ответ Post."""
+        pre = self.env.run("judge_tool.py", self.env.hook_input(
+            "PreToolUse", tool_name="Bash", tool_input={"command": command}, tool_use_id=tool_use_id), **extra)
+        self.assertEqual(pre.returncode, 0, pre.stderr)
+        self.pre = pre
+        subprocess.run(command if effect is None else effect, shell=True, cwd=self.p, capture_output=True)
+        fields = {"tool_response": {"stdout": "", "stderr": ""}} if event == "PostToolUse" else {
+            "error": "Exit code 1", "is_interrupt": False}
+        if post_cwd is not None:
+            fields["cwd"] = str(post_cwd)
+        return self.env.run("judge_tool.py", self.env.hook_input(
+            event, tool_name="Bash", tool_input={"command": command}, tool_use_id=tool_use_id, **fields), **extra)
+
+    # Генераторы requirements без заголовка: их транзитивные пакеты — не выбор агента.
+    GENERATORS = ("pip freeze > requirements.txt", "python3 -m pip freeze >requirements.txt",
+                  "poetry export -f requirements.txt -o requirements.txt",
+                  "poetry export -f requirements.txt > requirements.txt",
+                  "pipenv requirements > requirements.txt",
+                  "uv export --no-header --no-annotate -o requirements.txt",
+                  "uv pip freeze > requirements.txt", "pdm export --output=requirements.txt",
+                  "pip freeze | tee requirements.txt")
+    GENERATED = "httpx==0.27.0\nrich==13.7.1\nanyio==4.4.0\ncertifi==2024.7.4\n"
+
+    def test_generators_not_blocked(self):
+        for command in self.GENERATORS:
+            with self.subTest(command=command):
+                (self.p / "requirements.txt").write_text(REQUIREMENTS, encoding="utf-8")
+                r = self.run_command(command, effect=f"printf '{self.GENERATED}' > requirements.txt")
+                self.assertEqual(r.stdout, "", r.stderr)
+                self.assertEqual(self.state(), {})
+        self.assertEqual(self.env.log_lines(), [])
+
+    def test_generator_and_handwritten_append_blocked_by_second(self):
+        command = "pip freeze > requirements.txt && printf 'click\\n' >> requirements-dev.txt"
+        r = self.run_command(command, effect=f"printf '{self.GENERATED}' > requirements.txt && "
+                                             "printf 'click\\n' >> requirements-dev.txt")
+        reason = self.assert_blocked(r, "requirements-dev.txt: click")
+        self.assertNotIn("anyio", reason)
+
+    def test_generator_after_cd(self):
+        (self.p / "web" / "requirements.txt").write_text(REQUIREMENTS, encoding="utf-8")
+        r = self.run_command("cd web && pip freeze > requirements.txt", post_cwd=self.p / "web",
+                             effect=f"printf '{self.GENERATED}' > web/requirements.txt")
+        self.assertEqual(r.stdout, "", r.stderr)
+
+    def assert_blocked(self, r, *names):
+        out = output(r)
+        self.assertEqual(out["decision"], "block", r.stdout)
+        reason = out["reason"]
+        self.assertTrue(reason.startswith("planka: "), reason)
+        self.assertIn("вопрос автору", reason)
+        self.assertIn(str(self.env.root / "rules" / "dependencies.md"), reason)
+        self.assertIn("PLANKA_DEP_OK=1", reason)
+        for name in names:
+            self.assertIn(name, reason)
+        # Текст не велит откатывать вслепую: команда могла вернуть работу автора.
+        self.assertNotIn("Откати", reason)
+        self.assertIn("откатывай только свою правку", reason)
+        last = self.env.log_lines()[-1]
+        self.assertEqual((last["hook"], last["verdict"]), ("manifest", "block-dep"))
+        self.assertIsInstance(last["manifests"], int)
+        self.assertNotIn("files", last)
+        self.assertEqual(self.state(), {})
+        return reason
+
+    def test_python_append_blocked(self):
+        command = f"python3 -c \"open('requirements.txt', 'a').write('{SECRET_NAME}\\n')\""
+        r = self.run_command(command)
+        self.assertEqual(self.pre.stdout, "", self.pre.stderr)
+        self.assert_blocked(r, SECRET_NAME, "requirements.txt")
+        self.assertEqual(self.env.log_lines()[-1]["manifests"], 1)
+        assert_not_logged(self, self.env, SECRET_NAME)
+
+    def test_printf_append_blocked(self):
+        self.assert_blocked(self.run_command("printf 'flask\\n' >> requirements.txt"), "flask")
+
+    def test_json_edit_in_subdirectory_blocked(self):
+        command = ("python3 -c \"import json; p='web/package.json'; d=json.load(open(p)); "
+                   "d['dependencies']['axios']='^1'; json.dump(d, open(p, 'w'))\"")
+        self.assert_blocked(self.run_command(command), "axios", "web/package.json")
+
+    def test_new_manifest_file_blocked(self):
+        self.assert_blocked(self.run_command("printf 'click\\n' > requirements-dev.txt"), "click")
+
+    def test_failure_event_blocked(self):
+        self.assert_blocked(self.run_command("printf 'flask\\n' >> requirements.txt; false",
+                                             event="PostToolUseFailure"), "flask")
+
+    def test_marker_skips_check(self):
+        r = self.run_command("PLANKA_DEP_OK=1 printf 'flask\\n' >> requirements.txt")
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertEqual(self.state(), {})
+        self.assertEqual(self.env.log_lines(), [])
+
+    def test_marker_only_as_command_assignment(self):
+        # Маркер в комментарии или аргументом другой команды проверку не снимает.
+        for command in ("printf 'flask\\n' >> requirements.txt # PLANKA_DEP_OK=1",
+                        "echo PLANKA_DEP_OK=1; printf 'flask\\n' >> requirements.txt"):
+            with self.subTest(command=command):
+                (self.p / "requirements.txt").write_text(REQUIREMENTS, encoding="utf-8")
+                self.assert_blocked(self.run_command(command), "flask")
+
+    def test_transitive_becoming_direct_silent(self):
+        (self.p / "go.mod").write_text(ManifestEditTest.GO_MOD, encoding="utf-8")
+        (self.p / "requirements-lock.txt").write_text(ManifestEditTest.PIP_COMPILE, encoding="utf-8")
+        if self.use_git:
+            git("add", ".", cwd=self.p)
+            git("commit", "-qm", "go", cwd=self.p)
+        r = self.run_command("python3 -c \"import pathlib; p=pathlib.Path('go.mod'); "
+                             "p.write_text(p.read_text().replace(' // indirect', ''))\"")
+        self.assertEqual(r.stdout, "", r.stderr)
+        r = self.run_command("printf 'idna==3.7\\nrequests==2.32.3\\n' > requirements-lock.txt")
+        self.assertEqual(r.stdout, "", r.stderr)
+
+    def test_installed_packages_dirs_not_watched(self):
+        # Окружение без .gitignore: pip кладёт манифесты пакетов в site-packages.
+        command = ("mkdir -p venv2/lib/python3.12/site-packages/pandas vendor/acme/x && "
+                   "printf '[project]\\ndependencies = [\"numpy\"]\\n' > venv2/lib/python3.12/site-packages/pandas/pyproject.toml && "
+                   "printf '{\"require\": {\"psr/log\": \"1\"}}' > vendor/acme/x/composer.json")
+        r = self.run_command(command)
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertTrue((self.p / "vendor/acme/x/composer.json").exists())
+
+    def test_workspace_member_not_external(self):
+        command = ("mkdir -p packages/utils && printf '{\"name\": \"@acme/utils\"}' > packages/utils/package.json && "
+                   "python3 -c \"import json; p='web/package.json'; d=json.load(open(p)); "
+                   "d['dependencies']['@acme/utils']='*'; json.dump(d, open(p, 'w'))\"")
+        r = self.run_command(command)
+        self.assertEqual(r.stdout, "", r.stderr)
+
+    def test_existing_workspace_member_not_external(self):
+        # Член workspace есть до команды; команда меняет только зависимый манифест.
+        (self.p / "packages" / "b").mkdir(parents=True)
+        (self.p / "packages" / "b" / "package.json").write_text('{"name": "pkg-b"}', encoding="utf-8")
+        command = ("python3 -c \"import json; p='web/package.json'; d=json.load(open(p)); "
+                   "d['dependencies']['pkg-b']='*'; json.dump(d, open(p, 'w'))\"")
+        r = self.run_command(command)
+        self.assertEqual(r.stdout, "", r.stderr)
+
+    def test_requirements_moved_to_pyproject_not_new(self):
+        command = ("printf '[project]\\nname = \"app\"\\ndependencies = [\"httpx\", \"rich\"]\\n' > pyproject.toml"
+                   " && rm requirements.txt")
+        r = self.run_command(command)
+        self.assertTrue((self.p / "pyproject.toml").exists())
+        self.assertEqual(r.stdout, "", r.stderr)
+
+    def test_move_and_copy_not_new(self):
+        for command in ("mkdir -p app && mv web/package.json app/package.json",
+                        "mkdir -p web2 && cp web/package.json web2/package.json",
+                        "printf 'httpx\\n' > requirements-dev.txt"):
+            with self.subTest(command=command):
+                r = self.run_command(command)
+                self.assertEqual(r.stdout, "", r.stderr)
+
+    def test_unchanged_manifests_silent(self):
+        for command in ("ls", "printf 'x' > notes.txt", "printf 'rich>=14\\n' > requirements.txt",
+                        "rm web/package.json"):
+            with self.subTest(command=command):
+                r = self.run_command(command)
+                self.assertEqual(self.pre.stdout, "", self.pre.stderr)
+                self.assertEqual(r.stdout, "", r.stderr)
+                self.assertEqual(self.state(), {})
+        self.assertEqual(self.env.log_lines(), [])
+
+    def test_snapshot_holds_names_not_content(self):
+        self.env.run("judge_tool.py", self.env.hook_input(
+            "PreToolUse", tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="b1"))
+        dumped = json.dumps(self.state()["b1"])
+        for name in ("httpx", "rich", "react", "jest", "web/package.json"):
+            self.assertIn(name, dumped)
+        for content in ("0.27.0", "^18.2.0", "1.0.0", "scripts"):
+            self.assertNotIn(content, dumped)
+
+    def test_broken_manifest_after_command_warns(self):
+        r = self.run_command("printf '{broken' > web/package.json")
+        self.assertIsNone(output(r))
+        msgs = messages(r)
+        self.assertEqual(len(msgs), 1, msgs)
+        self.assertIn("web/package.json", msgs[0])
+        self.assertIn("не разобран", msgs[0])
+
+    def test_post_without_snapshot_silent(self):
+        r = self.env.run("judge_tool.py", self.env.hook_input(
+            "PostToolUse", tool_name="Bash", tool_input={"command": "printf 'flask\\n' >> requirements.txt"},
+            tool_use_id="none"))
+        self.assertEqual(r.stdout, "", r.stderr)
+
+    def test_denied_dependency_command_takes_no_snapshot(self):
+        r = self.env.run("judge_tool.py", self.env.hook_input(
+            "PreToolUse", tool_name="Bash", tool_input={"command": "npm install left-pad"}, tool_use_id="b1"))
+        self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(self.state(), {})
+
+    def test_parallel_commands_keyed_by_tool_use(self):
+        for tid in ("b1", "b2"):
+            self.env.run("judge_tool.py", self.env.hook_input(
+                "PreToolUse", tool_name="Bash", tool_input={"command": "ls"}, tool_use_id=tid))
+        self.assertEqual(sorted(self.state()), ["b1", "b2"])
+        self.env.run("judge_tool.py", self.env.hook_input(
+            "PostToolUse", tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="b1"))
+        self.assertEqual(sorted(self.state()), ["b2"])
+
+    def test_barrier(self):
+        r = self.run_command("printf 'flask\\n' >> requirements.txt", PLANKA_JUDGE="1")
+        self.assertEqual(r.stdout, "")
+        self.assertEqual(self.state(), {})
+
+
+@unittest.skipUnless(shutil.which("git"), "нет git")
+class ManifestBashGitTest(ManifestBashTest):
+    """Те же сценарии в git; имена из HEAD не новые: checkout ветки с добавленной автором зависимостью проходит."""
+
+    use_git = True
+
+    def test_checkout_of_committed_dependency_passes(self):
+        git("checkout", "-qb", "feature", cwd=self.p)
+        with open(self.p / "requirements.txt", "a", encoding="utf-8") as f:
+            f.write("flask\n")
+        git("commit", "-qam", "flask", cwd=self.p)
+        git("checkout", "-q", "-", cwd=self.p)
+        r = self.run_command("git checkout -q feature")
+        self.assertEqual((self.p / "requirements.txt").read_text(encoding="utf-8"), REQUIREMENTS + "flask\n")
+        self.assertEqual(r.stdout, "", r.stderr)
+
+    def test_git_mv_not_new(self):
+        r = self.run_command("mkdir -p app && git mv web/package.json app/package.json")
+        self.assertTrue((self.p / "app/package.json").exists())
+        self.assertEqual(r.stdout, "", r.stderr)
+
+    def branch_with(self, name, line):
+        """Ветка name: requirements.txt с дописанной строкой line и notes.txt, конфликтующий с текущей веткой."""
+        (self.p / "notes.txt").write_text("base\n", encoding="utf-8")
+        git("add", ".", cwd=self.p)
+        git("commit", "-qm", "notes", cwd=self.p)
+        git("checkout", "-qb", name, cwd=self.p)
+        with open(self.p / "requirements.txt", "a", encoding="utf-8") as f:
+            f.write(line)
+        (self.p / "notes.txt").write_text("theirs\n", encoding="utf-8")
+        git("commit", "-qam", name, cwd=self.p)
+        git("checkout", "-q", "-", cwd=self.p)
+        (self.p / "notes.txt").write_text("ours\n", encoding="utf-8")
+        git("commit", "-qam", "ours", cwd=self.p)
+
+    def test_conflicted_merge_and_cherry_pick_pass(self):
+        # Имена из MERGE_HEAD и CHERRY_PICK_HEAD при конфликте — уже в репозитории.
+        for i, op in enumerate(("merge", "cherry-pick")):
+            with self.subTest(op):
+                self.branch_with(f"feat{i}", f"pkg{i}\n")
+                r = self.run_command(f"git -c user.email=t@t -c user.name=t {op} feat{i}")
+                self.assertIn(f"pkg{i}", (self.p / "requirements.txt").read_text(encoding="utf-8"))
+                self.assertEqual(r.stdout, "", r.stderr)
+                git(op, "--abort", cwd=self.p)
+
+    def test_conflicted_revert_passes(self):
+        # Отменяемая правка убрала пакет: revert возвращает его из версии до неё (REVERT_HEAD^).
+        (self.p / "notes.txt").write_text("base\n", encoding="utf-8")
+        git("add", ".", cwd=self.p)
+        git("commit", "-qm", "notes", cwd=self.p)
+        (self.p / "requirements.txt").write_text("httpx==0.27.0\n", encoding="utf-8")
+        (self.p / "notes.txt").write_text("drop rich\n", encoding="utf-8")
+        git("commit", "-qam", "drop", cwd=self.p)
+        (self.p / "notes.txt").write_text("later\n", encoding="utf-8")
+        git("commit", "-qam", "later", cwd=self.p)
+        r = self.run_command("git -c user.email=t@t -c user.name=t revert --no-edit HEAD~1")
+        self.assertIn("rich", (self.p / "requirements.txt").read_text(encoding="utf-8"))
+        self.assertEqual(r.stdout, "", r.stderr)
+
+    def test_stash_pop_blocked_with_safe_reason(self):
+        # Возврат работы автора хук не отличает от правки агента: блок остаётся, текст не велит откатывать.
+        with open(self.p / "requirements.txt", "a", encoding="utf-8") as f:
+            f.write("flask\n")
+        git("stash", "-q", cwd=self.p)
+        self.assert_blocked(self.run_command("git stash pop -q"), "flask")
+
+    def test_ignored_manifest_not_watched(self):
+        (self.p / ".gitignore").write_text("vendor/\n", encoding="utf-8")
+        r = self.run_command("mkdir -p vendor && printf 'flask\\n' > vendor/requirements.txt")
+        self.assertEqual(r.stdout, "", r.stderr)
+
+
+class ManifestDeadlineTest(unittest.TestCase):
+    """Сроки, которые judge_tool передаёт снимку, сравнению и git cat-file, — константы из TimeoutsTest."""
+
+    def setUp(self):
+        self.env = Env()
+
+    def tearDown(self):
+        self.env.close()
+
+    def test_snapshot_and_compare_budgets(self):
+        seen = {}
+
+        def take(root, deadline):
+            seen["take"] = deadline - time.monotonic()
+            return {"root": str(root), "mode": "walk", "ts": time.time(), "files": {}}
+
+        def compare(entry, deadline, skip):
+            seen["compare"] = deadline - time.monotonic()
+            return {}, []
+        with mock.patch.object(manifest_watch, "take", side_effect=take), \
+                mock.patch.object(manifest_watch, "compare", side_effect=compare):
+            for event in ("PreToolUse", "PostToolUse"):
+                run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                    event, tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="b1"))
+        self.assertTrue(manifest_watch.SNAPSHOT_BUDGET - 1 < seen["take"] <= manifest_watch.SNAPSHOT_BUDGET, seen)
+        self.assertTrue(manifest_watch.CHECK_BUDGET - 1 < seen["compare"] <= manifest_watch.CHECK_BUDGET, seen)
+
+    def test_head_timeout(self):
+        with mock.patch.object(manifest_watch, "_git", return_value=None) as git_call:
+            out = run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                "PreToolUse", tool_name="Write", tool_input={
+                    "file_path": str(self.env.project / "package.json"), "content": "{}"}))
+            self.assertIsNone(out)
+            (self.env.project / "package.json").write_text("{broken", encoding="utf-8")
+            run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                "PreToolUse", tool_name="Write", tool_input={
+                    "file_path": str(self.env.project / "package.json"), "content": "{}"}))
+        self.assertEqual(git_call.call_args.args[1], manifest_watch.HEAD_TIMEOUT)
+
+
+class ManifestSnapshotFailureTest(unittest.TestCase):
+    def setUp(self):
+        self.env = Env()
+
+    def tearDown(self):
+        self.env.close()
+
+    def bash(self, tid, **extra):
+        return self.env.run("judge_tool.py", self.env.hook_input(
+            "PreToolUse", tool_name="Bash", tool_input={"command": "ls"}, tool_use_id=tid), **extra)
+
+    def test_too_many_manifests_warns_once(self):
+        with mock.patch.object(manifest_watch, "MAX_MANIFESTS", 1):
+            for rel in ("a/requirements.txt", "b/requirements.txt"):
+                (self.env.project / rel).parent.mkdir()
+                (self.env.project / rel).write_text("rich\n", encoding="utf-8")
+            out = run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                "PreToolUse", tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="b1"))
+            self.assertEqual(out, {"systemMessage": "planka: снимок манифестов не снят (манифестов больше 1): "
+                                                    "новые зависимости от команд Bash не проверяются"})
+            out = run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                "PreToolUse", tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="b2"))
+            self.assertIsNone(out)
+        # Предупреждение — раз на сессию, пропуск в журнале — на каждую команду.
+        logged = [(e["hook"], e["verdict"]) for e in self.env.log_lines()]
+        self.assertEqual(logged, [("manifest", "skipped")] * 2)
+        self.assertIn("манифестов больше 1", self.env.log_lines()[-1]["error"])
+
+    def test_unusable_data_dir_warns_without_internal_error(self):
+        blocker = self.env.data / "file"
+        blocker.write_text("", encoding="utf-8")
+        r = self.bash("b1", CLAUDE_PLUGIN_DATA=str(blocker / "sub"))
+        self.assertEqual(r.returncode, 0)
+        self.assertIsNone(output(r))
+        msgs = messages(r)
+        self.assertEqual(len(msgs), 1, msgs)
+        self.assertTrue(msgs[0].startswith("planka: снимок манифестов не снят"), msgs)
+
+
+class ManifestProjectUnderFixturesTest(unittest.TestCase):
+    def test_foreign_dirs_relative_to_project(self):
+        env = Env()
+        self.addCleanup(env.close)
+        project = env.project / "testdata" / "proj"
+        project.mkdir(parents=True)
+        r = env.run("judge_tool.py", env.hook_input(
+            "PreToolUse", tool_name="Write", cwd=str(project),
+            tool_input={"file_path": str(project / "requirements.txt"), "content": "flask\n"}))
+        self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+
+class HasMarkerTest(unittest.TestCase):
+    def test_marker_as_leading_assignment_of_segment(self):
+        cases = {
+            "PLANKA_DEP_OK=1 python3 -c x": True,
+            "cd app && PLANKA_DEP_OK=1 printf x >> requirements.txt": True,
+            "sudo PLANKA_DEP_OK=1 pip install -r requirements.txt": True,
+            "A=1 PLANKA_DEP_OK=1 npm i": True,
+            "printf x >> requirements.txt # PLANKA_DEP_OK=1": False,
+            "echo PLANKA_DEP_OK=1; printf x >> requirements.txt": False,
+            "printf 'PLANKA_DEP_OK=1 x' >> requirements.txt": False,
+            "PLANKA_DEP_OK=10 npm i": False,
+            "ls": False,
+        }
+        for command, expected in cases.items():
+            with self.subTest(command=command):
+                self.assertEqual(manifest_watch.has_marker(command), expected)
+
+
+class ManifestWatchStateTest(unittest.TestCase):
+    """Снимок в файле состояния, обход вне git и сравнение по size и mtime."""
+
+    def setUp(self):
+        self.env = Env()
+
+    def tearDown(self):
+        self.env.close()
+
+    def in_process(self, fn, *args):
+        with mock.patch.dict("os.environ", {"CLAUDE_PLUGIN_DATA": str(self.env.data)}):
+            return fn(*args)
+
+    def state_file(self):
+        return self.env.data / "state" / "s.manifests.json"
+
+    def test_store_drops_expired_entries(self):
+        now = time.time()
+        self.in_process(manifest_watch.store, "s", "old", {"ts": now - manifest_watch.ENTRY_TTL - 5})
+        self.in_process(manifest_watch.store, "s", "fresh", {"ts": now - manifest_watch.ENTRY_TTL + 60})
+        self.in_process(manifest_watch.store, "s", "new", {"ts": now})
+        self.assertEqual(sorted(json.loads(self.state_file().read_text(encoding="utf-8"))), ["fresh", "new"])
+
+    def test_pop_removes_empty_state_file(self):
+        entry = {"root": "/", "mode": "walk", "ts": time.time(), "files": {}}
+        self.in_process(manifest_watch.store, "s", "a", entry)
+        self.in_process(manifest_watch.store, "s", "b", entry)
+        self.assertEqual(self.in_process(manifest_watch.pop, "s", "a"), entry)
+        self.assertTrue(self.state_file().exists())
+        self.assertEqual(self.in_process(manifest_watch.pop, "s", "b"), entry)
+        self.assertFalse(self.state_file().exists())
+
+    def test_walk_files_limit(self):
+        root = self.env.project
+        for i in range(3):
+            (root / f"f{i}.txt").write_text("x", encoding="utf-8")
+        with mock.patch.object(manifest_watch, "MAX_WALK_FILES", 2):
+            with self.assertRaisesRegex(manifest_watch.Unavailable, "больше 2 файлов"):
+                manifest_watch.list_manifests(root, time.monotonic() + 30)
+        with mock.patch.object(manifest_watch, "MAX_WALK_FILES", 3):
+            self.assertEqual(manifest_watch.list_manifests(root, time.monotonic() + 30), ("walk", []))
+
+    def test_same_size_and_mtime_not_reread(self):
+        # Манифест с тем же размером и mtime не перечитывается: дешёвый пропуск правки, вернувшей их.
+        path = self.env.project / "requirements.txt"
+        path.write_text("rich\n", encoding="utf-8")
+        entry = manifest_watch.take(self.env.project, time.monotonic() + 30)
+        st = path.stat()
+        path.write_text("flsk\n", encoding="utf-8")
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30), ({}, []))
+        path.write_text("flask\n", encoding="utf-8")
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30), ({"requirements.txt": ["flask"]}, []))
+
+    def test_large_manifest_after_command_unknown(self):
+        path = self.env.project / "requirements.txt"
+        path.write_text("rich\n", encoding="utf-8")
+        entry = manifest_watch.take(self.env.project, time.monotonic() + 30)
+        path.write_text("rich\nflask\n", encoding="utf-8")
+        with mock.patch.object(manifest_watch, "MAX_MANIFEST_BYTES", 10):
+            self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30), ({}, ["requirements.txt"]))
+        with mock.patch.object(manifest_watch, "MAX_MANIFEST_BYTES", 11):
+            self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30), ({"requirements.txt": ["flask"]}, []))
+
+
+class GeneratedRequirementsTest(unittest.TestCase):
+    def test_targets(self):
+        cases = {
+            "pip freeze > requirements.txt": ["requirements.txt"],
+            "pip -q freeze >requirements.txt": ["requirements.txt"],
+            "python3 -m pip freeze 1> requirements/base.txt": ["requirements/base.txt"],
+            "sudo -u app pip3 freeze >> requirements.txt": ["requirements.txt"],
+            "poetry export -f requirements.txt -o requirements.txt": ["requirements.txt"],
+            "poetry export --without-hashes --output=req/requirements-prod.txt": ["req/requirements-prod.txt"],
+            "pipenv requirements --dev &> requirements-dev.txt": ["requirements-dev.txt"],
+            "uv export --no-header -orequirements.txt": ["requirements.txt"],
+            "uv pip freeze > requirements.txt": ["requirements.txt"],
+            "pdm export -o requirements.lock.txt": ["requirements.lock.txt"],
+            "cd app && pip freeze > requirements.txt; echo x >> requirements-dev.txt": ["requirements.txt"],
+            # Не генератор, вывод не в requirements, перенаправление не stdout, конвейер.
+            "echo x >> requirements.txt": [],
+            "pip install -r requirements.txt > requirements-log.txt": [],
+            "pip freeze > freeze.log": [],
+            "pip freeze 2> requirements.txt": [],
+            "pip freeze | sort > requirements.txt": [],
+            "poetry add x -o requirements.txt": [],
+            "echo 'pip freeze > requirements.txt'": [],
+            # tee сразу за генератором — его файлы; tee с другим вводом или после фильтра — нет.
+            "pip freeze | tee requirements.txt": ["requirements.txt"],
+            "pip freeze | sudo tee -a requirements/base.txt notes.txt >/dev/null": ["requirements/base.txt"],
+            "pip freeze |& tee requirements.txt": ["requirements.txt"],
+            "pip freeze | sort | tee requirements.txt": [],
+            "echo x | tee requirements.txt": [],
+            "pip freeze > a.log; tee requirements.txt < extra.txt": [],
+            "pip freeze > a.log && tee requirements.txt <<EOF\nflask\nEOF": [],
+        }
+        for command, expected in cases.items():
+            with self.subTest(command=command):
+                self.assertEqual(manifest_watch.generated_requirements(command), expected)

@@ -58,31 +58,39 @@ _BUN_VALUE_FLAGS = {"--cwd", "-c", "--config", "--registry", "--cache-dir", "--b
 # Флаги deno с необязательным значением (`--lock`, `--check`, `--env-file`) значение берут только через `=`.
 _DENO_VALUE_FLAGS = {"-c", "--config", "--cert", "--import-map", "-n", "--name", "--root", "-L", "--log-level",
                      "--location", "--seed"}
-_PIP_VALUE_FLAGS = {
+# Общие опции pip со значением (`pip --help`, General Options): стоят и перед подкомандой.
+_PIP_GLOBAL_VALUE_FLAGS = {"--python", "--log", "--log-file", "--keyring-provider", "--proxy", "--retries",
+                           "--timeout", "--exists-action", "--trusted-host", "--cert", "--client-cert",
+                           "--cache-dir", "--use-feature", "--use-deprecated", "--resume-retries"}
+_PIP_VALUE_FLAGS = _PIP_GLOBAL_VALUE_FLAGS | {
     "-r", "--requirement", "-c", "--constraint", "-i", "--index-url", "--extra-index-url", "-f", "--find-links",
-    "-t", "--target", "--prefix", "--root", "-e", "--editable", "--platform",
-    "--python-version", "--implementation", "--abi", "--timeout", "--retries", "--trusted-host",
-    "--upgrade-strategy", "--only-binary", "--no-binary", "--cache-dir", "--log", "--log-file", "--src",
-    "--proxy", "--progress-bar", "--config-settings", "-C", "--report", "--python", "--cert", "--client-cert",
-    "--exists-action", "--global-option", "--keyring-provider", "--root-user-action", "--use-feature",
-    "--use-deprecated", "--target-dir", "--group",
+    "-t", "--target", "--prefix", "--root", "-e", "--editable", "--platform", "--python-version",
+    "--implementation", "--abi", "--upgrade-strategy", "--only-binary", "--no-binary", "--src", "--progress-bar",
+    "--config-settings", "-C", "--report", "--global-option", "--root-user-action", "--target-dir", "--group",
 }
-_UV_PIP_VALUE_FLAGS = _PIP_VALUE_FLAGS | {"-p", "--index", "--default-index", "--index-strategy", "--python-platform"}
-_UV_VALUE_FLAGS = {"--directory", "--project", "--python", "-p", "--cache-dir", "--config-file", "--color"}
-_UV_ADD_VALUE_FLAGS = {"-r", "--requirements", "--index", "--default-index", "--python", "-p", "--group",
-                       "--extra", "--script", "--package", "--rev", "--tag", "--branch", "--bounds", "--marker",
-                       "-m", "--optional", "--directory", "--project", "-c", "--constraints"}
+# Наборы uv сверены с `--help` подкоманд uv 0.12.
+_UV_VALUE_FLAGS = {"--directory", "--project", "--python", "-p", "--cache-dir", "--config-file", "--color",
+                   "--allow-insecure-host", "--cert"}
+# Опции индекса, разрешения и сборки, общие для `uv pip install`, `uv add`, `uv tool install`, `uv run`.
 _UV_INDEX_FLAGS = {"--index", "--default-index", "-i", "--index-url", "--extra-index-url", "-f", "--find-links",
                    "--index-strategy", "--keyring-provider", "--allow-insecure-host", "-C", "--config-setting",
-                   "--prerelease", "--resolution", "--exclude-newer", "--link-mode", "--python-platform",
-                   "-P", "--upgrade-package", "--reinstall-package", "--refresh-package", "--no-binary-package",
-                   "--no-build-package"}
+                   "--config-settings-package", "--prerelease", "--prerelease-package", "--resolution",
+                   "--fork-strategy", "--exclude-newer", "--exclude-newer-package", "--link-mode",
+                   "--python-platform", "-P", "--upgrade-package", "--upgrade-group", "--reinstall-package",
+                   "--refresh-package", "--no-binary-package", "--no-build-package", "--no-sources-package",
+                   "--no-build-isolation-package"}
+_UV_PIP_VALUE_FLAGS = _PIP_VALUE_FLAGS | _UV_VALUE_FLAGS | _UV_INDEX_FLAGS | {
+    "--requirements", "--constraints", "--overrides", "--excludes", "-b", "--build-constraints", "--extra",
+    "--no-editable-package", "--output-format", "--torch-backend"}
+_UV_ADD_VALUE_FLAGS = _UV_VALUE_FLAGS | _UV_INDEX_FLAGS | {
+    "-r", "--requirements", "-c", "--constraints", "-m", "--marker", "--optional", "--group", "--bounds", "--rev",
+    "--tag", "--branch", "--extra", "--package", "--script", "--no-install-package"}
 _UV_TOOL_VALUE_FLAGS = _UV_VALUE_FLAGS | _UV_INDEX_FLAGS | {
     "--with", "-w", "--with-requirements", "--with-editable", "--with-executables-from", "--from", "-c",
-    "--constraints", "--overrides", "-b", "--build-constraints"}
+    "--constraints", "--overrides", "--excludes", "-b", "--build-constraints", "--torch-backend"}
 _UV_RUN_VALUE_FLAGS = _UV_VALUE_FLAGS | _UV_INDEX_FLAGS | {
     "--with", "-w", "--with-requirements", "--with-editable", "--package", "--extra", "--group", "--only-group",
-    "--no-group", "--no-extra", "--env-file"}
+    "--no-group", "--no-extra", "--env-file", "--no-editable-package"}
 _CARGO_VALUE_FLAGS = {"--path", "--git", "--registry", "--branch", "--tag", "--rev", "--features", "-F",
                       "--package", "-p", "--manifest-path", "--rename", "--target", "--config", "-Z", "-C"}
 _CARGO_INSTALL_VALUE_FLAGS = _CARGO_VALUE_FLAGS | {"--version", "--vers", "--root", "--index", "--target-dir",
@@ -94,6 +102,8 @@ _BUNDLE_VALUE_FLAGS = {"--version", "-v", "--source", "-s", "--group", "-g", "--
 _GEM_VALUE_FLAGS = {"-v", "--version", "--source", "-s", "-i", "--install-dir", "-n", "--bindir", "--platform",
                     "-P", "--trust-policy"}
 _COMPOSER_VALUE_FLAGS = {"--with", "--working-dir", "-d"}
+# `composer require`, его псевдоним `r` и однозначные сокращения имени (Symfony Console, от `req`).
+_COMPOSER_REQUIRE = {"r", "req", "requ", "requi", "requir", "require"}
 _GO_VALUE_FLAGS = {"-C", "-modfile"}
 _GO_BUILD_VALUE_FLAGS = _GO_VALUE_FLAGS | {"-o", "-p", "-mod", "-tags", "-ldflags", "-gcflags", "-asmflags",
                                            "-gccgoflags", "-buildmode", "-compiler", "-installsuffix", "-pkgdir",
@@ -141,9 +151,7 @@ _ARCHIVES = (".whl", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".tar.zst", ".zip
              ".rpm", ".apk", ".snap", ".flatpak", ".nupkg", ".rock", ".rockspec", ".ez")
 # Именованное требование на локальный путь: `name@file:///x`, `name @ file:x`.
 _NAMED_FILE = re.compile(r"@\s*file:")
-
-
-# Разбор на слова — посимвольный, линейный; _command смотрит только на ведущие слова сегмента.
+# Сколько первых символов сегмента _command разбирает на слова: пакет, названный дальше, не виден.
 _WORDS_LIMIT = 4096
 
 
@@ -357,17 +365,27 @@ def _after_flags(args, value_flags):
 
 
 def _python_module(w):
-    """Слова `python -m <модуль> …` с модуля; None, если модуль не запускается."""
+    """Слова `python -m <модуль> …` с модуля; None, если модуль не запускается. Короткие флаги склеиваются
+    (`-Im pip`, `-Impip`); значение `-W`/`-X` — остаток слова или следующее слово."""
     i = 1
     while i < len(w) and w[i].startswith("-"):
         a = w[i]
-        if a == "-m":
-            return w[i + 1:]
-        if a.startswith("-m"):
-            return [a[2:], *w[i + 1:]]
-        if a == "-c" or a == "-":
+        if a == "-":
             return None
-        i += 2 if a in _PYTHON_VALUE_FLAGS else 1
+        if a.startswith("--"):
+            i += 1
+            continue
+        step = 1
+        for j, letter in enumerate(a[1:], 1):
+            rest = a[j + 1:]
+            if letter == "m":
+                return [rest, *w[i + 1:]] if rest else w[i + 1:]
+            if letter == "c":
+                return None
+            if "-" + letter in _PYTHON_VALUE_FLAGS:
+                step = 1 if rest else 2
+                break
+        i += step
     return None
 
 
@@ -404,8 +422,13 @@ def _is_add(words, depth=0):
         if name in _RUNNERS and sub == "run":
             return _is_add(_after_flags(args, _RUNNERS[name]), depth + 1)
         return _OTHER_MANAGERS[name](w)
+    # `cargo +nightly install …`: выбор toolchain rustup перед подкомандой.
+    if name == "cargo" and w[1:2] and w[1].startswith("+"):
+        w = [w[0], *w[2:]]
     if name in _GLOBAL_FLAGS:
         w = _subcommand(w, _GLOBAL_FLAGS[name])
+    elif _PIP.match(name):
+        w = _subcommand(w, _PIP_GLOBAL_VALUE_FLAGS)
     if name == "yarn" and len(w) > 2 and w[1] == "workspace":
         w = [w[0], *w[3:]]
     if name in ("poetry", "composer", "yarn") and len(w) > 1 and w[1] in ("self", "global"):
@@ -441,8 +464,9 @@ def _is_add(words, depth=0):
     if name == "uv":
         if sub == "add":
             return _has(args, _UV_ADD_VALUE_FLAGS)
-        if sub == "pip" and args[:1] == ["install"]:
-            return _pip_add(args[1:], _UV_PIP_VALUE_FLAGS)
+        if sub == "pip":
+            args = _subcommand(["pip", *args], _UV_PIP_VALUE_FLAGS)[1:]
+            return args[:1] == ["install"] and _pip_add(args[1:], _UV_PIP_VALUE_FLAGS)
         if sub == "tool" and args[:1] == ["install"]:
             return _pip_add(args[1:], _UV_TOOL_VALUE_FLAGS)
         return False
@@ -466,7 +490,7 @@ def _is_add(words, depth=0):
     if name == "gem":
         return sub == "install" and _has(args, _GEM_VALUE_FLAGS)
     if name == "composer":
-        return sub == "require" and _has(args, _COMPOSER_VALUE_FLAGS)
+        return sub in _COMPOSER_REQUIRE and _has(args, _COMPOSER_VALUE_FLAGS)
     if name == "dotnet":
         if sub == "add":
             # `dotnet add [<проект>] package <пакет>`; `add reference` — ссылка на проект.
@@ -953,7 +977,6 @@ def _quoted_substitutions(text):
     return found
 
 
-
 # Флаги sh-подобных оболочек со значением.
 _SHELL_VALUE_FLAGS = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}
 # Флаги ssh со значением.
@@ -1094,14 +1117,25 @@ def heredocs(line):
     return found
 
 
+def _quoted_heredoc_runs(text):
+    """Heredoc внутри `$(…)` в тексте от открывающей кавычки: его команда — оболочка, исполняющая тело
+    (_heredoc_runs), а не `cat`, для которого тело — данные."""
+    cut = text.find("<<")
+    start = text.rfind("$(", 0, cut)
+    if cut < 0 or start < 0:
+        return False
+    return any(_heredoc_runs(_command(s)[0]) for s in _segments(text[start + 2:cut]))
+
+
 def _segments(command):
     """Сегменты команды: границы — `&&`, `||`, `;`, `|`, `&`, `(`, `)`, обратная кавычка и перевод
     строки вне кавычек.
 
     Кавычка, открытая на одной строке, продолжается на следующих; `\\` в конце строки продолжает
     сегмент. Тело heredoc — данные: строки после конца логической строки с `<<` до терминатора не
-    входят ни в один сегмент; тело heredoc оболочки без скрипта (`bash <<EOF`, `ssh host <<EOF`) —
-    команды (_heredoc_runs). Комментарий — `#` в начале строки или после пробела вне кавычек — до
+    входят ни в один сегмент; у heredoc внутри `"$(…)"`, открытой до конца строки, тело начинается со
+    следующей строки, внутри кавычки; тело heredoc оболочки без скрипта (`bash <<EOF`, `ssh host <<EOF`),
+    в том числе внутри `"$(…)"`, — команды (_heredoc_runs). Комментарий — `#` в начале строки или после пробела вне кавычек — до
     конца строки.
     """
     segments, current = [], []
@@ -1123,6 +1157,8 @@ def _segments(command):
             continue
         # Позиция, с которой строка идёт вне кавычки, перенесённой с прошлых строк.
         outside = 0 if quote is None else None
+        # Позиция последней кавычки, открытой на этой строке.
+        quote_start = None
         continued = False
         i, n = 0, len(line)
         while i < n:
@@ -1156,9 +1192,11 @@ def _segments(command):
                 continue
             elif c == "'" and line[i - 1:i] == "$":
                 quote = "$'"
+                quote_start = i
                 current.append(c)
             elif c in "'\"":
                 quote = c
+                quote_start = i
                 current.append(c)
             elif c == "#" and (i == 0 or line[i - 1].isspace()):
                 break
@@ -1173,11 +1211,16 @@ def _segments(command):
             if outside is None and quote is None:
                 outside = i + 1
             i += 1
-        if outside is not None:
-            opened.extend(heredocs(line[outside:i] if continued else line[outside:]))
         if quote is not None:
+            # Heredoc в `"$(…)"`, открытой до конца строки, — тело идёт со следующей строки внутри кавычки
+            # и кончается до её закрытия; тело — данные.
+            if outside is not None and quote_start is not None:
+                opened.extend(heredocs(line[outside:quote_start]))
+                pending = [] if _quoted_heredoc_runs(line[quote_start:]) else heredocs(line[quote_start:])
             current.append("\n")
             continue
+        if outside is not None:
+            opened.extend(heredocs(line[outside:i] if continued else line[outside:]))
         if continued:
             current.append(" ")
             continue
@@ -1188,7 +1231,6 @@ def _segments(command):
         logical_start = len(segments)
     flush()
     return segments
-
 
 
 def _find(command, depth):

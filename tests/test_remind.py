@@ -1,4 +1,4 @@
-import io
+import contextlib
 import json
 import os
 import shutil
@@ -8,6 +8,7 @@ import time
 import unittest
 from unittest import mock
 
+from tests import helpers
 from tests.helpers import Env, PHILOSOPHY, PLANKA_DIR, messages, output
 
 sys.path.insert(0, str(PLANKA_DIR))
@@ -35,9 +36,12 @@ class RemindTest(unittest.TestCase):
         self.assertEqual(ctx, expected + "\n\n" + no_docs)
 
     def test_barrier(self):
+        (self.env.project / "a.py").write_text("x\n", encoding="utf-8")
         r = self.env.run("remind.py", self.env.hook_input("UserPromptSubmit"), PLANKA_JUDGE="1")
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout, "")
+        # Барьер до снимка: внутри судьи хук не пишет состояние.
+        self.assertFalse((self.env.data / "state").exists())
 
     def test_missing_file_warns_and_emits_nothing(self):
         (self.env.root / "philosophy.md").unlink()
@@ -122,22 +126,14 @@ class RemindTest(unittest.TestCase):
         ctx = output(r2)["hookSpecificOutput"]["additionalContext"]
         self.assertIn("Язык комментариев: en; язык документации: en.", ctx)
 
-    def run_in_process(self, *patches):
-        """remind.main через common.run_hook в этом процессе; возвращает строки systemMessage и ответ."""
-        raw = json.dumps(self.env.hook_input("UserPromptSubmit", prompt="x", cwd=str(self.env.project)))
-        stdin = io.TextIOWrapper(io.BytesIO(raw.encode("utf-8")), encoding="utf-8")
-        stdout_bytes = io.BytesIO()
-        out = io.TextIOWrapper(stdout_bytes, encoding="utf-8", write_through=True)
-        with mock.patch.dict(os.environ, self.env.environ(), clear=True), \
-                mock.patch("sys.stdin", stdin), mock.patch("sys.stdout", new=out):
+    def run_in_process(self, *patches, **environ):
+        """remind.main в этом процессе (helpers.run_in_process) под подменами patches; строки systemMessage и
+        hookSpecificOutput ответа."""
+        with contextlib.ExitStack() as stack:
             for p in patches:
-                p.start()
-            try:
-                common.run_hook(remind.main)
-            finally:
-                for p in patches:
-                    p.stop()
-        reply = json.loads(stdout_bytes.getvalue().decode("utf-8"))
+                stack.enter_context(p)
+            reply = helpers.run_in_process(self.env, remind.main, self.env.hook_input("UserPromptSubmit", prompt="x"),
+                                           **environ)
         return reply.get("systemMessage", "").splitlines(), reply.get("hookSpecificOutput")
 
     def test_too_many_files_warns(self):
@@ -194,8 +190,7 @@ class RemindTest(unittest.TestCase):
         (bin_dir / "git").chmod(0o755)
         path = f"{bin_dir}:{self.env.environ()['PATH']}"
         started = time.monotonic()
-        msgs, out = self.run_in_process(mock.patch.object(remind, "SNAPSHOT_BUDGET", 1),
-                                        mock.patch.dict(os.environ, {"PATH": path}))
+        msgs, out = self.run_in_process(mock.patch.object(remind, "SNAPSHOT_BUDGET", 1), PATH=path)
         self.assertLess(time.monotonic() - started, 4)
         self.assertIn("# Философия работы", out["additionalContext"])
         self.assertTrue(any("снимок дерева не записан" in m for m in msgs), msgs)
@@ -216,6 +211,3 @@ class RemindTest(unittest.TestCase):
         self.assertFalse(stale.exists())
         self.assertTrue((state / "sess-1.snap.json").exists())
 
-
-if __name__ == "__main__":
-    unittest.main()

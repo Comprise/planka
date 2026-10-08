@@ -42,7 +42,7 @@
 
 | Документ | О чём |
 | --- | --- |
-| `context/architecture.md` | компоненты, контракт с правилами, ответ хука, судья, сроки, лимит отказов, память, неудачи команд, состояние, снимок, комментарии, платформы |
+| `context/architecture.md` | компоненты, контракт с правилами, ответ хука, судья, сроки, лимит отказов, разбор плана, память, неудачи команд, состояние, снимок, комментарии, платформы |
 | `context/development.md` | запуск, точки входа, правила кода, новый хук, документация, git |
 | `context/testing.md` | цели `make`, устройство тестов, изоляция окружения, заглушка судьи |
 | `context/deferred/INDEX.md` | отложенное |
@@ -56,8 +56,10 @@
 
 ## `plugin/planka/`
 
-Код хуков: точки входа `remind.py`, `judge_tool.py`, `guard_memory.py`, `judge_stop.py`,
-`debug_watch.py`, остальное — их модули.
+Код хуков: точки входа `remind.py`, `judge_tool.py` (`PreToolUse`, а на `Bash` ещё `PostToolUse` и
+`PostToolUseFailure` — проверка манифестов), `guard_memory.py`, `judge_stop.py`, `debug_watch.py`; остальное —
+их модули, среди них `manifests.py` (разбор манифестов) и `manifest_watch.py` (правка манифеста, снимок и
+сравнение после команды).
 
 Инварианты:
 
@@ -66,7 +68,8 @@
 - Вывод — только через `common.emit` и `common.warn`; `print` и stderr не используются.
 - Отказ запоминается через `common.emit` до записи журнала: сбой записи не отменяет отказ.
 - Запись файлов состояния — атомарная, через `common.atomic_write_json` (временный файл и
-  `os.replace`); чтение и запись счётчиков, предупреждений и неудач команд — под `common.state_lock`.
+  `os.replace`); чтение и запись счётчиков, предупреждений, неудач команд и снимков манифестов — под
+  `common.state_lock`.
 - Хук с судьёй проверяет лимит отказов до вызова судьи (`common.deny_budget_left`); ошибка судьи
   — пропуск с `common.skip_message`, в журнал — `Verdict.error` без текста модели.
 - JSON наружу — через `common.dumps`: имя файла не в UTF-8 не роняет запись.
@@ -83,8 +86,9 @@
 - Модуль начинается с заголовка и строки условия «Читай …».
 - Имя файла — контракт с кодом: переименование — правка вызовов `common.rubric` и
   `common.rule_texts` в `judge_tool.py`, `judge_stop.py`, `guard_memory.py`, `debug_watch.py`
-  (`MODULE`), ссылок `judge_tool.DEP_REASON`, `MODULES` в `tests/test_contract.py`, индекса в
-  `plugin/philosophy.md` и `README.md`.
+  (`MODULE`), ссылок `judge_tool.DEP_REASON`, `MANIFEST_REASON`, `COMMAND_REASON`, `MODULES` в
+  `tests/test_contract.py`, индекса в `plugin/philosophy.md` и `README.md`. Имена из вызовов тест выводит
+  из кода сам (`test_names_taken_by_code_exist`); `dependencies` код называет только текстом причин отказа.
 - Метки `{RULES}`, `{COMMENT_LANG}`, `{DOC_LANG}` подставляются при чтении; других меток нет.
 
 Читать перед правкой: `context/architecture.md`, «Контракт кода с текстами правил».

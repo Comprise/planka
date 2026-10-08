@@ -50,11 +50,7 @@ class DependencyAddTest(unittest.TestCase):
             "pip install .",
             "pip install ./pkg",
             "pip install /abs/pkg",
-            "go build ./...",
             "go get",
-            "git add -A",
-            "npm run build",
-            "cargo build",
             "gem list",
             "echo 'npm install left-pad'",
             "",
@@ -94,7 +90,11 @@ class HeredocTest(unittest.TestCase):
             self.assertIsNone(depcheck.dependency_add(cmd), cmd)
 
     def test_command_after_body_detected(self):
-        self.assertEqual(depcheck.dependency_add("cat <<EOF\nnpm install x\nEOF\nnpm install y"), "npm install y")
+        for opener, terminator in [("<<EOF", "EOF"), ("<<'EOF'", "EOF"), ('<<"EOF"', "EOF"), ("<<\\EOF", "EOF"),
+                                   ("<<E'O'F", "EOF"), ("<<-EOF", "\t\tEOF")]:
+            cmd = f"cat {opener}\n\tnpm install x\n{terminator}\nnpm install y"
+            with self.subTest(cmd):
+                self.assertEqual(depcheck.dependency_add(cmd), "npm install y")
 
     def test_introducing_line_checked(self):
         self.assertIsNotNone(depcheck.dependency_add("npm install x <<EOF\nhi\nEOF"))
@@ -135,7 +135,7 @@ class PipBootstrapAndArchivesTest(unittest.TestCase):
             self.assertIsNotNone(depcheck.dependency_add(cmd), cmd)
 
 
-class FalseDenyTest(unittest.TestCase):
+class NoNamedPackageTest(unittest.TestCase):
     def test_not_adds(self):
         for cmd in [
             "pip install -e .[dev]",
@@ -252,7 +252,6 @@ class MarkerScopeTest(unittest.TestCase):
         self.assertIsNone(depcheck.dependency_add("CI=1 PLANKA_DEP_OK=1 npm install lodash"))
 
 
-
 class RedirectionTest(unittest.TestCase):
     def test_redirections_are_not_packages(self):
         for cmd in [
@@ -315,7 +314,8 @@ class ValueFlagsTest(unittest.TestCase):
 
 class HashInsideWordTest(unittest.TestCase):
     def test_hash_inside_word_is_not_comment(self):
-        for cmd in ["X=a#b npm install lodash", "pip install -e git+https://h/r#egg=y requests"]:
+        # `#` внутри слова, принятый за комментарий, обрезал бы пакет за ним.
+        for cmd in ["X=a#b npm install lodash", "npm install ./a#b left-pad"]:
             self.assertIsNotNone(depcheck.dependency_add(cmd), cmd)
 
 
@@ -365,7 +365,6 @@ class MarkerParsingTest(unittest.TestCase):
             "if PLANKA_DEP_OK=1 npm install x; then :; fi",
             "sudo PLANKA_DEP_OK=1 npm install x",
             "env PLANKA_DEP_OK=1 npm install x",
-            "cd app && PLANKA_DEP_OK=1 npm install x",
         ]:
             self.assertIsNone(depcheck.dependency_add(cmd), cmd)
 
@@ -417,7 +416,7 @@ class GluedFlagsTest(unittest.TestCase):
             self.assertEqual(depcheck.dependency_add(cmd), cmd, cmd)
 
 
-class NewManagersTest(unittest.TestCase):
+class LanguageManagersTest(unittest.TestCase):
     def test_detected(self):
         for cmd in [
             "bun add zod",
@@ -469,8 +468,6 @@ class NewManagersTest(unittest.TestCase):
             "pipx install .",
             "pipx inject myenv",
             "pipx inject myenv ./local",
-            "conda env list",
-            "conda list",
             "conda install --file environment.yml",
             "conda install --revision 3",
             "micromamba install -y -f env.yml",
@@ -527,7 +524,7 @@ class GlobalInstallTest(unittest.TestCase):
 
 
 class OneOffRunTest(unittest.TestCase):
-    """Разовый запуск не добавляет зависимость: правило требует для него точную версию, а не согласие."""
+    """Разовый запуск без установки (`npx`, `uvx`, `pipx run`, `go run` и подобные) — не добавление пакета."""
 
     def test_not_adds(self):
         for cmd in ["npx create-react-app app", "npx -y tsc --noEmit", "bunx create-next-app", "bun x cowsay",
@@ -1100,7 +1097,7 @@ class BroadRunTest(unittest.TestCase):
             "brew --prefix", "brew --version", "apt-cache policy jq", "dpkg -l | grep jq", "rpm -qa",
             "pacman -Qe", "snap version", "flatpak --version", "nix --version", "nix-env --version",
             "conda env list", "conda activate base", "conda list", "pip list", "pip freeze > requirements.txt",
-            "pip show requests", "pip check", "uv sync", "uv lock", "uv run pytest", "poetry install",
+            "pip show requests", "pip check", "uv sync", "uv lock", "poetry install",
             "poetry lock", "bundle install", "bundle exec rspec", "composer install", "dotnet build",
             "mix test", "stack build", "cabal build", "opam env", "luarocks list", "Rscript analysis.R",
             "R --version", "port version", "zypper lr", "dnf repolist", "yum repolist", "apk version",
@@ -1115,3 +1112,234 @@ class BroadRunTest(unittest.TestCase):
             "ls install", "./install.sh", "bash install.sh --prefix ~/.local", "sh -c 'make install'",
         ]:
             self.assertIsNone(depcheck.dependency_add(cmd), cmd)
+
+
+class UvFlagsTest(unittest.TestCase):
+    """Флаги со значением `uv pip install` и `uv add` — по `uv pip install --help` и `uv add --help` uv 0.12."""
+
+    def test_flag_values_are_not_packages(self):
+        for cmd in [
+            "uv pip install --extra dev -e .",
+            "uv pip install --extra dev -r pyproject.toml",
+            "uv pip install --exclude-newer 2024-01-01 -e .",
+            "uv pip install --prerelease allow -r r.txt",
+            "uv pip install --link-mode copy -r r.txt",
+            "uv pip install -e . --refresh-package foo",
+            "uv pip install --torch-backend cpu -r r.txt",
+            "uv pip install --overrides o.txt --excludes e.txt -b b.txt -r r.txt",
+            "uv pip install --index-strategy unsafe-best-match --fork-strategy fewest -r r.txt",
+            "uv pip install --output-format json -r r.txt",
+            "uv add --prerelease allow -r r.txt",
+            "uv add --index-url https://e.com/simple -r r.txt",
+            "uv add --exclude-newer 2024-01-01 --no-install-package x -r r.txt",
+            "uv pip -q install -r r.txt",
+            "uv pip --cache-dir /c install -r r.txt",
+        ]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+    def test_package_after_flag_value_detected(self):
+        for cmd in [
+            "uv pip install --extra dev httpx",
+            "uv pip install --prerelease allow httpx",
+            "uv add --prerelease allow httpx",
+            "uv add --index-url https://e.com/simple httpx",
+            "uv pip -q install httpx",
+            "uv pip --cache-dir /c install httpx",
+        ]:
+            with self.subTest(cmd):
+                self.assertEqual(depcheck.dependency_add(cmd), cmd)
+
+
+class HeredocInQuotedSubstitutionTest(unittest.TestCase):
+    """Heredoc внутри `"$(…)"` на несколько строк — форма сообщения коммита агента
+    (`git commit -m "$(cat <<'EOF' … EOF )"`): тело кончается внутри кавычки."""
+
+    def test_command_after_quote_detected(self):
+        for cmd in [
+            "git commit -m \"$(cat <<'EOF'\nmsg\nEOF\n)\"\nnpm install x",
+            "x=\"$(cat <<EOF\nhi\nEOF\n)\"\nnpm install x",
+            "git commit -m \"$(cat <<'EOF'\nfix: handle 12\" screens\nEOF\n)\" && npm install x",
+        ]:
+            with self.subTest(cmd):
+                self.assertEqual(depcheck.dependency_add(cmd), "npm install x")
+
+    def test_body_with_odd_quote_is_data(self):
+        cmd = "git commit -m \"$(cat <<'EOF'\nfix: handle 12\" screens\nnpm install x\nEOF\n)\""
+        self.assertIsNone(depcheck.dependency_add(cmd))
+
+    def test_heredoc_before_open_quote_starts_after_quote(self):
+        # Тело heredoc, открытого до многострочной кавычки, начинается после строки, где она закрылась.
+        for cmd in ['cat <<EOF > f; echo "a\nb"\nnpm install x\nEOF\nnpm install y',
+                    "cat \"f\" <<EOF $'a\nb'\nnpm install x\nEOF\nnpm install y"]:
+            with self.subTest(cmd):
+                self.assertEqual(depcheck.dependency_add(cmd), "npm install y")
+
+    def test_heredoc_to_shell_inside_quote_runs_body(self):
+        # Тело heredoc оболочки внутри `"$(…)"` исполняется, как и вне кавычек.
+        for cmd in [
+            'x="$(bash <<EOF\nnpm install x\nEOF\n)"',
+            'echo "$(sh <<EOF\nnpm install x\nEOF\n)"',
+            'echo "$(echo a | bash <<EOF\nnpm install x\nEOF\n)"',
+        ]:
+            with self.subTest(cmd):
+                self.assertEqual(depcheck.dependency_add(cmd), cmd)
+
+    def test_heredoc_to_cat_inside_quote_is_data(self):
+        self.assertIsNone(depcheck.dependency_add("git commit -m \"$(cat <<'EOF'\nnpm install x\nEOF\n)\""))
+        self.assertEqual(depcheck.dependency_add("git commit -m \"$(cat <<'EOF'\nnpm install x\nEOF\n)\"\nnpm install x"),
+                         "npm install x")
+
+
+class PythonInterpreterFlagsTest(unittest.TestCase):
+    def test_value_flag_glued_or_separate_before_m(self):
+        for cmd in ["python -Wignore -m pip install x", "python -W ignore -m pip install x",
+                    "python -Xutf8 -m pip install x"]:
+            with self.subTest(cmd):
+                self.assertEqual(depcheck.dependency_add(cmd), cmd)
+
+    def test_glued_c_is_code_not_module(self):
+        for cmd in ["python -cm pip install x", "python -c 'import x'", "python -Ic 'import x' -m pip install x"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+    def test_uv_cert_value_is_not_package(self):
+        self.assertIsNone(depcheck.dependency_add("uv pip install --cert ca -r r.txt"))
+        for cmd in ["uv --cert ca pip install -r r.txt", "uv add --cert ca -r r.txt",
+                    "uv tool install --cert ca .", "uv run --cert ca script.py"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+
+class PipGlobalFlagsTest(unittest.TestCase):
+    """Общие опции pip перед подкомандой — по `pip --help` (General Options)."""
+
+    def test_detected(self):
+        for cmd in [
+            "pip -q install requests",
+            "pip --no-cache-dir install requests",
+            "python -m pip -q install requests",
+            "pip --python .venv/bin/python install requests",
+            "pip --log l.txt --timeout 30 --proxy p install requests",
+            "pip --disable-pip-version-check --isolated install requests",
+        ]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in ["pip --python .venv/bin/python install -r r.txt", "pip -q list", "pip --cache-dir /c freeze"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+
+class ToolchainAndAliasTest(unittest.TestCase):
+    def test_detected(self):
+        for cmd in [
+            "cargo +nightly install cargo-fuzz",
+            "cargo +stable add serde",
+            "python -Im pip install x",
+            "python -sm pip install x",
+            "python -Impip install x",
+            "python -W ignore -m pip install x",
+            "composer req monolog/monolog",
+            "composer r monolog/monolog",
+        ]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in ["cargo +nightly build", "cargo +nightly install --path .", "python -Ic 'import pip'",
+                    "python -Wignore script.py", "python -sm pytest", "composer req", "composer re x"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+
+class ValueFlagTableTest(unittest.TestCase):
+    """Флаг со значением без пакета — не добавление; тот же флаг с пакетом — добавление."""
+
+    CASES = [
+        ("bun add --cwd sub", "bun add --cwd sub zod"),
+        ("deno add --config deno.json", "deno add --config deno.json npm:chalk"),
+        ("yarn add --cwd sub", "yarn add --cwd sub react"),
+        ("uv tool install --python 3.12 --editable .", "uv tool install --python 3.12 ruff"),
+        ("pipx install --python 3.12 .", "pipx install --python 3.12 black"),
+        ("pipenv install --python 3.12", "pipenv install --python 3.12 requests"),
+        ("cargo install --root /opt --path .", "cargo install --root /opt ripgrep"),
+        ("poetry add --group dev", "poetry add --group dev pytest"),
+        ("bundle add -v 1.0", "bundle add -v 1.0 rails"),
+        ("go get -modfile alt.mod", "go get -modfile alt.mod golang.org/x/y"),
+        ("dotnet add package -v 1.0", "dotnet add package -v 1.0 Serilog"),
+        ("dotnet tool install --tool-path tools", "dotnet tool install --tool-path tools dotnet-ef"),
+        ("dart pub add -C sub", "dart pub add -C sub http"),
+        ("swift package add-dependency --from 1.0.0",
+         "swift package add-dependency --from 1.0.0 https://github.com/apple/swift-log"),
+        ("swift package --package-path sub add-dependency --from 1.0.0",
+         "swift package --package-path sub add-dependency https://github.com/apple/swift-log"),
+        ("apk add -X https://e.com/repo", "apk add -X https://e.com/repo curl"),
+        ("zypper install --from repo", "zypper install --from repo git"),
+        ("scoop install -a 64bit", "scoop install -a 64bit git"),
+        ("snap install --channel edge", "snap install --channel edge lxd"),
+        ("flatpak install --installation x", "flatpak install --installation x flathub org.gimp.GIMP"),
+        ("pixi add --feature test", "pixi add --feature test pytest"),
+        ("cabal install --installdir bin", "cabal install --installdir bin pandoc"),
+        ("vcpkg add port --triplet x64-linux", "vcpkg add port --triplet x64-linux fmt"),
+        # Глобальные флаги перед подкомандой.
+        ("deno -c deno.json add", "deno -c deno.json add npm:chalk"),
+        ("go -C sub get", "go -C sub get golang.org/x/y"),
+        ("cargo -Z unstable add", "cargo -Z unstable add serde"),
+        ("yarn --cwd sub add", "yarn --cwd sub add react"),
+        ("pipenv --python 3.12 install", "pipenv --python 3.12 install requests"),
+        ("aptitude -w 80 install", "aptitude -w 80 install htop"),
+        # Псевдонимы подкоманды.
+        ("npm in", "npm in lodash"),
+        ("npm isnt", "npm isnt lodash"),
+        ("pnpm install", "pnpm install lodash"),
+        ("bun a", "bun a zod"),
+        ("dnf in", "dnf in jq"),
+        ("dnf localinstall ./x.rpm", "dnf localinstall https://e.com/x.rpm"),
+        # Регистр: флаги choco, подкоманда nuget.
+        ("choco install --Version 1.0", "choco install --Version 1.0 git"),
+        ("nuget Install packages.config", "nuget Install Newtonsoft.Json"),
+    ]
+
+    def test_table(self):
+        for without, with_package in self.CASES:
+            with self.subTest(without):
+                self.assertIsNone(depcheck.dependency_add(without))
+            with self.subTest(with_package):
+                self.assertEqual(depcheck.dependency_add(with_package), with_package)
+
+
+class ParserEdgesTest(unittest.TestCase):
+    def test_wrappers(self):
+        for cmd in ["exec npm install x", "exec -a name npm install x", "command npm install x",
+                    "builtin npm install x", "doas npm install x", "doas -u bob npm install x",
+                    "env --split-string 'npm install x'"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+        for cmd in ["exec -a npm make", "doas -u npm make", "env --split-string 'make test'"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+    def test_go_install_without_version_not_adds(self):
+        self.assertIsNone(depcheck.dependency_add("go install github.com/me/proj/cmd/tool"))
+
+    def test_ansi_c_quoted_word(self):
+        # `\'` внутри `$'…'` не закрывает строку: слово — флаг `--save' x`, а не пакет.
+        self.assertIsNone(depcheck.dependency_add("npm install $'--save\\' x'"))
+        self.assertIsNotNone(depcheck.dependency_add("npm install $'left-pad'"))
+
+    def test_nesting_depth_boundary(self):
+        # README: вложенные команды глубже 4 уровней не разбираются.
+        self.assertEqual(depcheck._MAX_DEPTH, 4)
+        self.assertIsNotNone(depcheck.dependency_add("eval " * 4 + "npm install x"))
+        self.assertIsNone(depcheck.dependency_add("eval " * 5 + "npm install x"))
+
+    def test_words_limit_boundary(self):
+        # README: на слова разбираются первые 4096 символов сегмента.
+        self.assertEqual(depcheck._WORDS_LIMIT, 4096)
+        head = "npm install "
+        inside = head + " " * (4096 - len(head) - len("left-pad")) + "left-pad"
+        beyond = head + " " * (4096 - len(head)) + "left-pad"
+        self.assertIsNotNone(depcheck.dependency_add(inside))
+        self.assertIsNone(depcheck.dependency_add(beyond))

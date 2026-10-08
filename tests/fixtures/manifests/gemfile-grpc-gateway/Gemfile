@@ -1,0 +1,12 @@
+# источник: ~/go/pkg/mod/github.com/grpc-ecosystem/grpc-gateway/v2@v2.30.0/docs/Gemfile (group, обе кавычки, хвостовые комментарии)
+source "https://rubygems.org"
+gem "just-the-docs"
+group :jekyll_plugins do
+  gem "github-pages"                 # GitHub Pages
+  gem "jekyll-optional-front-matter" # GitHub Pages
+  gem "jekyll-default-layout"        # GitHub Pages
+  gem "jekyll-titles-from-headings"  # GitHub Pages
+  gem "jekyll-readme-index"          # GitHub Pages
+  gem "jekyll-relative-links"        # GitHub Pages
+  gem 'jekyll-include-cache'         # GitHub Pages
+end

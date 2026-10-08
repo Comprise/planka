@@ -1,6 +1,6 @@
 """Stop: последнее сообщение со списком вариантов судится по «Решениям», заявка о готовности — по модулю
 проверки, правка кода со снимка текущей реплики — по модулям документации, комментариев, паттернов и
-рефакторинга; при совпадении нескольких фильтров — один вызов, судья видит все сообщения реплики."""
+рефакторинга; при совпадении нескольких фильтров — один вызов, судья видит все сообщения реплики и реплику автора."""
 import re
 import time
 
@@ -31,8 +31,9 @@ def claims_done(text):
     return bool(_DONE.search(text or ""))
 
 
-# Сроки на Stop, с: таймаут хука в hooks.json — 120 с; git rev-parse — до 5 с, сверка со снимком — до
-# SNAPSHOT_BUDGET, строки комментариев — до COMMENTS_BUDGET, судья — до 65 с.
+# Сроки на Stop: таймаут хука в hooks.json — 120 с; git rev-parse — до common.GIT_ROOT_TIMEOUT, сверка со
+# снимком — до SNAPSHOT_BUDGET, строки комментариев — до COMMENTS_BUDGET, судья — до JUDGE_TIMEOUT + KILL_WAIT.
+# Сумму против таймаута проверяет tests/test_contract.py (TimeoutsTest).
 SNAPSHOT_BUDGET = 20
 COMMENTS_BUDGET = 20
 
@@ -138,7 +139,9 @@ def main():
     started = time.monotonic()
     verdict = common.run_judge(prompts.SYSTEM_PROMPT,
                                prompts.stop_prompt(rubric, content, options=options, done=done, docs=docs,
-                                                   label=prompts.TURN_LABEL),
+                                                   label=prompts.TURN_LABEL,
+                                                   author=prompts.author_context(transcript.author_turn,
+                                                                                 transcript.author_answers)),
                                common.judge_model(data, transcript))
     duration_ms = int((time.monotonic() - started) * 1000)
     if verdict.error:

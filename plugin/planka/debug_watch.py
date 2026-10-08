@@ -43,17 +43,21 @@ PASS_THROUGH = frozenset({"echo", "printf", "true", ":"})
 # Участки в кавычках и экранированные символы: перенаправление ищется вне них.
 UNQUOTED = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"|\\.", re.DOTALL)
 EXIT_LINE = re.compile(r"Exit code (\d+)")
+# Открытие heredoc: «<<» или «<<-», терминатор — слово, возможно в кавычках (here-string «<<<» не подходит).
+HEREDOC = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]*)'|\"([^\"\n]*)\"|\\?([A-Za-z0-9_.-]+))")
 
 LINE = "Команда `{command}` упала {ordinal} раз подряд — дальше по модулю {rules}/debugging.md."
 
 
-def command_key(command):
+def command_key(command, agent_id=""):
     """(SHA-256, текст) команды без краевых пробелов и с пробельными промежутками, схлопнутыми в один пробел;
-    пустая команда — (None, "")."""
+    пустая команда — (None, ""). Субагент (agent_id не пуст) считает отдельно от основного агента и других
+    субагентов: идентификатор входит в хэш; у основного агента хэш — хэш одного текста команды."""
     norm = re.sub(r"\s+", " ", command).strip()
     if not norm:
         return None, ""
-    return hashlib.sha256(norm.encode("utf-8", "surrogatepass")).hexdigest(), norm
+    data = f"{agent_id}\0{norm}" if agent_id else norm
+    return hashlib.sha256(data.encode("utf-8", "surrogatepass")).hexdigest(), norm
 
 
 def exit_code(error):
@@ -64,16 +68,36 @@ def exit_code(error):
     return int(m.group(1)) if m else None
 
 
+def _skip_heredocs(command, i, pending):
+    """Индекс после тел heredoc, открытых строкой: i — первый символ после перевода строки. Тело и строка
+    терминатора пропускаются для каждого heredoc по порядку; терминатора нет — до конца строки команды."""
+    for terminator, strip_tabs in pending:
+        while i < len(command):
+            end = command.find("\n", i)
+            line = command[i:] if end < 0 else command[i:end]
+            i = len(command) if end < 0 else end + 1
+            if (line.lstrip("\t") if strip_tabs else line) == terminator:
+                break
+    return i
+
+
 def _segments(command):
     """Непустые команды строки с разделителем перед каждой: [(разделитель, текст)]. Разделители вне кавычек —
     «|», «|&», «||», «&&», «;» и перевод строки; у первой команды разделитель "". Одиночный «&» и скобки не
-    разделяют. Комментарий от «#» в начале слова (после пробела, «;», «&», «|», скобки, «<», «>» или в начале
-    строки) до конца строки отбрасывается."""
+    разделяют; внутри «[[ … ]]» разделителей нет; тела heredoc отбрасываются, а «<<» внутри «$((…))» и
+    «((…))» — сдвиг, не heredoc. Комментарий от «#» в начале слова (после пробела, «;», «&», «|», скобки,
+    «<», «>» или в начале строки) до конца строки отбрасывается."""
     segments = [["", []]]
     i, n = 0, len(command)
     quote = None
     # Предыдущий символ — незаэкранированный разрыв слова вне кавычек: после него «#» начинает комментарий.
     boundary = True
+    in_test = False
+    pending = []
+    # Последний « ]]»: «[[ » открывает проверку, только если закрытие стоит дальше (один поиск, не на каждый «[[ »).
+    last_close = command.rfind(" ]]")
+    # Глубина скобок внутри арифметики «$((…))» и «((…))»; 0 — вне её.
+    arith = 0
     while i < n:
         c = command[i]
         step = 1
@@ -81,12 +105,33 @@ def _segments(command):
             end = command.find("\n", i)
             i = n if end < 0 else end
             continue
-        if quote is None and (c in "|;\n" or command.startswith("&&", i)):
+        if quote is None and boundary and not in_test and re.match(r"\[\[\s", command[i:i + 3]) \
+                and last_close >= i:
+            in_test = True
+        elif quote is None and in_test and boundary and command.startswith("]]", i):
+            in_test = False
+        if quote is None and not in_test and (c in "|;\n" or command.startswith("&&", i)):
             step = 2 if command[i:i + 2] in ("||", "&&", "|&") else 1
             segments.append([command[i:i + step], []])
             boundary = True
+            if c == "\n" and pending:
+                i = _skip_heredocs(command, i + 1, pending)
+                pending = []
+                continue
         else:
+            if quote is None:
+                if arith and c in "()":
+                    arith += 1 if c == "(" else -1
+                elif command.startswith("$((", i):
+                    arith, step = arith + 2, 3
+                elif boundary and command.startswith("((", i):
+                    arith, step = arith + 2, 2
             boundary = quote is None and (c.isspace() or c in "&()<>")
+            m = HEREDOC.match(command, i) if quote is None and c == "<" and not in_test and not arith and \
+                not command.startswith("<<<", i) and not command.startswith("<<<", i - 1) else None
+            if m:
+                word = next(g for g in m.groups()[1:] if g is not None)
+                pending.append((word, m.group(1) == "-"))
             if c == "\\" and quote != "'":
                 step = 2
             elif quote is None and c in "'\"":
@@ -191,33 +236,45 @@ def _counts(state):
     return {k: v for k, v in counts.items() if isinstance(v, int) and not isinstance(v, bool) and v > 0}
 
 
-def update(session, prompt_id, key, failed):
+def _shown_marks(state):
+    shown = state.get("shown")
+    if not isinstance(shown, dict):
+        return {}
+    return {k: v for k, v in shown.items() if isinstance(v, str)}
+
+
+def _state(counts, shown):
+    return {"counts": counts, "shown": shown} if shown else {"counts": counts}
+
+
+def update(session, prompt_id, key, failed, agent_id=""):
     """Счётчик неудач подряд по ключу в state/<session>.debug.json: неудача +1, успех — удаление ключа.
-    Модуль подмешивается с REPEAT_THRESHOLD-й неудачи подряд, не чаще раза за prompt_id на всю сессию:
-    возвращает (число неудач подряд, текст модуля), иначе (None, None). Нет модуля — (None, None)
-    с предупреждением от common.rule_texts, отметка о показе не ставится."""
+    Модуль подмешивается с REPEAT_THRESHOLD-й неудачи подряд, не чаще раза за prompt_id для каждого агента
+    (отметки — state["shown"][agent_id], у основного агента ключ ""): возвращает (число неудач подряд,
+    текст модуля), иначе (None, None). Нет модуля — (None, None) с предупреждением от
+    common.rule_texts, отметка о показе не ставится."""
     state_dir = common.data_dir() / "state"
     state_dir.mkdir(exist_ok=True)
     path = state_dir / f"{common.safe_name(session)}.debug.json"
     with common.state_lock(state_dir):
-        state = common.read_json(path, dict)
-        counts = _counts(state)
+        old = common.read_json(path, dict)
+        counts = _counts(old)
+        shown = _shown_marks(old)
+        # Пишутся только counts и shown: прочие поля прежних форматов не переносятся.
         if not failed:
             if key not in counts:
                 return None, None
             del counts[key]
-            state["counts"] = counts
-            common.atomic_write_json(path, state)
+            common.atomic_write_json(path, _state(counts, shown))
             return None, None
         counts[key] = counts.get(key, 0) + 1
-        state["counts"] = counts
         n = counts[key]
         text = None
-        if n >= REPEAT_THRESHOLD and state.get("shown_prompt") != prompt_id:
+        if n >= REPEAT_THRESHOLD and shown.get(agent_id) != prompt_id:
             text = common.rule_texts(MODULE)
             if text is not None:
-                state["shown_prompt"] = prompt_id
-        common.atomic_write_json(path, state)
+                shown[agent_id] = prompt_id
+        common.atomic_write_json(path, _state(counts, shown))
     common.prune_state(state_dir)
     return (n, text) if text is not None else (None, None)
 
@@ -240,7 +297,9 @@ def main():
     # Код 1 команды-ответа сбрасывает счётчик, как успех.
     failed = event == "PostToolUseFailure" and not (
         exit_code(data.get("error")) == 1 and code1_is_answer(command))
-    key, norm = command_key(command)
+    agent_id = data.get("agent_id")
+    agent_id = agent_id if isinstance(agent_id, str) else ""
+    key, norm = command_key(command, agent_id)
     if key is None:
         return
     session = data.get("session_id")
@@ -248,7 +307,7 @@ def main():
     prompt_id = data.get("prompt_id")
     prompt_id = prompt_id if isinstance(prompt_id, str) else ""
     try:
-        n, text = update(session, prompt_id, key, failed)
+        n, text = update(session, prompt_id, key, failed, agent_id)
     except OSError as e:
         common.warn(f"счётчик неудач команд не записан: {e!r}")
         return

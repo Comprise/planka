@@ -9,6 +9,7 @@
 #   unparsed  — строка, начинающаяся с «{», но не JSON
 #   notlogged — is_error=true, "Not logged in"
 # При PLANKA_STUB_RECORD=<файл> пишет туда аргументы, stdin, значение PLANKA_JUDGE, каталог и PID.
+# python3 ответа — с PYTHONUTF8=1: аргументы читаются в UTF-8, как у claude, в любой локали.
 if [ -n "${PLANKA_STUB_RECORD:-}" ]; then
   { printf 'ARGV\n'; printf '%s\n' "$@"; printf 'STDIN\n'; cat; printf 'ENV PLANKA_JUDGE=%s\n' "${PLANKA_JUDGE:-}"; printf 'CWD %s\n' "$(pwd -P)"; printf 'PID %s\n' "$$"; } > "$PLANKA_STUB_RECORD"
 else
@@ -19,9 +20,9 @@ case "${PLANKA_STUB:-ok}" in
     printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"{\"ok\":true,\"violated\":[],\"reason\":\"\"}","structured_output":{"ok":true,"violated":[],"reason":""},"duration_ms":10}' ;;
   deny)
     R="${PLANKA_STUB_REASON:-в списке нет варианта, снимающего причину}"
-    python3 -c 'import json, sys; print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "", "structured_output": {"ok": False, "violated": ["Решения 4"], "reason": sys.argv[1]}, "duration_ms": 10}))' "$R" ;;
+    PYTHONUTF8=1 python3 -c 'import json, sys; print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "", "structured_output": {"ok": False, "violated": ["Решения 4"], "reason": sys.argv[1]}, "duration_ms": 10}))' "$R" ;;
   violated)
-    python3 -c 'import json, sys; print(json.dumps({"type": "result", "is_error": False, "result": "", "structured_output": {"ok": False, "violated": json.loads(sys.argv[1]), "reason": "r"}}))' "${PLANKA_STUB_VIOLATED:-[]}" ;;
+    PYTHONUTF8=1 python3 -c 'import json, sys; print(json.dumps({"type": "result", "is_error": False, "result": "", "structured_output": {"ok": False, "violated": json.loads(sys.argv[1]), "reason": "r"}}))' "${PLANKA_STUB_VIOLATED:-[]}" ;;
   hang) exec sleep 100 ;;
   garbage) printf 'nonsense\n' ;;
   nostructured) printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"","duration_ms":10}' ;;
