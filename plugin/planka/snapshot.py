@@ -1,24 +1,30 @@
 """Снимок дерева проекта: какие файлы и с каким размером и mtime были на реплике."""
+import base64
 import json
 import os
 import pathlib
 import stat
+import struct
 import subprocess
 import time
+import zlib
 
 import common
 
 # Каталоги, которые обход вне git пропускает всегда.
 IGNORED_DIRS = frozenset({".git", "node_modules", "__pycache__", ".venv", "venv", "target", "build",
                           "dist", ".dart_tool", ".data", ".idea", ".vscode"})
-# Предел путей снимка: вне git — всех файлов, в git — изменённых и неотслеживаемых.
+# Предел изменённых и неотслеживаемых путей снимка в git: они хранятся словарём, объектом на путь, в памяти
+# и в JSON файла снимка. Обход вне git ограничен только сроком.
 MAX_FILES = 50_000
 # Срок проверяется раз в столько файлов при lstat.
 STAT_CHECK_EVERY = 256
+# Версия формата файла снимка; файл другой версии load отвергает.
+FORMAT = 2
 
 
 class TooManyFiles(Exception):
-    """Путей для снимка больше MAX_FILES; текст — причина для предупреждения."""
+    """Изменённых и неотслеживаемых путей снимка в git больше MAX_FILES; текст — причина для предупреждения."""
 
 
 def ignore_rules(directory):
@@ -74,49 +80,107 @@ def _git_ls(root, deadline, *args):
     return None if out is None else [os.fsdecode(e) for e in out.split(b"\0") if e]
 
 
-def _walk_paths(root, deadline):
-    """Пути файлов под root обходом каталогов; TooManyFiles, когда путей больше MAX_FILES: оборванный
-    обход не отдаётся как полный.
+def _walk(root, deadline):
+    """(каталог от root через «/», "" — сам root; [DirEntry обычных файлов каталога]) обходом под root;
+    TimeoutError по сроку deadline. Каталог без файлов не выдаётся.
 
     Правила каталога — правила родителя плюс его собственный .gitignore, упрощённо по ignore_rules;
-    действуют на его поддерево. os.walk не заходит в символические ссылки на каталоги.
+    действуют на его поддерево. Символические ссылки не обходятся и в файлы не попадают; каталог, который
+    не прочесть, пропускается.
     """
-    rules_by_dir = {}
-    paths = []
-    for dirpath, dirnames, filenames in os.walk(root):
+    stack = [("", os.fspath(root), (frozenset(), frozenset()))]
+    while stack:
         _remaining(deadline)
-        parent = rules_by_dir.get(os.path.dirname(dirpath), (set(), set()))
-        own = ignore_rules(pathlib.Path(dirpath))
-        names, exts = parent[0] | own[0], parent[1] | own[1]
-        rules_by_dir[dirpath] = (names, exts)
-        skip = IGNORED_DIRS | names
-        dirnames[:] = [d for d in dirnames if d not in skip]
-        for name in filenames:
-            if name in names or any(name.endswith("." + e) for e in exts):
-                continue
-            paths.append(os.path.relpath(os.path.join(dirpath, name), root).replace(os.sep, "/"))
-        if len(paths) > MAX_FILES:
-            raise TooManyFiles(f"дерево больше {MAX_FILES} файлов")
-    return paths
-
-
-def _stat_files(root, relpaths, deadline=None):
-    """{путь: [size, mtime_ns]} для обычных файлов (не ссылок) из relpaths; None, если их больше MAX_FILES;
-    TimeoutError по сроку deadline."""
-    files = {}
-    for i, rel in enumerate(relpaths):
-        if i % STAT_CHECK_EVERY == 0:
-            _remaining(deadline)
+        rel, path, rules = stack.pop()
         try:
-            st = os.lstat(os.path.join(root, rel))
+            with os.scandir(path) as it:
+                entries = list(it)
         except OSError:
             continue
-        if not stat.S_ISREG(st.st_mode):
+        if any(e.name == ".gitignore" for e in entries):
+            own_names, own_exts = ignore_rules(pathlib.Path(path))
+            if own_names or own_exts:
+                rules = (rules[0] | own_names, rules[1] | own_exts)
+        names, exts = rules
+        files = []
+        pre = f"{rel}/" if rel else ""
+        for e in entries:
+            if e.name in names:
+                continue
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if e.name not in IGNORED_DIRS:
+                        stack.append((pre + e.name, e.path, rules))
+                elif e.is_file(follow_symlinks=False) and not any(e.name.endswith("." + x) for x in exts):
+                    files.append(e)
+            except OSError:
+                continue
+        if files:
+            yield rel, files
+
+
+def _walk_paths(root, deadline):
+    """Пути обычных файлов под root обходом _walk; TimeoutError по сроку deadline."""
+    return [f"{rel}/{e.name}" if rel else e.name for rel, files in _walk(root, deadline) for e in files]
+
+
+# Запись файла в блоке каталога: имя в байтах ФС, NUL, size и mtime_ns. Имя файла не содержит NUL.
+_STAT = struct.Struct("<Qq")
+# Длина блока каталога в записи файла снимка.
+_LEN = struct.Struct("<I")
+
+
+def _walk_dirs(root, deadline):
+    """{каталог от root: блок} обычных файлов обхода _walk; TimeoutError по сроку deadline.
+
+    Блок — записи _STAT файлов каталога, отсортированные по имени: каталог без правок даёт тот же блок
+    при любом порядке readdir, и сверка сравнивает каталоги целиком, не разбирая записи. Пути не хранятся
+    объектом на файл: память — около размера блоков.
+    """
+    dirs = {}
+    count = 0
+    for rel, files in _walk(root, deadline):
+        records = []
+        for e in files:
+            count += 1
+            if count % STAT_CHECK_EVERY == 0:
+                _remaining(deadline)
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                records.append(os.fsencode(e.name) + b"\0" + _STAT.pack(st.st_size, st.st_mtime_ns))
+        if records:
+            records.sort()
+            dirs[rel] = b"".join(records)
+    return dirs
+
+
+def _records(block):
+    """{имя в байтах ФС: упакованные size и mtime_ns} блока _walk_dirs."""
+    out = {}
+    pos = 0
+    while pos < len(block):
+        end = block.index(b"\0", pos)
+        out[block[pos:end]] = block[end + 1:end + 1 + _STAT.size]
+        pos = end + 1 + _STAT.size
+    return out
+
+
+def diff(old, new):
+    """[(путь, есть ли файл в new)] файлов, которые отличаются между снимками _walk_dirs old и new, по пути."""
+    changed = []
+    for rel in old.keys() | new.keys():
+        a, b = old.get(rel, b""), new.get(rel, b"")
+        if a == b:
             continue
-        files[rel] = [st.st_size, st.st_mtime_ns]
-        if len(files) > MAX_FILES:
-            return None
-    return files
+        ra, rb = _records(a), _records(b)
+        pre = f"{rel}/" if rel else ""
+        names = ra.keys() ^ rb.keys()
+        names |= {n for n in ra.keys() & rb.keys() if ra[n] != rb[n]}
+        changed += [(pre + os.fsdecode(n), n in rb) for n in names]
+    return sorted(changed)
 
 
 def _stat_one(root, rel):
@@ -201,22 +265,19 @@ def _git_state(root, deadline, prefix="", repos=None):
 
 
 def capture(root, deadline=None):
-    """Снимок дерева root на старте реплики без prompt_id и root; TooManyFiles — путей больше MAX_FILES;
-    TimeoutError — не уложился в срок deadline (time.monotonic).
+    """Снимок дерева root на старте реплики без prompt_id и root; TooManyFiles — в git изменённых и
+    неотслеживаемых путей больше MAX_FILES; TimeoutError — не уложился в срок deadline (time.monotonic).
 
     В git ("mode": "git"): "repos" — {префикс: HEAD} корня, подмодулей и вложенных репозиториев,
     "dirty" — {путь: [size, mtime_ns] или None} изменённых против HEAD и неотслеживаемых путей; None —
     путь не обычный файл или удалён. Stat всех файлов не снимается: размер снимка не зависит от дерева.
-    Вне git ("mode": "walk"): "files" — {путь: [size, mtime_ns]} всех файлов обхода _walk_paths.
+    Вне git ("mode": "walk"): "dirs" — {каталог: блок} всех обычных файлов обхода _walk_dirs.
     "head" и "sub_heads" — базы для comments.extract.
     """
     root = pathlib.Path(root)
     repos = _git_state(root, deadline)
     if repos is None:
-        files = _stat_files(root, _walk_paths(root, deadline), deadline)
-        if files is None:
-            raise TooManyFiles(f"дерево больше {MAX_FILES} файлов")
-        return {"mode": "walk", "head": None, "sub_heads": {}, "files": files}
+        return {"mode": "walk", "head": None, "sub_heads": {}, "dirs": _walk_dirs(root, deadline)}
     # Предел ограничивает запись снимка: она идёт после проверки срока.
     dirty = list(dict.fromkeys(p for r in repos.values() for p in r["dirty"]))
     if len(dirty) > MAX_FILES:
@@ -249,7 +310,7 @@ def _since_commit(repo_dir, base, deadline):
 def changed_since(root, snap, deadline=None):
     """[(путь от root, обычный ли это файл сейчас)] файлов, изменённых со снимка snap (snapshot.load),
     по пути; None с предупреждением, если определить нельзя: сменился режим git/обход, пропал
-    репозиторий снимка, недоступен коммит HEAD снимка, вне git дерево больше MAX_FILES.
+    репозиторий снимка, недоступен коммит HEAD снимка.
     TimeoutError — не уложился в срок deadline (time.monotonic).
 
     В git изменённые — пути, отличные от HEAD снимка (коммиты и правки за реплику), грязные сейчас и
@@ -257,21 +318,12 @@ def changed_since(root, snap, deadline=None):
     """
     root = pathlib.Path(root)
     mode = snap.get("mode")
-    try:
-        repos = _git_state(root, deadline)
-    except TooManyFiles as e:
-        return _undetermined(str(e))
+    repos = _git_state(root, deadline)
     if (repos is not None) != (mode == "git"):
         return _undetermined("за реплику корень проекта " +
                              ("стал git-репозиторием" if repos is not None else "перестал быть git-репозиторием"))
     if repos is None:
-        try:
-            now = _stat_files(root, _walk_paths(root, deadline), deadline)
-        except TooManyFiles as e:
-            return _undetermined(str(e))
-        if now is None:
-            return _undetermined(f"дерево больше {MAX_FILES} файлов")
-        return [(p, p in now) for p in diff(snap["files"], now)]
+        return diff(snap["dirs"], _walk_dirs(root, deadline))
     start_heads, start_dirty = snap["repos"], snap["dirty"]
     gone = [p for p in start_heads if p not in repos]
     if gone:
@@ -306,32 +358,64 @@ def _snap_path(state_dir, session_id):
     return state_dir / f"{common.safe_name(session_id)}.snap.json"
 
 
+def _pack_dirs(dirs):
+    """Блоки _walk_dirs одной строкой: base64 от zlib записей «каталог в байтах ФС, NUL, длина блока, блок»."""
+    # Сжатие по каталогу: несжатая запись целиком в памяти не собирается.
+    z = zlib.compressobj(1)
+    parts = []
+    for rel, block in dirs.items():
+        parts.append(z.compress(os.fsencode(rel) + b"\0" + _LEN.pack(len(block))))
+        parts.append(z.compress(block))
+    parts.append(z.flush())
+    return base64.b64encode(b"".join(parts)).decode("ascii")
+
+
+def _unpack_dirs(text):
+    """Обратное _pack_dirs; ValueError, zlib.error или struct.error — запись повреждена."""
+    raw = zlib.decompress(base64.b64decode(text, validate=True))
+    dirs = {}
+    pos = 0
+    while pos < len(raw):
+        end = raw.index(b"\0", pos)
+        (size,) = _LEN.unpack_from(raw, end + 1)
+        start = end + 1 + _LEN.size
+        if start + size > len(raw):
+            raise ValueError("обрезанный блок каталога")
+        dirs[os.fsdecode(raw[pos:end])] = raw[start:start + size]
+        pos = start + size
+    return dirs
+
+
+
 def store(state_dir, session_id, prompt_id, root, snap):
-    """Снимок capture в state_dir/<session>.snap.json вместе с репликой и корнем."""
-    common.atomic_write_json(_snap_path(state_dir, session_id),
-                              {**snap, "prompt_id": prompt_id, "root": str(root)})
+    """Снимок capture в state_dir/<session>.snap.json вместе с репликой, корнем и версией формата FORMAT;
+    блоки режима walk — строкой _pack_dirs."""
+    data = {**snap, "format": FORMAT, "prompt_id": prompt_id, "root": str(root)}
+    if snap.get("mode") == "walk":
+        data["dirs"] = _pack_dirs(snap["dirs"])
+    common.atomic_write_json(_snap_path(state_dir, session_id), data)
 
 
 def load(state_dir, session_id):
-    """Снимок сессии; None — нет файла, битый JSON, режим не "git" и не "walk" или нет полей режима."""
+    """Снимок сессии; None — нет файла, битый JSON, версия формата не FORMAT, режим не "git" и не "walk",
+    нет полей режима или повреждены блоки walk."""
     path = _snap_path(state_dir, session_id)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     # ValueError покрывает JSONDecodeError и UnicodeDecodeError.
     except (OSError, ValueError):
         return None
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or data.get("format") != FORMAT:
         return None
     mode = data.get("mode")
     if mode == "git":
         valid = isinstance(data.get("dirty"), dict) and isinstance(data.get("repos"), dict) \
             and "" in data["repos"]
-    else:
-        valid = mode == "walk" and isinstance(data.get("files"), dict)
-    return data if valid else None
-
-
-def diff(old, new):
-    changed = old.keys() ^ new.keys()
-    changed |= {p for p in old.keys() & new.keys() if old[p] != new[p]}
-    return sorted(changed)
+        return data if valid else None
+    if mode != "walk" or not isinstance(data.get("dirs"), str):
+        return None
+    try:
+        data["dirs"] = _unpack_dirs(data["dirs"])
+    except (ValueError, zlib.error, struct.error):
+        return None
+    return data

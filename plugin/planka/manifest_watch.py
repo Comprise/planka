@@ -4,7 +4,8 @@
 манифестов проекта перед ней (state/<session>.manifests.json по tool_use_id) и сравнение после.
 Новым не считается имя из текста до правки вместе с транзитивными, из версии манифеста в HEAD и в
 источнике незавершённых merge, cherry-pick, rebase, revert, из другого манифеста того же реестра в
-проекте и имя пакета самого проекта (workspace, монорепозиторий).
+проекте, имя пакета самого проекта (workspace, монорепозиторий) и, после команды, имя из манифестов ref,
+откуда команда git возвращает файлы (stash, ветка, коммит), если ref создан до начала сессии.
 """
 import os
 import re
@@ -131,9 +132,10 @@ def _git(cwd, timeout, *args, input=None):
 _REPO_REFS = ("HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REBASE_HEAD", "REVERT_HEAD", "REVERT_HEAD^")
 
 
-def _blobs(out):
-    """Содержимое блобов вывода `git cat-file --batch`; отсутствующие и не блобы пропущены."""
-    blobs, i = [], 0
+def _objects(out):
+    """[(тип, содержимое) или None] вывода `git cat-file --batch` по строке ввода: None — объект не найден
+    (заголовок `<ввод> missing` или `ambiguous`)."""
+    objects, i = [], 0
     while i < len(out):
         end = out.find(b"\n", i)
         if end < 0:
@@ -142,10 +144,16 @@ def _blobs(out):
         i = end + 1
         if len(header) == 3 and header[2].isdigit():
             size = int(header[2])
-            if header[1] == b"blob":
-                blobs.append(out[i:i + size])
+            objects.append((header[1], out[i:i + size]))
             i += size + 1
-    return blobs
+        else:
+            objects.append(None)
+    return objects
+
+
+def _blobs(out):
+    """Содержимое блобов вывода `git cat-file --batch`; отсутствующие и не блобы пропущены."""
+    return [data for kind, data in filter(None, _objects(out)) if kind == b"blob"]
 
 
 def head_names(path, kind, timeout):
@@ -312,15 +320,16 @@ def compare(entry, deadline, skip=frozenset()):
 
     Новый манифест сравнивается с пустым; пропавший — ничего; манифест с тем же size и mtime не
     перечитывается; манифест, чей realpath в skip, не проверяется. Имя из любого манифеста того же реестра
-    (manifests.registry) в снимке и имя пакета самого проекта (в снимке или в манифесте после команды) — не
-    новое: перенос, копия, член workspace. Unavailable — снимок другого режима."""
+    (manifests.registry) в снимке, из ref до начала сессии (entry["known"], restored_names) и имя пакета
+    самого проекта (в снимке или в манифесте после команды) — не новое: перенос, копия, член workspace,
+    возврат работы автора. Unavailable — снимок другого режима."""
     root = entry["root"]
     mode, found = list_manifests(root, deadline)
     if mode != entry["mode"]:
         raise Unavailable("за команду корень проекта " +
                           ("стал git-репозиторием" if mode == "git" else "перестал быть git-репозиторием"))
     before = entry["files"]
-    project = {}
+    project = {registry: set(names) for registry, names in entry.get("known", {}).items()}
     for rel, (_, _, known, own) in before.items():
         names = project.setdefault(manifests.registry(watched_kind(rel)), set())
         names.update(known or ())
@@ -362,6 +371,154 @@ def compare(entry, deadline, skip=frozenset()):
         if names:
             added[rel] = names
     return added, unknown
+
+
+# Флаги со значением следующим словом: глобальные git до подкоманды и подкоманд, из чьих операндов берётся ref.
+_GIT_VALUE_FLAGS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix"}
+_MERGE_VALUE_FLAGS = {"-m", "-F", "--file", "-s", "--strategy", "-X", "--strategy-option", "--cleanup",
+                      "--into-name"}
+_CHERRY_PICK_VALUE_FLAGS = {"-m", "--mainline", "-X", "--strategy-option", "--strategy", "--cleanup"}
+_CHECKOUT_VALUE_FLAGS = {"-b", "-B", "--orphan", "--conflict", "--pathspec-from-file"}
+
+
+def _operands(args, value_flags):
+    """(операнды до `--` без флагов и их значений, стоит ли `--`)."""
+    out, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            return out, True
+        if a.startswith("-") and a != "-":
+            i += 2 if depcheck._takes_value(a, value_flags) else 1
+            continue
+        out.append(a)
+        i += 1
+    return out, False
+
+
+def _restore_source(args):
+    """Значение `--source`/`-s` команды `git restore`; None — нет."""
+    for i, a in enumerate(args):
+        if a == "--":
+            break
+        if a in ("--source", "-s"):
+            return args[i + 1] if i + 1 < len(args) else None
+        if a.startswith("--source="):
+            return a[len("--source="):]
+        if a.startswith("-s") and not a.startswith("--"):
+            return a[2:]
+    return None
+
+
+def command_refs(command):
+    """[(ref, это stash)] — откуда команда git кладёт файлы в рабочее дерево без коммита, по сегментам
+    (depcheck._segments, depcheck._command): `git stash pop|apply [N|stash@{N}]` (по умолчанию stash@{0}),
+    `git merge --squash <ref>…`, `git checkout <ref> [--] <пути>`, `git restore --source <ref>`,
+    `git cherry-pick -n|--no-commit <ref>…`.
+
+    Остальное — пропуск разбора, имена не добавляются: `git apply` (патч, не ref), merge, cherry-pick и
+    checkout ветки с коммитом — их имена в HEAD или источнике незавершённой операции (_REPO_REFS). `git -C`
+    не учитывается: ref разрешается в репозитории проекта."""
+    refs = []
+    for segment in depcheck._segments(command):
+        words, _ = depcheck._command(segment.strip())
+        if not words or depcheck._basename(words[0]) != "git":
+            continue
+        sub = depcheck._subcommand(words, _GIT_VALUE_FLAGS)
+        if len(sub) < 2:
+            continue
+        name, args = sub[1], sub[2:]
+        if name == "stash" and args[:1] in (["pop"], ["apply"]):
+            operands, _ = _operands(args[1:], depcheck._NO_VALUE_FLAGS)
+            rev = operands[0] if operands else "0"
+            refs.append((f"stash@{{{rev}}}" if rev.isdigit() else rev, True))
+        elif name == "merge" and "--squash" in args:
+            refs += [(rev, False) for rev in _operands(args, _MERGE_VALUE_FLAGS)[0]]
+        elif name == "cherry-pick" and ("-n" in args or "--no-commit" in args):
+            refs += [(rev, False) for rev in _operands(args, _CHERRY_PICK_VALUE_FLAGS)[0]]
+        elif name == "checkout":
+            # Один операнд без `--` — ветка или путь из индекса: файлы не из названного ref.
+            operands, dashdash = _operands(args, _CHECKOUT_VALUE_FLAGS)
+            if operands and (dashdash or len(operands) > 1):
+                refs.append((operands[0], False))
+        elif name == "restore":
+            rev = _restore_source(args)
+            if rev:
+                refs.append((rev, False))
+    return refs
+
+
+_COMMITTER = re.compile(rb"^committer .*> (\d+) [+-]\d{4}$", re.M)
+_TREE = re.compile(rb"^tree ([0-9a-f]+)$", re.M)
+
+
+def _old_trees(root, refs, start, deadline):
+    """Деревья коммитов refs, созданных до start: время коммиттера коммита (у stash — коммита stash) меньше
+    start. У stash дерево коммита — рабочее дерево на момент stash, неотслеживаемые файлы (`stash -u`) — в
+    дереве его третьего родителя. Ref не найден — пропуск."""
+    lines, primary = [], []
+    for rev, stash in refs:
+        # Ввод --batch построчный.
+        if "\n" in rev or "\r" in rev:
+            continue
+        lines.append(f"{rev}^{{commit}}")
+        primary.append(True)
+        if stash:
+            lines.append(f"{rev}^3^{{commit}}")
+            primary.append(False)
+    if not lines:
+        return []
+    out = _git(root, _remaining(deadline), "cat-file", "--batch", input=os.fsencode("".join(f"{l}\n" for l in lines)))
+    if out is None:
+        return []
+    trees, accepted = [], False
+    for is_primary, obj in zip(primary, _objects(out)):
+        if is_primary:
+            accepted = False
+        if obj is None or obj[0] != b"commit":
+            continue
+        head = obj[1].split(b"\n\n", 1)[0]
+        tree = _TREE.search(head)
+        if is_primary:
+            committed = _COMMITTER.search(head)
+            accepted = committed is not None and int(committed.group(1)) < start
+        if accepted and tree:
+            trees.append(tree.group(1).decode("ascii"))
+    return list(dict.fromkeys(trees))
+
+
+def restored_names(root, command, start, deadline):
+    """{реестр: имена с транзитивными} манифестов ref, откуда command возвращает файлы (command_refs), если
+    ref создан до start — начала сессии (session_start); это работа до сессии, после команды такие имена не
+    новые. start None, ref моложе, не найден, манифестов в дереве больше MAX_MANIFESTS или срок deadline вышел —
+    имена не добавляются: сравнение блокирует, как без ref.
+
+    Время ref — время коммиттера: коммит с поддельной датой (GIT_COMMITTER_DATE) проходит как старый."""
+    refs = command_refs(command)
+    if not refs or start is None:
+        return {}
+    known = {}
+    try:
+        for tree in _old_trees(root, refs, start, deadline):
+            listed = _git(root, _remaining(deadline), "ls-tree", "-r", "-z", "--name-only", "--full-tree", tree)
+            if listed is None:
+                continue
+            paths = [p for p in (os.fsdecode(e) for e in listed.split(b"\0") if e)
+                     if watched_kind(p) and "\n" not in p and "\r" not in p]
+            if not paths or len(paths) > MAX_MANIFESTS:
+                continue
+            out = _git(root, _remaining(deadline), "cat-file", "--batch",
+                       input=os.fsencode("".join(f"{tree}:{p}\n" for p in paths)))
+            for path, obj in zip(paths, _objects(out or b"")):
+                if obj is None or obj[0] != b"blob" or len(obj[1]) > MAX_MANIFEST_BYTES:
+                    continue
+                kind = watched_kind(path)
+                names = manifests.known_names(kind, obj[1].decode("utf-8", "replace"))
+                if names:
+                    known.setdefault(manifests.registry(kind), set()).update(names)
+    except TimeoutError:
+        return {}
+    return {registry: sorted(names) for registry, names in known.items()}
 
 
 # Подкоманды, печатающие установленные или зафиксированные пакеты в формате requirements: у pip и `uv pip` —
@@ -505,5 +662,30 @@ def pop(session, tool_use_id):
     valid = (isinstance(entry, dict) and isinstance(entry.get("root"), str) and entry.get("mode") in ("git", "walk")
              and isinstance(entry.get("files"), dict)
              and all(isinstance(v, list) and len(v) == 4 and (v[2] is None or isinstance(v[2], list))
-                     and (v[3] is None or isinstance(v[3], str)) for v in entry["files"].values()))
+                     and (v[3] is None or isinstance(v[3], str)) for v in entry["files"].values())
+             and isinstance(entry.get("known", {}), dict)
+             and all(isinstance(v, list) for v in entry.get("known", {}).values()))
     return entry if valid else None
+
+
+def _start_path(state_dir, session):
+    return state_dir / f"{common.safe_name(session)}.start.json"
+
+
+def mark_start(session):
+    """Начало сессии — целые секунды вниз — в state/<session>.start.json при первом вызове; дальше файл не
+    меняется. Зовётся на каждом PreToolUse judge_tool: до первого вызова агент не запускал ни Bash, ни правок."""
+    state_dir = common.data_dir() / "state"
+    path = _start_path(state_dir, session)
+    if path.exists():
+        return
+    state_dir.mkdir(exist_ok=True)
+    with common.state_lock(state_dir):
+        if not path.exists():
+            common.atomic_write_json(path, {"start": int(time.time())})
+
+
+def session_start(session):
+    """Начало сессии из mark_start, секунды; None — нет записи или она не той формы."""
+    start = common.read_json(_start_path(common.data_dir() / "state", session), dict).get("start")
+    return start if type(start) is int else None

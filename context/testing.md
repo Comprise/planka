@@ -59,18 +59,25 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
   `AddedContractTest`); хук — `tests/test_judge_tool.py`: `ManifestEditTest` (правка `Write`, `Edit`,
   `MultiEdit`), `ManifestEditGitTest` (версии `_REPO_REFS` — база), `ManifestBashTest` и его наследник
   `ManifestBashGitTest` (снимок и сравнение вне git и в git: генераторы, `tee`, маркер,
-  `PostToolUseFailure`, параллельные команды по `tool_use_id`, `mv`, `cp`, `git mv`; блок с безопасным
-  текстом на `git stash pop` — `test_stash_pop_blocked_with_safe_reason`),
+  `PostToolUseFailure`, параллельные команды по `tool_use_id`, `mv`, `cp`, `git mv`; ref до начала сессии:
+  stash и ref `checkout`, `restore --source`, `merge --squash`, `cherry-pick -n` старше начала — пропуск
+  (`test_author_stash_before_session_passes`, `test_author_stash_untracked_manifest_passes`,
+  `test_restore_from_old_ref_passes`), моложе, в ту же секунду или без записи начала — блок с безопасным текстом
+  (`test_stash_after_session_start_blocked_with_safe_reason`,
+  `test_restore_from_young_ref_blocked`, `test_ref_in_session_start_second_not_old`,
+  `test_old_ref_without_session_start_blocked`); начало сессии подменяется записью `start.json`),
+  `CommandRefsTest` (формы команд git, из которых `command_refs` берёт ref, и формы без ref — `git apply`),
   `ManifestProjectUnderFixturesTest` (`FOREIGN_DIRS` — от проекта), `GeneratedRequirementsTest` (файлы
   вывода генераторов), `ManifestWatchStateTest` (файл состояния снимков: срок записей, удаление пустого файла,
-  предел обхода вне git, повторно не читаются файлы с тем же размером и mtime).
+  предел обхода вне git, повторно не читаются файлы с тем же размером и mtime; `start.json` пишет первый
+  `PreToolUse` один раз, `PostToolUse` и хук внутри судьи — нет).
 - `tests/test_hostile_git.py` передаёт враждебный конфиг явно — `GIT_CONFIG_GLOBAL` на временный файл —
   только вызовам плагина (`snapshot.capture`, `snapshot.changed_since`, `comments.extract`,
-  `common.project_root`, `guard_memory.is_memory_path`, `manifest_watch.list_manifests` и
-  `manifest_watch.head_names` через `mock.patch.dict(os.environ)`, хукам `remind.py` и `judge_stop.py`
-  через `Env.run`); git подготовки репозитория идёт под изолированным конфигом. Настройки `HOSTILE` не должны
-  менять результат: каждая — отдельный `subTest` против ожидаемого результата под изолированным
-  конфигом, все вместе — отдельный тест и тест хуков. Внешний diff, пейджер, монитор файловой системы и
+  `common.project_root`, `guard_memory.is_memory_path`, `manifest_watch.list_manifests`,
+  `manifest_watch.head_names` и `manifest_watch.restored_names` через `mock.patch.dict(os.environ)`, хукам
+  `remind.py` и `judge_stop.py` через `Env.run`); git подготовки репозитория идёт под изолированным конфигом.
+  Настройки `HOSTILE` не должны менять результат: каждая — отдельный `subTest` против ожидаемого результата под
+  изолированным конфигом, все вместе — отдельный тест и тест хуков. Внешний diff, пейджер, монитор файловой системы и
   textconv-драйвер `diff.junk.textconv` — скрипт, печатающий строки вида diff и завершающийся с
   ошибкой; `core.attributesFile` — файл `ATTRIBUTES` (`*.py -diff`, у `a.py` драйвер `junk`). Репозиторий
   сценария держит свой `.gitattributes` (`b.py binary`, `ü.py -diff`), а `old.py` переименован в
@@ -113,8 +120,11 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
 - общий помощник — `helpers.run_in_process(env, main, hook_input, **environ)`: `main` хука через
   `common.run_hook` с окружением `Env.environ` и подменой stdin и stdout, ответ — словарём; подмены
   модулей ставит вызывающий;
-- порог `snapshot.MAX_FILES` и сбой снимка — `remind.main` через `RemindTest.run_in_process` (обёртка
-  над `helpers.run_in_process`);
+- порог `snapshot.MAX_FILES` грязных путей в git, его отсутствие вне git, срок снимка (предупреждение раз на
+  сессию) и сбой снимка — `remind.main` через `RemindTest.run_in_process` (обёртка над
+  `helpers.run_in_process`); снимок walk без предела числа файлов, независимый от порядка readdir, проверка срока
+  в `_walk_dirs`, имена не в UTF-8 и отказ `load` прошлому формату и повреждённым блокам — `WalkCaptureTest`,
+  `ChangedSinceWalkTest`, `StoreLoadDiffTest` в `tests/test_snapshot.py`;
 - гонка лимита отказов (параллельный вызов исчерпал лимит между проверкой и отказом) —
   `helpers.run_in_process` в `tests/test_judge_tool.py` и `tests/test_judge_stop.py`; счётчик на
   пределе ставит `helpers.fill_budget`;
@@ -137,12 +147,13 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
   `compare` подменены, проверяется срок, который им передаёт `judge_tool.main`, и `HEAD_TIMEOUT` вызова
   `manifest_watch._git`; сумма сроков правки манифеста `HEAD_TIMEOUT` + `GIT_ROOT_TIMEOUT` +
   `SNAPSHOT_BUDGET` против таймаута хука — `TimeoutsTest`; сбой снимка (больше `MAX_MANIFESTS`, недоступный
-  каталог данных; предупреждение раз, `skipped` на каждую команду) — `ManifestSnapshotFailureTest`;
+  каталог данных; предупреждение раз, `skipped` на каждую команду) — `ManifestSnapshotFailureTest`; имена ref
+  в сроке снимка `SNAPSHOT_BUDGET` — `ManifestDeadlineTest.test_restored_ref_within_snapshot_budget`;
 - манифесты под враждебным git-конфигом — `HostileManifestTest` в `tests/test_hostile_git.py`:
   `git ls-files` (отслеживаемые, неотслеживаемые, исключённые `.gitignore`, пути с пробелом и кириллицей,
   `FOREIGN_DIRS`) и `git cat-file --batch` версий `_REPO_REFS` при textconv-драйвере на манифесте и незавершённом
-  слиянии
-  (`MERGE_HEAD`).
+  слиянии (`MERGE_HEAD`); `git cat-file --batch` и `git ls-tree` в `restored_names` — по ветке и `stash -u` с
+  отслеживаемым и неотслеживаемым манифестом.
 
 Локаль с кодировкой ascii проверяет `NonUtf8LocaleTest` своим скриптом `_LOCALE_HOOK` подпроцессом
 (`LC_ALL=C`, `PYTHONUTF8=0`): судья с русским промптом через сторож, корень проекта и

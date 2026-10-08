@@ -23,9 +23,9 @@ planka — плагин Claude Code уровня пользователя: пя�
 | `planka/prompts.py` | системный промпт, схема ответа `JUDGE_SCHEMA`, вопросы судье по видам проверки, сборка содержимого |
 | `planka/planparse.py` | разбор плана на волны и задачи, владение файлами (`shared_files`) |
 | `planka/manifests.py` | разбор манифестов: вид по имени (`kind`), имена внешних зависимостей (`names`), они же с транзитивными (`known_names`), имя пакета манифеста (`own_name`) |
-| `planka/manifest_watch.py` | текст манифеста после правки файловым инструментом (`edit_texts`, `check_edit`), новые имена (`fresh_names`, `edit_names`), имена версии HEAD (`head_names`) и других манифестов проекта (`project_names`), снимок манифестов проекта и сравнение после команды (`take`, `compare`, `store`, `pop`), файлы вывода генераторов requirements (`generated_requirements`) |
+| `planka/manifest_watch.py` | текст манифеста после правки файловым инструментом (`edit_texts`, `check_edit`), новые имена (`fresh_names`, `edit_names`), имена версии HEAD (`head_names`) и других манифестов проекта (`project_names`), снимок манифестов проекта и сравнение после команды (`take`, `compare`, `store`, `pop`), имена ref до начала сессии, откуда команда git возвращает файлы (`command_refs`, `restored_names`; начало сессии — `mark_start`, `session_start`), файлы вывода генераторов requirements (`generated_requirements`) |
 | `planka/depcheck.py` | разбор команды Bash: добавляет ли она пакет (`dependency_add`), маркер `DEP_OK_MARKER`, heredoc (`heredocs`) |
-| `planka/snapshot.py` | снимок дерева (`capture`, `store`, `load`) и изменения с него (`changed_since`) в режимах git и walk; порог `MAX_FILES` |
+| `planka/snapshot.py` | снимок дерева (`capture`, `store`, `load`) и изменения с него (`changed_since`) в режимах git и walk; порог `MAX_FILES` грязных путей в git |
 | `planka/comments.py` | строки комментариев изменённых файлов для судьи документации (`extract`) |
 | `philosophy.md` | ядро правил; индекс «Модули» в конце |
 | `rules/*.md` | модули правил, по файлу на область |
@@ -150,15 +150,18 @@ author_answers)`: реплика автора текущего хода и ег�
 `git rev-parse` (до `common.GIT_ROOT_TIMEOUT`, 5 с), сверка со снимком со сроком `judge_stop.SNAPSHOT_BUDGET`
 (20 с) и извлечение комментариев со сроком `judge_stop.COMMENTS_BUDGET` (20 с) — вместе с судьёй (до 65 с) не
 больше 110 с. У `UserPromptSubmit` снимок ограничен сроком `remind.SNAPSHOT_BUDGET` (7 с от старта хука); не
-уложился — `TimeoutError`, снимок пропускается с предупреждением, напоминание выдаётся. Один вызов git в
+уложился — `TimeoutError`, снимок пропускается с предупреждением раз на сессию (`common.warn_once`, ключ
+`snapshot`, общий с `TooManyFiles`), напоминание выдаётся. Один вызов git в
 `snapshot` и `comments` — не дольше `GIT_TIMEOUT` (10 с) и остатка срока. У хуков `PreToolUse` с судьёй срок —
 `JUDGE_TIMEOUT` и `KILL_WAIT` (65 с) против 90 с; у `guard_memory` до судьи ещё `git check-ignore`
 (`guard_memory._repository_file`, срок `guard_memory.CHECK_IGNORE_TIMEOUT`, 5 с) — для цели под
 `autoMemoryDirectory` или cowork, который равен проекту или содержит его; вместе с судьёй 70 с против 90 с. У
 `judge_tool` на `Bash` снимок манифестов — `git rev-parse` корня (`common.GIT_ROOT_TIMEOUT`) и срок
-`manifest_watch.SNAPSHOT_BUDGET` (5 с) на `git ls-files` и разбор, у правки манифеста — один `git cat-file --batch`
-версий `_REPO_REFS` (`manifest_watch.HEAD_TIMEOUT`, 5 с) и после него корень проекта и обход манифестов проекта
-(`judge_tool._project_names`, ещё `SNAPSHOT_BUDGET`): `HEAD_TIMEOUT` + `GIT_ROOT_TIMEOUT` + `SNAPSHOT_BUDGET`; на
+`manifest_watch.SNAPSHOT_BUDGET` (5 с) на `git ls-files` и разбор, а у команды с ref (`command_refs`) — и на
+`git cat-file --batch` и `git ls-tree` ref до начала сессии (`restored_names`; срок вышел — имён ref нет), у
+правки манифеста — один `git cat-file --batch` версий `_REPO_REFS` (`manifest_watch.HEAD_TIMEOUT`, 5 с) и
+после него корень проекта и обход манифестов проекта (`judge_tool._project_names`, ещё `SNAPSHOT_BUDGET`):
+`HEAD_TIMEOUT` + `GIT_ROOT_TIMEOUT` + `SNAPSHOT_BUDGET`; на
 `PostToolUse` сравнение со снимком — срок `manifest_watch.CHECK_BUDGET` (5 с) против 30 с, в него входят и `git
 cat-file --batch` изменённых манифестов. Вышел срок — пропуск с предупреждением.
 
@@ -335,7 +338,8 @@ MCP — `guard_memory.is_memory_mcp`: слово из `WRITE_VERBS` в имен�
   и фильтров; имя файла с переводом строки не ложится в построчный ввод — тогда только HEAD через
   `cat-file blob HEAD:./<имя>`). Конфликт незавершённых merge, pull, cherry-pick, rebase, revert лежит в
   файле, но не в HEAD — версии источника его покрывают; `git merge --squash` `MERGE_HEAD` не пишет,
-  `git stash pop`, `git apply`, `git checkout <ref> -- <манифест>` тоже — блок остаётся. Что осталось,
+  `git stash pop`, `git apply`, `git checkout <ref> -- <манифест>` тоже — их источник в `_REPO_REFS` не попадает
+  (после команды `Bash` ref сверяет `restored_names`, ниже). Что осталось,
   сверяется с именами других манифестов того же реестра и пакетами самого проекта
   (`manifest_watch.project_names`, зовётся лениво через `judge_tool._project_names`, в пределах
   `SNAPSHOT_BUDGET`). Реестр вида — `manifests.registry` (`_REGISTRY`): package.json — npm, composer.json —
@@ -353,21 +357,37 @@ MCP — `guard_memory.is_memory_mcp`: слово из `WRITE_VERBS` в имен�
   --exclude-standard`, вне git обход `_walk` (в обоих режимах без `FOREIGN_DIRS`, куда входит
   `snapshot.IGNORED_DIRS`), не больше `MAX_WALK_FILES` файлов, — не больше `MAX_MANIFESTS` манифестов и на
   каждый пишет `[size, mtime_ns, имена с транзитивными или None, имя пакета манифеста или None]`:
-  содержимое не хранится. Снимок с полем `cwd` (каталог команды до неё) `store` кладёт в
+  содержимое не хранится. Если команда возвращает файлы из ref (`manifest_watch.command_refs`), в снимок идёт
+  поле `known` — `{реестр: имена}` манифестов ref, созданных до начала сессии (`restored_names`, ниже). Снимок
+  с полями `cwd` (каталог команды до неё) и `known` `store` кладёт в
   `state/<session>.manifests.json` под `tool_use_id` и там же удаляет записи старше `ENTRY_TTL`. Сбой
   снимка — `common.warn_once` с ключом `manifest-snapshot` и `skipped` в журнал на каждую команду.
 - После команды — `judge_tool.check_command_manifests` на `POST_EVENTS`: `manifest_watch.pop` забирает
   снимок; пути вывода генераторов requirements (`generated_requirements`) `resolve` разрешает от `cwd`
   снимка и от `cwd` после команды (`cd` внутри неё); `compare` — смена режима git/walk — `Unavailable`;
   манифест с тем же размером и mtime пропускается, новый сравнивается с пустым, не разобранный до или
-  после — в список предупреждения и `skipped`. Имя, объявленное в любом манифесте того же реестра в снимке (или
-  пакет самого проекта в снимке и в манифестах после команды), не новое: `mv`, `cp`, `git mv`, член
-  workspace. Остальное решает `fresh_names` с версиями `_REPO_REFS`. Новые имена — `block_output(COMMAND_REASON)`:
-  правка уже
-  в файле, хук не знает, чья она (`git stash pop`, `merge`, `apply`, `checkout <ref> -- <файл>` возвращают
-  работу автора), поэтому текст велит спросить автора, не откатывать вслепую и откатывать только свою
-  правку; в журнал `block-dep` с числами `manifests` и `added`. Ложный блок такой команды — записан в
-  `context/deferred/stash-restore-vs-agent-edit.md`.
+  после — в список предупреждения и `skipped`. Имя, объявленное в любом манифесте того же реестра в снимке, в
+  `known` снимка (ref до начала сессии) или пакет самого проекта в снимке и в манифестах после команды, не
+  новое: `mv`, `cp`, `git mv`, член workspace, возврат работы автора. Остальное решает `fresh_names` с версиями
+  `_REPO_REFS`. Новые имена — `block_output(COMMAND_REASON)`: правка уже в файле, хук не знает, чья она
+  (`git apply` патча, ref моложе начала сессии), поэтому текст велит спросить автора, не откатывать вслепую и
+  откатывать только свою правку; в журнал `block-dep` с числами `manifests` и `added`.
+
+Имена ref до начала сессии. `manifest_watch.command_refs(command)` по сегментам (`depcheck._segments`,
+`depcheck._command`) находит, откуда команда git кладёт файлы в рабочее дерево без коммита: `git stash pop|apply
+[N|stash@{N}]` (по умолчанию `stash@{0}`), `git merge --squash <ref>…`, `git checkout <ref> [--] <пути>` (один
+операнд без `--` — ветка или путь, не ref), `git restore --source <ref>`, `git cherry-pick -n|--no-commit <ref>…`;
+`git apply` (патч), merge, cherry-pick и checkout ветки с коммитом не разбираются — их имена в HEAD или
+`_REPO_REFS`; `git -C` не учитывается. Начало сессии — `manifest_watch.mark_start`: на каждом `PreToolUse`
+`judge_tool.main` (не на `POST_EVENTS`, не внутри судьи) пишет `state/<session>.start.json` с `int(time.time())`
+при первом вызове и дальше файл не меняет; сбой каталога состояния глотается — без начала сессии ref не
+сверяются. `manifest_watch.restored_names(root, command, start, deadline)` одним `git cat-file --batch` читает
+коммиты ref (`_old_trees`) и берёт деревья тех, чьё время коммиттера меньше `start`, у stash — ещё дерево
+третьего родителя (неотслеживаемые файлы `stash -u`); для каждого дерева `git ls-tree -r -z --name-only
+--full-tree` — пути манифестов (`watched_kind`, не больше `MAX_MANIFESTS`) и `git cat-file --batch` их блобов (не
+больше `MAX_MANIFEST_BYTES`) — `known_names` по реестру. `start` `None`, ref моложе, не найден или срок вышел —
+имён нет, сравнение блокирует, как без ref. Время ref — время коммиттера: поддельная дата и ref прошлой сессии
+агента проходят как работа автора — `context/deferred/stash-restore-vs-agent-edit.md`.
 
 Генератор requirements (`manifest_watch._is_generator`) узнаётся по словам сегмента `depcheck._command` приватными
 помощниками `depcheck`: `_subcommand`, `_after_flags`, `_python_module`, `_PIP`, `_GLOBAL_FLAGS` и наборы флагов;
@@ -385,10 +405,13 @@ requirements.txt`) нет — перенаправление в другом с�
 
 - `state/<session>.json` — счётчики отказов; `state/<session>.warned.json` — выданные
   однократные предупреждения (`common.warn_once`); `state/<session>.snap.json` — снимок дерева
-  текущей реплики (`snapshot.store`); `state/<session>.debug.json` — неудачи команд (`counts`) и
+  текущей реплики (`snapshot.store`, поле `format` = `snapshot.FORMAT`, 2; блоки режима walk — строкой
+  `snapshot._pack_dirs`); `state/<session>.start.json` — начало сессии `{"start": секунды}`
+  (`manifest_watch.mark_start`, пишется один раз); `state/<session>.debug.json` — неудачи команд (`counts`) и
   отметки показа модуля по агентам (`shown`); `state/<session>.manifests.json` — снимки манифестов перед
   командами `Bash`, `{tool_use_id: {root, mode, ts, cwd, files: {путь: [size, mtime_ns, имена или
-  None, имя пакета или None]}}}` (`manifest_watch.store`, `manifest_watch.pop`; запись не той формы `pop` отбрасывает).
+  None, имя пакета или None]}, known?: {реестр: [имена]}}}` (`manifest_watch.store`, `manifest_watch.pop`;
+  запись не той формы `pop` отбрасывает).
   Имя — `common.safe_name`. Запись атомарная (`common.atomic_write_json`: временный `.tmp-*` и
   `os.replace`); чтение — `common.read_json` (нет файла, битый JSON или значение не того типа —
   пустое значение); чтение и запись счётчиков, предупреждений, неудач и снимков манифестов — под `fcntl.flock` на
@@ -402,29 +425,35 @@ requirements.txt`) нет — перенаправление в другом с�
 ## Снимок дерева
 
 `snapshot.capture(root, deadline)` возвращает снимок одного из двух режимов; `snapshot.store`
-добавляет `prompt_id` и `root`, `snapshot.load` отвергает файл без полей своего режима.
+добавляет `prompt_id`, `root` и версию формата `format` (`snapshot.FORMAT`, 2), `snapshot.load` отвергает файл
+другой версии (снимок прошлого формата — `None`, как нет снимка), без полей своего режима и с повреждёнными
+блоками walk.
 
 - `git` — корень в git (`snapshot._git_state`): по каждому репозиторию — корню, инициализированному
   подмодулю (запись `160000` в `ls-files -s` и свой `.git`) и вложенному репозиторию-не-подмодулю
   (неотслеживаемый каталог `dir/` в `git status`) — HEAD и пути из `git status --porcelain=v2
   --untracked-files=all --ignore-submodules=all` (`snapshot._status`). В снимке `repos` —
   `{префикс: HEAD}`, `dirty` — `{путь: [size, mtime_ns] или None}`, `head` и `sub_heads` — базы для
-  `comments.extract`. Размер снимка не зависит от размера дерева; `MAX_FILES` ограничивает число
-  грязных путей. Вложенный репозиторий, где git не работает, обходится как вне git.
-- `walk` — вне git: `files` — `{путь: [size, mtime_ns]}` обхода `snapshot._walk_paths`
-  (`IGNORED_DIRS` и упрощённый `.gitignore` по `snapshot.ignore_rules`). Порог `MAX_FILES` проверяет
-  уже обход: имён файлов в нём — с символическими ссылками и не обычными файлами, которых в снимке
-  нет, — больше `MAX_FILES` — `_walk_paths` бросает `snapshot.TooManyFiles`, и оборванный обход не
-  отдаётся как полный. `capture` его не ловит, `remind.take_snapshot` предупреждает раз на сессию
-  (`context/deferred/snapshot-threshold.md`). Так же обходится вложенный репозиторий, где git не
-  работает, и в режиме `git`.
+  `comments.extract`. Размер снимка не зависит от размера дерева. `MAX_FILES` (50 000) ограничивает число
+  грязных путей: они хранятся словарём, объектом на путь, в памяти и в JSON; больше — `snapshot.TooManyFiles`,
+  `capture` его не ловит. Вложенный репозиторий, где git не работает, обходится `_walk_paths` без предела
+  числа файлов: его файлы — грязные пути родителя, и предел `MAX_FILES` на них действует уже в `capture`.
+- `walk` — вне git: `dirs` — `{каталог от корня через «/», "" — корень: блок}` обхода `snapshot._walk_dirs`.
+  Обход `snapshot._walk` — стек каталогов и `os.scandir`, `IGNORED_DIRS` и упрощённый `.gitignore` по
+  `snapshot.ignore_rules` (правила родителя плюс свои, на поддерево); символические ссылки не обходятся и в
+  снимок не попадают, непрочитанный каталог пропускается. Блок каталога — записи его обычных файлов «имя в
+  байтах ФС, NUL, `snapshot._STAT` (size, mtime_ns)», отсортированные: каталог без правок даёт тот же блок при
+  любом порядке readdir. Объекта на файл нет — память около размера блоков. Предела числа файлов нет:
+  обход ограничен только сроком, срок проверяется на каждом каталоге и раз в `STAT_CHECK_EVERY` файлов.
+  В файл снимка блоки идут одной строкой `snapshot._pack_dirs` — base64 от zlib (уровень 1, сжатие по
+  каталогу) записей «каталог, NUL, `_LEN` длины блока, блок»; `load` разворачивает её `_unpack_dirs`.
 
 `snapshot.changed_since(root, snap, deadline)` даёт `[(путь, обычный ли файл сейчас)]`. В git
 кандидаты — грязные пути на старте и сейчас и, для репозитория, чей HEAD сменился, `git diff
 --name-only` против HEAD снимка (без HEAD — все отслеживаемые); из них отбрасываются пути, чей stat
-совпал со снимком. В walk — разница двух обходов (`snapshot.diff`). `None` с предупреждением — смена
-режима, пропавший репозиторий, недоступный коммит, `TooManyFiles` любого обхода (в том числе
-оборванного и обхода вложенного репозитория в git); `TimeoutError` — срок.
+совпал со снимком. В walk — `snapshot.diff` блоков двух обходов: равные блоки каталога пропускаются целиком,
+у разных сравниваются записи (`snapshot._records`). `None` с предупреждением — смена режима, пропавший
+репозиторий, недоступный коммит; `TimeoutError` — срок.
 
 Снимок связывает `UserPromptSubmit` и `Stop`: `judge_stop.changed_this_turn` сравнивает его с
 текущим деревом, только если совпали `prompt_id` и корень проекта. Корень (`common.project_root`)
@@ -478,6 +507,25 @@ Heredoc Ruby, Perl и Terraform без строки-терминатора до 
 разбор `_parse`, запретив открывать heredoc в этих позициях (`banned`); всего разборов не больше
 `comments._MAX_REPARSE` (8) — каждый следующий снимает хотя бы одно открытие; тело такого heredoc читается как
 код. Heredoc оболочки (`depcheck.heredocs`) так не повторяется.
+
+Регулярные выражения, slashy-строки и JSX — поля `comments._Syntax` `regex` и `jsx`. `regex="js"` (js, jsx, mjs,
+cjs, ts, tsx, mts, cts) и `regex="groovy"` (groovy, gradle): `/` в начале выражения (`comments._expr_start`) —
+литерал, `//` и `/*` раньше — комментарии. Начало выражения — по предыдущему токену: назад через пробелы знак из
+`_EXPR_AFTER` (не `)`, `]`, кавычка, слово; `++` и `--` — постфикс) или слово из `_EXPR_KEYWORDS` не после `.`;
+слово просматривается не дальше `_KEYWORD_MAX` + 1 знаков — время линейное. В начале строки решает `fresh`: в JS —
+по концу прошлой строки кода (`a\n/ b` — деление; блочный комментарий в конце строки и строка из одних
+комментариев его не меняют), в Groovy всегда начало (конец строки завершает оператор). Литерал — `_JS_REGEX`
+(escape, класс `[...]`, флаги) или `_SLASHY` до конца строки, без отката; незакрытый в строке кончается с ней:
+многострочная slashy-строка дальше читается как код, мнимая регулярка не прячет следующие строки. Dollar-slashy
+Groovy `$/…/$` — многострочный литерал с escape `dollar` (`comments._close`: `$$`, `$/` — escape). `jsx=True`
+(js, jsx, tsx; в ts `<T>(x) => x` — обобщение) — `<` в начале выражения, за которым `comments._jsx_opens` видит
+тег (`>` фрагмента или имя, за ним `>`, `/`, `{`, атрибут или конец строки; `<T,>`, `<T extends X>`, `<T = X>` —
+обобщение), открывает разметку: `comments._markup` ведёт стек `ctx` (`text` — дети элемента, `tag` —
+открывающий тег, `close` — закрывающий, `code` — код в `{…}` со счётчиком скобок, его разбирает
+`comments._jsx_code`). Текст между тегами — не код; в теге `//` и `/* */` — комментарии, строки атрибутов —
+многострочные без escape. Тег или текст, не закрытые к концу файла, `_parse` возвращает в незакрытых, и
+`_comments` повторяет разбор, запретив открывать их (`banned`), как heredoc без терминатора. Шаблонные строки JS
+— литерал целиком, подстановки `${…}` не разбираются; остаток — `context/deferred/comment-syntaxes.md`.
 
 Прочие поля `comments._Syntax`: `nested` — блоки вкладываются, глубину считает `comments._close_nested`
 (`/* */` kt, scala, swift, rs, dart; `{- -}` hs, `#= =#` jl, `(* *)` fs, `#[ ]#` nim, `#| |#` lisp;

@@ -650,7 +650,7 @@ class DocsFilterTest(unittest.TestCase):
         state = self.env.data / "state"
         state.mkdir()
         snapshot.store(state, "sess-1", "p-1", self.env.data, {"mode": "walk", "head": None, "sub_heads": {},
-                                                               "files": {}})
+                                                               "dirs": {}})
         (self.project / "a.py").write_text("x\n", encoding="utf-8")
         self.assertEqual(self.in_process(self.env.hook_input("Stop")), (None, []))
 
@@ -664,8 +664,9 @@ class DocsFilterTest(unittest.TestCase):
     def test_changed_this_turn_undetermined_is_none(self):
         self.snap()
         (self.project / "a.py").write_text("x\n", encoding="utf-8")
-        text = "planka: сверка документации не проверена: дерево больше 0 файлов"
-        self.assertEqual(self.in_process(self.env.hook_input("Stop"), MAX_FILES=0), (None, [text]))
+        text = "planka: сверка документации не проверена: за реплику корень проекта стал git-репозиторием"
+        git_state = mock.Mock(return_value={"": {"head": None, "dirty": []}})
+        self.assertEqual(self.in_process(self.env.hook_input("Stop"), _git_state=git_state), (None, [text]))
 
     @unittest.skipUnless(shutil.which("git"), "нет git")
     def test_changed_this_turn_git_mode(self):

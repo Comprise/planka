@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import pathlib
@@ -7,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+import zlib
 from unittest import mock
 
 PLANKA_DIR = pathlib.Path(__file__).resolve().parent.parent / "plugin" / "planka"
@@ -15,11 +17,29 @@ import common  # noqa: E402
 import snapshot  # noqa: E402
 
 
+def files_of(dirs):
+    """{путь: (size, mtime_ns)} из блоков каталогов снимка walk."""
+    return {(f"{rel}/" if rel else "") + os.fsdecode(name): snapshot._STAT.unpack(packed)
+            for rel, block in dirs.items() for name, packed in snapshot._records(block).items()}
+
+
 def walk_files(root, deadline=None):
     """Файлы снимка capture вне git."""
     snap = snapshot.capture(root, deadline)
     assert snap["mode"] == "walk", snap["mode"]
-    return snap["files"]
+    return files_of(snap["dirs"])
+
+
+def make_non_utf8(test, root, rel):
+    """Файл root/rel (байты) с содержимым «x»; пропуск теста, если ФС не принимает имя не в UTF-8."""
+    path = os.path.join(os.fsencode(root), rel)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("x")
+    except OSError:
+        test.skipTest("ФС не принимает имя не в UTF-8")
+    return path
 
 
 class WalkCaptureTest(unittest.TestCase):
@@ -97,39 +117,50 @@ class WalkCaptureTest(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             snapshot._walk_paths(self.root, time.monotonic() - 1)
 
-    def test_truncated_walk_is_too_many_even_if_few_regular_files(self):
-        for i in range(6):
-            os.symlink(self.root / "nowhere", self.root / f"l{i}")
-        self.write("z/a.py")
+    def test_walk_not_limited_by_file_count(self):
+        names = [f"d{i % 3}/f{i}.py" for i in range(8)]
+        for name in names:
+            self.write(name)
         with mock.patch.object(snapshot, "MAX_FILES", 5):
-            with self.assertRaises(snapshot.TooManyFiles):
-                snapshot.capture(self.root)
+            self.assertEqual(sorted(walk_files(self.root)), sorted(names))
+
+    def test_snapshot_independent_of_readdir_order(self):
+        for name in ("b.py", "a.py", "c.py"):
+            self.write(f"d/{name}")
+        dirs = snapshot.capture(self.root)["dirs"]
+        real = os.scandir
+
+        class Reversed:
+            def __init__(self, path):
+                self.it = real(path)
+
+            def __enter__(self):
+                return reversed(list(self.it))
+
+            def __exit__(self, *exc):
+                self.it.close()
+
+        with mock.patch.object(snapshot.os, "scandir", Reversed):
+            self.assertEqual(snapshot.capture(self.root)["dirs"], dirs)
 
     def test_non_utf8_name(self):
-        name = b"bad\xff.py"
-        try:
-            with open(os.path.join(os.fsencode(self.root), name), "w") as f:
-                f.write("x")
-        except OSError:
-            self.skipTest("ФС не принимает имя не в UTF-8")
-        self.assertEqual(list(walk_files(self.root)), [os.fsdecode(name)])
+        make_non_utf8(self, self.root, b"d\xfe/bad\xff.py")
+        self.assertEqual(list(walk_files(self.root)), [os.fsdecode(b"d\xfe/bad\xff.py")])
 
     def test_no_heads_outside_git(self):
         snap = snapshot.capture(self.root)
         self.assertEqual((snap["head"], snap["sub_heads"]), (None, {}))
 
-    def test_stat_files_deadline(self):
-        self.write("a")
-        with self.assertRaises(TimeoutError):
-            snapshot._stat_files(self.root, ["a"], time.monotonic() - 1)
-
-    def test_stat_files_checks_deadline_periodically(self):
-        paths = [f"missing{i}" for i in range(snapshot.STAT_CHECK_EVERY * 2)]
+    def test_walk_dirs_checks_deadline_periodically(self):
+        for i in range(snapshot.STAT_CHECK_EVERY * 2):
+            self.write(f"f{i}")
         calls = []
         real = snapshot._remaining
         with mock.patch.object(snapshot, "_remaining", side_effect=lambda d: calls.append(d) or real(d)):
-            self.assertEqual(snapshot._stat_files(self.root, paths, time.monotonic() + 60), {})
-        self.assertEqual(len(calls), 2)
+            dirs = snapshot._walk_dirs(self.root, time.monotonic() + 60)
+        self.assertEqual(len(files_of(dirs)), snapshot.STAT_CHECK_EVERY * 2)
+        # Один раз на каталог и раз в STAT_CHECK_EVERY файлов.
+        self.assertEqual(len(calls), 3)
 
 
 GIT_ENV = ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-c", "protocol.file.allow=always"]
@@ -436,11 +467,8 @@ class ChangedSinceGitTest(unittest.TestCase):
         self.write("nested/new.py"); self.write("nested/y.log")
         self.assertEqual(snapshot.changed_since(self.root, snap), [("nested/new.py", True)])
 
-    def test_nested_repo_walk_too_many_is_undetermined(self):
+    def test_nested_repo_walk_not_limited_in_changed_since(self):
         self.git("init", "-q", str(self.root / "nested"))
-        snap = self.roundtrip()
-        for name in ("a.py", "b.py", "c.py"):
-            self.write(f"nested/{name}")
         real = snapshot._status
 
         def status(root, deadline):
@@ -448,8 +476,14 @@ class ChangedSinceGitTest(unittest.TestCase):
 
         with mock.patch.object(snapshot, "_status", side_effect=status), \
                 mock.patch.object(snapshot, "MAX_FILES", 2):
-            self.assertIsNone(snapshot.changed_since(self.root, snap))
-        self.assertEqual(common._messages, ["planka: сверка документации не проверена: дерево больше 2 файлов"])
+            snap = self.roundtrip()
+            for name in ("a.py", "b.py", "c.py"):
+                self.write(f"nested/{name}")
+            self.assertEqual(snapshot.changed_since(self.root, snap),
+                             [("nested/a.py", True), ("nested/b.py", True), ("nested/c.py", True)])
+            with self.assertRaises(snapshot.TooManyFiles):
+                snapshot.capture(self.root)
+        self.assertEqual(common._messages, [])
 
     def test_new_nested_repo_all_files(self):
         snap = self.roundtrip()
@@ -539,10 +573,32 @@ class ChangedSinceWalkTest(unittest.TestCase):
         (self.root / "a.py").unlink()
         self.assertEqual(snapshot.changed_since(self.root, snap), [("a.py", False), ("b.py", True)])
 
-    def test_walk_too_many(self):
-        with mock.patch.object(snapshot, "MAX_FILES", 0):
-            with self.assertRaises(snapshot.TooManyFiles):
-                snapshot.capture(self.root)
+    def roundtrip(self):
+        """Снимок через store/load, как его прочтёт judge_stop."""
+        state = self.root / ".data"
+        state.mkdir(exist_ok=True)
+        snapshot.store(state, "s", "p", self.root, snapshot.capture(self.root))
+        return snapshot.load(state, "s")
+
+    def test_walk_tree_beyond_count_limit_finds_edit(self):
+        for i in range(12):
+            (self.root / f"d{i % 4}").mkdir(exist_ok=True)
+            (self.root / f"d{i % 4}" / f"f{i}.py").write_text("x", encoding="utf-8")
+        with mock.patch.object(snapshot, "MAX_FILES", 5):
+            snap = self.roundtrip()
+            self.assertIsNotNone(snap)
+            (self.root / "d2" / "f6.py").write_text("longer", encoding="utf-8")
+            (self.root / "d1" / "f1.py").unlink()
+            self.assertEqual(snapshot.changed_since(self.root, snap), [("d1/f1.py", False), ("d2/f6.py", True)])
+        self.assertEqual(common._messages, [])
+
+    def test_walk_non_utf8_names_roundtrip(self):
+        path = make_non_utf8(self, self.root, b"d\xfe/bad\xff.py")
+        snap = self.roundtrip()
+        self.assertEqual(snapshot.changed_since(self.root, snap), [])
+        with open(path, "w") as f:
+            f.write("longer")
+        self.assertEqual(snapshot.changed_since(self.root, snap), [(os.fsdecode(b"d\xfe/bad\xff.py"), True)])
 
     def test_walk_deadline_in_changed_since(self):
         snap = snapshot.capture(self.root)
@@ -551,21 +607,22 @@ class ChangedSinceWalkTest(unittest.TestCase):
                 snapshot.changed_since(self.root, snap, time.monotonic() - 1)
 
     def test_walk_stat_phase_deadline_in_changed_since(self):
+        for i in range(snapshot.STAT_CHECK_EVERY):
+            (self.root / f"f{i}").write_text("x", encoding="utf-8")
         snap = snapshot.capture(self.root)
-        with mock.patch.object(snapshot, "_git_state", return_value=None), \
-                mock.patch.object(snapshot, "_walk_paths", return_value=["a.py"]):
-            with self.assertRaises(TimeoutError):
-                snapshot.changed_since(self.root, snap, time.monotonic() - 1)
+        calls = []
 
-    def test_walk_truncated_is_undetermined(self):
-        snap = snapshot.capture(self.root)
-        for i in range(6):
-            os.symlink(self.root / "nowhere", self.root / f"l{i}")
-        (self.root / "z").mkdir()
-        (self.root / "z" / "a.py").write_text("x", encoding="utf-8")
-        with mock.patch.object(snapshot, "MAX_FILES", 5):
-            self.assertIsNone(snapshot.changed_since(self.root, snap))
-        self.assertEqual(common._messages, ["planka: сверка документации не проверена: дерево больше 5 файлов"])
+        def remaining(deadline):
+            calls.append(deadline)
+            if len(calls) > 1:
+                raise TimeoutError("снимок не уложился в срок")
+
+        with mock.patch.object(snapshot, "_git_state", return_value=None), \
+                mock.patch.object(snapshot, "_remaining", side_effect=remaining):
+            with self.assertRaises(TimeoutError):
+                snapshot.changed_since(self.root, snap, time.monotonic() + 60)
+        # Срок истёк на stat файлов единственного каталога, а не при входе в каталог.
+        self.assertEqual(len(calls), 2)
 
     @unittest.skipUnless(shutil.which("git"), "нет git")
     def test_git_init_during_turn_is_undetermined(self):
@@ -587,24 +644,53 @@ class StoreLoadDiffTest(unittest.TestCase):
         self.tmp.cleanup()
 
     @staticmethod
-    def walk(files, head=None):
-        return {"mode": "walk", "head": head, "sub_heads": {}, "files": files}
+    def walk(dirs, head=None):
+        return {"mode": "walk", "head": head, "sub_heads": {}, "dirs": dirs}
+
+    @staticmethod
+    def block(*records):
+        return b"".join(os.fsencode(n) + b"\0" + snapshot._STAT.pack(size, mtime) for n, size, mtime in records)
 
     def test_roundtrip(self):
-        files = {"a.py": [1, 2], "b/c.go": [3, 4]}
-        snapshot.store(self.state, "sess/1", "p-1", self.root, self.walk(files))
+        dirs = {"": self.block(("a.py", 1, 2)), "b": self.block(("c.go", 3, 4), ("d.go", 0, -5))}
+        snapshot.store(self.state, "sess/1", "p-1", self.root, self.walk(dirs))
+        raw = json.loads((self.state / "sess_1.snap.json").read_text(encoding="utf-8"))
+        self.assertIsInstance(raw["dirs"], str)
         got = snapshot.load(self.state, "sess/1")
         self.assertEqual(got["prompt_id"], "p-1")
         self.assertEqual(got["root"], str(self.root))
-        self.assertEqual(got["files"], files)
+        self.assertEqual(got["dirs"], dirs)
+        self.assertEqual(files_of(got["dirs"]), {"a.py": (1, 2), "b/c.go": (3, 4), "b/d.go": (0, -5)})
         self.assertEqual([p.name for p in self.state.iterdir()], ["sess_1.snap.json"])
 
     def test_roundtrip_non_utf8_name(self):
-        files = {"bad\udcff.py": [1, 2]}
-        snapshot.store(self.state, "s", "p", self.root, self.walk(files, "abc"))
+        dirs = {"d\udcfe": self.block(("bad\udcff.py", 1, 2))}
+        snapshot.store(self.state, "s", "p", self.root, self.walk(dirs, "abc"))
         got = snapshot.load(self.state, "s")
-        self.assertEqual(got["files"], files)
+        self.assertEqual(got["dirs"], dirs)
+        self.assertEqual(files_of(got["dirs"]), {"d\udcfe/bad\udcff.py": (1, 2)})
         self.assertEqual(got["head"], "abc")
+
+    def test_previous_format_rejected(self):
+        old = {"mode": "walk", "head": None, "sub_heads": {}, "files": {"a.py": [1, 2]}, "prompt_id": "p",
+               "root": str(self.root)}
+        common.atomic_write_json(self.state / "w.snap.json", old)
+        self.assertIsNone(snapshot.load(self.state, "w"))
+        old = {"mode": "git", "head": None, "sub_heads": {}, "repos": {"": None}, "dirty": {}, "prompt_id": "p",
+               "root": str(self.root)}
+        common.atomic_write_json(self.state / "g.snap.json", old)
+        self.assertIsNone(snapshot.load(self.state, "g"))
+
+    def test_damaged_dirs_rejected(self):
+        snapshot.store(self.state, "s", "p", self.root, self.walk({"d": self.block(("a.py", 1, 2))}))
+        path = self.state / "s.snap.json"
+        good = json.loads(path.read_text(encoding="utf-8"))
+        packed = base64.b64decode(good["dirs"])
+        raw = zlib.decompress(packed)
+        for dirs in ("не base64", good["dirs"][:-8], base64.b64encode(packed[:-3]).decode(),
+                     base64.b64encode(zlib.compress(raw[:-4])).decode(), 5):
+            path.write_text(json.dumps({**good, "dirs": dirs}), encoding="utf-8")
+            self.assertIsNone(snapshot.load(self.state, "s"), dirs)
 
     def test_snapshot_without_mode_rejected(self):
         snapshot.store(self.state, "old", "p", self.root, {"head": None, "sub_heads": {}, "files": {}})
@@ -635,6 +721,8 @@ class StoreLoadDiffTest(unittest.TestCase):
         self.assertIsNone(snapshot.load(self.state, "bin"))
 
     def test_diff(self):
-        old = {"a": [1, 1], "b": [1, 1], "c": [1, 1]}
-        new = {"a": [1, 1], "b": [2, 1], "d": [1, 1]}
-        self.assertEqual(snapshot.diff(old, new), ["b", "c", "d"])
+        same = self.block(("x", 1, 1))
+        old = {"": self.block(("a", 1, 1), ("b", 1, 1), ("c", 1, 1)), "gone": same, "keep": same}
+        new = {"": self.block(("a", 1, 1), ("b", 2, 1), ("d", 1, 1)), "keep": same, "new": same}
+        self.assertEqual(snapshot.diff(old, new), [("b", True), ("c", False), ("d", True), ("gone/x", False),
+                                                   ("new/x", True)])

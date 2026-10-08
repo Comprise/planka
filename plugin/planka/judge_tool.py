@@ -220,7 +220,8 @@ def _command_and_id(data):
 
 
 def snapshot_manifests(data):
-    """Снимок имён манифестов проекта перед командой Bash; команда с маркером согласия не снимается. Сбой —
+    """Снимок имён манифестов проекта перед командой Bash с именами ref до начала сессии, откуда команда
+    возвращает файлы (manifest_watch.restored_names); команда с маркером согласия не снимается. Сбой —
     предупреждение раз на сессию и пропуск в журнале на каждую команду, команда идёт без проверки манифестов."""
     command, tool_use_id = _command_and_id(data)
     cwd = data.get("cwd")
@@ -229,9 +230,14 @@ def snapshot_manifests(data):
     deadline = time.monotonic() + manifest_watch.SNAPSHOT_BUDGET
     session = _session(data)
     try:
-        entry = manifest_watch.take(common.project_root(cwd), deadline)
+        root = common.project_root(cwd)
+        entry = manifest_watch.take(root, deadline)
         # Каталог команды до неё: от него разрешаются пути вывода генераторов requirements.
         entry["cwd"] = common.input_path(cwd)
+        # Имена ref до начала сессии, откуда команда git возвращает файлы, — работа автора, не новые.
+        known = manifest_watch.restored_names(root, command, manifest_watch.session_start(session), deadline)
+        if known:
+            entry["known"] = known
         manifest_watch.store(session, tool_use_id, entry)
     except (manifest_watch.Unavailable, OSError) as e:
         # TimeoutError — подкласс OSError.
@@ -298,6 +304,12 @@ def main():
     if data.get("hook_event_name") in POST_EVENTS:
         check_command_manifests(data)
         return
+    try:
+        manifest_watch.mark_start(_session(data))
+    except OSError:
+        # Каталог состояния недоступен: без начала сессии ref не сверяются, блок после команды остаётся;
+        # снимок манифестов предупредит сам.
+        pass
     tool = data.get("tool_name")
     if tool == "AskUserQuestion":
         judge_question(data)

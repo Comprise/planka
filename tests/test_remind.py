@@ -85,10 +85,16 @@ class RemindTest(unittest.TestCase):
     def test_snapshot_written(self):
         (self.env.project / "a.py").write_text("x\n", encoding="utf-8")
         self.prompt()
-        snap = json.loads((self.env.data / "state" / "sess-1.snap.json").read_text(encoding="utf-8"))
+        snap = snapshot.load(self.env.data / "state", "sess-1")
         self.assertEqual(snap["prompt_id"], "p-1")
         self.assertEqual(snap["mode"], "walk")
-        self.assertEqual(sorted(snap["files"]), ["a.py"])
+        self.assertEqual(self.walk_paths(snap), ["a.py"])
+
+    @staticmethod
+    def walk_paths(snap):
+        """Пути файлов снимка walk."""
+        return sorted((f"{rel}/" if rel else "") + os.fsdecode(name)
+                      for rel, block in snap["dirs"].items() for name in snapshot._records(block))
 
     def git(self, *args):
         subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(self.env.project), *args],
@@ -136,22 +142,30 @@ class RemindTest(unittest.TestCase):
                                            **environ)
         return reply.get("systemMessage", "").splitlines(), reply.get("hookSpecificOutput")
 
-    def test_too_many_files_warns(self):
+    def test_tree_outside_git_not_limited_by_file_count(self):
         for i in range(3):
             (self.env.project / f"f{i}").write_text("x", encoding="utf-8")
         msgs, _ = self.run_in_process(mock.patch.object(snapshot, "MAX_FILES", 2))
-        self.assertEqual(msgs, ["planka: дерево больше 2 файлов, сверка документации не проверяется"])
-        self.assertFalse((self.env.data / "state" / "sess-1.snap.json").exists())
+        self.assertEqual(msgs, [])
+        snap = snapshot.load(self.env.data / "state", "sess-1")
+        self.assertEqual(self.walk_paths(snap), ["f0", "f1", "f2"])
 
-    def test_too_many_files_warned_once_per_session(self):
-        for i in range(3):
-            (self.env.project / f"f{i}").write_text("x", encoding="utf-8")
-        patch = mock.patch.object(snapshot, "MAX_FILES", 2)
+    def test_snapshot_timeout_warned_once_per_session(self):
+        (self.env.project / "a.py").write_text("x", encoding="utf-8")
+        patch = mock.patch.object(remind, "SNAPSHOT_BUDGET", -1)
         first, _ = self.run_in_process(patch)
         second, out = self.run_in_process(patch)
-        self.assertEqual(len(first), 1)
+        self.assertEqual(first, ["planka: снимок не уложился в срок, сверка документации не проверяется"])
         self.assertEqual(second, [])
         self.assertIn("# Философия работы", out["additionalContext"])
+        self.assertFalse((self.env.data / "state" / "sess-1.snap.json").exists())
+
+    def test_walk_timeout_warns(self):
+        (self.env.project / "a.py").write_text("x", encoding="utf-8")
+        timeout = TimeoutError("снимок не уложился в срок")
+        msgs, _ = self.run_in_process(mock.patch.object(snapshot, "_walk_dirs", side_effect=timeout))
+        self.assertEqual(msgs, ["planka: снимок не уложился в срок, сверка документации не проверяется"])
+        self.assertFalse((self.env.data / "state" / "sess-1.snap.json").exists())
 
     def test_no_cwd_no_snapshot_no_docs_line(self):
         hook_input = self.env.hook_input("UserPromptSubmit", prompt="x")
@@ -193,7 +207,7 @@ class RemindTest(unittest.TestCase):
         msgs, out = self.run_in_process(mock.patch.object(remind, "SNAPSHOT_BUDGET", 1), PATH=path)
         self.assertLess(time.monotonic() - started, 4)
         self.assertIn("# Философия работы", out["additionalContext"])
-        self.assertTrue(any("снимок дерева не записан" in m for m in msgs), msgs)
+        self.assertEqual(msgs, ["planka: git не уложился в срок снимка, сверка документации не проверяется"])
 
     def test_reminder_survives_snapshot_error(self):
         msgs, out = self.run_in_process(mock.patch.object(snapshot, "capture", side_effect=ValueError("сбой")))

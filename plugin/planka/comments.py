@@ -36,17 +36,21 @@ class _Syntax:
     знаки, после которых (и пробелов) слово REM открывает комментарий, None — REM не комментарий.
     line_block — (начало, конец) блока из целых строк с первой колонки (=begin/=end Ruby, POD Perl).
     exdoc — атрибуты @doc, @moduledoc, @typedoc Elixir со строкой — документация, в вывод.
+    regex — «/» в начале выражения (_expr_start) открывает литерал: "js" — регулярное выражение JS с классами
+    «[...]», "groovy" — slashy-строка «/…/» и dollar-slashy «$/…/$» Groovy. jsx — «<» в начале выражения
+    открывает разметку JSX (_jsx_opens): текст между тегами — не код.
     """
 
     def __init__(self, line=(), blocks=(), strings=(), char=False, quote_word=False, docstring=False,
                  heredoc=None, lua=False, raw=None, zig=False, shebang=False, nested=False, prefix=None,
-                 rem=None, line_block=None, exdoc=False):
+                 rem=None, line_block=None, exdoc=False, regex=None, jsx=False):
         self.line, self.blocks, self.char, self.quote_word = line, blocks, char, quote_word
         # Длинное открытие проверяется раньше короткого: «"""» раньше «"».
         self.strings = sorted(strings, key=lambda s: -len(s[0]))
         self.docstring, self.heredoc, self.lua, self.raw, self.zig, self.shebang = (
             docstring, heredoc, lua, raw, zig, shebang)
         self.nested, self.prefix, self.rem, self.line_block, self.exdoc = nested, prefix, rem, line_block, exdoc
+        self.regex, self.jsx = regex, jsx
         firsts = {m[0] for m, _ in line} | {o[0] for o, _ in blocks} | {s[0][0] for s in strings}
         firsts |= {"'"} if char else set()
         firsts |= {"<"} if heredoc in ("tf", "ruby", "perl", "php") else set()
@@ -55,7 +59,12 @@ class _Syntax:
         firsts |= {prefix[0]} if prefix else set()
         firsts |= {"r", "R"} if rem is not None else set()
         firsts |= {"@"} if exdoc else set()
+        firsts |= {"/"} if regex else set()
+        firsts |= {"$"} if regex == "groovy" else set()
+        firsts |= {"<"} if jsx else set()
         self.starts = re.compile("[" + "".join(re.escape(c) for c in sorted(firsts)) + "]")
+        # Код в фигурных скобках разметки JSX: ещё скобки, чтобы найти конец выражения.
+        self.code_starts = re.compile("[" + "".join(re.escape(c) for c in sorted(firsts | {"{", "}"})) + "]")
 
 
 _DQ = ('"', '"', False, "\\")
@@ -102,10 +111,12 @@ _add(("cs",), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ_RAW, _DQ), char=True,
 _add(("rs",), line=_SLASH, blocks=_C_BLOCK, strings=(('"', '"', True, "\\"),), char=True, raw="rust",
      nested=True)
 _add(("go",), line=_SLASH, blocks=_C_BLOCK, strings=(("`", "`", True, None), _DQ), char=True)
-_add(("js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"),
-     line=_SLASH, blocks=_C_BLOCK, strings=(("`", "`", True, "\\"), _DQ, _SQ))
+# Разметка JSX — в jsx, tsx и js (React); в ts «<T>(x) => x» — обобщение, а не тег.
+_JS_STRINGS = (("`", "`", True, "\\"), _DQ, _SQ)
+_add(("mjs", "cjs", "ts", "mts", "cts"), line=_SLASH, blocks=_C_BLOCK, strings=_JS_STRINGS, regex="js")
+_add(("js", "jsx", "tsx"), line=_SLASH, blocks=_C_BLOCK, strings=_JS_STRINGS, regex="js", jsx=True)
 _add(("dart",), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ, _T_SQ, _DQ, _SQ), nested=True)
-_add(("groovy", "gradle"), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ, _T_SQ, _DQ, _SQ))
+_add(("groovy", "gradle"), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ, _T_SQ, _DQ, _SQ), regex="groovy")
 _add(("php",), line=_SLASH + (("#", "php"),), blocks=_C_BLOCK, strings=(_DQ, _SQ), heredoc="php")
 _add(("proto", "sol"), line=_SLASH, blocks=_C_BLOCK, strings=(_DQ, _SQ))
 _add(("zig",), line=_SLASH, strings=(_DQ,), char=True, zig=True)
@@ -235,6 +246,12 @@ def _close(raw, i, close, esc):
         elif esc == "double" and raw.startswith(close, j + len(close)):
             i = j + 2 * len(close)
             continue
+        elif esc == "dollar":
+            # Dollar-slashy Groovy: «$$» и «$/» — escape, «$/$» — escape «$/» и знак «$», а не закрытие.
+            k = raw.find("$", i, j)
+            if k >= 0:
+                i = k + 2 if raw[k + 1] in "$/" else k + 1
+                continue
         elif esc == "nix" and raw[j + 2:j + 3] in ("'", "$", "\\") and raw[j + 2:j + 3]:
             i = j + (4 if raw[j + 2] == "\\" else 3)
             continue
@@ -411,14 +428,138 @@ def _heredoc_ok(raw, i, m, perl=False):
     return bool(m.group(1) or m.group(2) or ident[:1].isupper())
 
 
-def _token(syn, raw, i, pending, unclosed, n=0, banned=frozenset()):
+# Слова, после которых начинается выражение: «/» за ними — литерал, «<» — тег.
+_EXPR_KEYWORDS = frozenset(("return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "throw", "case",
+                            "do", "else", "yield", "await"))
+_KEYWORD_MAX = max(map(len, _EXPR_KEYWORDS))
+# Знаки, после которых начинается выражение; «)», «]», кавычка, «/» и слово — конец значения.
+_EXPR_AFTER = frozenset("(,=:[!&|?{};+-*%<>~^")
+
+
+def _is_ident(c):
+    return _is_word(c) or c == "$"
+
+
+def _expr_start(raw, i, fresh=True):
+    """Начинается ли в i выражение: перед i через пробелы — знак из _EXPR_AFTER (кроме «++» и «--» постфикса)
+    или слово из _EXPR_KEYWORDS, не свойство после «.»; только пробелы — fresh, то же для конца прошлой строки
+    кода. Назад — пробелы и не больше _KEYWORD_MAX + 1 знаков слова: время — линейное по длине строки."""
+    j = _back(raw, i, str.isspace)
+    if not j:
+        return fresh
+    c = raw[j - 1]
+    if _is_ident(c):
+        k, lo = j - 1, max(0, j - _KEYWORD_MAX - 1)
+        while k > lo and _is_ident(raw[k - 1]):
+            k -= 1
+        return raw[k:j] in _EXPR_KEYWORDS and not (k and (_is_ident(raw[k - 1]) or raw[k - 1] == "."))
+    if c in "+-" and raw[j - 2:j - 1] == c:
+        return False
+    return c in _EXPR_AFTER
+
+
+# Регулярное выражение JS: escape, класс «[...]» (в нём «/» не закрывает), флаги. Slashy-строка Groovy: escape.
+# Альтернативы начинаются с разных знаков, повторы — без отката: время — линейное по длине строки.
+_JS_REGEX = re.compile(r"/(?:[^\\/\[]|\\.|\[(?:[^\\\]]|\\.)*+\])++/\w*")
+_SLASHY = re.compile(r"/(?:[^\\/]|\\.)++/")
+# Имя тега JSX: «div», «Foo.Bar», «svg:path», «my-elem».
+_JSX_NAME = re.compile(r"[A-Za-z_$][\w$.:-]*")
+_JSX_TEXT = re.compile(r"[<{]")
+_JSX_TAG = re.compile(r"[{\"'/>]")
+
+
+def _jsx_opens(raw, i):
+    """Открывает ли «<» в i тег JSX: за ним «>» (фрагмент) или имя, а за именем через пробелы — «>», «/», «{»,
+    атрибут или конец строки. «<T,>», «<T extends X>», «<T = X>» — параметры обобщения TS, не тег."""
+    if raw.startswith(">", i + 1):
+        return True
+    m = _JSX_NAME.match(raw, i + 1)
+    if not m:
+        return False
+    k = m.end()
+    while k < len(raw) and raw[k] in " \t":
+        k += 1
+    if k == len(raw) or raw[k] in ">/{":
+        return True
+    if k > m.end() and raw.startswith("extends", k) and not _is_ident(raw[k + 7:k + 8]):
+        return False
+    return _is_ident(raw[k])
+
+
+def _markup(raw, i, ctx, n, banned):
+    """Разбор разметки JSX с позиции i: вершина ctx — текст или тег. Действие — как у _token; ctx меняется на
+    месте. Элементы стека: ["text", позиция открытия] — дети элемента, ["tag", позиция] — открывающий тег,
+    ["close"] — закрывающий тег, ["code", глубина] — код в фигурных скобках."""
+    top = ctx[-1]
+    if top[0] == "text":
+        m = _JSX_TEXT.search(raw, i)
+        if m is None:
+            return "skip", len(raw)
+        i = m.start()
+        if raw[i] == "{":
+            ctx.append(["code", 0])
+        elif raw.startswith("</", i):
+            ctx.append(["close"])
+            return "skip", i + 2
+        elif (n, i) not in banned and _jsx_opens(raw, i):
+            ctx.append(["tag", (n, i)])
+        return "skip", i + 1
+    m = _JSX_TAG.search(raw, i)
+    if m is None:
+        return "skip", len(raw)
+    i = m.start()
+    c = raw[i]
+    if c == "{":
+        ctx.append(["code", 0])
+        return "skip", i + 1
+    if c in "\"'":
+        # Строка атрибута — без escape и может занимать несколько строк.
+        return "open", c, None, False, i, i + 1
+    if c == "/":
+        if raw.startswith("//", i):
+            return "line", i
+        if raw.startswith("/*", i):
+            return "open", "*/", None, True, i, i + 2
+        if raw.startswith("/>", i) and top[0] == "tag":
+            ctx.pop()
+            return "skip", i + 2
+        return "skip", i + 1
+    if top[0] == "tag":
+        ctx[-1] = ["text", top[1]]
+    else:
+        ctx.pop()
+        if ctx and ctx[-1][0] == "text":
+            ctx.pop()
+    return "skip", i + 1
+
+
+def _jsx_code(syn, raw, i, ctx, pending, unclosed, n, banned, fresh):
+    """Действие в коде файла с разметкой JSX: вне разметки или в фигурных скобках внутри неё (вершина ctx —
+    ["code", глубина]). «<» в начале выражения открывает тег; прочее — _token."""
+    c = raw[i]
+    if ctx and c in "{}":
+        if c == "{":
+            ctx[-1][1] += 1
+        elif ctx[-1][1]:
+            ctx[-1][1] -= 1
+        else:
+            ctx.pop()
+        return "skip", i + 1
+    if c == "<" and (n, i) not in banned and _expr_start(raw, i, fresh) and _jsx_opens(raw, i):
+        ctx.append(["tag", (n, i)])
+        return "skip", i + 1
+    return _token(syn, raw, i, pending, unclosed, n, banned, fresh)
+
+
+def _token(syn, raw, i, pending, unclosed, n=0, banned=frozenset(), fresh=True):
     """Разбор с позиции i вне литерала и комментария.
 
-    ("line",) — строчный комментарий до конца строки; ("skip", j) — литерал до j; ("open", закрытие,
-    escape, в вывод ли, начало вывода, конец открытия[, открытие вложенного блока]) — многострочный блок или
-    литерал; None — обычный символ.
+    ("line",) — строчный комментарий до конца строки (у _markup — ("line", начало комментария)); ("skip", j) —
+    литерал до j; ("open", закрытие, escape, в вывод ли, начало вывода, конец открытия[, открытие вложенного
+    блока]) — многострочный блок или литерал; None — обычный символ.
     unclosed — открытия однострочных литералов, не закрытых в этой строке; _token дополняет его. n — номер
-    строки; heredoc с позицией (n, i) из banned не открывается.
+    строки; heredoc с позицией (n, i) из banned не открывается. fresh — начинается ли выражение в начале
+    строки (_expr_start).
     """
     c = raw[i]
     if syn.prefix and c == syn.prefix[0] and not (
@@ -458,6 +599,14 @@ def _token(syn, raw, i, pending, unclosed, n=0, banned=frozenset()):
     for marker, rule in syn.line:
         if raw.startswith(marker, i) and _marker_ok(raw, i, rule):
             return ("line",)
+    if syn.regex and c in "/$" and _expr_start(raw, i, fresh):
+        # «//» и «/*» выше — комментарии. Незакрытый в строке литерал кончается с ней: многострочная
+        # slashy-строка Groovy дальше читается как код, а мнимая регулярка не прячет следующие строки.
+        if c == "/":
+            m = (_JS_REGEX if syn.regex == "js" else _SLASHY).match(raw, i)
+            return "skip", m.end() if m else len(raw)
+        if syn.regex == "groovy" and raw.startswith("$/", i):
+            return "open", "/$", "dollar", False, i, i + 2
     if syn.lua and c == "[":
         m = _LUA_LONG.match(raw, i)
         if m:
@@ -502,7 +651,8 @@ _MAX_REPARSE = 8
 def _comments(text, ext, deadline=None):
     """[(номер строки с 1, строка комментария)]; номер считается по «\\n», как в git diff. TimeoutError, если
     срок deadline (time.monotonic) прошёл до конца разбора. Heredoc Ruby, Perl и Terraform без терминатора
-    до конца файла — не heredoc: разбор повторяется без него, и тело читается как код."""
+    до конца файла — не heredoc: разбор повторяется без него, и тело читается как код. Так же тег JSX без
+    закрытия до конца файла — не тег: разбор повторяется без всех незакрытых тегов."""
     syn = _SYNTAX.get(ext.lower())
     if syn is None:
         return []
@@ -517,7 +667,8 @@ def _comments(text, ext, deadline=None):
 
 
 def _parse(text, syn, deadline, banned):
-    """(комментарии, heredoc без терминатора к концу файла); banned — позиции heredoc, не открывающихся."""
+    """(комментарии, heredoc и теги JSX без закрытия к концу файла); banned — позиции heredoc и тегов, не
+    открывающихся."""
     out = []
     # Открытый многострочный блок или литерал: (закрытие, escape, идут ли его строки в вывод, открытие
     # вложенного блока или None, глубина вложенности).
@@ -526,6 +677,11 @@ def _parse(text, syn, deadline, banned):
     pending = []
     # Конец открытого блока из целых строк (line_block) или None.
     line_block = None
+    # Стек разметки JSX (_markup); пуст — код вне разметки.
+    ctx = []
+    # Начинается ли выражение в начале строки: в JS — по концу прошлой строки кода («a\n/ b» — деление);
+    # в Groovy конец строки завершает оператор.
+    fresh = True
     steps = 0
 
     def tick():
@@ -569,6 +725,9 @@ def _parse(text, syn, deadline, banned):
             continue
         start = 0 if state and state[2] else None
         unclosed = set()
+        # Конец кода строки: начало строчного комментария или конец строки; начало и конец последнего блочного
+        # комментария строки (-1 — открыт в прошлых строках или нет).
+        cut, opened_at, closed_at = len(raw), -1, -1
         while i < len(raw):
             tick()
             if state and state[3]:
@@ -576,23 +735,29 @@ def _parse(text, syn, deadline, banned):
                 if j < 0:
                     state = state[:4] + (depth,)
                     break
-                i, state = j, None
+                i, state, closed_at = j, None, j
                 continue
             if state:
                 j = _close(raw, i, state[0], state[1])
                 if j < 0:
                     break
-                i, state = j, None
+                i, state, closed_at = j, None, j if state[2] else closed_at
                 continue
-            m = syn.starts.search(raw, i)
-            if m is None:
-                break
-            i = m.start()
-            act = _token(syn, raw, i, pending, unclosed, n, banned)
+            if ctx and ctx[-1][0] != "code":
+                act = _markup(raw, i, ctx, n, banned)
+            else:
+                m = (syn.code_starts if ctx else syn.starts).search(raw, i)
+                if m is None:
+                    break
+                i = m.start()
+                act = (_jsx_code(syn, raw, i, ctx, pending, unclosed, n, banned, fresh) if syn.jsx
+                       else _token(syn, raw, i, pending, unclosed, n, banned, fresh))
             if act is None:
                 i += 1
             elif act[0] == "line":
-                start = i if start is None else start
+                cut = act[1] if len(act) > 1 else i
+                if start is None:
+                    start = cut
                 break
             elif act[0] == "skip":
                 i = act[1]
@@ -600,12 +765,21 @@ def _parse(text, syn, deadline, banned):
                 _, closing, esc, emit, at, end, *nest = act
                 if emit and start is None:
                     start = at
+                opened_at = at if emit else opened_at
                 state, i = (closing, esc, emit, nest[0] if nest else None, 1), end
         if start is not None and raw[start:].strip():
             out.append((n, raw[start:].strip()))
+        if syn.regex == "js" and state is None and not (ctx and ctx[-1][0] != "code"):
+            # Блочный комментарий в конце строки — не код: конец кода перед ним. Строка из одних комментариев и
+            # пробелов, как и блок из прошлых строк, конец кода не меняет.
+            j = _back(raw, cut, str.isspace)
+            if j and j == closed_at:
+                j = _back(raw, opened_at, str.isspace) if opened_at >= 0 else 0
+            if j:
+                fresh = _expr_start(raw, j, fresh)
         if syn.heredoc == "shell":
             pending = [(term, "tabs" if tabs else "exact", None) for term, tabs in depcheck.heredocs(raw)]
-    return out, pending
+    return out, pending + [(None, "jsx", e[1]) for e in ctx if e[0] in ("tag", "text")]
 
 
 def comment_lines(text, ext):
