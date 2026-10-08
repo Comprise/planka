@@ -10,7 +10,10 @@
 
 **Чем доказано.** Документация хуков (code.claude.com/docs/en/hooks.md): поле `model` во входе есть
 только у `SessionStart` и `/model` посреди сессии не отражает; сообщений реплики во входе `Stop` нет —
-только `last_assistant_message`. Формат проверен на транскриптах автора 2026-10-07 и 2026-10-08 (Claude Code 2.1.293).
+только `last_assistant_message`. Формат проверен на транскриптах автора 2026-10-07 и 2026-10-08 (Claude
+Code 2.1.293). В бинарнике Claude Code 2.1.294 общий вход хука — `session_id`, `transcript_path`, `cwd`,
+`scratchpad_dir`, `prompt_id`, `permission_mode`, `agent_id`, `agent_type`, `effort`; `model` и сообщений
+реплики нет (`strings`, 2026-10-08).
 
 **Верное решение и цена.** Документированные поля входа хука: модель сессии и сообщения реплики.
 Цена — зависит от Claude Code: таких полей нет.

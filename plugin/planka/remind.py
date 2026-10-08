@@ -15,7 +15,8 @@ def take_snapshot(session, prompt_id, root, deadline):
         return
     try:
         snap = snapshot.capture(root, deadline)
-    except snapshot.TooManyFiles as e:
+    # TimeoutError — обход или git не уложились в deadline.
+    except (snapshot.TooManyFiles, TimeoutError) as e:
         common.warn_once(session, "snapshot", f"{e}, сверка документации не проверяется")
         return
     state_dir = common.data_dir() / "state"

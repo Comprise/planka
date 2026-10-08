@@ -1125,12 +1125,113 @@ class ManifestBashGitTest(ManifestBashTest):
         self.assertIn("rich", (self.p / "requirements.txt").read_text(encoding="utf-8"))
         self.assertEqual(r.stdout, "", r.stderr)
 
-    def test_stash_pop_blocked_with_safe_reason(self):
-        # Возврат работы автора хук не отличает от правки агента: блок остаётся, текст не велит откатывать.
+    # Начало сессии в state/sess-1.start.json; коммиты автора — до него, агента — после.
+    START = int(time.time()) - 1000
+    BEFORE = START - 500
+    AFTER = START + 10
+
+    def setUp(self):
+        super().setUp()
+        state = self.env.data / "state"
+        state.mkdir(exist_ok=True)
+        (state / "sess-1.start.json").write_text(json.dumps({"start": self.START}), encoding="utf-8")
+
+    def git_at(self, ts, *args):
+        """git с датами автора и коммиттера ts."""
+        date = f"@{ts} +0000"
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args], cwd=self.p, check=True,
+                       capture_output=True, env={**os.environ, "GIT_COMMITTER_DATE": date, "GIT_AUTHOR_DATE": date})
+
+    def stash_with(self, ts, line, *flags):
         with open(self.p / "requirements.txt", "a", encoding="utf-8") as f:
-            f.write("flask\n")
-        git("stash", "-q", cwd=self.p)
+            f.write(line)
+        self.git_at(ts, "stash", "-q", *flags)
+
+    def branch_at(self, ts, name, line):
+        """Ветка name с коммитом от ts: requirements.txt с дописанной строкой line; текущая ветка не меняется."""
+        git("checkout", "-qb", name, cwd=self.p)
+        with open(self.p / "requirements.txt", "a", encoding="utf-8") as f:
+            f.write(line)
+        self.git_at(ts, "commit", "-qam", name)
+        git("checkout", "-q", "-", cwd=self.p)
+
+    def test_stash_after_session_start_blocked_with_safe_reason(self):
+        # stash, сделанный в сессии, мог заложить агент: блок, текст не велит откатывать.
+        self.stash_with(self.AFTER, "flask\n")
         self.assert_blocked(self.run_command("git stash pop -q"), "flask")
+
+    def test_author_stash_before_session_passes(self):
+        self.stash_with(self.BEFORE, "flask\n")
+        r = self.run_command("git stash pop -q")
+        self.assertIn("flask", (self.p / "requirements.txt").read_text(encoding="utf-8"))
+        self.assertEqual(r.stdout, "", r.stderr)
+
+    def test_stash_index_selects_ref(self):
+        # stash@{1} автора старше сессии, stash@{0} агента моложе: время берётся у названного.
+        self.stash_with(self.BEFORE, "flask\n")
+        self.stash_with(self.AFTER, "django\n")
+        for command in ("git stash apply 1", "git stash apply -q stash@{1}", "git stash apply --index 'stash@{1}'"):
+            with self.subTest(command=command):
+                git("checkout", "-q", "--", ".", cwd=self.p)
+                r = self.run_command(command)
+                self.assertIn("flask", (self.p / "requirements.txt").read_text(encoding="utf-8"))
+                self.assertEqual(r.stdout, "", r.stderr)
+        git("checkout", "-q", "--", ".", cwd=self.p)
+        self.assert_blocked(self.run_command("git stash apply"), "django")
+
+    def test_author_stash_untracked_manifest_passes(self):
+        (self.p / "api").mkdir()
+        (self.p / "api" / "requirements.txt").write_text("flask\n", encoding="utf-8")
+        self.git_at(self.BEFORE, "stash", "-q", "-u")
+        self.assertFalse((self.p / "api" / "requirements.txt").exists())
+        r = self.run_command("git stash pop")
+        self.assertTrue((self.p / "api" / "requirements.txt").exists())
+        self.assertEqual(r.stdout, "", r.stderr)
+
+    def test_restore_from_old_ref_passes(self):
+        self.branch_at(self.BEFORE, "old", "flask\n")
+        commands = ("git checkout old -- requirements.txt", "git checkout old requirements.txt",
+                    "git restore --source=old requirements.txt", "git restore -s old -- requirements.txt",
+                    "git restore --source old requirements.txt", "git merge --squash old",
+                    "git -c user.email=t@t cherry-pick -n old", "git cherry-pick --no-commit old",
+                    "cd web && git checkout old -- ../requirements.txt")
+        for command in commands:
+            with self.subTest(command=command):
+                git("reset", "-q", "--hard", cwd=self.p)
+                r = self.run_command(command)
+                self.assertIn("flask", (self.p / "requirements.txt").read_text(encoding="utf-8"))
+                self.assertEqual(r.stdout, "", r.stderr)
+
+    def test_restore_from_young_ref_blocked(self):
+        self.branch_at(self.AFTER, "feat", "flask\n")
+        for command in ("git checkout feat -- requirements.txt", "git restore --source=feat requirements.txt",
+                        "git merge --squash feat", "git cherry-pick -n feat"):
+            with self.subTest(command=command):
+                git("reset", "-q", "--hard", cwd=self.p)
+                self.assert_blocked(self.run_command(command), "flask")
+
+    def test_ref_in_session_start_second_not_old(self):
+        # Время коммиттера — целые секунды: ref той же секунды, что начало сессии, мог создать агент.
+        self.branch_at(self.START, "same", "flask\n")
+        command = "git checkout same -- requirements.txt"
+        self.assertEqual(manifest_watch.restored_names(self.p, command, self.START, time.monotonic() + 30), {})
+        self.assertEqual(manifest_watch.restored_names(self.p, command, self.START + 1, time.monotonic() + 30),
+                         {"pypi": ["flask", "httpx", "rich"], "npm": ["jest", "react"]})
+
+    def test_old_ref_without_session_start_blocked(self):
+        # Начала сессии нет в состоянии (каталог данных был недоступен): время ref не с чем сравнить — блок.
+        self.branch_at(self.BEFORE, "old", "flask\n")
+        (self.env.data / "state" / "sess-1.start.json").unlink()
+        with mock.patch.object(manifest_watch, "mark_start"):
+            r = run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                "PreToolUse", tool_name="Bash", tool_input={"command": "git checkout old -- requirements.txt"},
+                tool_use_id="b1"))
+        self.assertIsNone(r)
+        git("checkout", "old", "--", "requirements.txt", cwd=self.p)
+        r = self.env.run("judge_tool.py", self.env.hook_input(
+            "PostToolUse", tool_name="Bash", tool_input={"command": "git checkout old -- requirements.txt"},
+            tool_use_id="b1", tool_response={"stdout": "", "stderr": ""}))
+        self.assert_blocked(r, "flask")
 
     def test_ignored_manifest_not_watched(self):
         (self.p / ".gitignore").write_text("vendor/\n", encoding="utf-8")
@@ -1164,6 +1265,19 @@ class ManifestDeadlineTest(unittest.TestCase):
                     event, tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="b1"))
         self.assertTrue(manifest_watch.SNAPSHOT_BUDGET - 1 < seen["take"] <= manifest_watch.SNAPSHOT_BUDGET, seen)
         self.assertTrue(manifest_watch.CHECK_BUDGET - 1 < seen["compare"] <= manifest_watch.CHECK_BUDGET, seen)
+
+    def test_restored_ref_within_snapshot_budget(self):
+        # git ref, названного командой, — в том же сроке SNAPSHOT_BUDGET, что и снимок.
+        def take(root, deadline):
+            time.sleep(0.2)
+            return {"root": str(root), "mode": "git", "ts": time.time(), "files": {}}
+        with mock.patch.object(manifest_watch, "take", side_effect=take), \
+                mock.patch.object(manifest_watch, "_git", return_value=None) as git_call:
+            run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                "PreToolUse", tool_name="Bash", tool_input={"command": "git stash pop"}, tool_use_id="b1"))
+        self.assertEqual(git_call.call_args.args[2:4], ("cat-file", "--batch"))
+        self.assertTrue(0 < git_call.call_args.args[1] <= manifest_watch.SNAPSHOT_BUDGET - 0.2,
+                        git_call.call_args)
 
     def test_head_timeout(self):
         with mock.patch.object(manifest_watch, "_git", return_value=None) as git_call:
@@ -1247,6 +1361,47 @@ class HasMarkerTest(unittest.TestCase):
                 self.assertEqual(manifest_watch.has_marker(command), expected)
 
 
+class CommandRefsTest(unittest.TestCase):
+    """Ref, из которого команда git возвращает файлы, и признак stash."""
+
+    def test_refs(self):
+        cases = {
+            "git stash pop": [("stash@{0}", True)],
+            "git stash pop -q": [("stash@{0}", True)],
+            "git stash apply 2": [("stash@{2}", True)],
+            "git stash apply --index stash@{1}": [("stash@{1}", True)],
+            "git stash pop 'stash@{3}'": [("stash@{3}", True)],
+            "git stash": [],
+            "git stash list": [],
+            "git stash drop stash@{1}": [],
+            "git merge --squash feat": [("feat", False)],
+            "git merge --squash -m 'msg' feat other": [("feat", False), ("other", False)],
+            "git merge feat": [],
+            "git checkout feat -- requirements.txt": [("feat", False)],
+            "git checkout -q feat requirements.txt": [("feat", False)],
+            "git checkout feat": [],
+            "git checkout -- requirements.txt": [],
+            "git checkout -b x feat": [],
+            "git restore --source=feat requirements.txt": [("feat", False)],
+            "git restore --source feat -- requirements.txt": [("feat", False)],
+            "git restore -s feat requirements.txt": [("feat", False)],
+            "git restore -sfeat requirements.txt": [("feat", False)],
+            "git restore requirements.txt": [],
+            "git cherry-pick -n abc123": [("abc123", False)],
+            "git cherry-pick --no-commit -X theirs abc def": [("abc", False), ("def", False)],
+            "git cherry-pick abc123": [],
+            "git -C sub -c a=b stash pop": [("stash@{0}", True)],
+            "cd app && git stash pop; git checkout old -- go.mod": [("stash@{0}", True), ("old", False)],
+            "sudo git stash pop": [("stash@{0}", True)],
+            "echo git stash pop": [],
+            "git apply x.patch": [],
+            "git stash pop # git checkout old -- go.mod": [("stash@{0}", True)],
+        }
+        for command, expected in cases.items():
+            with self.subTest(command=command):
+                self.assertEqual(manifest_watch.command_refs(command), expected)
+
+
 class ManifestWatchStateTest(unittest.TestCase):
     """Снимок в файле состояния, обход вне git и сравнение по size и mtime."""
 
@@ -1262,6 +1417,32 @@ class ManifestWatchStateTest(unittest.TestCase):
 
     def state_file(self):
         return self.env.data / "state" / "s.manifests.json"
+
+    def test_session_start_written_once_by_any_pre_tool_use(self):
+        path = self.env.data / "state" / "sess-1.start.json"
+        before = int(time.time())
+        edit = self.env.hook_input("PreToolUse", tool_name="Edit", tool_input={
+            "file_path": str(self.env.project / "a.py"), "old_string": "a", "new_string": "b"})
+        self.assertIsNone(run_in_process(self.env, judge_tool.main, edit))
+        start = json.loads(path.read_text(encoding="utf-8"))["start"]
+        self.assertTrue(before <= start <= time.time(), start)
+        path.write_text(json.dumps({"start": 5}), encoding="utf-8")
+        run_in_process(self.env, judge_tool.main, self.env.hook_input(
+            "PreToolUse", tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="b1"))
+        run_in_process(self.env, judge_tool.main, self.env.hook_input(
+            "PostToolUse", tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="b1"))
+        self.assertEqual(self.in_process(manifest_watch.session_start, "sess-1"), 5)
+        # Не той формы — начала нет.
+        path.write_text(json.dumps({"start": True}), encoding="utf-8")
+        self.assertIsNone(self.in_process(manifest_watch.session_start, "sess-1"))
+
+    def test_session_start_not_written_after_post_tool_use_or_inside_judge(self):
+        path = self.env.data / "state" / "sess-1.start.json"
+        run_in_process(self.env, judge_tool.main, self.env.hook_input(
+            "PostToolUse", tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="b1"))
+        run_in_process(self.env, judge_tool.main, self.env.hook_input(
+            "PreToolUse", tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="b1"), PLANKA_JUDGE="1")
+        self.assertFalse(path.exists())
 
     def test_store_drops_expired_entries(self):
         now = time.time()

@@ -3,7 +3,8 @@
 tests/__init__.py изолирует процесс тестов от git-настроек машины. Здесь враждебный конфиг передаётся
 явно — GIT_CONFIG_GLOBAL на временный файл — только вызовам плагина: snapshot.capture,
 snapshot.changed_since, comments.extract, common.project_root, guard_memory.is_memory_path (git check-ignore),
-manifest_watch.list_manifests (git ls-files) и manifest_watch.head_names (git cat-file --batch)
+manifest_watch.list_manifests (git ls-files), manifest_watch.head_names (git cat-file --batch),
+manifest_watch.restored_names (git cat-file --batch, git ls-tree)
 и хукам remind.py и judge_stop.py подпроцессом. Git-команды подготовки репозитория идут под изолированным
 конфигом процесса.
 
@@ -254,11 +255,13 @@ class HostileMemoryTest(HostileCase):
 # проекта и имена версий из HEAD.
 # Версия package.json из HEAD объединена с версией из MERGE_HEAD (lodash) незавершённого слияния.
 EXPECTED_MANIFESTS = ("git", ["new/requirements.txt", "package.json", "sp ace/Cargo.toml", "ü/requirements.txt"],
-                      {"package.json": ["lodash", "react"], "ü/requirements.txt": ["rich"], "new/requirements.txt": None})
+                      {"package.json": ["lodash", "react"], "ü/requirements.txt": ["rich"], "new/requirements.txt": None},
+                      {"npm": ["lodash", "react"], "pypi": ["click", "flask", "rich"], "crates.io": ["serde"]})
 
 
 class HostileManifestTest(HostileCase):
-    """Манифесты проекта (git ls-files) и их версии в HEAD (git cat-file) под враждебным конфигом."""
+    """Манифесты проекта (git ls-files), их версии в HEAD (git cat-file) и имена ref, откуда команда возвращает
+    файлы (git cat-file и git ls-tree restored_names), под враждебным конфигом."""
 
     def manifest_scenario(self, cfg):
         root = self.repo()
@@ -274,6 +277,10 @@ class HostileManifestTest(HostileCase):
         write(root, "package.json", '{"dependencies": {"react": "^18", "lodash": "^4"}}\n')
         git("commit", "-qam", "feat", cwd=root)
         git("checkout", "-q", "-", cwd=root)
+        # stash с отслеживаемым и неотслеживаемым манифестом: имена ref читаются тем же cat-file --batch.
+        write(root, "ü/requirements.txt", "rich\nflask\n")
+        write(root, "st/requirements.txt", "click\n")
+        git("stash", "-q", "-u", cwd=root)
         # Незавершённое слияние feat: git пишет MERGE_HEAD файлом, update-ref псевдоссылку не создаёт.
         sha = subprocess.run([*GIT, "rev-parse", "feat"], cwd=root, check=True, capture_output=True, text=True)
         (root / ".git" / "MERGE_HEAD").write_text(sha.stdout, encoding="utf-8")
@@ -287,7 +294,10 @@ class HostileManifestTest(HostileCase):
             for rel in ("package.json", "ü/requirements.txt", "new/requirements.txt"):
                 names = manifest_watch.head_names(str(root / rel), manifest_watch.watched_kind(rel), 10)
                 heads[rel] = None if names is None else sorted(names)
-        return mode, sorted(found), heads
+            # Начало сессии позже коммитов: ref — работа до сессии.
+            restored = manifest_watch.restored_names(root, "git checkout feat -- package.json; git stash pop",
+                                                     int(time.time()) + 100, time.monotonic() + 30)
+        return mode, sorted(found), heads, restored
 
     def test_baseline(self):
         self.assertEqual(self.manifest_scenario(os.devnull), EXPECTED_MANIFESTS)

@@ -455,6 +455,71 @@ class ParserEdgeTest(unittest.TestCase):
         self.assertEqual(comments.comment_lines(src, "rb"), ["# real"])
 
 
+class ExpressionLiteralTest(unittest.TestCase):
+    """Регулярные выражения JS и TS, slashy-строки Groovy, разметка JSX: «/» и «<» после токена, за которым
+    начинается выражение, — литерал или тег; после значения — деление и сравнение."""
+
+    def test_js_regex_literals(self):
+        for ext in ("js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"):
+            self.assertEqual(comments._comments("let r = /\\/\\//;\n", ext), [], ext)
+            self.assertEqual(comments._comments("let r = /a\\/*/;\nx = 1;\n// c\n", ext), [(3, "// c")], ext)
+            self.assertEqual(comments._comments("let r = /[/]/; // c\n", ext), [(1, "// c")], ext)
+            self.assertEqual(comments._comments("return /x/.test(s); // c\n", ext), [(1, "// c")], ext)
+            self.assertEqual(comments._comments("s.replace(/\\/+/g, '/'); // c\n", ext), [(1, "// c")], ext)
+            self.assertEqual(comments._comments("x = c ? /a/ : /b\\//i // c\n", ext), [(1, "// c")], ext)
+
+    def test_js_division_stays_division(self):
+        for src in ("x = a / b // c\n", "y = x[i] / 2 // c\n", "z = f() / 3 // c\n", ")/2 // c\n",
+                    "n = i++ / 2 // c\n", "q = this.return / 2 // c\n", "w = 1 /2/ 3 // c\n"):
+            self.assertEqual(comments.comment_lines(src, "js"), ["// c"], src)
+
+    def test_division_continues_previous_line(self):
+        # Начало строки — начало выражения, только если им кончилась прошлая строка кода.
+        src = "s = a[u] // c1\n// c2\n/ b.c // c3\n/ d; // c4\nx = (\n/a\\//.test(y)) // c5\n"
+        self.assertEqual(comments.comment_lines(src, "js"), ["// c1", "// c2", "// c3", "// c4", "// c5"])
+        self.assertEqual(comments.comment_lines("f() /* c1 */\n/ 2 // c2\n", "ts"), ["/* c1 */", "// c2"])
+
+    def test_unclosed_regex_ends_at_line_end(self):
+        # Мнимая регулярка без закрытия прячет только остаток своей строки.
+        self.assertEqual(comments._comments("x = /[a // b\n// c\n", "js"), [(2, "// c")])
+
+    def test_groovy_slashy_strings(self):
+        for ext in ("groovy", "gradle"):
+            self.assertEqual(comments._comments("def u = /http:\\/\\/x/ // c\n", ext), [(1, "// c")], ext)
+            self.assertEqual(comments._comments("def u = /http://x/\n", ext), [], ext)
+            self.assertEqual(comments._comments("def u = $/http://x/$ // c\n", ext), [(1, "// c")], ext)
+            self.assertEqual(comments._comments("def u = $/\nhttp://x $/ $$\n/* not */\n/$\n// c\n", ext),
+                             [(5, "// c")], ext)
+            self.assertEqual(comments._comments("def h = a / b // c\n", ext), [(1, "// c")], ext)
+
+    def test_jsx_text_is_not_code(self):
+        for ext in ("jsx", "tsx", "js"):
+            src = "const a = <p>see http://x.y</p>; // c\n"
+            self.assertEqual(comments._comments(src, ext), [(1, "// c")], ext)
+            src = ("return (\n  <div className=\"a//b\">\n    see http://x.y\n    {/* jsx */}\n"
+                   "    {items.map(i => <li key={i}>// {i}</li>)}\n    <br/>\n    <>frag // t</>\n  </div>\n);\n"
+                   "// after\n")
+            self.assertEqual(comments._comments(src, ext), [(4, "{/* jsx */}"[1:]), (10, "// after")], ext)
+
+    def test_jsx_tag_comment_in_attributes(self):
+        src = "x = <div // c\n  id='a'\n>text // t</div>\n"
+        self.assertEqual(comments._comments(src, "jsx"), [(1, "// c")])
+
+    def test_comparison_and_generics_are_not_tags(self):
+        for src in ("if (a <b) f() // c\n", "const x: Array<string> = [] // c\n",
+                    "const f = <T,>(x: T) => x // c\n", "const g = <T extends X>(x: T) => x // c\n",
+                    "useState<string>(null) // c\n"):
+            self.assertEqual(comments.comment_lines(src, "tsx"), ["// c"], src)
+
+    def test_plain_ts_has_no_jsx(self):
+        self.assertEqual(comments.comment_lines("const f = <T>(x: T) => x // c\n", "ts"), ["// c"])
+
+    def test_unclosed_tag_is_rolled_back(self):
+        # Мнимый тег без закрытия до конца файла — не тег: разбор повторяется, и комментарии за ним видны.
+        src = "type F = <T>(x: T) => T;\n// c\nconst a = <p>t // t</p>;\n"
+        self.assertEqual(comments._comments(src, "tsx"), [(2, "// c")])
+
+
 class ExtractTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -885,7 +950,15 @@ class LinearParseTest(unittest.TestCase):
                  (' "a' * 50000, "vim"), ('x"' * 50000 + ' "', "vim"), ("<<<A " * 50000, "php"),
                  ("@doc " * 50000, "ex"), ("{" * 100000 + "} <<B" * 20000, "pl"),
                  ("print " + "{$a->{b}}<<B " * 20000, "pl"), ('#' * 100000 + '"', "swift"),
-                 ('r"' * 100000, "nim"))
+                 ('r"' * 100000, "nim"),
+                 # Регулярки, slashy-строки, теги JSX: незакрытые литералы, классы, имена тегов, вложенность.
+                 ("(/[" * 100000, "js"), ("=/" * 100000, "ts"), ("(/\\" * 100000, "js"),
+                 (" " * 100000 + "/a/" * 30000, "js"),
+                 ("return" * 50000 + "/", "js"), ("(/" * 100000, "groovy"), ("=$/" * 100000, "gradle"),
+                 ("$/" + "$$/" * 50000, "groovy"), ("(<a>" * 50000, "jsx"), ("=<" * 100000, "tsx"),
+                 ("(<" + "a" * 100000 + " " * 100000 + "=" * 1000, "tsx"), ("<a " * 100000, "jsx"),
+                 ("x = <p>" + "<b>{" * 30000 + "\n" + "}</b>" * 30000 + "</p>\n", "jsx"),
+                 ("(<T,>" * 50000, "tsx"), ("(<a>\n" * 3000 + "// c\n" * 3000, "js"))
         for text, ext in cases:
             started = time.monotonic()
             comments._comments(text, ext, time.monotonic() + 30)
