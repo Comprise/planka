@@ -2,10 +2,13 @@ import hashlib
 import json
 import sys
 import unittest
+from unittest import mock
 
-from tests.helpers import RULES, Env, PLANKA_DIR, messages, output
+from tests.helpers import (RULES, Env, PLANKA_DIR, assert_not_logged, author_block, fill_budget, messages, output,
+                           run_in_process)
 
 sys.path.insert(0, str(PLANKA_DIR))
+import common  # noqa: E402
 import judge_tool  # noqa: E402
 
 QUESTION_INPUT = {"questions": [{
@@ -25,6 +28,24 @@ PLAN_CONFLICT = """## Волна 1
 """
 
 NO_PLAN_PATH = "planka: план не найден: в транскрипте нет planFilePath"
+
+AUTHOR_TURN = "Нужна быстрая заплатка гонки, перестройку владения не предлагай."
+AUTHOR_ANSWER = 'User has answered your questions: "Чинить сейчас?"="Да, сегодня".'
+
+
+def author_entries(model="claude-test-model"):
+    """Записи транскрипта: реплика автора, вопрос AskUserQuestion агента и ответ автора на него.
+
+    Форма — Claude Code без origin: реплика — строка content, ответ — tool_result с текстом
+    «User has answered your questions: …»."""
+    return [
+        {"type": "user", "message": {"role": "user", "content": AUTHOR_TURN}},
+        {"type": "assistant", "message": {"model": model, "content": [
+            {"type": "tool_use", "id": "q1", "name": "AskUserQuestion", "input": {}}]}},
+        {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "q1", "content": AUTHOR_ANSWER}]}},
+    ]
+
 
 PLAN_CLEAN = PLAN_CONFLICT.replace("- Создать: `x.py`\n### Задача 2", "- Создать: `y.py`\n### Задача 2")
 
@@ -64,6 +85,29 @@ class QuestionTest(unittest.TestCase):
         self.assertNotIn("## Планы", text)
         self.assertIn("1. Мьютекс (Recommended) — три строки", text)
         self.assertIn("2. Один писатель — перестроить владение", text)
+
+    def test_judge_gets_author_turn_not_logged(self):
+        self.env.transcript.write_text("".join(json.dumps(e) + "\n" for e in author_entries()), encoding="utf-8")
+        rec = self.env.data / "rec.txt"
+        r = self.ask(PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertEqual(author_block(rec), "Реплика автора текущего хода:\n" + AUTHOR_TURN + "\n\n"
+                                            "Ответы автора на AskUserQuestion после неё:\n" + AUTHOR_ANSWER)
+        self.assertIn("Явная просьба автора в <author> побеждает рубрику", rec.read_text(encoding="utf-8"))
+        last = self.env.log_lines()[-1]
+        self.assertEqual(last["content_len"], len(judge_tool.prompts.render_questions(QUESTION_INPUT)))
+        assert_not_logged(self, self.env, AUTHOR_TURN, "быстрая заплатка", "Да, сегодня", "Мьютекс")
+
+    def test_budget_reached_at_deny_time_passes(self):
+        # Параллельный вызов исчерпал лимит между проверкой до судьи и отказом.
+        fill_budget(self.env, "question")
+        with mock.patch.object(common, "deny_budget_left", return_value=True):
+            out = run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                "PreToolUse", tool_name="AskUserQuestion", tool_input=QUESTION_INPUT), PLANKA_STUB="deny")
+        self.assertEqual(out, {"systemMessage": "planka: лимит отказов, пропущено без проверки"})
+        last = self.env.log_lines()[-1]
+        self.assertEqual(last["verdict"], "budget")
+        self.assertEqual(last["reason"], "в списке нет варианта, снимающего причину")
 
     def test_session_model_from_transcript(self):
         rec = self.env.data / "rec.txt"
@@ -158,15 +202,35 @@ class PlanTest(unittest.TestCase):
     def tearDown(self):
         self.env.close()
 
-    def with_plan(self, text):
+    def with_plan(self, text, author=False):
+        """Транскрипт с путём к плану text; author — перед ним реплика автора и ответ на AskUserQuestion."""
         plan = self.env.data / "plan.md"
         plan.write_text(text, encoding="utf-8")
         t = self.env.data / "t.jsonl"
-        t.write_text(
-            json.dumps({"type": "assistant", "message": {"model": "claude-test-model"}}) + "\n"
-            + json.dumps({"type": "attachment", "attachment": {"type": "plan_mode", "planFilePath": str(plan)}}) + "\n",
-            encoding="utf-8")
+        entries = author_entries() if author else [{"type": "assistant", "message": {"model": "claude-test-model"}}]
+        entries.append({"type": "attachment", "attachment": {"type": "plan_mode", "planFilePath": str(plan)}})
+        t.write_text("".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8")
         return str(t)
+
+    def test_plan_judge_gets_author_turn_not_logged(self):
+        rec = self.env.data / "rec.txt"
+        r = self.exit_plan(self.with_plan(PLAN_CLEAN, author=True), PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        block = author_block(rec)
+        self.assertIn(AUTHOR_TURN, block)
+        self.assertIn(AUTHOR_ANSWER, block)
+        self.assertNotIn("Задача 2: B", block)
+        self.assertEqual(self.env.log_lines()[-1]["content_len"], len(PLAN_CLEAN))
+        assert_not_logged(self, self.env, AUTHOR_TURN, "Да, сегодня", "Задача 2: B")
+
+    def test_plan_budget_reached_at_deny_time_passes(self):
+        fill_budget(self.env, "plan")
+        t = self.with_plan(PLAN_CLEAN)
+        with mock.patch.object(common, "deny_budget_left", return_value=True):
+            out = run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                "PreToolUse", tool_name="ExitPlanMode", tool_input={}, transcript_path=t), PLANKA_STUB="deny")
+        self.assertEqual(out, {"systemMessage": "planka: лимит отказов, пропущено без проверки"})
+        self.assertEqual(self.env.log_lines()[-1]["verdict"], "budget")
 
     def exit_plan(self, transcript, **extra):
         return self.env.run("judge_tool.py", self.env.hook_input(
@@ -246,6 +310,23 @@ class PlanTest(unittest.TestCase):
         r = self.exit_plan(t)
         self.assertIsNone(output(r))
         self.assertEqual(messages(r), [f"planka: план не найден: нет файла {self.env.data / 'plan.md'}"])
+
+    def test_unreadable_plan_passes_with_warning(self):
+        # Каталог вместо файла — OSError, NUL в пути из транскрипта — ValueError: пропуск, не внутренняя ошибка.
+        for path in (self.env.data, str(self.env.data / "plan.md") + "\0x"):
+            with self.subTest(path=path):
+                t = self.env.data / "t.jsonl"
+                t.write_text(json.dumps({"attachment": {"type": "plan_mode", "planFilePath": str(path)}}) + "\n",
+                             encoding="utf-8")
+                r = self.exit_plan(str(t), PLANKA_STUB="deny")
+                self.assertEqual(r.returncode, 0)
+                self.assertIsNone(output(r))
+                msgs = messages(r)
+                self.assertEqual(len(msgs), 1, msgs)
+                self.assertTrue(msgs[0].startswith(f"planka: план не прочитан: {path}: "), msgs)
+                last = self.env.log_lines()[-1]
+                self.assertEqual(last["verdict"], "skipped")
+                self.assertTrue(last["error"].startswith("план не прочитан"), last)
 
     def test_plan_judge_gets_modules(self):
         rec = self.env.data / "rec.txt"
@@ -424,6 +505,3 @@ class BashTest(unittest.TestCase):
             self.assertEqual(r.stdout, "")
             self.assertNotIn("Traceback", r.stderr)
 
-
-if __name__ == "__main__":
-    unittest.main()

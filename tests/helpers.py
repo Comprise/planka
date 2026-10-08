@@ -1,14 +1,19 @@
 """Окружение для тестов planka: временный каталог плагина, подмена claude, запуск скриптов."""
+import io
 import json
 import os
 import pathlib
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 STUB_DIR = REPO / "tests" / "stub"
 PLANKA_DIR = REPO / "plugin" / "planka"
+
+sys.path.insert(0, str(PLANKA_DIR))
+import common  # noqa: E402
 
 PHILOSOPHY = """# Философия работы
 
@@ -72,9 +77,12 @@ class Env:
             json.dumps({"type": "assistant", "message": {"model": "claude-test-model"}}) + "\n", encoding="utf-8")
 
     def environ(self, **extra):
+        """Окружение хука. PYTHONUTF8=0: хук работает в кодировке локали, как python3 пользователя без UTF-8 mode;
+        в локали C (make test-hostile) это ascii, а не UTF-8, которую Python включает там сам."""
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("PLANKA_", "CLAUDE_PLUGIN_OPTION_"))
-               and k not in ("CLAUDE_PROJECT_DIR", "CLAUDE_CONFIG_DIR")}
+               and k not in ("CLAUDE_PROJECT_DIR", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_REMOTE_MEMORY_DIR",
+                            "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE")}
         home = pathlib.Path(self.tmp.name) / "home"
         home.mkdir(exist_ok=True)
         env.update({
@@ -83,16 +91,18 @@ class Env:
             "CLAUDE_PLUGIN_DATA": str(self.data),
             "PATH": f"{STUB_DIR}:{env.get('PATH', '')}",
             "PLANKA_STUB": "ok",
+            "PYTHONUTF8": "0",
         })
         env.update(extra)
         return env
 
     def run(self, script, hook_input, **extra):
-        """Запускает plugin/planka/<script> как хук: stdin — JSON, возвращает CompletedProcess."""
+        """Запускает plugin/planka/<script> как хук: stdin — JSON, возвращает CompletedProcess.
+        Обмен — в UTF-8, как у Claude Code, при любой локали процесса тестов."""
         stdin = hook_input if isinstance(hook_input, str) else json.dumps(hook_input)
         return subprocess.run(
             [sys.executable, str(PLANKA_DIR / script)],
-            input=stdin, capture_output=True, text=True,
+            input=stdin, capture_output=True, text=True, encoding="utf-8",
             env=self.environ(**extra), timeout=30,
         )
 
@@ -131,3 +141,36 @@ def messages(r):
     msg = json.loads(r.stdout).get("systemMessage")
     return msg.splitlines() if msg else []
 
+
+def run_in_process(env, main, hook_input, **environ):
+    """main хука через common.run_hook в этом процессе, с окружением env.environ(**environ) и подменой stdin и
+    stdout; ответ хука словарём, пустой ответ — None. Подмены модулей ставит вызывающий вокруг вызова."""
+    stdin = io.TextIOWrapper(io.BytesIO(json.dumps(hook_input).encode("utf-8")), encoding="utf-8")
+    raw = io.BytesIO()
+    stdout = io.TextIOWrapper(raw, encoding="utf-8", write_through=True)
+    with mock.patch.dict(os.environ, env.environ(**environ), clear=True), \
+            mock.patch("sys.stdin", stdin), mock.patch("sys.stdout", new=stdout):
+        common.run_hook(main)
+    return json.loads(raw.getvalue().decode("utf-8")) if raw.getvalue() else None
+
+
+def fill_budget(env, hook, prompt_id="p-1"):
+    """Счётчик отказов sess-1 по реплике и хуку — на пределе common.MAX_DENIES."""
+    state = env.data / "state"
+    state.mkdir(exist_ok=True)
+    (state / "sess-1.json").write_text(json.dumps({f"{prompt_id}:{hook}": common.MAX_DENIES}), encoding="utf-8")
+
+
+def assert_not_logged(test, env, *texts):
+    """Ни одна строка журнала env не содержит texts: журнал хранит содержимое только длиной и SHA-256."""
+    lines = env.log_lines()
+    test.assertTrue(lines)
+    for entry in lines:
+        dumped = json.dumps(entry, ensure_ascii=False)
+        for text in texts:
+            test.assertNotIn(text, dumped)
+
+
+def author_block(rec):
+    """Блок <author> промпта судьи из записи заглушки PLANKA_STUB_RECORD."""
+    return rec.read_text(encoding="utf-8").split("\n<author>\n", 1)[1].split("\n</author>\n", 1)[0]

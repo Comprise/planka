@@ -1,5 +1,6 @@
 import pathlib
 import sys
+import time
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -296,12 +297,18 @@ class ReadOnlyNoteTest(unittest.TestCase):
         for note in ["(только чтение)", "(Только для чтения)", "(только читать)", "(чтение)", "(читать)",
                      "(не трогать)", "(не менять)", "(read-only)", "(readonly)", "(Read only)", "(read)",
                      "(do not modify)", "(don't edit)", "(*read-only*)", "(только чтение: нужен `X`)",
-                     "(read-only, for the interface)"]:
+                     "(read-only, for the interface)", "(без изменений)", "(Без изменений)", "(reference)",
+                     "(reference only)", "(только импорт)", "(для справки)", "(только для справки)",
+                     "(справка)", "(справочно)", "(контекст)", "(no changes)", "(no change)", "(unchanged)",
+                     "(read access)", "(reading)", "(imports only)", "(import only)", "(import)", "(context only)",
+                     "(не изменяется)", "(без изменения)"]:
             self.assertEqual(_files(f"- `a.py`\n- `common.py` {note}"), ["a.py"], note)
             self.assertEqual(_files(f"- `a.py`\n- common.py {note}"), ["a.py"], note)
 
     def test_note_that_only_starts_like_marker_is_owned(self):
-        for note in ["(чтение конфига и запись)", "(новый)", "(readme)", "(read and write)"]:
+        for note in ["(чтение конфига и запись)", "(новый)", "(readme)", "(read and write)",
+                     "(reference implementation)", "(контекст запроса)", "(добавить `run_hook`)",
+                     "(import path)", "(без изменений в API)"]:
             self.assertEqual(_files(f"- `common.py` {note}"), ["common.py"], note)
 
     def test_note_applies_to_preceding_path(self):
@@ -323,9 +330,173 @@ class ReadOnlyNoteTest(unittest.TestCase):
         self.assertEqual(_files("- `a.py`\n\n- `common.py` (read-only)\n\n- `b.py`"), ["a.py", "b.py"])
 
 
+class ReadNoteConflictTest(unittest.TestCase):
+    def test_reference_note_gives_no_conflict(self):
+        plan = ("## Волна 1\n### Задача 1: A\n**Файлы:**\n- `a.py`\n- `common.py` (reference)\n"
+                "### Задача 2: B\n**Файлы:**\n- `b.py`\n- `common.py` (reference)\n")
+        self.assertEqual(planparse.shared_files(planparse.parse_plan(plan)), [])
+
+    def test_unknown_note_keeps_conflict(self):
+        plan = ("## Волна 1\n### Задача 1: A\n**Файлы:**\n- `common.py` (добавить `run_hook`)\n"
+                "### Задача 2: B\n**Файлы:**\n- `common.py` (добавить `stop_hook`)\n")
+        self.assertEqual(planparse.shared_files(planparse.parse_plan(plan)), [("common.py", 1, ["1", "2"])])
+
+    def test_second_files_line_with_sentence_is_description(self):
+        plan = ("## Волна 1\n### Задача 1: A\n**Файлы:** `a.py`\n\nФайл: `cfg.yaml` читается при старте.\n"
+                "### Задача 2: B\n**Файлы:** `cfg.yaml`\n")
+        tasks = planparse.parse_plan(plan)
+        self.assertEqual([t.files for t in tasks], [["a.py"], ["cfg.yaml"]])
+        self.assertEqual(planparse.shared_files(tasks), [])
+
+    def test_second_files_line_with_paths_or_dash_note_is_owned(self):
+        plan = "### Задача 1: A\n**Файлы:** `a.py`\n\nФайлы: `b.py`, `c.py` — новые.\nФайл: `d.py`.\n"
+        self.assertEqual(planparse.parse_plan(plan)[0].files, ["a.py", "b.py", "c.py", "d.py"])
+
+    def test_first_files_line_with_sentence_keeps_paths(self):
+        self.assertEqual(_files("", head="Файлы: `a.py` читается при старте."), ["a.py"])
+
+    def test_connector_continues_series(self):
+        for head in ("Файлы: `a.py` и `b.py`", "Files: `a.py` and `b.py`", "Файлы: `a.py` или `b.py`",
+                     "Files: `a.py` or `b.py`", "Files: `a.py` + `b.py`", "Files: `a.py`, and `b.py`"):
+            self.assertEqual(_files("", head=head), ["a.py", "b.py"], head)
+
+    def test_repeated_files_line_with_connector_or_note_is_owned(self):
+        plan = ("## Волна 1\n### Задача 1: A\n**Файлы:** `a.py`\n\n**Files:** `x.py` and `y.py`\n"
+                "### Задача 2: B\n**Файлы:** `x.py`\n")
+        tasks = planparse.parse_plan(plan)
+        self.assertEqual(tasks[0].files, ["a.py", "x.py", "y.py"])
+        self.assertEqual(planparse.shared_files(tasks), [("x.py", 1, ["1", "2"])])
+        plan = "### Задача 1: A\n**Файлы:** `a.py`\n\n**Files:** `t.py` (new) for tests\n"
+        self.assertEqual(planparse.parse_plan(plan)[0].files, ["a.py", "t.py"])
+        plan = "### Задача 1: A\n**Файлы:** `a.py`\n\nFiles: `t.py` and `u.py` are read at startup.\n"
+        self.assertEqual(planparse.parse_plan(plan)[0].files, ["a.py"])
+
+    def test_files_line_state_is_per_task(self):
+        plan = ("### Задача 1: A\nФайлы: `a.py`\n### Задача 2: B\nФайл: `b.py` правится\n")
+        self.assertEqual(_structure(plan), [(None, "1", ["a.py"]), (None, "2", ["b.py"])])
+
+
+class RobustnessTest(unittest.TestCase):
+    def test_bom_at_start_keeps_wave(self):
+        plan = "\ufeff" + PLAN_RU.split("\n", 2)[2]
+        self.assertTrue(plan.startswith("\ufeff## Волна 1"))
+        self.assertEqual([t.wave for t in planparse.parse_plan(plan)], [1, 1, 2])
+        self.assertEqual(planparse.shared_files(planparse.parse_plan(plan)), [("b/two.py", 1, ["1", "2"])])
+
+    def test_adversarial_input_is_linear(self):
+        inputs = ["- " + "a/" * 8000 + " x",
+                  "- " + "a." * 20000 + " (",
+                  "- " + "a.py" + " " * 30000 + "x",
+                  "- `a.py`" + " " * 30000 + "x",
+                  "- x.py" + " " * 30000 + "(a",
+                  "- " + "(" * 20000]
+        for item in inputs:
+            for plan in (f"### Task 1: A\n**Files:**\n{item}\n", f"### Task 1: A\nFiles: {item[2:]}\n",
+                         "# a" + " " * 30000 + "b\n"):
+                started = time.monotonic()
+                planparse.parse_plan(plan)
+                self.assertLess(time.monotonic() - started, 1, item[:30])
+
+
+class ParserBranchesTest(unittest.TestCase):
+    def test_item_after_blank_line_ends_list_even_if_next_is_path(self):
+        plan = "### Задача 1: A\n**Файлы:**\n- `a.py`\n\n- `make test` проходит\n- `b.py`\n"
+        self.assertEqual(planparse.parse_plan(plan)[0].files, ["a.py"])
+
+    def test_non_path_item_without_blank_line_keeps_list(self):
+        plan = "### Задача 1: A\n**Файлы:**\n- `a.py`\n\n- `b.py`\n- `make test` проходит\n- `c.py`\n"
+        self.assertEqual(planparse.parse_plan(plan)[0].files, ["a.py", "b.py", "c.py"])
+
+    def test_fence_not_closed_by_info_line(self):
+        plan = ("## Волна 1\n### Задача 1: A\nФайлы: `a.py`\n```markdown\n```python\n"
+                "### Задача 2: B\nФайлы: `a.py`\n```\n")
+        self.assertEqual(_structure(plan), [(1, "1", ["a.py"])])
+
+    def test_fence_not_closed_by_other_char(self):
+        plan = ("## Волна 1\n### Задача 1: A\nФайлы: `a.py`\n```\n~~~\n### Задача 2: B\nФайлы: `a.py`\n```\n")
+        self.assertEqual(_structure(plan), [(1, "1", ["a.py"])])
+        plan = ("## Волна 1\n### Задача 1: A\nФайлы: `a.py`\n~~~\n```\n### Задача 2: B\nФайлы: `a.py`\n~~~\n")
+        self.assertEqual(_structure(plan), [(1, "1", ["a.py"])])
+
+    def test_fence_ends_files_list(self):
+        plan = "### Задача 1: A\n**Файлы:**\n- `a.py`\n```\ncode\n```\n- `b.py`\n"
+        self.assertEqual(planparse.parse_plan(plan)[0].files, ["a.py"])
+
+    def test_comment_end_is_cut_whole(self):
+        plan = "### Задача 1: A\nФайлы: `c.py` <!-- x --> `d.py`\n"
+        self.assertEqual(planparse.parse_plan(plan)[0].files, ["c.py", "d.py"])
+        plan = "### Задача 1: A\n<!--\nтекст\n--> Файлы: `b.py`\n"
+        self.assertEqual(planparse.parse_plan(plan)[0].files, ["b.py"])
+
+    def test_indented_hash_line_is_not_heading(self):
+        plan = "## Волна 1\n### Задача 1: A\nФайлы: `a.py`\n    ### Задача 2: B\nФайлы: `b.py`\n"
+        self.assertEqual(_structure(plan), [(1, "1", ["a.py", "b.py"])])
+        plan = "## Волна 1\n   ### Задача 1: A\nФайлы: `a.py`\n"
+        self.assertEqual(_structure(plan), [(1, "1", ["a.py"])])
+
+    def test_closing_hashes_dropped_from_title(self):
+        tasks = planparse.parse_plan("## Волна 1 ##\n### Задача 1: A ###\nФайлы: `a.py`\n")
+        self.assertEqual([(t.wave, t.title) for t in tasks], [(1, "A")])
+        tasks = planparse.parse_plan("### Задача 1: C#\nФайлы: `a.py`\n")
+        self.assertEqual(tasks[0].title, "C#")
+
+    def test_heading_without_space_after_hashes(self):
+        plan = "##Волна 1\n###Задача 1: A\nФайлы: `a.py`\n"
+        self.assertEqual(_structure(plan), [(1, "1", ["a.py"])])
+
+    def test_setext_underline_indent(self):
+        plan = "### Задача 1: A\nФайлы: `a.py`\n   Волна 2\n   ---\n### Задача 2: B\nФайлы: `a.py`\n"
+        self.assertEqual(_structure(plan), [(None, "1", ["a.py"]), (2, "2", ["a.py"])])
+        plan = ("## Волна 1\n### Задача 1: A\nФайлы: `a.py`\nВолна 2\n    ---\n"
+                "### Задача 2: B\nФайлы: `a.py`\n")
+        self.assertEqual(_structure(plan), [(1, "1", ["a.py"]), (1, "2", ["a.py"])])
+
+    def test_keywords_ignore_case(self):
+        plan = "## wave 1\n### task 1: A\nФайлы: `a.py`\n## ВОЛНА 2\n### задача 2: B\nФайлы: `a.py`\n"
+        self.assertEqual(_structure(plan), [(1, "1", ["a.py"]), (2, "2", ["a.py"])])
+
+    def test_bold_forms_ignore_case(self):
+        plan = "**wave 2: Name**\n**task 1:** A\nФайлы: `a.py`\n"
+        self.assertEqual(_structure(plan), [(2, "1", ["a.py"])])
+
+    def test_files_head_after_blank_line_resets_blank(self):
+        plan = "### Задача 1: A\n**Файлы:**\n- `a.py`\n\nФайлы: `b.py` — новый.\n- запустить тесты\n- `c.py`\n"
+        self.assertEqual(planparse.parse_plan(plan)[0].files, ["a.py", "b.py", "c.py"])
+
+    def test_bold_wave_needs_separator(self):
+        plan = "**Волна 1 описание**\n### Задача 1: A\nФайлы: `a.py`\n"
+        self.assertEqual(_structure(plan), [(None, "1", ["a.py"])])
+        plan = "**Wave 2: Name**\n### Задача 1: A\nФайлы: `a.py`\n"
+        self.assertEqual(_structure(plan), [(2, "1", ["a.py"])])
+
+    def test_list_item_above_equals_underline_is_not_heading(self):
+        plan = ("## Волна 1\n### Задача 1: A\nФайлы: `a.py`\n- пункт\n=====\n"
+                "### Задача 2: B\nФайлы: `a.py`\n")
+        self.assertEqual(planparse.shared_files(planparse.parse_plan(plan)), [("a.py", 1, ["1", "2"])])
+
+    def test_plain_task_line_is_not_heading(self):
+        plan = "### Задача 1: A\nФайлы: `a.py`\n\nЗадача 2: B\nФайлы: `b.py`\n"
+        self.assertEqual(_structure(plan), [(None, "1", ["a.py", "b.py"])])
+
+    def test_note_applies_only_to_adjacent_path(self):
+        self.assertEqual(_files("", head="Files: `a.py` (новый) (только чтение)"), ["a.py"])
+        self.assertEqual(_files("- `a.py`, `make test` (read-only)"), ["a.py"])
+        self.assertEqual(_files("", head="Files: `a.py`, `make test` - read-only"), ["a.py"])
+        self.assertEqual(_files("- `a.py` (новый), `b.py` (read-only)"), ["a.py"])
+
+
 # Корпус настоящих по форме планов: (волна, номер, файлы) каждой задачи и конфликты владения.
 CORPUS = {
-    "plan-waves.md": None,
+    "plan-waves.md": (
+        [(1, "1", [".claude-plugin/plugin.json", "hooks/hooks.json", "philosophy.md", "Makefile", ".gitignore"]),
+         (1, "2", ["planka/common.py", "planka/prompts.py", "tests/stub/claude", "tests/helpers.py",
+                   "tests/__init__.py", "tests/test_common.py", "tests/test_prompts.py"]),
+         (1, "3", ["planka/planparse.py", "tests/test_planparse.py"]),
+         (2, "4", ["planka/remind.py", "tests/test_remind.py"]),
+         (2, "5", ["planka/judge_stop.py", "tests/test_judge_stop.py"]),
+         (2, "6", ["planka/judge_tool.py", "tests/test_judge_tool.py"]),
+         (3, "7", ["README.md"])],
+        []),
     "plan-superpowers.md": (
         [(None, "1", ["src/notes/exporters.py", "tests/test_exporters.py"]),
          (None, "2", ["src/notes/cli.py", "tests/test_cli.py"]),
@@ -354,15 +525,8 @@ class CorpusTest(unittest.TestCase):
 
     def test_corpus(self):
         for name, expected in CORPUS.items():
-            if expected is None:
-                # plan-waves.md проверяет FenceTest.test_repo_plan_is_disjoint.
-                continue
             with self.subTest(name):
                 text = (REPO / "tests" / "fixtures" / name).read_text(encoding="utf-8")
                 structure, conflicts = expected
                 self.assertEqual(_structure(text), structure)
                 self.assertEqual(planparse.shared_files(planparse.parse_plan(text)), conflicts)
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -17,6 +17,10 @@ MAX_FILES = 50_000
 STAT_CHECK_EVERY = 256
 
 
+class TooManyFiles(Exception):
+    """Путей для снимка больше MAX_FILES; текст — причина для предупреждения."""
+
+
 def ignore_rules(directory):
     """Записи .gitignore каталога: имена без подстановочных знаков и расширения из «*.ext».
 
@@ -71,10 +75,11 @@ def _git_ls(root, deadline, *args):
 
 
 def _walk_paths(root, deadline):
-    """Пути файлов под root обходом каталогов; обход останавливается, когда путей больше MAX_FILES.
+    """Пути файлов под root обходом каталогов; TooManyFiles, когда путей больше MAX_FILES: оборванный
+    обход не отдаётся как полный.
 
     Правила каталога — правила родителя плюс его собственный .gitignore, упрощённо по ignore_rules;
-    действуют на его поддерево. Символические ссылки на каталоги не обходятся.
+    действуют на его поддерево. os.walk не заходит в символические ссылки на каталоги.
     """
     rules_by_dir = {}
     paths = []
@@ -85,13 +90,13 @@ def _walk_paths(root, deadline):
         names, exts = parent[0] | own[0], parent[1] | own[1]
         rules_by_dir[dirpath] = (names, exts)
         skip = IGNORED_DIRS | names
-        dirnames[:] = [d for d in dirnames if d not in skip and not os.path.islink(os.path.join(dirpath, d))]
+        dirnames[:] = [d for d in dirnames if d not in skip]
         for name in filenames:
             if name in names or any(name.endswith("." + e) for e in exts):
                 continue
             paths.append(os.path.relpath(os.path.join(dirpath, name), root).replace(os.sep, "/"))
         if len(paths) > MAX_FILES:
-            break
+            raise TooManyFiles(f"дерево больше {MAX_FILES} файлов")
     return paths
 
 
@@ -112,10 +117,6 @@ def _stat_files(root, relpaths, deadline=None):
         if len(files) > MAX_FILES:
             return None
     return files
-
-
-class TooManyFiles(Exception):
-    """Путей для снимка больше MAX_FILES; текст — причина для предупреждения."""
 
 
 def _stat_one(root, rel):
@@ -160,7 +161,7 @@ def _status(root, deadline):
             parts = tok.split(b" ", _V2_FIELDS[kind])
             # У переименования исходный путь — следующая запись -z.
             orig = next(tokens, b"") if kind == b"2" else None
-            if len(parts) <= _V2_FIELDS[kind] or parts[2].startswith(b"S"):
+            if len(parts) <= _V2_FIELDS[kind]:
                 continue
             paths.append(os.fsdecode(parts[-1]))
             if orig:
@@ -256,12 +257,18 @@ def changed_since(root, snap, deadline=None):
     """
     root = pathlib.Path(root)
     mode = snap.get("mode")
-    repos = _git_state(root, deadline)
+    try:
+        repos = _git_state(root, deadline)
+    except TooManyFiles as e:
+        return _undetermined(str(e))
     if (repos is not None) != (mode == "git"):
         return _undetermined("за реплику корень проекта " +
                              ("стал git-репозиторием" if repos is not None else "перестал быть git-репозиторием"))
     if repos is None:
-        now = _stat_files(root, _walk_paths(root, deadline), deadline)
+        try:
+            now = _stat_files(root, _walk_paths(root, deadline), deadline)
+        except TooManyFiles as e:
+            return _undetermined(str(e))
         if now is None:
             return _undetermined(f"дерево больше {MAX_FILES} файлов")
         return [(p, p in now) for p in diff(snap["files"], now)]

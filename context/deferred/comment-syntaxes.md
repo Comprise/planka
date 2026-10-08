@@ -1,13 +1,21 @@
 # Комментарии только известных синтаксисов
 
 **Что не так.** `comments.extract` извлекает строки комментариев только для синтаксисов из
-`comments._SYNTAX` и `comments._NAMES`. Файлы кода erl, clj, fs, vb, nim, el, vim, bat, cmd судятся
-по самоотчёту агента. Не разбираются: Ruby `=begin/=end`, Perl POD, PHP heredoc `<<<`, Swift
-`#"…"#`, slashy-строки Groovy, регулярные выражения JS с `//` или `/*`, вложенные `{- -}` и `/* */`;
-Elixir `@doc """…"""` считается строкой.
+`comments._SYNTAX` и `comments._NAMES`. Файлы кода erl, clj, fs, vb, nim, el, vim, bat, cmd судятся по
+самоотчёту агента. Не разбираются: Ruby `=begin/=end`, Perl POD, PHP heredoc `<<<`, Swift `#"…"#`,
+slashy-строки Groovy, регулярные выражения JS с `//` или `/*`, вложенные `{- -}` и `/* */`; Elixir `@doc
+"""…"""` считается строкой. Символьный литерал `?#` Ruby и Elixir открывает комментарий; текст JSX с `//`
+(`<p>http://x</p>`) — комментарий; heredoc Ruby и Perl вплотную к слову (`x<<EOS`; в Perl — кроме
+`print<<EOT`, `print CSS<<EOF`) читается как сдвиг, а после слова и пробела со строчным идентификатором
+без `-`, `~` и кавычек (`puts <<eof`) — как добавление (`comments._heredoc_ok`): его тело — как код.
+Дескриптор Perl в фигурных скобках вплотную к `print` или со сложным выражением (`print{$fh} <<END`,
+`print {$self->{fh}} <<END`, `print {*STDOUT} <<END`) не узнаётся: heredoc читается как сдвиг, тело — как
+код.
 
 **Чем доказано.** Чтением `comments._SYNTAX`; тест `test_code_exts_cover_comment_families`
-перечисляет расширения `CODE_EXTS` без синтаксиса.
+перечисляет расширения `CODE_EXTS` без синтаксиса. Вызовом `comments.comment_lines`: `"x = ?#\n"`
+(`ex`) → `["#"]`; `"const a = <p>see http://x.y</p>;\n"` (`jsx`) → `["//x.y</p>;"]`;
+`"s = x<<EOS\n# a\nEOS\n"` (`rb`) → `["# a"]`; `"puts <<eof\n# a\neof\n"` (`rb`) → `["# a"]`.
 
 **Верное решение и цена.** Синтаксис на каждый язык из `CODE_EXTS` и разбор перечисленных
 конструкций в `comments._comments`; цена — по таблице и тесту на язык, рост разбора с состоянием

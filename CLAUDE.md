@@ -42,7 +42,7 @@
 
 | Документ | О чём |
 | --- | --- |
-| `context/architecture.md` | компоненты, контракт с правилами, ответ хука, судья, сроки, лимит отказов, память, неудачи команд, состояние, снимок, комментарии, платформы |
+| `context/architecture.md` | компоненты, контракт с правилами, ответ хука, судья, сроки, лимит отказов, разбор плана, память, неудачи команд, состояние, снимок, комментарии, платформы |
 | `context/development.md` | запуск, точки входа, правила кода, новый хук, документация, git |
 | `context/testing.md` | цели `make`, устройство тестов, изоляция окружения, заглушка судьи |
 | `context/deferred/INDEX.md` | отложенное |
@@ -84,7 +84,8 @@
 - Имя файла — контракт с кодом: переименование — правка вызовов `common.rubric` и
   `common.rule_texts` в `judge_tool.py`, `judge_stop.py`, `guard_memory.py`, `debug_watch.py`
   (`MODULE`), ссылок `judge_tool.DEP_REASON`, `MODULES` в `tests/test_contract.py`, индекса в
-  `plugin/philosophy.md` и `README.md`.
+  `plugin/philosophy.md` и `README.md`. Имена из вызовов тест выводит из кода сам
+  (`test_names_taken_by_code_exist`); `dependencies` код называет только текстом `DEP_REASON`.
 - Метки `{RULES}`, `{COMMENT_LANG}`, `{DOC_LANG}` подставляются при чтении; других меток нет.
 
 Читать перед правкой: `context/architecture.md`, «Контракт кода с текстами правил».

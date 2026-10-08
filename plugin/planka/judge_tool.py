@@ -58,6 +58,12 @@ def _judge_and_emit(hook, data, transcript, user_prompt, content):
           reason=verdict.reason, violated=verdict.violated, duration_ms=duration_ms)
 
 
+def _author(transcript):
+    """Блок <author> судьи: реплика автора и его ответы — граница задачи. В журнал не идёт: content журнала —
+    только проверяемое содержимое."""
+    return prompts.author_context(transcript.author_turn, transcript.author_answers)
+
+
 def judge_question(data):
     session = data.get("session_id", "")
     content = prompts.render_questions(data.get("tool_input") or {})
@@ -71,7 +77,8 @@ def judge_question(data):
     if _budget_spent("question", data, content):
         return
     transcript = common.read_transcript(data.get("transcript_path"))
-    _judge_and_emit("question", data, transcript, prompts.question_prompt(rubric, content), content)
+    _judge_and_emit("question", data, transcript, prompts.question_prompt(rubric, content, _author(transcript)),
+                    content)
 
 
 def judge_plan(data):
@@ -82,8 +89,12 @@ def judge_plan(data):
         return
     try:
         plan = transcript.plan_file.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    except FileNotFoundError:
         _skip("plan", session, f"план не найден: нет файла {transcript.plan_file}")
+        return
+    except (OSError, ValueError) as e:
+        # ValueError — NUL в пути из транскрипта.
+        _skip("plan", session, f"план не прочитан: {transcript.plan_file}: {e!r}")
         return
     if _budget_spent("plan", data, plan):
         return
@@ -99,7 +110,7 @@ def judge_plan(data):
         # Предупреждение уже выдал common.rubric.
         common.log_event("plan", session, verdict="skipped", error="нет раздела рубрики")
         return
-    _judge_and_emit("plan", data, transcript, prompts.plan_prompt(rubric, plan), plan)
+    _judge_and_emit("plan", data, transcript, prompts.plan_prompt(rubric, plan, _author(transcript)), plan)
 
 
 DEP_REASON = ("planka: новая зависимость — вопрос автору (ядро, «Границы»): назови пакет, зачем он "

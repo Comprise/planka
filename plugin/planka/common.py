@@ -19,6 +19,10 @@ from prompts import JUDGE_SCHEMA
 
 MAX_DENIES = 2
 JUDGE_TIMEOUT = 60
+# Ожидание завершения группы судьи после SIGKILL и срок git rev-parse корня проекта, в секундах; входят в суммы
+# сроков хуков против таймаутов hooks.json (context/architecture.md, «Сроки»).
+KILL_WAIT = 5
+GIT_ROOT_TIMEOUT = 5
 MAX_REASON = 2000
 MAX_DETAIL = 200
 STATE_TTL = 7 * 86400
@@ -200,13 +204,13 @@ def skip_message(verdict):
 
 
 def _kill_group(proc):
-    """SIGKILL группе процессов судьи (он лидер своей группы) и ожидание завершения до 5 с."""
+    """SIGKILL группе процессов судьи (он лидер своей группы) и ожидание завершения до KILL_WAIT с."""
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except OSError:
         pass
     try:
-        proc.communicate(timeout=5)
+        proc.communicate(timeout=KILL_WAIT)
     except (subprocess.TimeoutExpired, OSError, ValueError):
         pass
 
@@ -215,7 +219,8 @@ _PR_SET_PDEATHSIG = 1
 
 
 def _die_with_hook(hook_pid):
-    """preexec_fn судьи на Linux: SIGKILL судье, когда умирает процесс хука."""
+    """preexec_fn судьи на Linux: SIGKILL процессу судьи, когда умирает процесс хука; потомкам судьи
+    PR_SET_PDEATHSIG не наследуется."""
     def set_signal():
         ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_PDEATHSIG, signal.SIGKILL)
         # Хук умер до prctl — сигнала не будет.
@@ -245,9 +250,9 @@ while True:
 
 
 def _start_judge(cmd, platform, **popen_kwargs):
-    """Popen судьи лидером своей группы процессов, которая умирает вместе с хуком: на Linux — через
-    PR_SET_PDEATHSIG, на других платформах — через сторож _WATCHDOG. FileNotFoundError — нет cmd[0] в PATH
-    окружения popen_kwargs["env"]."""
+    """Popen судьи лидером своей группы процессов. Вместе с хуком умирает: на Linux — процесс судьи
+    (PR_SET_PDEATHSIG), его потомков убивает только _kill_group по таймауту; на других платформах — вся группа
+    через сторож _WATCHDOG. FileNotFoundError — нет cmd[0] в PATH окружения popen_kwargs["env"]."""
     hook_pid = os.getpid()
     if platform.startswith("linux"):
         return subprocess.Popen(cmd, start_new_session=True, preexec_fn=_die_with_hook(hook_pid), **popen_kwargs)
@@ -324,11 +329,13 @@ def _is_author_turn(entry, msg, origin_seen):
 
 
 def read_transcript(path):
-    """Transcript из файла JSONL path; нет пути, файла или ошибка чтения — пустой Transcript.
+    """Transcript из файла JSONL path (путь из входа хука, input_path); нет пути, файла, путь с нулевым байтом
+    или ошибка чтения — пустой Transcript.
     Строки не JSON и записи не словари пропускаются."""
     out = Transcript()
     if not isinstance(path, str) or not path:
         return out
+    path = input_path(path)
     plan = None
     asked = set()
     origin_seen = False
@@ -375,9 +382,9 @@ def read_transcript(path):
                     text = "".join(_text_blocks(content))
                     if text.strip():
                         out.turn_messages.append(text)
-    except OSError:
+    except (OSError, ValueError):
         return Transcript()
-    out.plan_file = pathlib.Path(plan) if plan else None
+    out.plan_file = pathlib.Path(input_path(plan)) if plan else None
     return out
 
 
@@ -399,27 +406,54 @@ def judge_model(data, transcript=None):
     return transcript.model
 
 
+def input_path(path):
+    """Путь из JSON входа хука или транскрипта — строка в кодировке файловой системы процесса.
+
+    Claude Code пишет пути байтами UTF-8 независимо от локали; в локали не UTF-8 (ascii, latin-1) строка
+    с кириллицей не кодируется для open и subprocess, а возвращённая строка отдаёт им исходные байты.
+    В локали UTF-8 — та же строка. Не строка или суррогат вне U+DC80..U+DCFF — path как есть."""
+    if not isinstance(path, str):
+        return path
+    try:
+        return os.fsdecode(path.encode("utf-8", "surrogateescape"))
+    except UnicodeEncodeError:
+        return path
+
+
+def _utf8(text):
+    """Текст для claude байтами UTF-8 при любой локали: claude читает argv и stdin в UTF-8.
+
+    Суррогат U+DC80..U+DCFF — байт пути, декодированного os.fsdecode, — уходит исходным байтом: в локали
+    не UTF-8 так путь с кириллицей доходит буквами. Прочие одиночные суррогаты — «?»."""
+    try:
+        return text.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "replace")
+
+
 def run_judge(system_prompt, user_prompt, model, *, timeout=JUDGE_TIMEOUT):
-    """Вложенный claude -p; model None — без --model; любая ошибка — пропуск с описанием в error."""
-    cmd = ["claude", *JUDGE_FLAGS, "--json-schema", json.dumps(JUDGE_SCHEMA),
-           *(["--model", model] if model else []), "--system-prompt", system_prompt]
+    """Вложенный claude -p; model None — без --model; любая ошибка — пропуск с описанием в error.
+    Аргументы после claude и stdin — байты _utf8, ответ декодируется из UTF-8 с заменой."""
+    args = [*JUDGE_FLAGS, "--json-schema", json.dumps(JUDGE_SCHEMA),
+            *(["--model", model] if model else []), "--system-prompt", system_prompt]
+    cmd = ["claude", *map(_utf8, args)]
     env = dict(os.environ, PLANKA_JUDGE="1")
     try:
         proc = _start_judge(cmd, sys.platform, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=env,
-                            cwd=str(data_dir()))
+                            stderr=subprocess.PIPE, env=env, cwd=str(data_dir()))
     except FileNotFoundError:
         return _skipped("claude не найден в PATH")
-    except (OSError, subprocess.SubprocessError) as e:
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
         return _skipped(f"claude не запущен: {e}")
     try:
-        stdout, stderr = proc.communicate(user_prompt, timeout=timeout)
+        out, err = proc.communicate(_utf8(user_prompt), timeout=timeout)
     except subprocess.TimeoutExpired:
         _kill_group(proc)
         return _skipped(f"таймаут судьи {timeout} с")
     except (OSError, ValueError) as e:
         _kill_group(proc)
         return _skipped(f"обмен с claude не удался: {e}")
+    stdout, stderr = out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
     line = next((l for l in stdout.splitlines() if l.startswith("{")), None)
     if line is None:
         return _skipped("ответ судьи не JSON", f"{stdout[:200]!r} {stderr[:200]!r}")
@@ -516,15 +550,16 @@ def project_root(cwd):
     вне репозитория — сам каталог.
 
     CLAUDE_PROJECT_DIR — каталог запуска сессии, после cd агента он не меняется; cwd хука меняется.
+    cwd — путь из входа хука, он приводится к кодировке файловой системы (input_path).
     """
-    base = os.environ.get("CLAUDE_PROJECT_DIR") or cwd
+    base = os.environ.get("CLAUDE_PROJECT_DIR") or input_path(cwd)
     try:
         proc = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=base, capture_output=True,
-                              timeout=5)
+                              timeout=GIT_ROOT_TIMEOUT)
         top = proc.stdout.strip()
         if proc.returncode == 0 and top:
             return pathlib.Path(os.fsdecode(top))
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         pass
     return pathlib.Path(base)
 

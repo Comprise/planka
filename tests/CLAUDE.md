@@ -8,17 +8,22 @@ unittest плагина; запуск — `make test` из корня.
   `philosophy.md` и `rules/`.
 - Настоящий `claude` не вызывается: `tests/stub` первый в `PATH`, ответ задаёт `PLANKA_STUB`.
 - Тест не зависит от окружения сессии, в которой запущен: `Env.environ` вычищает `PLANKA_*`,
-  `CLAUDE_PLUGIN_OPTION_*`, `CLAUDE_PROJECT_DIR`, `CLAUDE_CONFIG_DIR` и ставит `HOME` во временный
-  каталог; новая переменная, которую читает код, — туда же. `tests/__init__.py` изолирует git на
-  уровне процесса: глобальный и системный конфиг, `GIT_*`, `GIT_CEILING_DIRECTORIES`.
+  `CLAUDE_PLUGIN_OPTION_*`, `CLAUDE_PROJECT_DIR`, `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_REMOTE_MEMORY_DIR`,
+  `CLAUDE_COWORK_MEMORY_PATH_OVERRIDE`, ставит `HOME` во временный
+  каталог и `PYTHONUTF8=0` хуку; новая переменная, которую читает код, — туда же. `tests/__init__.py`
+  изолирует git на уровне процесса: снимает все `GIT_*`, отключает глобальный и системный конфиг и
+  системные атрибуты, подменяет `XDG_CONFIG_HOME` пустым каталогом, ставит `GIT_CEILING_DIRECTORIES`.
+  Изоляцию проверяет `make test-hostile`.
 - Устойчивость плагина к чужому git-конфигу — `test_hostile_git.py`: враждебный `GIT_CONFIG_GLOBAL`
   передаётся явно только вызовам плагина, git подготовки репозитория — под изолированным конфигом.
-  Новый вызов git в плагине проверяется там же.
+  Новый вызов git в плагине проверяется там же (`git check-ignore` в `guard_memory` — `HostileMemoryTest`).
+- Тест не импортирует другой тест: помощники, нужные нескольким файлам (`run_in_process`, `fill_budget`,
+  `assert_not_logged`, `author_block`), — в `helpers.py`.
 - Вход хука — `Env.hook_input(event, **fields)`: `cwd` — каталог проекта `Env`, `transcript_path` —
   `Env.transcript` с ответом ассистента модели `claude-test-model`.
-- `fixtures/` — корпуса настоящих форм входа: `plan-*.md` (`test_planparse`), `transcript-shapes.jsonl`
-  (`test_common`), `bash-failure-errors.jsonl` (`test_debug_watch`); новый край разборщика — образцом в
-  корпус.
+- `fixtures/` — корпуса настоящих форм входа: `plan-*.md` (`test_planparse`, ожидаемая структура
+  каждого плана — `CORPUS`), `transcript-shapes.jsonl` (`test_common`), `bash-failure-errors.jsonl`
+  (`test_debug_watch`); новый край разборщика — образцом в корпус.
 
 ## Читать перед правкой
 

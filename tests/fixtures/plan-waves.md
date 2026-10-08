@@ -1,3 +1,4 @@
+<!-- Образец корпуса: план реализации этого проекта (planka), формат волн: `## Волна N`, `### Task N: <заголовок>`, строки `**Files:**` с `Create:`/`Modify:`/`Test:`; содержимое реальное, без правок. -->
 # planka Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

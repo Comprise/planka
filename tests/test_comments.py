@@ -168,6 +168,153 @@ class CommentLinesTest(unittest.TestCase):
                          [(2, "# a"), (6, "# b")])
 
 
+class ParserEdgeTest(unittest.TestCase):
+    """Края разборщика: каждый тест держит одну ветвь _token, _close или _comments."""
+
+    def test_backslash_escaped_quote_keeps_string_open(self):
+        self.assertEqual(comments.comment_lines('const a = "a \\" // not"; // yes\n', "js"), ["// yes"])
+        self.assertEqual(comments.comment_lines("s = 'it\\'s # x' # c\n", "py"), ["# c"])
+
+    def test_char_literal_quote_does_not_open_string(self):
+        cases = {"c": "char q = '\"'; s = \"//x\"; // c\n",
+                 "go": "q := '\"'; s := \"//x\" // c\n",
+                 "rs": "let q = '\"'; let s = \"//x\"; // c\n"}
+        for ext, src in cases.items():
+            self.assertEqual(comments.comment_lines(src, ext), ["// c"], ext)
+
+    def test_csharp_verbatim_interpolated_string(self):
+        self.assertEqual(comments.comment_lines('var s = @$"C:\\{d}\\"; var t = "// x"; // c\n', "cs"), ["// c"])
+
+    def test_cpp_prefixed_raw_string(self):
+        self.assertEqual(comments.comment_lines('auto s = u8R"(a " // not)"; // yes\n', "cpp"), ["// yes"])
+
+    def test_rust_byte_raw_string(self):
+        self.assertEqual(comments.comment_lines('let s = br"a\\"; // c\nlet t = 1;\n', "rs"), ["// c"])
+
+    def test_hash_after_dollar_or_brace_is_code(self):
+        self.assertEqual(comments.comment_lines("my $n = $#a; # c\n", "pl"), ["# c"])
+        self.assertEqual(comments.comment_lines("t:\n\techo $${#PATH} # c\n", "makefile"), ["# c"])
+
+    def test_escaped_hash_is_code(self):
+        self.assertEqual(comments.comment_lines("x := a\\#b # c\n", "makefile"), ["# c"])
+        self.assertEqual(comments.comment_lines("set(X a\\#b) # c\n", "cmake"), ["# c"])
+
+    def test_crlf_heredoc_terminator(self):
+        self.assertEqual(comments.comment_lines("cat <<EOF > s.md\r\n# body\r\nEOF\r\n# real\r\n", "sh"), ["# real"])
+
+    def test_dash_heredoc_with_tab_indented_terminator(self):
+        self.assertEqual(comments.comment_lines("cat <<-EOF\n\t# body\n\tEOF\n# real\n", "sh"), ["# real"])
+
+    def test_bom_before_shebang(self):
+        self.assertEqual(comments.comment_lines("\ufeff#!/usr/bin/env python3\n# c\n", "py"), ["# c"])
+        self.assertEqual(comments.comment_lines("\ufeff# c\n", "py"), ["# c"])
+
+    def test_ruby_heredoc_body_is_data(self):
+        src = "sql = <<~SQL\n  # not\n  SQL\nq = <<-'EOS'.strip # tail\n# not\n    EOS\nt = <<EOF\n# not\nEOF\n# real\n"
+        self.assertEqual(comments.comment_lines(src, "rb"), ["# tail", "# real"])
+        self.assertEqual(comments.comment_lines("execute <<~SQL\n  # not\nSQL\n# real\n", "rakefile"), ["# real"])
+        self.assertEqual(comments.comment_lines('print <<"EOT";\n# not\nEOT\n# real\n', "pl"), ["# real"])
+
+    def test_shift_is_not_ruby_heredoc(self):
+        src = "x = 1<<BITS # a\nclass << self # b\n  arr << ITEM # c\nend\n"
+        self.assertEqual(comments.comment_lines(src, "rb"), ["# a", "# b", "# c"])
+
+    def test_shift_after_closer_is_not_heredoc(self):
+        for src in ("a[0]<<X # a\n# b\nX\n", "h{1}<<X # a\n# b\nX\n", "f(1)<<X # a\n# b\nX\n"):
+            self.assertEqual(comments.comment_lines(src, "rb"), ["# a", "# b"], src)
+
+    def test_shift_after_space_is_not_heredoc(self):
+        # Переменная Perl перед пробелом и строчный идентификатор после слова Ruby — сдвиг и добавление.
+        self.assertEqual(comments._comments("my $s = $a <<EOF; # c5\n# c6\n", "pl"), [(1, "# c5"), (2, "# c6")])
+        self.assertEqual(comments._comments("push @a, @b <<EOF; # c5\n# c6\n", "pl"), [(1, "# c5"), (2, "# c6")])
+        self.assertEqual(comments._comments("a = [1]\na <<b\n# c2\nb\n", "rb"), [(3, "# c2")])
+        self.assertEqual(comments._comments("a = [1]\n(a) <<EOF\n# c2\nEOF\n", "rb"), [(3, "# c2")])
+        # С терминатором: откат незакрытого heredoc не маскирует решение «сдвиг».
+        self.assertEqual(comments._comments("my $s = $a <<B; # c1\n# c2\nB\n", "pl"), [(1, "# c1"), (2, "# c2")])
+        self.assertEqual(comments._comments("push @a, @b <<B; # c1\n# c2\nB\n", "pl"), [(1, "# c1"), (2, "# c2")])
+        # Переменная Perl без print перед ней и слово, лишь кончающееся на print, — сдвиг.
+        self.assertEqual(comments._comments("$fh <<EOF; # c1\n# c2\nEOF\n", "pl"), [(1, "# c1"), (2, "# c2")])
+        self.assertEqual(comments._comments("reprint $fh <<EOF; # c1\n# c2\nEOF\n", "pl"), [(1, "# c1"), (2, "# c2")])
+        # Ruby: «$fh» — глобальная переменная, «<<» за ней — сдвиг и после print.
+        self.assertEqual(comments._comments("print $fh <<EOF # c1\n# c2\nEOF\n", "rb"), [(1, "# c1"), (2, "# c2")])
+
+    def test_perl_heredoc_into_filehandle(self):
+        # print, printf, say в дескриптор: «$fh», «{$fh}», STDOUT, STDERR — heredoc.
+        for src in ("print $fh <<EOF;\n# not\nEOF\n# real\n", "printf $out <<\"EOT\", 1;\n# not\nEOT\n# real\n",
+                    "say {$fh} <<~EOT;\n  # not\n  EOT\n# real\n", "print STDERR <<eof;\n# not\neof\n# real\n",
+                    "if ($x) { print  $log  <<'END' }\n# not\nEND\n# real\n"):
+            self.assertEqual(comments.comment_lines(src, "pl"), ["# real"], src)
+
+    def test_perl_heredoc_real_corpus_forms(self):
+        # Идентификатор с ведущим «_», «::» в имени дескриптора, «<<» вплотную после функции вывода.
+        for src in ("print <<_EOUSAGE_ ;\n# not\n_EOUSAGE_\n# real\n", "print <<_EOVERS;\n# not\n_EOVERS\n# real\n",
+                    "print {$DB::OUT} <<EOP;\n# not\nEOP\n# real\n", "die<<EOF;\n# not\nEOF\n# real\n",
+                    "warn<<EOF;\n# not\nEOF\n# real\n", "print<<EOT;\n# not\nEOT\n# real\n",
+                    "printf<<EOT, 1;\n# not\nEOT\n# real\n", "say<<EOT;\n# not\nEOT\n# real\n",
+                    "print CSS<<EOF;\n# not\nEOF\n# real\n", "print STDERR<<EOF;\n# not\nEOF\n# real\n"):
+            self.assertEqual(comments.comment_lines(src, "pl"), ["# real"], src)
+
+    def test_perl_tight_shift_is_not_heredoc(self):
+        # Вплотную после прочего слова, переменной или константы вне print — сдвиг; в Ruby print<<EOT — сдвиг.
+        for src, ext in (("x = 1<<EOF; # c1\n# c2\nEOF\n", "pl"), ("$print<<EOF; # c1\n# c2\nEOF\n", "pl"),
+                         ("foo CSS<<EOF; # c1\n# c2\nEOF\n", "pl"), ("$h->print<<EOF; # c1\n# c2\nEOF\n", "pl"),
+                         ("reprint<<EOF; # c1\n# c2\nEOF\n", "pl"), ("print<<EOF # c1\n# c2\nEOF\n", "rb"),
+                         ("print CSS<<EOF # c1\n# c2\nEOF\n", "rb"), ("print <<_ # c1\n# c2\n_\n", "pl")):
+            self.assertEqual(comments.comment_lines(src, ext), ["# c1", "# c2"], src)
+        self.assertEqual(comments.comment_lines("puts <<_eof # c1\n# c2\n_eof\n", "rb"), ["# c1", "# c2"])
+
+    def test_perl_hash_element_before_shift(self):
+        # «}» закрывает элемент хеша, а не «{$дескриптор}» после print.
+        self.assertEqual(comments._comments("my $x = $h{$k} <<FLAGS; # c1\n# c2\nFLAGS\n", "pl"),
+                         [(1, "# c1"), (2, "# c2")])
+        self.assertEqual(comments._comments("print $h{$k} <<FLAGS; # c1\n# c2\nFLAGS\n", "pl"),
+                         [(1, "# c1"), (2, "# c2")])
+
+    def test_shift_after_quoted_term_is_not_heredoc(self):
+        for src in ('puts "a" <<EOF # c1\n# c2\nEOF\n', "puts 'a' <<EOF # c1\n# c2\nEOF\n",
+                    "puts `a` <<EOF # c1\n# c2\nEOF\n"):
+            self.assertEqual(comments.comment_lines(src, "rb"), ["# c1", "# c2"], src)
+
+    def test_lowercase_heredoc_after_operator_or_line_start(self):
+        # Строчный идентификатор без «-», «~» и кавычек — heredoc там, где добавление невозможно.
+        self.assertEqual(comments.comment_lines("x = <<eof\n# not\neof\n# real\n", "rb"), ["# real"])
+        self.assertEqual(comments.comment_lines("  <<'eof'\n# not\neof\n# real\n", "rb"), ["# real"])
+        self.assertEqual(comments.comment_lines("puts <<'eof'\n# not\neof\n# real\n", "rb"), ["# real"])
+        self.assertEqual(comments.comment_lines("puts <<`eof`\n# not\neof\n# real\n", "rb"), ["# real"])
+
+    def test_perl_filehandle_branch_needs_print_and_dollar(self):
+        self.assertEqual(comments.comment_lines("print STDOUT <<eof;\n# not\neof\n# real\n", "pl"), ["# real"])
+        self.assertEqual(comments.comment_lines("print STDERR <<eof;\n# not\neof\n# real\n", "pl"), ["# real"])
+        for src in ("foo STDOUT <<eof; # c1\n# c2\neof\n", "foo STDERR <<eof; # c1\n# c2\neof\n",
+                    "print @a <<EOF; # c1\n# c2\nEOF\n"):
+            self.assertEqual(comments.comment_lines(src, "pl"), ["# c1", "# c2"], src)
+
+    def test_many_unterminated_heredocs_are_all_rolled_back(self):
+        # Каждый откат снимает открытие, поглотившее остаток файла: четыре подряд — пять разборов.
+        src = "a = <<A\n# c2\nb = <<B\n# c4\nc = <<C\n# c6\nd = <<D\n# c8\n"
+        self.assertEqual(comments._comments(src, "rb"), [(2, "# c2"), (4, "# c4"), (6, "# c6"), (8, "# c8")])
+        # Все незакрытые открытия одной строки снимаются за один откат.
+        many = "f(" + ", ".join(f"<<A{i}" for i in range(10)) + ")\n# c2\n"
+        self.assertEqual(comments._comments(many, "rb"), [(2, "# c2")])
+
+    def test_heredoc_after_operator_or_function_name(self):
+        for src in ("x = <<EOF\n# not\nEOF\n# real\n", "foo(<<EOF)\n# not\nEOF\n# real\n",
+                    "print <<EOF;\n# not\nEOF\n# real\n", "puts <<~sql\n# not\nsql\n# real\n",
+                    "foo a, <<EOF\n# not\nEOF\n# real\n", "<<EOF\n# not\nEOF\n# real\n"):
+            self.assertEqual(comments.comment_lines(src, "rb"), ["# real"], src)
+
+    def test_unterminated_heredoc_is_rolled_back(self):
+        self.assertEqual(comments._comments("x = <<EOF\n# c2\n# c3\n", "rb"), [(2, "# c2"), (3, "# c3")])
+        # Откат касается только незакрытого: закрытый heredoc остаётся данными.
+        src = "a = <<ONE\n# not\nONE\nb = <<TWO\n# c5\n"
+        self.assertEqual(comments._comments(src, "rb"), [(5, "# c5")])
+        self.assertEqual(comments._comments("x = <<EOT\n# c2\n", "tf"), [(2, "# c2")])
+
+    def test_indented_terminator_of_plain_heredoc_is_not_terminator(self):
+        src = "x = <<ID\n  ID\n# not\nID\n# real\n"
+        self.assertEqual(comments.comment_lines(src, "rb"), ["# real"])
+
+
 class ExtractTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -247,6 +394,13 @@ class ExtractTest(unittest.TestCase):
         self.assertEqual(len(lines), comments.MAX_BYTES // len(f"a.py: {body}"))
         self.assertLessEqual(sum(len(l.encode("utf-8")) for l in lines), comments.MAX_BYTES)
 
+    def test_no_lines_after_byte_truncation(self):
+        self.write("a.py", ("# " + "x" * 1000 + "\n") * 20)
+        self.write("b.py", "# s\n")
+        lines, truncated, _, _ = comments.extract(self.root, ["a.py", "b.py"])
+        self.assertTrue(truncated)
+        self.assertEqual([l for l in lines if l.startswith("b.py")], [])
+
     def test_deadline_passed_files_without_check(self):
         common._reset()
         self.write("a.py", "# a\n")
@@ -318,6 +472,123 @@ class ExtractTest(unittest.TestCase):
                              ["sub/s.py: # new sub"])
         finally:
             shutil.rmtree(lib, ignore_errors=True)
+
+    def init_repo(self, path, files):
+        """Отдельный репозиторий path с коммитом files {путь: текст}; HEAD."""
+        path.mkdir(parents=True, exist_ok=True)
+        git = ["git", "-C", str(path), "-c", "user.email=t@t", "-c", "user.name=t"]
+        subprocess.run([*git, "init", "-q"], check=True)
+        for rel, text in files.items():
+            (path / rel).write_text(text, encoding="utf-8")
+        subprocess.run([*git, "add", "--", *files], check=True)
+        subprocess.run([*git, "commit", "-qm", "i"], check=True)
+        return subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_nested_repo_against_its_base(self):
+        self.git("init", "-q")
+        self.write("top.py", "x = 1\n")
+        self.commit("top.py")
+        nested = self.init_repo(self.root / "nested", {"n.py": "# old comment english\n"})
+        inner = self.init_repo(self.root / "nested" / "inner", {"i.py": "# old inner\n"})
+        self.write("nested/n.py", "# old comment english\n# новый комментарий\n")
+        self.write("nested/inner/i.py", "# old inner\n# новый внутренний\n")
+        bases = {"nested": nested, "nested/inner": inner}
+        lines, _, _, _ = comments.extract(self.root, ["nested/n.py", "nested/inner/i.py"], "HEAD", bases)
+        self.assertEqual(lines, ["nested/n.py: # новый комментарий", "nested/inner/i.py: # новый внутренний"])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_nested_repo_inside_submodule_against_its_base(self):
+        lib = pathlib.Path(self.tmp.name + "-lib")
+        self.addCleanup(shutil.rmtree, lib, True)
+        self.git("init", "-q")
+        self.init_repo(lib, {"s.py": "x = 1\n"})
+        subprocess.run(["git", "-c", "protocol.file.allow=always", "-C", str(self.root), "submodule", "add", "-q",
+                        str(lib), "sub"], check=True, capture_output=True)
+        sub = subprocess.run(["git", "-C", str(self.root / "sub"), "rev-parse", "HEAD"], capture_output=True,
+                             text=True, check=True).stdout.strip()
+        inner = self.init_repo(self.root / "sub" / "inner", {"i.py": "# old inner\n"})
+        self.write("sub/inner/i.py", "# old inner\n# новый\n")
+        lines, _, _, _ = comments.extract(self.root, ["sub/inner/i.py"], "HEAD", {"sub": sub, "sub/inner": inner})
+        self.assertEqual(lines, ["sub/inner/i.py: # новый"])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_project_gitattributes_binary_still_diffed(self):
+        self.git("init", "-q")
+        self.write(".gitattributes", "*.py -diff\n*.go binary\n")
+        self.write("a.py", "# old\nx = 1\n")
+        self.write("b.go", "// old\n")
+        self.commit(".gitattributes", "a.py", "b.go")
+        self.write("a.py", "# old\nx = 1\n# new\n")
+        self.write("b.go", "// old\n// new\n")
+        self.assertEqual(comments.extract(self.root, ["a.py", "b.go"])[0], ["a.py: # new", "b.go: // new"])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_renamed_file_against_old_path(self):
+        self.git("init", "-q")
+        body = "# old one\n" + "x = 1\n" * 10 + "# old two\n"
+        self.write("a.py", body)
+        self.write("keep.py", "y = 1\n")
+        self.commit("a.py", "keep.py")
+        (self.root / "pkg").mkdir()
+        self.git("mv", "a.py", "pkg/b.py")
+        self.write("pkg/b.py", body + "# новое\n")
+        self.write("keep.py", "y = 1\n# k\n")
+        lines, _, _, _ = comments.extract(self.root, ["keep.py", "pkg/b.py"])
+        self.assertEqual(lines, ["keep.py: # k", "pkg/b.py: # новое"])
+        # Переименование, закоммиченное за реплику, — против базы на старте.
+        base = subprocess.run(["git", "-C", str(self.root), "rev-parse", "HEAD"], capture_output=True,
+                              text=True, check=True).stdout.strip()
+        self.git("add", "-A")
+        self.git("commit", "-qm", "mv")
+        self.assertEqual(comments.extract(self.root, ["pkg/b.py"], base)[0], ["pkg/b.py: # новое"])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_rename_sources_limit(self):
+        self.git("init", "-q")
+        body = "# old one\n" + "x = 1\n" * 10 + "# old two\n"
+        self.write("a.py", body)
+        self.commit("a.py")
+        self.git("mv", "a.py", "b.py")
+        self.write("b.py", body + "# новое\n")
+        # Предел включительно: один удалённый путь при пределе 1 — пара находится, при пределе 0 — файл целиком.
+        with mock.patch.object(comments, "MAX_RENAME_SOURCES", 1):
+            self.assertEqual(comments.extract(self.root, ["b.py"])[0], ["b.py: # новое"])
+        with mock.patch.object(comments, "MAX_RENAME_SOURCES", 0):
+            self.assertEqual(comments.extract(self.root, ["b.py"])[0],
+                             ["b.py: # old one", "b.py: # old two", "b.py: # новое"])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_new_tracked_file_without_rename_is_whole(self):
+        self.git("init", "-q")
+        self.write("gone.py", "x = 1\n")
+        self.write("a.py", "y = 2\n")
+        self.commit("gone.py", "a.py")
+        self.git("rm", "-q", "gone.py")
+        self.write("n.py", "# one\n# two\n")
+        self.git("add", "n.py")
+        self.assertEqual(comments.extract(self.root, ["n.py"])[0], ["n.py: # one", "n.py: # two"])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_plain_mv_untracked_target_is_whole_file(self):
+        """Остаток: путь после mv без git add не отслеживается, пары с удалённым у git нет."""
+        self.git("init", "-q")
+        self.write("a.py", "# old\n")
+        self.commit("a.py")
+        os.rename(self.root / "a.py", self.root / "b.py")
+        self.assertEqual(comments.extract(self.root, ["b.py"])[0], ["b.py: # old"])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_added_line_looking_like_diff_header(self):
+        self.git("init", "-q")
+        self.write("a.c", "int a;\n" * 10)
+        self.commit("a.c")
+        lines = ["int a;"] * 10
+        lines.insert(1, "++ i;")
+        lines.insert(8, "// c")
+        self.write("a.c", "\n".join(lines) + "\n")
+        self.assertEqual(comments.extract(self.root, ["a.c"])[0], ["a.c: // c"])
 
     @unittest.skipUnless(shutil.which("git"), "нет git")
     def test_git_two_calls_for_many_files(self):
@@ -433,8 +704,8 @@ class UnquoteTest(unittest.TestCase):
         self.assertEqual(comments._unquote('"b\\377\\t.py"'), os.fsdecode(b"b\xff\t.py"))
 
 
-class MakefileNamesTest(unittest.TestCase):
-    def test_all_code_names_have_hash_syntax(self):
+class CodeNamesTest(unittest.TestCase):
+    def test_all_code_names_have_comment_syntax(self):
         for name in common.CODE_NAMES:
             self.assertEqual(comments.extract("/nonexistent", [name])[2], [], name)
 
@@ -451,6 +722,19 @@ class LinearParseTest(unittest.TestCase):
         started = time.monotonic()
         self.assertEqual(comments.comment_lines('x = """a""" ' * 250000, "py"), [])
         self.assertLess(time.monotonic() - started, 3)
+
+    def test_long_prefix_before_many_heredoc_openers(self):
+        # Решение «heredoc или сдвиг» смотрит только хвост строки перед «<<», а не весь префикс.
+        cases = (('my $d = "' + "ab" * 50000 + '"; print $fh <<EOF;\nbody\nEOF\n', "pl", []),
+                 ("x" * 200000 + " <<b " * 2000, "rb", []),
+                 ("print {$" + "f" * 200000 + "} <<B " * 2000 + "\n# not\nB\n", "pl", []),
+                 (" " * 200000 + "x <<b " * 20000, "rb", []),
+                 # Первые тройные кавычки — docstring: строка идёт в вывод целиком.
+                 (" " * 200000 + '"""""" ' * 20000, "py", [(1, ('"""""" ' * 20000).strip())]))
+        for text, ext, expected in cases:
+            started = time.monotonic()
+            self.assertEqual(comments._comments(text, ext, time.monotonic() + 30), expected, ext)
+            self.assertLess(time.monotonic() - started, 1, ext)
 
     def test_deadline_during_parse_files_without_check(self):
         common._reset()
@@ -471,6 +755,23 @@ class LinearParseTest(unittest.TestCase):
                          ["planka: строки комментариев не извлечены в срок, файлов кода без проверки: 1"])
         common._reset()
 
+    def test_deadline_inside_one_long_line(self):
+        common._reset()
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        pathlib.Path(root, "a.js").write_text('x = "a"; ' * 200000 + "// c\n", encoding="utf-8")
+        ticks = iter(range(10 ** 9))
+        seen = []
 
-if __name__ == "__main__":
-    unittest.main()
+        def clock():
+            seen.append(next(ticks))
+            return seen[-1]
+
+        # Часы идут на единицу за вызов; срок истекает, когда в строке ещё сотни тысяч позиций.
+        with mock.patch.object(comments.time, "monotonic", side_effect=clock):
+            lines, _, _, late = comments.extract(root, ["a.js"], None, None, 50)
+        self.assertEqual((lines, late), ([], ["a.js"]))
+        # Разбор остановился на сроке, а не дошёл до конца строки: проверок срока на несколько порядков
+        # меньше позиций.
+        self.assertLess(len(seen), 200)
+        common._reset()

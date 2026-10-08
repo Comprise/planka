@@ -26,7 +26,7 @@ class _Syntax:
     """Синтаксис комментариев и строковых литералов одного языка.
 
     line — (маркер, правило) строчного комментария: правило "any" — маркер везде, "word" — в начале строки
-    или после пробела, "code" — не сразу после «$» и «{», "php" — «#» не перед «[», "css" — не сразу после
+    или после пробела, "code" — не сразу после «$», «{» и «\\», "php" — «#» не перед «[», "css" — не сразу после
     «:» (url(http://…) без кавычек). blocks — (открытие,
     закрытие) блочного комментария. strings — (открытие, закрытие, многострочный ли, escape): escape "\\" —
     обратная косая, "double" — удвоенная закрывающая кавычка, "nix" — escape строк '' Nix, None — нет;
@@ -42,7 +42,7 @@ class _Syntax:
             docstring, heredoc, lua, raw, zig, shebang)
         firsts = {m[0] for m, _ in line} | {o[0] for o, _ in blocks} | {s[0][0] for s in strings}
         firsts |= {"'"} if char else set()
-        firsts |= {"<"} if heredoc == "tf" else set()
+        firsts |= {"<"} if heredoc in ("tf", "ruby", "perl") else set()
         firsts |= {"-", "["} if lua else set()
         firsts |= {"\\"} if zig else set()
         self.starts = re.compile("[" + "".join(re.escape(c) for c in sorted(firsts)) + "]")
@@ -85,7 +85,11 @@ _add(("proto", "sol"), line=_SLASH, blocks=_C_BLOCK, strings=(_DQ, _SQ))
 _add(("zig",), line=_SLASH, strings=(_DQ,), char=True, zig=True)
 _add(("py", "pyi"), line=_H, strings=(_T_DQ, _T_SQ, _DQ, _SQ), docstring=True, shebang=True)
 _add(("sh", "bash", "zsh"), line=(("#", "word"),), strings=(_DQ, _SQ_RAW), heredoc="shell", shebang=True)
-_add(("rb", "pl", "r", "mk", "makefile", "cmake") + tuple(n.lower() for n in _HASH_NAMES),
+_RUBY_NAMES = ("rakefile", "gemfile")
+_add(("rb",) + _RUBY_NAMES, line=_H, strings=(_DQ, _SQ), quote_word=True, shebang=True, heredoc="ruby")
+# Perl — heredoc Ruby и ещё heredoc в дескриптор: «print $fh <<EOF».
+_add(("pl",), line=_H, strings=(_DQ, _SQ), quote_word=True, shebang=True, heredoc="perl")
+_add(("r", "mk", "makefile", "cmake") + tuple(n.lower() for n in _HASH_NAMES if n.lower() not in _RUBY_NAMES),
      line=_H, strings=(_DQ, _SQ), quote_word=True, shebang=True)
 _add(("toml",), line=_H, strings=(_T_DQ, _T_SQ_RAW, _DQ, _SQ_RAW))
 _add(("yaml", "yml"), line=(("#", "word"),), strings=(_DQ, ("'", "'", False, "double")), quote_word=True)
@@ -112,6 +116,8 @@ _LUA_BLOCK = re.compile(r"--\[(=*)\[")
 _LUA_LONG = re.compile(r"\[(=*)\[")
 _CPP_RAW = re.compile(r'"([^()\\\s]{0,16})\(')
 _TF_HEREDOC = re.compile(r"<<(-?)([A-Za-z_][\w-]*)")
+# Heredoc Ruby и Perl: «<<ID», «<<-ID», «<<~ID», идентификатор и в кавычках.
+_RUBY_HEREDOC = re.compile(r"<<([-~]?)([\"'`]?)([A-Za-z_]\w*)\2")
 # Символьный литерал: один символ или escape; «'a» без закрывающей кавычки — время жизни Rust, штрих Haskell.
 _CHAR = re.compile(r"'(?:[^'\\]|\\(?:u\{[0-9a-fA-F]{1,6}\}|x[0-9a-fA-F]{2}|[0-7]{1,3}|.))'")
 
@@ -124,7 +130,7 @@ def _marker_ok(raw, i, rule):
     if rule == "word":
         return i == 0 or raw[i - 1].isspace()
     if rule == "code":
-        return i == 0 or raw[i - 1] not in "${"
+        return i == 0 or raw[i - 1] not in "${\\"
     if rule == "php":
         return not raw.startswith("[", i + 1)
     if rule == "css":
@@ -176,27 +182,105 @@ def _raw_string(mode, raw, i):
     return None
 
 
-_LEAD_SPACE = re.compile(r"\s*")
+def _back(raw, j, pred):
+    """Начало серии символов с pred, кончающейся перед j."""
+    while j and pred(raw[j - 1]):
+        j -= 1
+    return j
+
+
+# Хвосты строки перед позицией разбора просматриваются назад; время — линейное по длине строки.
 
 
 def _docstring_start(raw, i):
     """Начало docstring, чьи тройные кавычки стоят в i: строка начинается с них (префикс r или u); иначе None."""
-    lead = _LEAD_SPACE.match(raw, 0, i).end()
-    return lead if lead == i or (lead == i - 1 and raw[lead] in "rRuU") else None
+    k = i - 1 if i and raw[i - 1] in "rRuU" else i
+    return k if not _back(raw, k, str.isspace) else None
 
 
-def _token(syn, raw, i, pending, unclosed):
+_PRINT = frozenset(("print", "printf", "say"))
+# Функции Perl, после которых «<<ID» вплотную — heredoc.
+_PERL_TIGHT = _PRINT | {"die", "warn"}
+_PERL_HANDLE = re.compile(r"[A-Z_][A-Z0-9_]*")
+
+
+def _after_print(raw, j):
+    """Стоит ли перед j через пробел отдельное слово print, printf или say Perl."""
+    k = _back(raw, j, str.isspace)
+    if k == j:
+        return False
+    # Слово длиннее «printf» — не из _PRINT: дальше назад не идём.
+    start = k
+    while start and _is_word(raw[start - 1]) and k - start <= 6:
+        start -= 1
+    return raw[start:k] in _PRINT
+
+
+def _tight_perl(raw, i):
+    """Стоит ли перед «<<» в i вплотную слово Perl, после которого идёт heredoc: print, printf, say, die,
+    warn («print<<EOT») или дескриптор из заглавных и «_» после print, printf, say («print CSS<<EOF»)."""
+    k = _back(raw, i, _is_word)
+    if k == i or k and raw[k - 1] in "$@%&>":
+        return False
+    word = raw[k:i]
+    return word in _PERL_TIGHT or bool(_PERL_HANDLE.fullmatch(word)) and _after_print(raw, k)
+
+
+def _heredoc_ok(raw, i, m, perl=False):
+    """Открывает ли «<<» с совпавшим _RUBY_HEREDOC m в позиции i heredoc, а не сдвиг или добавление.
+
+    Сразу после слова или закрывающей скобки — сдвиг («1<<BITS», «a[0]<<X»). После пробела: за скобкой или
+    кавычкой — терм, сдвиг; за переменной Perl («$a», «@a») — сдвиг; за прочим словом — heredoc, если
+    идентификатор с «-», «~», в кавычках или с заглавной буквы («print <<EOF»), иначе добавление
+    («a <<b»). За любым другим знаком («=», «(», «,») и в начале строки — heredoc.
+
+    perl — ещё heredoc в дескриптор после print, printf, say: «$fh», «{$fh}», «{$DB::OUT}», STDOUT, STDERR
+    через пробел; «<<» вплотную после print, printf, say, die, warn и после дескриптора из заглавных и «_»
+    за print, printf, say (_tight_perl); ведущие «_» идентификатора не мешают заглавной букве
+    («<<_EOUSAGE_»). В Ruby «print $fh <<EOF» — сдвиг глобальной переменной, там правило не действует.
+    """
+    if not i:
+        return True
+    if _is_word(raw[i - 1]) or raw[i - 1] in ")]}":
+        return perl and _tight_perl(raw, i)
+    j = _back(raw, i, str.isspace)
+    if j == i or not j:
+        return True
+    if perl and raw[j - 1] == "}":
+        k = _back(raw, j - 1, lambda c: _is_word(c) or c == ":")
+        return k < j - 1 and raw[k - 2:k] == "{$" and _after_print(raw, k - 2)
+    if raw[j - 1] in ")]}\"'`":
+        return False
+    k = _back(raw, j, _is_word)
+    if k == j:
+        return True
+    if k and raw[k - 1] in "$@":
+        return perl and raw[k - 1] == "$" and _after_print(raw, k - 1)
+    if perl and raw[k:j] in ("STDOUT", "STDERR") and _after_print(raw, k):
+        return True
+    ident = m.group(3).lstrip("_") if perl else m.group(3)
+    return bool(m.group(1) or m.group(2) or ident[:1].isupper())
+
+
+def _token(syn, raw, i, pending, unclosed, n=0, banned=frozenset()):
     """Разбор с позиции i вне литерала и комментария.
 
     ("line",) — строчный комментарий до конца строки; ("skip", j) — литерал до j; ("open", закрытие,
     escape, в вывод ли, начало вывода, конец открытия) — многострочный блок или литерал; None — обычный символ.
-    unclosed — открытия однострочных литералов, не закрытых в этой строке; _token дополняет его.
+    unclosed — открытия однострочных литералов, не закрытых в этой строке; _token дополняет его. n — номер
+    строки; heredoc с позицией (n, i) из banned не открывается.
     """
     c = raw[i]
     if syn.heredoc == "tf" and raw.startswith("<<", i):
         m = _TF_HEREDOC.match(raw, i)
         if m:
-            pending.append((m.group(2), "strip"))
+            if (n, i) not in banned:
+                pending.append((m.group(2), "strip", (n, i)))
+                return "skip", m.end()
+    if syn.heredoc in ("ruby", "perl") and raw.startswith("<<", i) and (n, i) not in banned:
+        m = _RUBY_HEREDOC.match(raw, i)
+        if m and _heredoc_ok(raw, i, m, syn.heredoc == "perl"):
+            pending.append((m.group(3), "exact" if not m.group(1) else "strip", (n, i)))
             return "skip", m.end()
     if syn.lua and raw.startswith("--", i):
         m = _LUA_BLOCK.match(raw, i)
@@ -240,28 +324,52 @@ def _token(syn, raw, i, pending, unclosed):
     return None
 
 
-# Срок разбора проверяется раз на столько строк.
+# Срок разбора проверяется раз на столько шагов; шаг — строка или позиция разбора внутри строки.
 _DEADLINE_EVERY = 1000
+# Повторов разбора без незакрытых heredoc; каждый повтор отбрасывает хотя бы один.
+_MAX_REPARSE = 8
 
 
 def _comments(text, ext, deadline=None):
     """[(номер строки с 1, строка комментария)]; номер считается по «\\n», как в git diff. TimeoutError, если
-    срок deadline (time.monotonic) прошёл до конца разбора."""
+    срок deadline (time.monotonic) прошёл до конца разбора. Heredoc Ruby, Perl и Terraform без терминатора
+    до конца файла — не heredoc: разбор повторяется без него, и тело читается как код."""
     syn = _SYNTAX.get(ext.lower())
     if syn is None:
         return []
+    banned = frozenset()
+    for _ in range(_MAX_REPARSE):
+        out, open_ = _parse(text, syn, deadline, banned)
+        if not open_ or syn.heredoc == "shell":
+            break
+        banned |= {where for _, _, where in open_}
+    return out
+
+
+def _parse(text, syn, deadline, banned):
+    """(комментарии, heredoc без терминатора к концу файла); banned — позиции heredoc, не открывающихся."""
     out = []
     # Открытый многострочный блок или литерал: (закрытие, escape, идут ли его строки в вывод).
     state = None
-    # Открытые heredoc: (терминатор, как сравнивать строку): тело heredoc — данные.
+    # Открытые heredoc: (терминатор, как сравнивать строку, позиция «<<» или None): тело heredoc — данные.
     pending = []
-    for n, raw in enumerate(text.split("\n"), 1):
-        if deadline is not None and n % _DEADLINE_EVERY == 1 and time.monotonic() >= deadline:
+    steps = 0
+
+    def tick():
+        nonlocal steps
+        steps += 1
+        if deadline is not None and steps % _DEADLINE_EVERY == 1 and time.monotonic() >= deadline:
             raise TimeoutError
+
+    for n, raw in enumerate(text.split("\n"), 1):
+        tick()
         if raw.endswith("\r"):
             raw = raw[:-1]
+        # BOM UTF-8 в начале файла — не текст: иначе «#!» первой строки не узнаётся.
+        if n == 1 and raw.startswith("\ufeff"):
+            raw = raw[1:]
         if pending:
-            term, mode = pending[0]
+            term, mode, _ = pending[0]
             if (raw.strip() if mode == "strip" else raw.lstrip("\t") if mode == "tabs" else raw) == term:
                 pending.pop(0)
             continue
@@ -271,6 +379,7 @@ def _comments(text, ext, deadline=None):
         i = 0
         unclosed = set()
         while i < len(raw):
+            tick()
             if state:
                 j = _close(raw, i, state[0], state[1])
                 if j < 0:
@@ -281,7 +390,7 @@ def _comments(text, ext, deadline=None):
             if m is None:
                 break
             i = m.start()
-            act = _token(syn, raw, i, pending, unclosed)
+            act = _token(syn, raw, i, pending, unclosed, n, banned)
             if act is None:
                 i += 1
             elif act[0] == "line":
@@ -297,8 +406,8 @@ def _comments(text, ext, deadline=None):
         if start is not None and raw[start:].strip():
             out.append((n, raw[start:].strip()))
         if syn.heredoc == "shell":
-            pending = [(term, "tabs" if tabs else "exact") for term, tabs in depcheck.heredocs(raw)]
-    return out
+            pending = [(term, "tabs" if tabs else "exact", None) for term, tabs in depcheck.heredocs(raw)]
+    return out, pending
 
 
 def comment_lines(text, ext):
@@ -359,36 +468,63 @@ def _unquote(path):
 
 
 _HUNK = re.compile(rb"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+# Больше удалённых путей в пару переименованию не подбирается: командная строка git ограничена.
+MAX_RENAME_SOURCES = 1000
 
 
-def _added_lines(root, relpaths, base, deadline):
-    """{путь: номера строк рабочей версии, добавленных против коммита base} по одному git diff на все пути;
-    None, если diff не получен."""
-    out = _git(root, deadline, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--relative",
-               "--src-prefix=a/", "--dst-prefix=b/", "-U0", "--inter-hunk-context=0", base, "--", *relpaths)
+def _diff(root, paths, base, deadline):
+    """({путь: номера добавленных строк}, пути, новые против base без пары-переименования) git diff путей
+    paths против коммита base; None, если diff не получен. --text — и для файлов с атрибутом -diff или
+    binary; --find-renames — переименованный файл сравнивается со старым путём, если тот есть в paths."""
+    out = _git(root, deadline, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--text", "--find-renames",
+               "--relative", "--src-prefix=a/", "--dst-prefix=b/", "-U0", "--inter-hunk-context=0", base, "--",
+               *paths)
     if out is None:
         return None
-    added, current, in_header = {}, None, False
+    added, new, current, in_header, from_null = {}, set(), None, False, False
     for line in out.split(b"\n"):
         if line.startswith(b"diff --git "):
-            current, in_header = None, True
+            current, in_header, from_null = None, True, False
+        elif in_header and line.startswith(b"--- "):
+            from_null = line == b"--- /dev/null"
         elif in_header and line.startswith(b"+++ "):
             target = os.fsdecode(line[4:])
             current = None if target == "/dev/null" else _unquote(target)[2:]
+            if current is not None and from_null:
+                new.add(current)
         elif line.startswith(b"@@"):
             in_header = False
             m = _HUNK.match(line)
             if current is not None and m:
                 first, count = int(m.group(1)), 1 if m.group(2) is None else int(m.group(2))
                 added.setdefault(current, set()).update(range(first, first + count))
-    return added
+    return added, new
+
+
+def _added_lines(root, relpaths, base, deadline):
+    """{путь: номера строк рабочей версии, добавленных против коммита base}; None, если diff не получен.
+
+    Один git diff на все пути; если среди них есть новые против base, diff повторяется вместе с путями,
+    удалёнными против base: переименованный файл (git mv) — против своего старого пути, а не целиком.
+    """
+    found = _diff(root, relpaths, base, deadline)
+    if found is None or not found[1]:
+        return None if found is None else found[0]
+    gone = _git(root, deadline, "diff", "--name-only", "-z", "--no-renames", "--diff-filter=D", "--relative",
+                base, "--")
+    sources = [os.fsdecode(e) for e in (gone or b"").split(b"\0") if e]
+    if not sources or len(sources) > MAX_RENAME_SOURCES:
+        return found[0]
+    paired = _diff(root, [*relpaths, *sources], base, deadline)
+    return found[0] if paired is None else paired[0]
 
 
 def _select(root, relpaths, base, sub_bases, deadline, prefix, out):
     """Заполняет out {prefix + путь: номера строк к проверке или None — весь файл}: для отслеживаемого файла —
     строки, добавленные против коммита base; весь файл — для неотслеживаемого, без base и при недоступном diff.
     Файл подмодуля — против sub_bases[путь подмодуля] (HEAD подмодуля на старте реплики), без записи — против
-    текущего HEAD подмодуля. TimeoutError — по сроку deadline; уже заполненное остаётся в out."""
+    текущего HEAD подмодуля; файл вложенного репозитория не подмодуля — против sub_bases[его путь].
+    Ключи sub_bases — пути от root. TimeoutError — по сроку deadline; уже заполненное остаётся в out."""
     if base is None:
         out.update({prefix + p: None for p in relpaths})
         return
@@ -397,14 +533,17 @@ def _select(root, relpaths, base, sub_bases, deadline, prefix, out):
     stage = [os.fsdecode(e).partition("\t") for e in listing.split(b"\0") if e]
     subs = [path for meta, _, path in stage if meta.startswith("160000 ")]
     listed = {path for meta, _, path in stage if not meta.startswith("160000 ")}
+    # Вложенный репозиторий не подмодуль — ключ sub_bases без записи 160000 в индексе; его файлы — против
+    # своей базы, как файлы подмодуля. Файл достаётся самому глубокому репозиторию, чей путь — его префикс.
+    repos = {**{sub: "HEAD" for sub in subs}, **sub_bases}
     in_subs = set()
-    for sub in subs:
-        inside = [p for p in relpaths if p.startswith(sub + "/")]
+    for sub in sorted(repos, key=len, reverse=True):
+        inside = [p for p in relpaths if p.startswith(sub + "/") and p not in in_subs]
         if inside:
             in_subs.update(inside)
-            nested = {k[len(sub) + 1:]: v for k, v in sub_bases.items() if k.startswith(sub + "/")}
-            _select(os.path.join(root, sub), [p[len(sub) + 1:] for p in inside], sub_bases.get(sub, "HEAD"),
-                    nested, deadline, f"{prefix}{sub}/", out)
+            # Базы глубже sub уже применены: их репозитории обработаны раньше.
+            _select(os.path.join(root, sub), [p[len(sub) + 1:] for p in inside], repos[sub], {}, deadline,
+                    f"{prefix}{sub}/", out)
     rest = [p for p in relpaths if p not in in_subs]
     tracked = [p for p in rest if p in listed]
     added = _added_lines(root, tracked, base, deadline) if tracked else {}
@@ -426,8 +565,8 @@ def extract(root, relpaths, base="HEAD", sub_bases=None, deadline=None):
 
     Файл разбирается целиком, в вывод идут комментарии на строках, добавленных против коммита base (HEAD на
     старте реплики: коммит в ходе реплики их не прячет); None — репозиторий без коммитов, файлы берутся
-    целиком. sub_bases — то же для подмодулей: {путь подмодуля: коммит}. Непустой список не разобранных к
-    сроку — с предупреждением.
+    целиком. sub_bases — то же для подмодулей и вложенных репозиториев: {путь репозитория от root: коммит или
+    None}. Непустой список не разобранных к сроку — с предупреждением.
     """
     unknown = [p for p in relpaths if _ext(p) not in _KNOWN]
     known = [p for p in relpaths if _ext(p) in _KNOWN]

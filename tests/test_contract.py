@@ -1,19 +1,83 @@
 """Контракт кода с настоящими текстами правил: имена разделов ядра, файлы модулей, метки."""
+import ast
+import json
 import re
+import sys
 import unittest
 
-from tests.helpers import REPO
+from tests.helpers import PLANKA_DIR, REPO
+
+sys.path.insert(0, str(PLANKA_DIR))
+import common  # noqa: E402
+import guard_memory  # noqa: E402
+import judge_stop  # noqa: E402
+import remind  # noqa: E402
 
 PLUGIN = REPO / "plugin"
-# Разделы ядра и модули, которые код берёт по имени: common.rubric, common.philosophy_sections,
-# common.rule_texts в judge_tool, judge_stop, debug_watch и guard_memory; «Границы» называют judge_tool.DEP_REASON
-# и guard_memory, dependencies — judge_tool.DEP_REASON, refactoring и design-patterns — рубрики судей плана и
-# документации, heuristics — рубрика судьи плана, debugging — debug_watch, memory — guard_memory.
+# Обратное направление: разделы и модули, которые код обязан брать (имена выводит из кода _code_names);
+# «Границы» называют judge_tool.DEP_REASON и guard_memory, dependencies — judge_tool.DEP_REASON.
 SECTIONS = ("Решения", "Планы", "Границы")
 MODULES = ("planning", "subagents", "verification", "docs", "comments", "dependencies",
            "refactoring", "design-patterns", "heuristics", "debugging", "memory")
 # Метки, которые подставляет common.substitute; любая другая дошла бы до агента как есть.
 MARKS = {"{RULES}", "{COMMENT_LANG}", "{DOC_LANG}"}
+
+
+def _strings(node):
+    """Строковые литералы в выражении (кортежи, списки, условные выражения)."""
+    return {n.value for n in ast.walk(node) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+
+
+def _code_names():
+    """(разделы, модули), которые код plugin/planka/*.py берёт по имени.
+
+    Разделы — литералы в common.rubric (1-й аргумент) и common.philosophy_sections; модули — литералы
+    в common.rubric (2-й аргумент) и common.rule_texts, константа MODULE, а для имени-списка в
+    rubric(..., tuple(имя)) — всё, что в него кладут: литерал, append, +=."""
+    sections, modules = set(), set()
+    for path in PLANKA_DIR.glob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        lists = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "MODULE"
+                                                    for t in node.targets):
+                modules |= _strings(node.value)
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            attr = node.func.attr
+            if attr == "philosophy_sections":
+                for arg in node.args:
+                    sections |= _strings(arg)
+            elif attr == "rule_texts":
+                for arg in node.args:
+                    modules |= _strings(arg)
+            elif attr == "rubric" and len(node.args) >= 2:
+                sections |= _strings(node.args[0])
+                modules |= _strings(node.args[1])
+                lists |= {n.id for n in ast.walk(node.args[1]) if isinstance(n, ast.Name) and n.id != "tuple"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in (
+                    "append", "extend") and isinstance(node.func.value, ast.Name) and node.func.value.id in lists:
+                for arg in node.args:
+                    modules |= _strings(arg)
+            elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name) and node.target.id in lists:
+                modules |= _strings(node.value)
+            elif isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in lists
+                                                      for t in node.targets):
+                modules |= _strings(node.value)
+    return sections, modules
+
+
+def _hook_timeouts():
+    """{файл хука: [timeout, ...]} из plugin/hooks/hooks.json."""
+    hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text(encoding="utf-8"))["hooks"]
+    found = {}
+    for event, groups in hooks.items():
+        for group in groups:
+            for hook in group["hooks"]:
+                name = re.search(r"planka/(\w+)\.py", hook["command"]).group(1)
+                found.setdefault((event, name), []).append(hook["timeout"])
+    return found
 
 
 class ContractTest(unittest.TestCase):
@@ -28,6 +92,19 @@ class ContractTest(unittest.TestCase):
     def test_modules_exist(self):
         for name in MODULES:
             self.assertTrue((PLUGIN / "rules" / f"{name}.md").is_file(), name)
+
+    def test_names_taken_by_code_exist(self):
+        sections, modules = _code_names()
+        # Сборщик находит каждое имя ручных списков: пустое множество — сбой разбора.
+        self.assertGreaterEqual(sections, set(SECTIONS))
+        # dependencies код называет только в тексте judge_tool.DEP_REASON, не вызовом.
+        self.assertGreaterEqual(modules, set(MODULES) - {"dependencies"})
+        headings = set(re.findall(r"^## (.+)$", self.core, re.MULTILINE))
+        for name in sorted(sections):
+            self.assertIn(name, headings, f"раздел {name!r}, который берёт код, не найден в philosophy.md")
+        for name in sorted(modules):
+            self.assertTrue((PLUGIN / "rules" / f"{name}.md").is_file(),
+                            f"модуль {name!r}, который берёт код, не найден в plugin/rules/")
 
     def test_every_module_starts_with_heading_and_condition(self):
         for path in (PLUGIN / "rules").glob("*.md"):
@@ -68,5 +145,37 @@ class ContractTest(unittest.TestCase):
         self.assertIn("{RULES}", self.core)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TimeoutsTest(unittest.TestCase):
+    """Сроки внутри хука укладываются в его timeout из hooks.json: иначе Claude Code убьёт хук раньше
+    судьи, и предупреждение с журналом пропадут."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.timeouts = _hook_timeouts()
+
+    def test_pre_tool_use_judges_fit(self):
+        # guard_memory до судьи ещё зовёт git check-ignore для цели под autoMemoryDirectory в проекте.
+        spent = {"judge_tool": common.JUDGE_TIMEOUT + common.KILL_WAIT,
+                 "guard_memory": guard_memory.CHECK_IGNORE_TIMEOUT + common.JUDGE_TIMEOUT + common.KILL_WAIT}
+        for name, total in spent.items():
+            for timeout in self.timeouts[("PreToolUse", name)]:
+                self.assertLess(total, timeout, name)
+
+    def test_stop_fits(self):
+        spent = (common.GIT_ROOT_TIMEOUT + judge_stop.SNAPSHOT_BUDGET + judge_stop.COMMENTS_BUDGET
+                 + common.JUDGE_TIMEOUT + common.KILL_WAIT)
+        for timeout in self.timeouts[("Stop", "judge_stop")]:
+            self.assertLess(spent, timeout)
+
+    def test_user_prompt_submit_fits(self):
+        # Срок снимка отсчитывается от старта хука, определение корня входит в него.
+        for timeout in self.timeouts[("UserPromptSubmit", "remind")]:
+            self.assertLess(remind.SNAPSHOT_BUDGET, timeout)
+
+    def test_post_tool_use_has_no_judge(self):
+        tree = ast.parse((PLANKA_DIR / "debug_watch.py").read_text(encoding="utf-8"))
+        calls = {n.func.attr for n in ast.walk(tree)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+        self.assertNotIn("run_judge", calls)
+        for event in ("PostToolUse", "PostToolUseFailure"):
+            self.assertIn((event, "debug_watch"), self.timeouts)

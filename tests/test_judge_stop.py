@@ -9,7 +9,8 @@ import time
 import unittest
 from unittest import mock
 
-from tests.helpers import RULES, Env, PLANKA_DIR, messages, output
+from tests.helpers import (RULES, Env, PLANKA_DIR, assert_not_logged, author_block, fill_budget, messages, output,
+                           run_in_process)
 
 sys.path.insert(0, str(PLANKA_DIR))
 import common  # noqa: E402
@@ -29,9 +30,10 @@ PLAIN_MSG = "Смотрю, что сломалось."
 TURN_MISSING = "planka: сообщения реплики не найдены в транскрипте, судья видит последнее сообщение"
 
 
-def write_turn(env, *texts):
-    """Транскрипт env: реплика автора, затем ответы ассистента texts; между ответами — tool_use и tool_result."""
-    entries = [{"type": "user", "message": {"role": "user", "content": "реплика автора"}}]
+def write_turn(env, *texts, author="реплика автора"):
+    """Транскрипт env: реплика автора author, затем ответы ассистента texts; между ответами — tool_use и
+    tool_result."""
+    entries = [{"type": "user", "message": {"role": "user", "content": author}}]
     for i, text in enumerate(texts):
         if i:
             entries.append({"type": "user", "message": {"role": "user", "content": [
@@ -68,10 +70,11 @@ class StopHookTest(unittest.TestCase):
     def tearDown(self):
         self.env.close()
 
-    def stop(self, msg, **extra):
+    def stop(self, msg, active=False, **extra):
+        """Stop с последним сообщением msg; active — stop_hook_active: вход после блокировки этим же хуком."""
         write_turn(self.env, msg)
         return self.env.run("judge_stop.py",
-                            self.env.hook_input("Stop", last_assistant_message=msg, stop_hook_active=False),
+                            self.env.hook_input("Stop", last_assistant_message=msg, stop_hook_active=active),
                             **extra)
 
     def test_plain_message_passes_without_judge(self):
@@ -104,13 +107,31 @@ class StopHookTest(unittest.TestCase):
         self.assertIn("## Решения", text)
         self.assertNotIn("## Поведение", text)
         self.assertIn("<content>\n" + OPTIONS_MSG, text)
+        # Вопросы и модули несовпавших фильтров судье не уходят.
+        for needle in ("# Доказательство", "команда-доказательство", "# Документация", "локальный CLAUDE.md"):
+            self.assertNotIn(needle, text)
+        self.assertIn("Сообщение без выбора между вариантами", text)
+
+    def test_judge_gets_author_turn_not_logged(self):
+        author = "Сделай быструю заплатку, без перестройки."
+        write_turn(self.env, OPTIONS_MSG, author=author)
+        rec = self.env.data / "rec.txt"
+        r = self.env.run("judge_stop.py", self.env.hook_input("Stop", last_assistant_message=OPTIONS_MSG),
+                         PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertEqual(author_block(rec), "Реплика автора текущего хода:\n" + author + "\n\n"
+                                            "Ответы автора на AskUserQuestion после неё:\n(нет)")
+        self.assertEqual(judged(rec), OPTIONS_MSG)
+        self.assertEqual(self.env.log_lines()[-1]["content_len"], len(OPTIONS_MSG))
+        assert_not_logged(self, self.env, author, "быструю заплатку", "Перестроить владение")
 
     def test_budget_exhausted_passes_without_judge(self):
-        for _ in range(2):
-            r = self.stop(OPTIONS_MSG, PLANKA_STUB="deny")
+        # После блокировки Claude Code зовёт Stop снова с stop_hook_active: судья работает и на нём.
+        for active in (False, True):
+            r = self.stop(OPTIONS_MSG, active=active, PLANKA_STUB="deny")
             self.assertEqual(output(r)["decision"], "block")
         rec = self.env.data / "rec.txt"
-        r = self.stop(OPTIONS_MSG, PLANKA_STUB="deny", PLANKA_STUB_RECORD=str(rec))
+        r = self.stop(OPTIONS_MSG, active=True, PLANKA_STUB="deny", PLANKA_STUB_RECORD=str(rec))
         self.assertIsNone(output(r))
         self.assertEqual(messages(r), ["planka: лимит отказов, пропущено без проверки"])
         self.assertFalse(rec.exists())
@@ -163,6 +184,25 @@ class StopHookTest(unittest.TestCase):
         kept = content.split(prompts.TURN_SEPARATOR, 1)[1]
         self.assertLessEqual(len(kept), prompts.MAX_TURN_CHARS)
         self.assertGreater(kept.count(prompts.TURN_SEPARATOR) * len(prompts.TURN_SEPARATOR), 100)
+
+    def test_budget_reached_at_deny_time_passes(self):
+        # Параллельный вызов исчерпал лимит между проверкой до судьи и отказом.
+        write_turn(self.env, OPTIONS_MSG)
+        fill_budget(self.env, "stop")
+        with mock.patch.object(common, "deny_budget_left", return_value=True):
+            out = run_in_process(self.env, judge_stop.main, self.env.hook_input(
+                "Stop", last_assistant_message=OPTIONS_MSG, stop_hook_active=True), PLANKA_STUB="deny")
+        self.assertEqual(out, {"systemMessage": "planka: лимит отказов, пропущено без проверки"})
+        last = self.env.log_lines()[-1]
+        self.assertEqual((last["verdict"], last["filters"]), ("budget", ["options"]))
+
+    def test_done_filter_uses_last_message_only(self):
+        rec = self.env.data / "rec.txt"
+        write_turn(self.env, DONE_MSG, PLAIN_MSG)
+        r = self.env.run("judge_stop.py", self.env.hook_input("Stop", last_assistant_message=PLAIN_MSG),
+                         PLANKA_STUB="deny", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "")
+        self.assertFalse(rec.exists())
 
     def test_filters_use_last_message_only(self):
         rec = self.env.data / "rec.txt"
@@ -321,6 +361,9 @@ class DoneHookTest(unittest.TestCase):
         self.assertIn("# Доказательство", text)
         self.assertNotIn("## Решения", text)
         self.assertIn("команда-доказательство", text)
+        for needle in ("самый правильный", "Сообщение без выбора между вариантами", "# Документация",
+                       "локальный CLAUDE.md"):
+            self.assertNotIn(needle, text)
         self.assertEqual(self.env.log_lines()[-1]["filters"], ["done"])
 
     def test_done_denied_blocks(self):
@@ -368,10 +411,47 @@ class DocsFilterTest(unittest.TestCase):
         state.mkdir(exist_ok=True)
         snapshot.store(state, "sess-1", prompt_id, self.project, snapshot.capture(self.project))
 
-    def stop(self, msg, **extra):
+    def stop(self, msg, active=False, **extra):
         write_turn(self.env, msg)
         return self.env.run("judge_stop.py", self.env.hook_input(
-            "Stop", last_assistant_message=msg, stop_hook_active=False, cwd=str(self.project)), **extra)
+            "Stop", last_assistant_message=msg, stop_hook_active=active, cwd=str(self.project)), **extra)
+
+    def test_claude_md_present_no_line(self):
+        (self.project / "CLAUDE.md").write_text("# x\n", encoding="utf-8")
+        self.snap()
+        (self.project / "a.py").write_text("x = 1\n", encoding="utf-8")
+        rec = self.env.data / "rec.txt"
+        r = self.stop("Поправил.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertIn("- a.py — код", judged(rec))
+        self.assertNotIn("В корне проекта нет CLAUDE.md.", judged(rec))
+
+    def test_docs_waiting_for_author_note(self):
+        self.snap()
+        (self.project / "a.py").write_text("x = 1\n", encoding="utf-8")
+        rec = self.env.data / "rec.txt"
+        self.stop("Поправил.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        text = rec.read_text(encoding="utf-8")
+        self.assertIn("ждёт ответа автора", text)
+        for needle in ("самый правильный", "команда-доказательство", "# Доказательство", "## Решения"):
+            self.assertNotIn(needle, text)
+
+    def test_deadlines_passed_to_changed_since_and_extract(self):
+        # Сверка и разбор комментариев получают срок SNAPSHOT_BUDGET и COMMENTS_BUDGET от своего старта; сумма
+        # сроков против таймаута Stop — tests/test_contract.py, TimeoutsTest.
+        self.snap()
+        (self.project / "a.py").write_text("# x\n", encoding="utf-8")
+        extract = mock.Mock(return_value=([], False, [], []))
+        started = time.monotonic()
+        with mock.patch.object(snapshot, "changed_since", wraps=snapshot.changed_since) as changed, \
+                mock.patch.object(judge_stop.comments, "extract", extract), \
+                mock.patch.dict(os.environ, self.env.environ(), clear=True):
+            self.assertIsNotNone(judge_stop.docs_check(self.env.hook_input("Stop")))
+        finished = time.monotonic()
+        for deadline, budget in ((changed.call_args.args[2], judge_stop.SNAPSHOT_BUDGET),
+                                 (extract.call_args.args[4], judge_stop.COMMENTS_BUDGET)):
+            self.assertGreaterEqual(deadline, started + budget)
+            self.assertLessEqual(deadline, finished + budget)
 
     def test_code_change_triggers_docs_judge(self):
         self.snap()
@@ -532,7 +612,9 @@ class DocsFilterTest(unittest.TestCase):
         for i in range(3):
             self.snap()
             (self.project / "a.py").write_text(f"x = {i}\n", encoding="utf-8")
-            r = self.stop("Поправил.", PLANKA_STUB="deny", PLANKA_STUB_RECORD=str(rec) if i == 2 else "")
+            r = self.stop("Поправил.", active=i > 0, PLANKA_STUB="deny", PLANKA_STUB_RECORD=str(rec) if i == 2 else "")
+            if i < 2:
+                self.assertEqual(output(r)["decision"], "block")
         self.assertIsNone(output(r))
         self.assertEqual(messages(r), ["planka: лимит отказов, пропущено без проверки"])
         self.assertFalse(rec.exists())
@@ -709,6 +791,3 @@ class DocsFilterTest(unittest.TestCase):
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
         self.assertEqual(self.env.log_lines()[-1]["filters"], ["docs"])
 
-
-if __name__ == "__main__":
-    unittest.main()
