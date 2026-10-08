@@ -40,7 +40,9 @@ planka — плагин Claude Code уровня пользователя: пя�
 - Разделы ядра берутся по заголовку `## <имя>` (`common.philosophy_sections`, `common.rubric`): `Решения` —
   рубрика вопроса, плана и фильтра «варианты»; `Планы` — рубрика плана; `Границы` — рубрика записи в память,
   её же называют `judge_tool.DEP_REASON`, `MANIFEST_REASON` и `COMMAND_REASON`. Пункт 7 «Решений» называют
-  вопросы `prompts._QUESTION_CHECKS`.
+  вопросы `prompts._QUESTION_CHECKS`. Опоры рекомендации из пункта 4 «Решений» проверяет только фильтр
+  «варианты» (`prompts._MESSAGE_CHECKS`, вопрос 6): судья `Stop` видит сообщения реплики с выводом команд, судья
+  `AskUserQuestion` — только вопрос, и вопрос об опорах там остался бы без ответа (ложный отказ).
 - Модули берутся по имени файла (`common.rule_texts`, `common.rubric`): `planning`, `subagents`,
   `refactoring`, `design-patterns`, `heuristics` — план (`judge_tool.judge_plan`); `verification` — фильтр «готово»;
   `docs`, `comments` — фильтр «документация» (`judge_stop.judge`; судья видит сообщения, список файлов и

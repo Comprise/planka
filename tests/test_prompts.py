@@ -79,6 +79,13 @@ class PromptsTest(unittest.TestCase):
         for marker in ["«пока»", "«временно»", "«потом»", "«вне рамок»"]:
             self.assertNotIn(marker, p)
 
+    def test_options_filter_asks_recommendation_premises(self):
+        # Судья Stop видит сообщения реплики и может проверить опоры рекомендации; судья AskUserQuestion — только
+        # вопрос, этого пункта у него нет.
+        question = "Если рекомендация опирается на утверждение о коде, данных или поведении"
+        self.assertIn(question, prompts.stop_prompt("R", "C", options=True, done=False))
+        self.assertNotIn(question, prompts.question_prompt("R", "C"))
+
     def test_plan_prompt_asks_plan_questions(self):
         p = prompts.plan_prompt("R", "C")
         for needle in ["волн", "схождени", "контракт", "самодостаточ",

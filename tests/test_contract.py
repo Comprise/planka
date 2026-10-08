@@ -286,6 +286,12 @@ class RulesMatchJudgeTest(unittest.TestCase):
         self.assertIn("Директивы языка и инструментов", rule)
         self.assertIn("не комментарии: правила модуля к ним не применяются", rule)
 
+    def test_recommendation_premises_checked(self):
+        self.assertIn("проверено ли оно в сообщениях агента за реплику", prompts._MESSAGE_CHECKS)
+        rule = " ".join(common.philosophy_sections("Решения").split())
+        self.assertIn("факты, на которых держится рекомендация", rule)
+        self.assertIn("проверены командой или чтением до рекомендации", rule)
+
     def test_numbers_from_command_output(self):
         self.assertIn("Числа и подсчёты — из вывода команды", prompts._DONE_CHECKS)
         gate = next(item for item in self.flat(self.rules["verification"]).split("- ") if item.startswith("Шлюз"))
