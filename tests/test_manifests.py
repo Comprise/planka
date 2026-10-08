@@ -1,11 +1,18 @@
+import json
+import os
 import pathlib
+import subprocess
 import sys
+import tempfile
+import time
 import unittest
+from unittest import mock
 
 from tests.helpers import assert_linear
 
 PLANKA_DIR = pathlib.Path(__file__).resolve().parent.parent / "plugin" / "planka"
 sys.path.insert(0, str(PLANKA_DIR))
+import common  # noqa: E402
 import manifest_watch  # noqa: E402
 import manifests  # noqa: E402
 
@@ -863,3 +870,170 @@ class LegacySourcesTest(unittest.TestCase):
         self.assertEqual(manifest_watch._known("setup.py", large), frozenset(f"x{i}" for i in range(7)))
         assert_linear(self, lambda: manifest_watch._known("setup.py", small),
                       lambda: manifest_watch._known("setup.py", large))
+
+
+class SessionStartTtlTest(unittest.TestCase):
+    """Начало сессии (manifest_watch.mark_start) переживает common.prune_state в сессии дольше STATE_TTL."""
+
+    def test_start_survives_prune_in_long_session(self):
+        with tempfile.TemporaryDirectory() as data, mock.patch.dict("os.environ", {"CLAUDE_PLUGIN_DATA": data}):
+            state = pathlib.Path(data) / "state"
+            state.mkdir()
+            path = state / "s.start.json"
+            path.write_text(json.dumps({"start": 5}), encoding="utf-8")
+            old = time.time() - common.STATE_TTL - 60
+            os.utime(path, (old, old))
+            manifest_watch.mark_start("s")
+            common.prune_state(state)
+            self.assertEqual(manifest_watch.session_start("s"), 5)
+
+
+def _git(*args, cwd):
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args], cwd=cwd, check=True,
+                   capture_output=True)
+
+
+# Патч автора: package.json получает left-pad, setup.cfg — cfg-dep, requirements.txt — Requests_Foo; строки README —
+# не манифест.
+AUTHOR_PATCH = """\
+diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -1,3 +1,4 @@
+ {
+-  "dependencies": {"react": "^18"}
++  "dependencies": {"react": "^18",
++                   "left-pad": "^1.0.0"}
+ }
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1,2 +1,2 @@
+--- not-a-header
++++ also-not-a-header
+diff --git a/setup.cfg b/setup.cfg
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -1,3 +1,3 @@
+ [options]
+-install_requires = old-dep
++install_requires = cfg-dep
+diff --git a/requirements.txt b/requirements.txt
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -0,0 +1 @@
++Requests_Foo==1.0
+"""
+
+
+class OldPatchTest(unittest.TestCase):
+    """`git apply` патча, не менявшегося с начала сессии (ctime файла раньше начала): имена его изменённых строк
+    в манифестах — работа до сессии (manifest_watch.restored_names)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+        self.patch = os.path.join(self.root, "author.patch")
+        with open(self.patch, "w", encoding="utf-8") as f:
+            f.write(AUTHOR_PATCH)
+        self.after = int(os.stat(self.patch).st_ctime) + 2
+        self.deadline = time.monotonic() + 30
+
+    def names(self, command, start=None):
+        return manifest_watch.restored_names(self.root, command, self.after if start is None else start,
+                                             self.deadline)
+
+    def test_names_of_changed_manifest_lines(self):
+        known = self.names("git apply author.patch")
+        self.assertIn("left-pad", known["npm"])
+        self.assertIn("react", known["npm"])
+        self.assertIn("requests-foo", known["pypi"])
+        # Блоки README и setup.cfg короче чисел своих заголовков `@@`: следующий заголовок файла всё равно узнаётся.
+        self.assertIn("cfg-dep", known["pypi"])
+        # Строки README — не манифест; строка `--- …` внутри блока — содержимое, не заголовок.
+        self.assertNotIn("not-a-header", known.get("npm", []))
+        self.assertNotIn("also-not-a-header", known.get("pypi", []))
+
+    def test_forms(self):
+        for command in ("git apply -p1 --exclude x --directory . author.patch", "git apply < author.patch",
+                        "git apply - < author.patch", f"git apply {self.patch}", "git apply --3way -- author.patch",
+                        "cd . && git apply -v author.patch"):
+            with self.subTest(command):
+                self.assertIn("left-pad", self.names(command).get("npm", []))
+
+    def test_not_old_patch(self):
+        cases = {
+            # Патч изменён после начала сессии.
+            "git apply author.patch": int(os.stat(self.patch).st_ctime) - 1,
+            # Патч из heredoc, конвейера, без файла — текст агента.
+            "git apply <<EOF\n" + AUTHOR_PATCH + "EOF": None,
+            "cat author.patch | git apply": None,
+            "git apply missing.patch": None,
+            # Значение флага — не патч.
+            "git apply --exclude author.patch": None,
+            "git am author.patch": None,
+        }
+        for command, start in cases.items():
+            with self.subTest(command):
+                self.assertEqual(self.names(command, start), {})
+        with mock.patch.object(manifest_watch, "_remaining", return_value=1):
+            self.assertEqual(manifest_watch.restored_names(self.root, "git apply author.patch", None, 0), {})
+
+    def test_fifo_and_directory_not_read(self):
+        os.mkfifo(os.path.join(self.root, "pipe.patch"))
+        os.mkdir(os.path.join(self.root, "dir.patch"))
+        self.assertEqual(self.names("git apply pipe.patch dir.patch"), {})
+
+    def test_large_patch_not_read(self):
+        with open(self.patch, "a", encoding="utf-8") as f:
+            f.write("x" * manifest_watch.MAX_MANIFEST_BYTES)
+        self.assertEqual(self.names("git apply author.patch", int(time.time()) + 2), {})
+
+    def test_relative_to_cwd(self):
+        sub = os.path.join(self.root, "sub")
+        os.mkdir(sub)
+        known = manifest_watch.restored_names(self.root, "git apply ../author.patch", self.after, self.deadline,
+                                              cwd=sub)
+        self.assertIn("left-pad", known["npm"])
+
+
+class OldPatchGitTest(unittest.TestCase):
+    """Сравнение после `git apply` в настоящем репозитории: патч автора до сессии не блокируется, патч,
+    записанный в сессии, — блокируется."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+        with open(os.path.join(self.root, "package.json"), "w", encoding="utf-8") as f:
+            f.write('{"dependencies": {"react": "^18"}}\n')
+        _git("init", "-q", cwd=self.root)
+        _git("add", ".", cwd=self.root)
+        _git("commit", "-qm", "i", cwd=self.root)
+        with open(os.path.join(self.root, "package.json"), "w", encoding="utf-8") as f:
+            f.write('{"dependencies": {"react": "^18", "left-pad": "^1.0.0"}}\n')
+        diff = subprocess.run(["git", "diff"], cwd=self.root, check=True, capture_output=True).stdout
+        _git("checkout", "--", "package.json", cwd=self.root)
+        self.patch = os.path.join(self.root, "author.patch")
+        with open(self.patch, "wb") as f:
+            f.write(diff)
+        # Неотслеживаемый патч исключён из снимка: в .git/info/exclude.
+        with open(os.path.join(self.root, ".git", "info", "exclude"), "a", encoding="utf-8") as f:
+            f.write("author.patch\n")
+
+    def added(self, start):
+        deadline = time.monotonic() + 30
+        command = "git apply author.patch"
+        entry = manifest_watch.take(self.root, deadline)
+        known = manifest_watch.restored_names(self.root, command, start, deadline)
+        if known:
+            entry["known"] = known
+        _git("apply", "author.patch", cwd=self.root)
+        return manifest_watch.compare(entry, deadline)[0]
+
+    def test_patch_before_session_passes(self):
+        self.assertEqual(self.added(int(os.stat(self.patch).st_ctime) + 2), {})
+
+    def test_patch_written_in_session_blocked(self):
+        self.assertEqual(self.added(int(os.stat(self.patch).st_ctime) - 1), {"package.json": ["left-pad"]})

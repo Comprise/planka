@@ -443,8 +443,7 @@ def read_transcript(path):
                         asked.update(b.get("id") for b in content if isinstance(b, dict)
                                      and b.get("type") == "tool_use" and b.get("name") == "AskUserQuestion")
                     model = msg.get("model")
-                    # Служебные ответы помечены моделью вида «<synthetic>»: --model её не примет.
-                    if isinstance(model, str) and model and not model.startswith("<"):
+                    if usable_model(model):
                         out.model = model
                     text = "".join(_text_blocks(content))
                     if text.strip():
@@ -468,15 +467,41 @@ def read_transcript(path):
     return out
 
 
+def usable_model(model):
+    """Годится ли model для --model судьи: непустая строка. Служебные ответы помечены моделью вида «<synthetic>»:
+    --model её не примет."""
+    return isinstance(model, str) and bool(model) and not model.startswith("<")
+
+
+def session_model_path(state_dir, session_id):
+    """Файл модели сессии: {"model": ...} из SessionStart и PostModelSwitch (model_watch)."""
+    return state_dir / f"{safe_name(session_id)}.model.json"
+
+
+def stored_session_model(session_id):
+    """Модель сессии, записанная model_watch; нет файла, битый файл, негодная модель или сбой — None.
+    Чтение без state_lock: файл пишется целиком через atomic_write_json, а не дописывается."""
+    if not isinstance(session_id, str):
+        return None
+    try:
+        model = read_json(session_model_path(data_dir() / "state", session_id), dict).get("model")
+    except OSError:
+        return None
+    return model if usable_model(model) else None
+
+
 def judge_model(data, transcript=None):
-    """Модель судьи из judge_model; «session» — модель сессии из transcript (None — транскрипт входа хука
-    читается здесь).
+    """Модель судьи из judge_model; «session» — модель сессии: записанная model_watch из событий SessionStart и
+    PostModelSwitch, без неё — из transcript (None — транскрипт входа хука читается здесь).
 
     Модель сессии не найдена — None с предупреждением раз на сессию: судья идёт на модели claude по умолчанию.
     """
     model = os.environ.get("CLAUDE_PLUGIN_OPTION_JUDGE_MODEL") or SESSION_MODEL
     if model != SESSION_MODEL:
         return model
+    stored = stored_session_model(data.get("session_id"))
+    if stored:
+        return stored
     if transcript is None:
         transcript = read_transcript(data.get("transcript_path"))
     if transcript.model is None:

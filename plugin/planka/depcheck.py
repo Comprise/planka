@@ -21,7 +21,7 @@ _WRAPPERS = {
     "sudo": (frozenset({"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-T"}), 0),
     "doas": (frozenset({"-u", "-C"}), 0),
     "stdbuf": (frozenset({"-i", "-o", "-e", "--input", "--output", "--error"}), 0),
-    # Пакеты из stdin xargs не видны: проверяются только слова самой команды.
+    # Пакеты из stdin xargs не видны: команду установки без пакета под xargs отдаёт _doubt.
     "xargs": (frozenset({"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a", "--arg-file", "--delimiter",
                          "--max-args", "--max-procs", "--max-lines", "--max-chars", "--eof",
                          "--process-slot-var"}), 0),
@@ -165,8 +165,24 @@ _ARCHIVES = (".whl", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".tar.zst", ".zip
 _LOCAL_PROTOCOLS = ("file:", "workspace:", "link:", "portal:")
 # Именованное требование на локальный пакет: `name@file:///x`, `name @ file:x`, `@org/x@workspace:*`.
 _NAMED_LOCAL = re.compile(r"@\s*(?:file|workspace|link|portal):")
-# Сколько первых символов сегмента _command разбирает на слова: пакет, названный дальше, не виден.
+# Сколько первых символов сегмента _command разбирает на слова: пакет, названный дальше, не виден — команду
+# установки без пакета в длинном сегменте отдаёт _doubt.
 _WORDS_LIMIT = 4096
+# Сколько пар «флаг значение» перед подкомандой по очереди склеивает _loosened.
+_LOOSE_FLAGS = 4
+# Пакет вместо слов, которых разбор не видит (stdin xargs, хвост сегмента за _WORDS_LIMIT): с `@`, чтобы
+# `go install` считал его пакетом с версией.
+_STDIN_PACKAGE = "x@1"
+# Режимы _is_add при сомнении: _LOOSE — флаг перед подкомандой берёт следующее слово значением (_loosened),
+# _MASKED — `--dry-run` значением флага менеджера не пробный прогон (_dry_run), _DEEP — команда глубже _MAX_DEPTH
+# ищется по словам (_flat_add).
+_LOOSE, _MASKED, _DEEP = "loose", "masked", "deep"
+# Доводы сомнения dependency_doubt.
+_WHY_FLAG = "флаг перед подкомандой вне известных наборов: если он берёт значение, подкоманда — установка"
+_WHY_DRY = "`--dry-run` стоит значением другого флага: пробного прогона может не быть"
+_WHY_XARGS = "пакеты приходят из stdin xargs, разбор их не видит"
+_WHY_DEPTH = f"вложенность глубже {_MAX_DEPTH} уровней разобрана только по словам"
+_WHY_CUT = f"сегмент длиннее {_WORDS_LIMIT} символов: пакет может стоять дальше"
 
 
 # Склейка коротких флагов одним словом: `-qr`, `-euo`, `+eo`.
@@ -269,14 +285,24 @@ def _drop_redirects(pairs):
 
 
 def _command(segment):
-    """Слова команды сегмента и стоит ли маркер согласия среди её ведущих присваиваний.
+    """Слова команды сегмента и стоит ли маркер согласия среди её ведущих присваиваний (_command_info)."""
+    words, marker, _, _ = _command_info(segment)
+    return words, marker
+
+
+def _command_info(segment):
+    """Слова команды сегмента, стоит ли маркер согласия среди её ведущих присваиваний, снята ли обёртка
+    `xargs` и есть ли слова-не-флаги, начатые за первыми _WORDS_LIMIT символами сегмента.
 
     Перенаправления с их целью выброшены; ведущие присваивания, ключевые слова shell и обёртки
     (`sudo`, `env`, `timeout`, `nice`, `xargs`, `stdbuf` и др.) с их флагами сняты; строка `env -S`
     разбита на слова. Комментарий из сегмента уже убран _segments.
     """
     words = _drop_redirects(_split(segment[:_WORDS_LIMIT]))
-    marker = False
+    # Слова-не-флаги, начатые за _WORDS_LIMIT: разбор их не видит.
+    cut = len(segment) > _WORDS_LIMIT and any(
+        not w.startswith("-") for w in _drop_redirects(_split(segment))[len(words):])
+    marker = xargs = False
     while words:
         word = words[0]
         if _ENV_ASSIGN.match(word):
@@ -286,6 +312,7 @@ def _command(segment):
             words.pop(0)
         elif _basename(word) in _WRAPPERS:
             name = _basename(word)
+            xargs = xargs or name == "xargs"
             value_flags, operands = _WRAPPERS[name]
             words.pop(0)
             while words and words[0].startswith("-"):
@@ -304,7 +331,7 @@ def _command(segment):
             del words[:operands]
         else:
             break
-    return words, marker
+    return words, marker, xargs, cut
 
 
 def _is_local(word, pip):
@@ -461,42 +488,89 @@ def _npm_dry_run(args):
     return dry
 
 
-def _dry_run(w):
+def _dry_run(w, masked=False):
     """Слова команды w (с именем) — пробный прогон: у npm — по _npm_dry_run, у apt, apt-get и aptitude его
-    разбирает _apt; у прочих — слово `--dry-run` среди слов (у brew ещё `-n` — _brew_dry_run в _brew)."""
+    разбирает _apt; у прочих — слово `--dry-run` среди слов (у brew ещё `-n` — _brew_dry_run в _brew). При masked
+    `--dry-run` сразу за флагом со значением этого менеджера (_dry_value_flags) — значение флага."""
     if w[0] == "npm":
         return _npm_dry_run(w[1:])
-    return w[0] not in _APTS and _DRY_RUN in w
+    if w[0] in _APTS:
+        return False
+    flags = _dry_value_flags(w[0]) if masked else _NO_VALUE_FLAGS
+    return any(a == _DRY_RUN and not _takes_value(w[i - 1], flags) for i, a in enumerate(w[1:], 1))
 
 
-def _is_add(words, depth=0):
+def _npm_subcommand(w):
+    """Слова npm с подкоманды, как _subcommand; `true` или `false` за флагом без `=` — значение флага: nopt берёт
+    его и у булева флага, и у флага, которого npm не знает."""
+    i = 1
+    while i < len(w) and w[i].startswith("-"):
+        boolean = "=" not in w[i] and w[i + 1:i + 2] in (["true"], ["false"])
+        i += 2 if boolean or _takes_value(w[i], _NPM_VALUE_FLAGS) else 1
+    return [w[0], *w[i:]]
+
+
+def _loosened(w):
+    """Варианты слов менеджера w, где флаги перед подкомандой без `=` берут следующее слово-не-флаг значением
+    (`--weird val` → `--weird=val`): k-й вариант склеивает первые k таких пар, k ≤ _LOOSE_FLAGS. `--` и слово-не-флаг
+    не за флагом завершают флаги; `+toolchain` cargo пропускается."""
+    out = list(w)
+    i = 2 if w[0] == "cargo" and w[1:2] and w[1].startswith("+") else 1
+    for _ in range(_LOOSE_FLAGS):
+        while i + 1 < len(out) and out[i] != "--" and out[i].startswith("-") and (
+                "=" in out[i] or out[i + 1].startswith("-")):
+            i += 1
+        if i + 1 >= len(out) or out[i] == "--" or not out[i].startswith("-"):
+            return
+        out[i:i + 2] = [out[i] + "=" + out[i + 1]]
+        i += 1
+        yield list(out)
+
+
+# Менеджеры без подкоманды: операция — флагом (`pacman -S`, `nix-env -i`) или выражением (`R -e`).
+_NO_SUBCOMMAND = {"pacman", "yay", "paru", "nix-env", "cpan", "cpanm", "R", "Rscript", "r", "rscript"}
+
+
+def _has_subcommand(name):
+    """Менеджер с подкомандой, чьи флаги перед ней пропускает разбор (_subcommand, _sub_args)."""
+    return (name in _GLOBAL_FLAGS or name in _OTHER_MANAGERS or bool(_PIP.match(name))) and name not in _NO_SUBCOMMAND
+
+
+def _is_add(words, depth=0, mode=None):
     """Команда добавляет пакет: в проект или глобально (`npm i -g`, `cargo install`, `pipx install`).
 
     Разовый запуск без установки (`npx`, `bunx`, `uvx`, `pipx run`, `go run`) — не добавление, кроме запуска
     менеджера (`npx pnpm add x`, `corepack pnpm add x`); пробный прогон (_dry_run, у apt — _apt_parse, у brew —
-    _brew_dry_run) — тоже не добавление.
+    _brew_dry_run) — тоже не добавление. mode — режим сомнения (_LOOSE, _MASKED, _DEEP) или None; он переходит во
+    вложенные команды.
     """
-    if not words or depth > _MAX_DEPTH:
+    if not words:
         return False
+    if depth > _MAX_DEPTH:
+        return mode == _DEEP and _flat_add(words)
     w = [_basename(words[0]), *words[1:]]
     name = w[0]
     if name == "corepack" or name in _NPX:
         # `corepack <менеджер>[@версия] …`, `npx [флаги] <пакет>[@версия] …`: исполняется программа пакета.
         rest = w[1:] if name == "corepack" else _after_flags(w[1:], _NPX_VALUE_FLAGS)
-        return bool(rest) and _is_add([_VERSION.sub("", rest[0]), *rest[1:]], depth + 1)
+        return bool(rest) and _is_add([_VERSION.sub("", rest[0]), *rest[1:]], depth + 1, mode)
     if _PYTHON.match(name):
         module = _python_module(w)
-        return module is not None and _is_add(module, depth + 1)
+        return module is not None and _is_add(module, depth + 1, mode)
+    if mode == _LOOSE and _has_subcommand(name) and any(_is_add(v, depth) for v in _loosened(w)):
+        return True
     if name in _OTHER_MANAGERS:
         sub, args = _sub_args(w)
         if name in _RUNNERS and sub == "run":
-            return _is_add(_after_flags(args, _RUNNERS[name]), depth + 1)
-        return not _dry_run(w) and _OTHER_MANAGERS[name](w)
-    dry = _dry_run(w)
+            return _is_add(_after_flags(args, _RUNNERS[name]), depth + 1, mode)
+        return not _dry_run(w, mode == _MASKED) and _OTHER_MANAGERS[name](w)
+    dry = _dry_run(w, mode == _MASKED)
     # `cargo +nightly install …`: выбор toolchain rustup перед подкомандой.
     if name == "cargo" and w[1:2] and w[1].startswith("+"):
         w = [w[0], *w[2:]]
-    if name in _GLOBAL_FLAGS:
+    if name == "npm":
+        w = _npm_subcommand(w)
+    elif name in _GLOBAL_FLAGS:
         w = _subcommand(w, _GLOBAL_FLAGS[name])
     elif _PIP.match(name):
         w = _subcommand(w, _PIP_GLOBAL_VALUE_FLAGS)
@@ -509,7 +583,7 @@ def _is_add(words, depth=0):
     if sub is None:
         return False
     if name in _RUNNERS and sub == "run":
-        return _is_add(_after_flags(args, _RUNNERS[name]), depth + 1)
+        return _is_add(_after_flags(args, _RUNNERS[name]), depth + 1, mode)
     if dry:
         return False
     if name == "go":
@@ -1109,6 +1183,31 @@ _OTHER_MANAGERS = {
     "vcpkg": _vcpkg, "conan": _conan, "R": _r, "Rscript": _r, "r": _r, "rscript": _r,
 }
 
+# Флаги со значением по менеджерам для _dry_run при сомнении: `--dry-run` за таким флагом — его значение. У pip —
+# _PIP_VALUE_FLAGS.
+_DRY_VALUE_FLAGS = {
+    "pnpm": _PNPM_VALUE_FLAGS, "yarn": _YARN_VALUE_FLAGS, "bun": _BUN_VALUE_FLAGS, "deno": _DENO_VALUE_FLAGS,
+    "uv": _UV_PIP_VALUE_FLAGS | _UV_ADD_VALUE_FLAGS | _UV_TOOL_VALUE_FLAGS, "cargo": _CARGO_INSTALL_VALUE_FLAGS,
+    "poetry": _POETRY_VALUE_FLAGS, "bundle": _BUNDLE_VALUE_FLAGS, "gem": _GEM_VALUE_FLAGS,
+    "composer": _COMPOSER_VALUE_FLAGS, "go": _GO_BUILD_VALUE_FLAGS, "pipx": _PIPX_VALUE_FLAGS,
+    "pipenv": _PIPENV_VALUE_FLAGS, "dotnet": _DOTNET_ADD_VALUE_FLAGS | _DOTNET_TOOL_VALUE_FLAGS,
+    "dart": _PUB_VALUE_FLAGS, "flutter": _PUB_VALUE_FLAGS, "swift": _SWIFT_PACKAGE_VALUE_FLAGS | _SWIFT_ADD_VALUE_FLAGS,
+    "brew": _BREW_VALUE_FLAGS, "zypper": _ZYPPER_VALUE_FLAGS, "apk": _APK_VALUE_FLAGS, "choco": _CHOCO_VALUE_FLAGS,
+    "nuget": _NUGET_VALUE_FLAGS, "winget": _WINGET_VALUE_FLAGS, "scoop": _SCOOP_VALUE_FLAGS, "port": _PORT_VALUE_FLAGS,
+    "snap": _SNAP_VALUE_FLAGS, "flatpak": _FLATPAK_VALUE_FLAGS, "nix-env": _NIX_VALUE_FLAGS, "nix": _NIX_VALUE_FLAGS,
+    "pdm": _PDM_ADD_VALUE_FLAGS, "rye": _RYE_VALUE_FLAGS, "pixi": _PIXI_VALUE_FLAGS, "mix": _MIX_INSTALL_VALUE_FLAGS,
+    "cabal": _CABAL_VALUE_FLAGS, "stack": _STACK_VALUE_FLAGS, "opam": _OPAM_VALUE_FLAGS,
+    "luarocks": _LUAROCKS_VALUE_FLAGS, "cpan": _CPAN_VALUE_FLAGS, "cpanm": _CPANM_VALUE_FLAGS,
+    "vcpkg": _VCPKG_VALUE_FLAGS, "conan": _CONAN_VALUE_FLAGS,
+    **dict.fromkeys(_CONDAS, _CONDA_VALUE_FLAGS),
+    **dict.fromkeys(("dnf", "dnf5", "microdnf", "yum"), _DNF_VALUE_FLAGS),
+    **dict.fromkeys(("pacman", "yay", "paru"), _PACMAN_VALUE_FLAGS),
+}
+
+
+def _dry_value_flags(name):
+    return _PIP_VALUE_FLAGS if _PIP.match(name) else _DRY_VALUE_FLAGS.get(name, _NO_VALUE_FLAGS)
+
 
 def _inline_script(words):
     """Строка, которую команда исполняет как команду: `sh -c '…'`, `eval …`; None, если такой нет."""
@@ -1484,6 +1583,90 @@ def _segment_adds(segment, depth):
         if _is_add(words) or script and _find(script, depth + 1):
             return True
     return any(_find(s, depth + 1) for s in _quoted_substitutions(segment))
+
+
+# Разделители команд и кавычки в тексте глубже _MAX_DEPTH для _soup_add.
+_SOUP_SPLIT = re.compile(r"[;&|()`\n]+")
+_SOUP_QUOTES = re.compile(r"[\"'\\]")
+
+
+def _flat_add(words):
+    """Слова, где вложенность уже не разбирается, ставят пакет: первое слово после присваиваний, ключевых слов,
+    флагов, обёрток, `eval`, оболочек, запускателей (`npx`, `corepack`, `python`) и `<менеджер> run` с версией
+    `@…` без неё и слова за ним разбирает _is_add. Маркер согласия среди присваиваний перед ним снимает
+    проверку."""
+    i, n = 0, len(words)
+    while i < n:
+        word = words[i]
+        name = _basename(word)
+        if word == DEP_OK_MARKER:
+            return False
+        if (_ENV_ASSIGN.match(word) or word.startswith(("-", "+")) or word in _KEYWORDS or name in _WRAPPERS
+                or name in _C_SHELLS or name in _NPX or name in ("eval", "corepack") or _PYTHON.match(name)):
+            i += 1
+        elif name in _RUNNERS and words[i + 1:i + 2] == ["run"]:
+            i += 2
+        else:
+            break
+    return i < n and _is_add([_VERSION.sub("", words[i]), *words[i + 1:]])
+
+
+def _soup_add(text):
+    """Текст глубже _MAX_DEPTH ставит пакет: кавычки и `\\` сняты, команды разделены по `;`, `&`, `|`, скобкам,
+    обратной кавычке и переводу строки, каждая проверена _flat_add."""
+    return any(_flat_add(_SOUP_QUOTES.sub("", piece).split()) for piece in _SOUP_SPLIT.split(text))
+
+
+def _doubt(words, xargs, cut):
+    """Довод сомнения для слов команды сегмента (_command_info): менеджер и команда установки распознаны, а пакет
+    или подкоманда под сомнением; None — сомнения нет."""
+    if (xargs or cut) and _is_add([*words, _STDIN_PACKAGE]):
+        return _WHY_XARGS if xargs else _WHY_CUT
+    if _is_add(words, mode=_MASKED):
+        return _WHY_DRY
+    if _is_add(words, mode=_LOOSE):
+        return _WHY_FLAG
+    if _is_add(words, mode=_DEEP):
+        return _WHY_DEPTH
+    return None
+
+
+def _segment_doubt(segment, depth):
+    """Довод сомнения сегмента: его команда (_doubt), строка `sh -c`/`eval` и подстановки в двойных кавычках —
+    как в _segment_adds; на глубине _MAX_DEPTH вложенный текст проверяет _soup_add."""
+    words, marker, xargs, cut = _command_info(segment)
+    script = None if marker else _inline_script(words)
+    why = None if marker else _doubt(words, xargs, cut)
+    if why:
+        return why
+    nested = ([script] if script else []) + _quoted_substitutions(segment)
+    if depth >= _MAX_DEPTH:
+        return _WHY_DEPTH if any(_soup_add(t) for t in nested) else None
+    for text in nested:
+        found = _find_doubt(text, depth + 1)
+        if found:
+            return found[1]
+    return None
+
+
+def _find_doubt(command, depth):
+    """Первый сегмент команды с сомнением и довод (_segment_doubt); None, если такого нет."""
+    for segment in _segments(command):
+        segment = segment.strip()
+        why = _segment_doubt(segment, depth)
+        if why:
+            return segment, why
+    return None
+
+
+def dependency_doubt(command):
+    """Сегмент команды, где менеджер и команда установки распознаны, а пакет или подкоманда под сомнением, и
+    довод: флаг перед подкомандой вне известных наборов, `--dry-run` значением флага, пакеты из stdin xargs,
+    вложенность глубже _MAX_DEPTH, сегмент длиннее _WORDS_LIMIT. None — сомнения нет. Смысл — для команды, где
+    dependency_add добавления не нашёл; маркер согласия снимает сомнение там же, где и проверку."""
+    if not isinstance(command, str):
+        return None
+    return _find_doubt(command, 0)
 
 
 def dependency_add(command):

@@ -126,16 +126,29 @@ DEP_REASON = ("planka: новая зависимость — вопрос авт
               "сегменте, а не в начале всей строки: `cd app && {marker} npm install x`. Команда: {command}")
 
 
+DEP_DOUBT_REASON = ("planka: команда похожа на добавление пакета, но разбор под сомнением: {why}. Если она добавляет "
+                    "пакет, это новая зависимость — вопрос автору (ядро, «Границы»): назови пакет, зачем он и что из "
+                    "stdlib или уже установленного задачу не закрывает; прочитай {rules}/dependencies.md и после "
+                    "согласия автора повтори команду с {marker} прямо перед командой в её сегменте. Если пакета она не "
+                    "добавляет, повтори её так же с {marker}. Команда: {command}")
+
+
 def judge_bash(data):
-    """Добавление пакета отклоняется детерминированно: без модели и без лимита отказов. Иначе — снимок
+    """Добавление пакета (depcheck.dependency_add) и команда установки с пакетом или подкомандой под сомнением
+    (depcheck.dependency_doubt) отклоняются детерминированно: без модели и без лимита отказов. Иначе — снимок
     манифестов для сравнения после команды (snapshot_manifests)."""
     command = (data.get("tool_input") or {}).get("command")
     segment = depcheck.dependency_add(command)
-    if segment is None:
+    doubt = None if segment is not None else depcheck.dependency_doubt(command)
+    if segment is None and doubt is None:
         snapshot_manifests(data)
         return
     session = data.get("session_id", "")
-    reason = DEP_REASON.format(rules=common.rules_dir(), marker=depcheck.DEP_OK_MARKER, command=segment)
+    if doubt is None:
+        reason = DEP_REASON.format(rules=common.rules_dir(), marker=depcheck.DEP_OK_MARKER, command=segment)
+    else:
+        reason = DEP_DOUBT_REASON.format(why=doubt[1], rules=common.rules_dir(), marker=depcheck.DEP_OK_MARKER,
+                                         command=doubt[0])
     common.emit(common.deny_output(reason))
     common.log_event("bash", session, verdict="deny-dep", content=command)
 
@@ -241,10 +254,11 @@ def snapshot_manifests(data):
     try:
         root = common.project_root(cwd)
         entry = manifest_watch.take(root, deadline)
-        # Каталог команды до неё: от него разрешаются пути вывода генераторов requirements.
+        # Каталог команды до неё: от него разрешаются пути вывода генераторов requirements и патчей git apply.
         entry["cwd"] = common.input_path(cwd)
-        # Имена ref до начала сессии, откуда команда git возвращает файлы, — работа автора, не новые.
-        known = manifest_watch.restored_names(root, command, manifest_watch.session_start(session), deadline)
+        # Имена ref до начала сессии, откуда команда git возвращает файлы, и старых патчей — работа автора.
+        known = manifest_watch.restored_names(root, command, manifest_watch.session_start(session), deadline,
+                                              cwd=entry["cwd"])
         if known:
             entry["known"] = known
         manifest_watch.store(session, tool_use_id, entry)

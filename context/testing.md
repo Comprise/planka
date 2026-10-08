@@ -76,35 +76,37 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
   и пропускаются без `git`.
 - Проверка манифестов: разбор — `tests/test_manifests.py` (корпус, по классу на вид манифеста,
   `AddedContractTest`, `LegacySourcesTest` — разбор `_LEGACY` на корпусе `legacy-*`, края: цикл присваиваний,
-  цепочка из 30 имён, `test_setup_py_references_linear`); хук — `tests/test_judge_tool.py`: `ManifestEditTest` (правка
-  `Write`, `Edit`, `MultiEdit`), `ManifestEditGitTest` (версии `_REPO_REFS` — база), `ManifestBashTest` и его наследник
-  `ManifestBashGitTest` (снимок и сравнение вне git и в git: генераторы, `tee`, маркер, `PostToolUseFailure`,
-  параллельные команды по `tool_use_id`, `mv`, `cp`, `git mv`; ref до начала сессии: stash и ref `checkout`, `restore
-  --source`, `merge --squash`, `cherry-pick -n` старше начала — пропуск (`test_author_stash_before_session_passes`,
-  `test_author_stash_untracked_manifest_passes`, `test_restore_from_old_ref_passes`), моложе, в ту же секунду или без
-  записи начала — блок с безопасным текстом (`test_stash_after_session_start_blocked_with_safe_reason`,
-  `test_restore_from_young_ref_blocked`, `test_ref_in_session_start_second_not_old`,
-  `test_old_ref_without_session_start_blocked`); начало сессии подменяется записью `start.json`; время ref — по
-  коммиттеру, не автору, имена HEAD убранного манифеста, `Unavailable` `restored_names` по сроку, пределу и нечитаемому
-  дереву ref (`test_restored_names_unreadable_tree_unavailable`) и пропуск снимка с предупреждением; перенос из
-  незакоммиченного `_LEGACY` вне git и в git блокируется — `test_uncommitted_legacy_source_names_new`, из закоммиченного
-  проходит — `test_committed_legacy_source_moved_to_pyproject_not_new`), `ManifestConflictTest` (стороны конфликта
-  индекса после `git stash pop`, `git merge --squash`, `git cherry-pick -n`: `Write`, `Edit` разрешения и `git checkout
-  --theirs` проходят, имя ни одной стороны отклоняется; источник `git rebase` — `REBASE_HEAD` после `git add` нашей
-  стороны; стадии `:1:`, `:2:`, `:3:`, записанные `git update-index --index-info` в форме `git ls-files -s`, у каждой
-  своё имя — `test_each_index_stage_read`), `ManifestTransferEditTest` (имена версии HEAD убранного манифеста и файлов
-  `_LEGACY` версии HEAD проходят; имена `_LEGACY` рабочего дерева — неотслеживаемого, в подкаталоге `scratch/`,
-  изменённого после коммита — новые: обход в два шага, `test_legacy_source_in_tree_only_names_new`; `SyntaxWarning`
-  закоммиченного setup.py не в stderr), `ManifestFailureBranchesTest` (сбои `pop`, `compare`, срок правки — точный
-  `systemMessage` и `skipped`), `CommandRefsTest` (формы команд git, из которых `command_refs` берёт ref, и формы без
-  ref — `git apply`), `ManifestProjectUnderFixturesTest` (`FOREIGN_DIRS` — от проекта),
-  `ManifestProjectUnderHomeRepoTest` (проект без своего git под `HOME`-репозиторием с `status.showUntrackedFiles=no` и
-  `.gitignore` `*`: `list_manifests` — режим `walk`, правка и команда с новым именем — отказ и блок, имена версии HEAD
-  и stash `~` не известны; файл вне корня читает версии своего репозитория), `GeneratedRequirementsTest`
-  (файлы вывода генераторов), `ManifestWatchStateTest` (файл состояния снимков: срок записей, удаление пустого файла,
-  предел обхода вне git, повторно не читаются файлы с тем же размером и mtime, та же длина с новым mtime перечитывается,
-  смена режима git/walk — `Unavailable`; `start.json` пишет первый `PreToolUse` один раз, `PostToolUse` и хук внутри
-  судьи — нет).
+  цепочка из 30 имён, `test_setup_py_references_linear`; патчи `git apply` до начала сессии — `OldPatchTest` и
+  `OldPatchGitTest`, mtime `start.json` в долгой сессии — `SessionStartTtlTest`); хук — `tests/test_judge_tool.py`:
+  `ManifestEditTest` (правка `Write`, `Edit`, `MultiEdit`), `ManifestEditGitTest` (версии `_REPO_REFS` — база),
+  `ManifestBashTest` и его наследник `ManifestBashGitTest` (снимок и сравнение вне git и в git: генераторы, `tee`,
+  маркер, `PostToolUseFailure`, параллельные команды по `tool_use_id`, `mv`, `cp`, `git mv`; ref до начала сессии: stash
+  и ref `checkout`, `restore --source`, `merge --squash`, `cherry-pick -n` старше начала — пропуск
+  (`test_author_stash_before_session_passes`, `test_author_stash_untracked_manifest_passes`,
+  `test_restore_from_old_ref_passes`), моложе, в ту же секунду или без записи начала — блок с безопасным текстом
+  (`test_stash_after_session_start_blocked_with_safe_reason`, `test_restore_from_young_ref_blocked`,
+  `test_ref_in_session_start_second_not_old`, `test_old_ref_without_session_start_blocked`); начало сессии подменяется
+  записью `start.json`; время ref — по коммиттеру, не автору, имена HEAD убранного манифеста, `Unavailable`
+  `restored_names` по сроку, пределу и нечитаемому дереву ref (`test_restored_names_unreadable_tree_unavailable`) и
+  пропуск снимка с предупреждением; перенос из незакоммиченного `_LEGACY` вне git и в git блокируется —
+  `test_uncommitted_legacy_source_names_new`, из закоммиченного проходит —
+  `test_committed_legacy_source_moved_to_pyproject_not_new`), `ManifestConflictTest` (стороны конфликта индекса после
+  `git stash pop`, `git merge --squash`, `git cherry-pick -n`: `Write`, `Edit` разрешения и `git checkout --theirs`
+  проходят, имя ни одной стороны отклоняется; источник `git rebase` — `REBASE_HEAD` после `git add` нашей стороны;
+  стадии `:1:`, `:2:`, `:3:`, записанные `git update-index --index-info` в форме `git ls-files -s`, у каждой своё имя —
+  `test_each_index_stage_read`), `ManifestTransferEditTest` (имена версии HEAD убранного манифеста и файлов `_LEGACY`
+  версии HEAD проходят; имена `_LEGACY` рабочего дерева — неотслеживаемого, в подкаталоге `scratch/`, изменённого после
+  коммита — новые: обход в два шага, `test_legacy_source_in_tree_only_names_new`; `SyntaxWarning` закоммиченного
+  setup.py не в stderr), `ManifestFailureBranchesTest` (сбои `pop`, `compare`, срок правки — точный `systemMessage` и
+  `skipped`), `CommandRefsTest` (формы команд git, из которых `command_refs` берёт ref, и формы без ref — `git apply`),
+  `ManifestProjectUnderFixturesTest` (`FOREIGN_DIRS` — от проекта), `ManifestProjectUnderHomeRepoTest` (проект без
+  своего git под `HOME`-репозиторием с `status.showUntrackedFiles=no` и `.gitignore` `*`: `list_manifests` — режим
+  `walk`, правка и команда с новым именем — отказ и блок, имена версии HEAD и stash `~` не известны; файл вне корня
+  читает версии своего репозитория), `GeneratedRequirementsTest` (файлы вывода генераторов), `ManifestWatchStateTest`
+  (файл состояния снимков: срок записей, удаление пустого файла, предел обхода вне git, повторно не читаются файлы с тем
+  же размером и mtime, та же длина с новым mtime перечитывается, смена режима git/walk — `Unavailable`; `start.json`
+  пишет первый `PreToolUse` один раз, `PostToolUse` и хук внутри судьи — нет); старый патч по относительному пути из
+  подкаталога — `test_old_patch_by_relative_path_from_subdir_passes` (`ManifestBashGitTest`).
 - `tests/test_hostile_git.py` передаёт враждебный конфиг явно — `GIT_CONFIG_GLOBAL` на временный файл —
   только вызовам плагина (`snapshot.capture`, `snapshot.changed_since`, `comments.extract`,
   `common.project_root` (`git rev-parse`, `git ls-files` под домашним каталогом-репозиторием — `HostileRootTest`),
@@ -141,7 +143,8 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
   `LegacySourcesTest.test_setup_py_references_linear` (setup.py с шестью уровнями имён по 4 и 16 ссылок),
   `LinearParseTest` (комментарии), `FilterTest.test_list_items_linear_in_blank_lines`,
   `BacktickInDoubleQuotesTest.test_linear` в `tests/test_depcheck.py` (подстановка `` `…` `` в `"…"`: закрытая,
-  незакрытая до конца команды, на многих строках), `RobustnessTest.test_adversarial_input_is_linear`
+  незакрытая до конца команды, на многих строках), `DoubtTest.test_linear` там же (формы сомнения детектора),
+  `RobustnessTest.test_adversarial_input_is_linear`
   (`tests/test_planparse.py`: каждый враждебный пункт и строка при множителе 1 и 4),
   `SegmentsTest.test_unclosed_test_brackets_linear` (`tests/test_debug_watch.py`);
   `WalkCaptureTest.test_walk_cost_independent_of_ext_count` — обход при 1 и 2000 расширениях `.gitignore` через
@@ -152,7 +155,8 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
   как `python3` пользователя без UTF-8 mode) и `tests/stub` первым в `PATH`; `Env.run` обменивается с
   хуком в UTF-8, как Claude Code, при любой локали процесса тестов. Вместо
   `claude` отвечает заглушка `tests/stub/claude`. `judge_model` не задан — действует `session`, модель
-  берётся из `Env.transcript`. Новая переменная окружения, которую читает код, вычищается там же.
+  берётся из `Env.transcript` (файла модели сессии `Env` не пишет; модель из состояния — `tests/test_model_watch.py`).
+  Новая переменная окружения, которую читает код, вычищается там же.
 
 ## Заглушка судьи
 
@@ -251,7 +255,7 @@ PID процесса. Ответ с текстом собирает `python3` с
   `TimeoutsTest`: сроки внутри хуков против таймаутов `hooks/hooks.json`
   (`context/architecture.md`, «Сроки»), в сумме — `common.GIT_ROOT_TIMEOUT`, `guard_memory.CHECK_IGNORE_TIMEOUT` и сроки
   `manifest_watch`, и умолчание `timeout` у `common.run_judge` — `common.JUDGE_TIMEOUT`.
-- Живой `claude`: вызов судьи, показ `systemMessage`, хуки `guard_memory` и `debug_watch`, проверка
+- Живой `claude`: вызов судьи, показ `systemMessage`, хуки `guard_memory`, `debug_watch` и `model_watch`, проверка
   манифестов (отказ правке и блок `PostToolUse`) в настоящей сессии проверяются только вручную.
 - Сторож судьи на платформе не Linux не запускался.
 - Вложения с `attachment.planFilePath` в корпусе `transcript-shapes.jsonl` нет: тесты собирают его

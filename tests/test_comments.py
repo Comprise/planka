@@ -25,25 +25,31 @@ CORPUS = {
     "esp-idf-ci/idf_ci.toml": [1, 10, 26],
     "esp-idf-gitlab/pre_check.yml": [1, 3, 4, 10, 11, 22, 34, 44, 54],
     "ffmpeg-doc/libswscale.html": [1, 4],
+    "flutter-gradle-continuation/flutter.gradle": [1, 2, 3, 4, 6, 7, 8],
     "flutter-gradle/gradle.dart": [1],
     "flutter-issue-form/04_performance_others.yml": [1],
     "flutter-resolve-deps/resolve_dependencies.gradle.kts": [1, *range(4, 17)],
     "fzf-tmux/fzf-tmux.sh": [1, 7, 8, 9, 12, 22, 37, 42],
     "go-template-lex/lex.go": [1, 11, 31, 38],
+    "groovy-spec-slashy/SyntaxTest.groovy": [1, 3, 6, 8, 11, 13, 19, 21, 26],
     "grpc-gateway-ci/ci.yml": [1, 6, 7, 14, 21, 22, 26],
     "kernel-make/Makefile": [1],
     "kernel-rustdoc/rustdoc_test_gen.rs": [*range(1, 10)],
     "kernel-unifdef/unifdef.c": [1, 8, *range(10, 21), 22, 23, 59, 64, 65, 66],
     "lib-pq/20-config.sql": [1, 12, 13],
     "mbedtls-readthedocs/readthedocs.yaml": [*range(1, 5), 6, 9, 14, 27, 32, 37],
+    "mermaid-zenuml-render/render.js": [1],
     "mldsa-hol-light/hol_light.yml": [1, 2, *range(10, 14), 21],
     "moby-dockerfile/Dockerfile": [1, 2, 9, 10, 13, 17, 21, 24, *range(31, 35), *range(37, 44), 48, 51, 52, 58,
         *range(61, 65)],
     "moby-swagger/swagger.yaml": [1],
+    "nimble-log2smtest/log2smtest.rb": [1],
     "npm-install/install.js": [1, 6, 7, 8, 10, 15, 16, 46, 49, 52],
     "openssh-findssl/findssl.sh": [*range(1, 7), 10, 11, 12, 15, 16, 17, 24, 25, 26, 33],
     "perl-cpan-distribution/Distribution.pl": [1, 26, 33, 46, 52, 53],
+    "perl-encode-kr/2022_KR.pl": [1, 5, 6, 7, 8],
     "perl-mime-header/Header.pl": [1, 3, 12, 24, 26, 35, 52],
+    "perl-module-load/Load.pl": [1, 8],
     "perl-proxysubs/ProxySubs.pl": [1],
     "python-shlex/shlex.py": [1, 2, *range(4, 10), 20, 59, 61, 63],
     "react-virtual/index.tsx": [1, *range(9, 14), *range(22, 44), *range(45, 55)],
@@ -521,6 +527,14 @@ class ParserEdgeTest(unittest.TestCase):
                     "if ($x) { print  $log  <<'END' }\n# not\nEND\n# real\n"):
             self.assertEqual(comments.comment_lines(src, "pl"), ["# real"], src)
 
+    def test_perl_long_block_filehandle(self):
+        # Блок-дескриптор узнаётся любой длины и вложенности; скобки перед ним не мешают.
+        name = "a" * 300
+        for src in ("print {$self->{" + name + "}} <<EOF;\n# not\nEOF\n# c\n",
+                    "f({}); print {$h{x}{" + name + "}} <<EOF;\n# not\nEOF\n# c\n"):
+            self.assertEqual(comments.comment_lines(src, "pl"), ["# c"], src[:40])
+        self.assertEqual(comments.comment_lines("f({" + name + "}} <<EOF); # c1\n# c2\nEOF\n", "pl"), ["# c1", "# c2"])
+
     def test_perl_heredoc_real_corpus_forms(self):
         # Идентификатор с ведущим «_», «::» в имени дескриптора, «<<» вплотную после функции вывода.
         for src in ("print <<_EOUSAGE_ ;\n# not\n_EOUSAGE_\n# real\n", "print <<_EOVERS;\n# not\n_EOVERS\n# real\n",
@@ -535,9 +549,40 @@ class ParserEdgeTest(unittest.TestCase):
         for src, ext in (("x = 1<<EOF; # c1\n# c2\nEOF\n", "pl"), ("$print<<EOF; # c1\n# c2\nEOF\n", "pl"),
                          ("foo CSS<<EOF; # c1\n# c2\nEOF\n", "pl"), ("$h->print<<EOF; # c1\n# c2\nEOF\n", "pl"),
                          ("reprint<<EOF; # c1\n# c2\nEOF\n", "pl"), ("print<<EOF # c1\n# c2\nEOF\n", "rb"),
-                         ("print CSS<<EOF # c1\n# c2\nEOF\n", "rb"), ("print <<_ # c1\n# c2\n_\n", "pl")):
+                         ("print CSS<<EOF # c1\n# c2\nEOF\n", "rb")):
             self.assertEqual(comments.comment_lines(src, ext), ["# c1", "# c2"], src)
-        self.assertEqual(comments.comment_lines("puts <<_eof # c1\n# c2\n_eof\n", "rb"), ["# c1", "# c2"])
+        # Ruby: за методом через пробел — heredoc и со строчным идентификатором; Perl: за print — тоже.
+        self.assertEqual(comments.comment_lines("puts <<_eof # c1\n# c2\n_eof\n", "rb"), ["# c1"])
+        self.assertEqual(comments.comment_lines("print <<_ # c1\n# c2\n_\n", "pl"), ["# c1"])
+
+    def test_ruby_heredoc_by_word_before(self):
+        # Лексер Ruby: «<<» вплотную за словом — сдвиг, кроме ключевых слов, за которыми начинается выражение
+        # (return, if, and…); через пробел за методом и константой — heredoc, за локальной переменной, числом и
+        # self, nil, true, false, end — сдвиг и добавление при любом идентификаторе. Ожидания сверены с Prism.
+        cases = (("puts <<eof\n# a\neof\n# c\n", ["# c"]), ("return<<eos\n# a\neos\n# c\n", ["# c"]),
+                 ("x if<<eos\n# a\neos\n# c\n", ["# c"]), ("x.y <<-eof\n# a\neof\n# c\n", ["# c"]),
+                 ("Foo <<eof\n# a\neof\n# c\n", ["# c"]), ("x = 1\nx.x <<eof\n# a\neof\n# c\n", ["# c"]),
+                 ("self <<EOF # c1\n# c2\nEOF\n", ["# c1", "# c2"]),
+                 ("x = 1\nx <<~EOF # c1\n# c2\nEOF\n", ["# c1", "# c2"]),
+                 ("x = 1\nx <<'EOF' # c1\n# c2\nEOF\n", ["# c1", "# c2"]),
+                 ("1 <<eof # c1\n# c2\neof\n", ["# c1", "# c2"]),
+                 ("x.return<<EOS # c1\n# c2\nEOS\n", ["# c1", "# c2"]))
+        for src, expected in cases:
+            self.assertEqual(comments.comment_lines(src, "rb"), expected, src)
+
+    def test_perl_builtins_decide_slash_and_heredoc(self):
+        # За встроенной функцией Perl, ждущей аргумент, «/» — регулярка и через пробел (и многострочная), «<<» —
+        # heredoc и вплотную; за функцией без аргументов (time, wantarray) и __LINE__ — деление и сдвиг.
+        # Ожидания сверены с perl -MO=Deparse.
+        cases = (("my @a = reverse / #/; # c\n", ["# c"]), ("my $t = time /2; # c\n", ["# c"]),
+                 ("my $x = getppid /2; # c\n", ["# c"]), ("my $h = shift / 2;\n# c/;\n", []),
+                 ("print <<eof;\n# not\neof\n# c\n", ["# c"]), ("my $s = lc<<EOS;\n# not\nEOS\n# c\n", ["# c"]),
+                 ("return<<EOS;\n# not\nEOS\n# c\n", ["# c"]),
+                 ("my $n = time <<EOF; # c1\n# c2\nEOF\n", ["# c1", "# c2"]),
+                 ("my $n = __LINE__ <<EOF; # c1\n# c2\nEOF\n", ["# c1", "# c2"]),
+                 ("$o->length / #/; # c\n", ["#/; # c"]))
+        for src, expected in cases:
+            self.assertEqual(comments.comment_lines(src, "pl"), expected, src)
 
     def test_perl_hash_element_before_shift(self):
         # «}» закрывает элемент хеша, а не «{$дескриптор}» после print.
@@ -619,6 +664,99 @@ class ExpressionLiteralTest(unittest.TestCase):
     def test_unclosed_regex_ends_at_line_end(self):
         # Мнимая регулярка без закрытия прячет только остаток своей строки.
         self.assertEqual(comments._comments("x = /[a // b\n// c\n", "js"), [(2, "// c")])
+
+    def test_regex_after_statement_parenthesis(self):
+        # «)» условия if, while, for, with — конец заголовка оператора: «/» за ним — регулярка (так acorn); «)»
+        # вызова и группы — конец значения, «/» — деление.
+        for ext in ("js", "ts", "jsx", "tsx"):
+            cases = (("if (x) /\\/\\//.test(y) // c\n", [(1, "// c")]),
+                     ("while (f(x)) /\\/\\//.exec(s) // c\n", [(1, "// c")]),
+                     ("for (;;) /a\\//.test(s) // c\n", [(1, "// c")]),
+                     ("if (a)\n  /\\/\\//.test(y) // c\n", [(2, "// c")]),
+                     ("if (a) b = f(x) /2/ 1 // c\n", [(1, "// c")]),
+                     ("x.if (a) /2/ 1 // c\n", [(1, "// c")]),
+                     ("z = (a) /2/ 1 // c\n", [(1, "// c")]))
+            for src, expected in cases:
+                self.assertEqual(comments._comments(src, ext), expected, (ext, src))
+
+    def test_regex_after_block_comment(self):
+        # Блочный комментарий прозрачен: решает токен перед ним. «`» за регуляркой — её знак; за делением —
+        # многострочная шаблонная строка до «`» последней строки, она прячет «// d».
+        for ext in ("js", "ts"):
+            cases = (("x = /* c */ /`/\n// d\nz = `\n", [(1, "/* c */ /`/"), (2, "// d")]),
+                     ("x = /* c\n*/ /`/\n// d\nz = `\n", [(1, "/* c"), (2, "*/ /`/"), (3, "// d")]),
+                     ("x = a /* c\n*/ /`/\n// d\nz = `\n", [(1, "/* c"), (2, "*/ /`/")]),
+                     ("x = /* c */\n/`/\n// d\nz = `\n", [(1, "/* c */"), (3, "// d")]),
+                     ("x = /a/ /`/\n// d\nz = `\n", []),
+                     ("x = /a/ /2/ 1 // c\n", [(1, "// c")]))
+            for src, expected in cases:
+                self.assertEqual(comments._comments(src, ext), expected, (ext, src))
+
+    def test_js_increment_and_division_before_slash(self):
+        # «++» и «--» не меняют ответ токена перед собой, в начале строки — префикс; «/» деления — начало выражения.
+        # «`» за делением открыл бы шаблонную строку до «`» последней строки и спрятал «// d». Ожидания сверены с
+        # парсером TypeScript.
+        for ext in ("js", "ts"):
+            cases = (("x = ++/`/\n", 1), ("a +++/`/\n", 1), ("f(a)\n++/`/\n", 2), ("x = a / /`/\n", 1),
+                     ("x = a /\n/`/\n", 2), ("x = a ++\n/2/`\n", None), ("x = a++ /2/`\n", None))
+            for src, line in cases:
+                n = src.count("\n")
+                expected = [(n + 1, "// d")] if line else []
+                self.assertEqual(comments._comments(src + "// d\nz = `\n", ext), expected, (ext, src))
+
+    def test_groovy_multiline_slashy_strings(self):
+        # Slashy-строка Groovy многострочна; без закрытия до конца файла лексер Groovy читает «/» как деление.
+        # Ожидания сверены с лексером Groovy 4 (org.apache.groovy.parser.antlr4.GroovyLexer).
+        for ext in ("groovy", "gradle"):
+            cases = (("def u = /a\nb // c/\n// d\n", [(3, "// d")]),
+                     ("def u = /a\n// c\n", []),
+                     ("def u = /a\\/\n// b/ // c\n", [(2, "// c")]),
+                     ("def u = /a\\\\/ // b/ // c\n", [(1, "// c")]),
+                     ("def u = /a ${b /* x */ / 2} // c/ // d\n", [(1, "/* x */ / 2} // c/ // d")]),
+                     ("def u = /a ${'}'} b/ // c\n", [(1, "// c")]),
+                     ("def u = /a/ /2/ 1 // c\n", [(1, "// c")]),
+                     ("def u = a / /b // c/\n", []),
+                     ("def u = {1} /2/ 1 // c\n", [(1, "// c")]),
+                     ("def u = {1} /b // c/\n", [(1, "// c/")]),
+                     ("def u = /a/ /b // c/\n", [(1, "// c/")]),
+                     ("def u = (a\n/b // c/)\n", [(2, "// c/)")]),
+                     ("def u = this /2/ 1 // c\n", [(1, "// c")]),
+                     ("def u = null /2/ 1 // c\n", [(1, "// c")]),
+                     ("def u = a++ /2/ 1 // c\n", [(1, "// c")]),
+                     ("def u = a.in /b // c/\n", []),
+                     ("assert /b // c/\n", []),
+                     ("def u = a $/b/$ // c\n", [(1, "// c")]),
+                     ("def u = a$/b/$ // c\n", [(1, "// c")]),
+                     ("def u = a$/ 2 // c/$\n", [(1, "// c/$")]),
+                     ("def u = a $/b\n// c\n", [(2, "// c")]),
+                     ("def u = a /* c */ /2/ 1 // d\n", [(1, "/* c */ /2/ 1 // d")]),
+                     ("def u = (a\n/2/ 1) // c\n", [(2, "// c")]),
+                     ("def u = (a // b\n/2/ 1) // c\n", [(1, "// b"), (2, "// c")]),
+                     ("def u = [a\n/2/ 1] // c\n", [(2, "// c")]),
+                     ("def u = a\n/b // c/\n", []),
+                     ("def u = ({\n/b // c/ })\n", []),
+                     ("try (a\n/b // c/) {}\n", []))
+            for src, expected in cases:
+                self.assertEqual(comments._comments(src, ext), expected, (ext, src))
+
+    def test_groovy_string_line_continuation(self):
+        # «\» в конце строки продолжает строку Groovy в кавычках на следующей; «\\» — escape самой косой.
+        for ext in ("groovy", "gradle"):
+            cases = (('x = "a \\\nhttps://b \\\n" // c\n', [(3, "// c")]),
+                     ("x = 'a \\\nhttps://b' // c\n", [(2, "// c")]),
+                     ('x = "a \\\\\nhttps://b" // c\n', [(2, '//b" // c')]),
+                     # «"""» без закрытия — «""» и строка «" "», «\» за ней — продолжение кода, не строки.
+                     ('x = """ "a \\\nb //c"\n', [(2, '//c"')]))
+            for src, expected in cases:
+                self.assertEqual(comments._comments(src, ext), expected, (ext, src))
+
+    def test_unclosed_openings_reported_for_rollback(self):
+        # Slashy-строка без закрытия — открытие для отката, запрещённое — деление; ожидание второй части s{…}{…}
+        # к концу файла ничего не прячет и в откат не идёт.
+        groovy, perl = comments._SYNTAX["groovy"], comments._SYNTAX["pl"]
+        self.assertEqual(comments._parse("x = /a\n", groovy, None, frozenset())[1], [(None, "ctx", (1, 4))])
+        self.assertEqual(comments._parse("x = /a\n", groovy, None, frozenset({(1, 4)}))[1], [])
+        self.assertEqual(comments._parse("$s =~ s{a}\n", perl, None, frozenset())[1], [])
 
     def test_groovy_slashy_strings(self):
         for ext in ("groovy", "gradle"):
@@ -791,6 +929,15 @@ class RubyPerlElixirLiteralTest(unittest.TestCase):
         for ext, src, expected in cases:
             self.assertEqual(comments.comment_lines(src, ext), expected, src)
 
+    def test_ruby_slash_after_keywords(self):
+        # За return, else и подобными «/» — регулярка и через пробел; за self, nil — деление; not — как метод.
+        # Ожидания сверены с Prism.
+        cases = (("return / #/ if x # c\n", [(1, "# c")]), ("self /a # c\n", [(1, "# c")]),
+                 ("x = foo? / 2 # c\n", [(1, "# c")]), ("foo?<<EOF # c1\n# c2\nEOF\n", [(1, "# c1"), (2, "# c2")]),
+                 ("nil /a # c\n", [(1, "# c")]), ("not / 2 # c/\n", [(1, "# c/")]), ("not /#/ # c\n", [(1, "# c")]))
+        for src, expected in cases:
+            self.assertEqual(comments._comments(src, "rb"), expected, src)
+
     def test_ruby_slash_operand_forms(self):
         # Метод после «.» с именем локальной переменной или слова из _TERM_WORDS — не переменная и не начало
         # выражения; «::/» — не символ; «/=» после слова — деление с присваиванием и вплотную к знаку;
@@ -810,6 +957,19 @@ class RubyPerlElixirLiteralTest(unittest.TestCase):
                "$x = qr{\n  a\n}s, 1; # c3\n$s =~ s{a}{b}s, 1; # c4\n")
         self.assertEqual(comments.comment_lines(src, "pl"), [f"# c{i}" for i in range(1, 5)])
         self.assertEqual(comments.comment_lines("r = %r{\n  a\n}s # c1\n", "rb"), ["# c1"])
+
+    def test_perl_second_part_on_later_line(self):
+        # Вторая часть s{…}{…}, tr{…}{…} в скобках — и на следующих строках, за пробелами и комментариями (perlop,
+        # «Gory details of parsing quoted constructs»): она строка или код (e), её флаги решают про /x первой.
+        cases = (("$s =~ s{\n a #b\n}\n{c};\n# d\n", [(5, "# d")]),
+                 ("$s =~ s{\n a #b\n}\n{c}x;\n", [(2, "#b")]),
+                 ("$s =~ s{a} # c\n\n  { #not}x; # e\n", [(1, "# c"), (3, "# e")]),
+                 ("$s =~ s{a}\n  # c\n{ #not};\n# d\n", [(2, "# c"), (4, "# d")]),
+                 ("$s =~ s{a}\n  # c\n{\n f() # d\n}e;\n", [(2, "# c"), (4, "# d")]),
+                 ("$s =~ s{\n a #b\n} # c\n {\n f() # d\n }ex; # e\n", [(2, "#b"), (3, "# c"), (5, "# d"), (6, "# e")]),
+                 ("$s =~ tr{a}\n{ #not};\n# c\n", [(3, "# c")]))
+        for src, expected in cases:
+            self.assertEqual(comments._comments(src, "pl"), expected, src)
 
     def test_perl_substitution_replacement_code_only_with_e_flag(self):
         # Вторая часть s{…}{…} — код с флагом e, иначе строка; на первой строке и на следующих.
@@ -899,6 +1059,19 @@ class MultilineStringTest(unittest.TestCase):
         # «script» шага github-script не под «with:» — shell.
         self.assertEqual(comments._comments("- uses: actions/github-script\n  env:\n    script: |\n      # a\n",
                                             "yml"), [(4, "# a")])
+
+    def test_github_script_uses_after_with(self):
+        # Порядок ключей шага не важен: «uses» после «with:» решает язык входа «script» так же; без «uses» до конца
+        # шага — shell. Строки вывода — по порядку номеров.
+        cases = (("- with:\n    script: |\n      // a\n  uses: actions/github-script@v7\n", [(3, "// a")]),
+                 ("- with:\n    script: |\n      // a\n      # b\n  # c\n  uses: actions/github-script@v7\n",
+                  [(3, "// a"), (5, "# c")]),
+                 ("- with:\n    script: |\n      # a\n  uses: actions/checkout@v4\n", [(3, "# a")]),
+                 ("- with:\n    script: |\n      # a\n- uses: actions/github-script@v7\n", [(3, "# a")]),
+                 ("steps:\n  - with:\n      script: |\n        # a\n", [(4, "# a")]),
+                 ("a:\n  - with:\n      script: |\n        # a\nb:\n  uses: actions/github-script@v7\n", [(4, "# a")]))
+        for src, expected in cases:
+            self.assertEqual(comments._comments(src, "yml"), expected, src)
 
     def test_yaml_key_stack_keeps_one_key_per_column(self):
         keys, uses = [], {}
@@ -1446,7 +1619,25 @@ class LinearParseTest(unittest.TestCase):
             (lambda k: ("".join(" " * d + f"k{d}:\n" for d in range(100)) + " |\n  # c\n") * k, "yaml", 100),
             (lambda k: "a = 1; " * k + "a /b # c", "rb", 5000), (lambda k: "do |" * k, "rb", 5000),
             (lambda k: "def f(" * k, "rb", 5000), (lambda k: "a, " * k + "= 1", "rb", 5000),
-            (lambda k: "qr{\n a #b\n}\n" * k, "pl", 1000), (lambda k: "s{a}{\n" * k + "}e\n" * k, "pl", 500)))
+            (lambda k: "qr{\n a #b\n}\n" * k, "pl", 1000), (lambda k: "s{a}{\n" * k + "}e\n" * k, "pl", 500),
+            # Стек скобок JS и Groovy, «++» перед «/», блочные комментарии перед «/», slashy-строки с подстановками,
+            # продолжение строки Groovy, тройная кавычка без закрытия.
+            (lambda k: "(" * k + ")" * k + " /a/", "js", 5000), (lambda k: "if (a) /b/ " * k, "ts", 2000),
+            (lambda k: "x" + " ++" * k + " /`/", "js", 5000), (lambda k: "x = ++" * k + "/a/", "js", 3000),
+            (lambda k: "/* */ " * k + "/a/", "js", 3000), (lambda k: "(\n" * k + "/a/\n" * k, "groovy", 1000),
+            (lambda k: "x = /a ${" * k + "}/" * k, "groovy", 2000), (lambda k: "+" * k + "/a/", "groovy", 20000),
+            (lambda k: 'x = "a \\\n' * k, "gradle", 2000), (lambda k: '"""' + ' ""' * k + "\n", "groovy", 5000),
+            (lambda k: "x = a $/" * k + "\n", "groovy", 5000),
+            # Вторая часть s{…}{…} на следующих строках, длинный блок-дескриптор, слова перед «<<» и «/».
+            (lambda k: "s{a}\n" * k + "{b}\n", "pl", 2000), (lambda k: "s{a} # c\n\n" * k, "pl", 2000),
+            (lambda k: "f({}) " * k + "print {$x->{" + "a" * k + "}} <<B\n# c\nB\n", "pl", 2000),
+            (lambda k: "print {$a->{b}} <<B " * k + "\nB\n", "pl", 500), (lambda k: "lc<<A " * k, "pl", 2000),
+            (lambda k: "a?" * k + " /b", "rb", 5000), (lambda k: "x = 1\n" + "x <<eof " * k, "rb", 3000),
+            # Входы «script» шагов без uses.
+            (lambda k: "- with:\n    script: |\n      # a\n" * k + "  uses: actions/github-script@v7\n", "yml",
+             1000),
+            (lambda k: "".join(" " * d + "- with:\n" + " " * d + "    script: |\n" + " " * d + "      # a\n"
+                               for d in range(k)), "yml", 100)))
 
     def test_deadline_during_parse_files_without_check(self):
         common._reset()

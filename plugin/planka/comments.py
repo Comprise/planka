@@ -1,5 +1,6 @@
 """Извлечение строк комментариев из изменённых файлов для судьи."""
 import codecs
+import functools
 import os
 import re
 import subprocess
@@ -32,19 +33,21 @@ class _Syntax:
     табуляции) как "word" и сразу за префиксами «@», «-», «+» (_MAKE_PREFIX), в прочих как "code", "vim" и
     "vim9" — по _vim_quote и _marker_ok. blocks —
     (открытие, закрытие) блочного комментария; nested — блоки вкладываются (счётчик глубины). strings —
-    (открытие, закрытие, многострочный ли, escape): escape "\\" — обратная косая, "`" — обратная кавычка
+    (открытие, закрытие, многострочный ли, escape): многострочный — True, False или "cont" (на следующую строку —
+    только за нечётной серией «\\» в конце строки, Groovy); escape "\\" — обратная косая, "`" — обратная кавычка
     PowerShell, "double" — удвоенная закрывающая кавычка, "nix" — escape строк '' Nix, None — нет; однострочный
     литерал без закрывающей кавычки в той же строке литералом не считается, многострочный без закрытия до конца
-    файла — тоже (_comments). prefix — (первый знак, регулярка, нужно ли не-слово перед ним) символьного
-    литерала с особым знаком: «$%» Erlang, «?#» Ruby, «\\;» Clojure. rem — знаки, после которых (и пробелов)
-    слово REM открывает комментарий, None — REM не комментарий.
+    файла — тоже (_comments), тройная кавычка тогда — пустая строка и кавычка. prefix — (первый знак, регулярка,
+    нужно ли не-слово перед ним) символьного литерала с особым знаком: «$%» Erlang, «?#» Ruby, «\\;» Clojure. rem —
+    знаки, после которых (и пробелов) слово REM открывает комментарий, None — REM не комментарий.
     line_block — (начало, конец) блока из целых строк с первой колонки (=begin/=end Ruby, POD Perl).
     exdoc — атрибуты @doc, @moduledoc, @typedoc Elixir со строкой — документация, в вывод.
     regex — «/» в начале выражения (_expr_start) открывает литерал: "js" — регулярное выражение JS с классами
-    «[...]» и шаблонная строка «`…`» с подстановками «${…}», "groovy" — slashy-строка «/…/» и dollar-slashy
-    «$/…/$» Groovy, "ruby" — регулярное выражение «/…/» (_literal_opens), литералы «%r{…}», «%w(…)» и строки
-    «"…"», «`…`» с подстановками «#{…}», "perl" — «/…/» (_literal_opens) и операторы-кавычки «m//», «s///»,
-    «qr{}», «tr///», «q()», «qw[]» (_quote_parts); в обоих «$"», «$'», «$`» — переменные, после __END__ — данные.
+    «[...]» и шаблонная строка «`…`» с подстановками «${…}», "groovy" — многострочная slashy-строка «/…/» с
+    подстановками «${…}» (_groovy_slashy_ok) и dollar-slashy «$/…/$» Groovy, "ruby" — регулярное выражение «/…/»
+    (_literal_opens), литералы «%r{…}», «%w(…)» и строки «"…"», «`…`» с подстановками «#{…}», "perl" — «/…/»
+    (_literal_opens) и операторы-кавычки «m//», «s///», «qr{}», «tr///», «q()», «qw[]» (_quote_parts); в обоих
+    «$"», «$'», «$`» — переменные, после __END__ — данные.
     jsx — «<» в начале выражения открывает разметку JSX (_jsx_opens): текст между тегами — не код. sigil — сигилы
     Elixir «~r/…/», «~w(…)», с тройными кавычками. block_scalar — блочные скаляры YAML «key: |», «- >-»: строки с
     отступом больше родителя (_yaml_block) — скрипт по _yaml_script_ext, иначе данные.
@@ -70,6 +73,8 @@ class _Syntax:
         firsts |= {"@"} if exdoc else set()
         firsts |= {"/"} if regex else set()
         firsts |= {"$"} if regex == "groovy" else set()
+        # Скобки ведут стек _brackets: «)» условия JS, перевод строки в «(» и «[» Groovy.
+        firsts |= set(_BRACKETS[regex]) if regex in _BRACKETS else set()
         firsts |= {"`"} if regex == "js" else set()
         firsts |= {"%", '"', "`"} if regex == "ruby" else set()
         firsts |= {"<"} if jsx else set()
@@ -122,6 +127,10 @@ _XRE_COMMENT = re.compile(r"(?<!\S)#(?!\{)")
 # («#» через пробел — комментарий).
 _PERL_QUOTE = re.compile(r"(?<![\w$@%&:>])(?:tr|qr|qq|qw|qx|[msqy])(?=[^\w\s=})\];>]|=(?!>)|\s+[/{(\[<])")
 
+# Скобки, которые ведёт стек _parse: в JS — «(» и «)» (заголовок if, while, for, with), в Groovy — все три пары
+# (перевод строки внутри «(» и «[» лексер Groovy пропускает).
+_BRACKETS = {"js": "()", "groovy": "()[]{}"}
+
 _SYNTAX = {}
 
 
@@ -146,7 +155,9 @@ _JS_STRINGS = (_DQ, _SQ)
 _add(("mjs", "cjs", "ts", "mts", "cts"), line=_SLASH, blocks=_C_BLOCK, strings=_JS_STRINGS, regex="js")
 _add(("js", "jsx", "tsx"), line=_SLASH, blocks=_C_BLOCK, strings=_JS_STRINGS, regex="js", jsx=True)
 _add(("dart",), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ, _T_SQ, _DQ, _SQ), nested=True)
-_add(("groovy", "gradle"), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ, _T_SQ, _DQ, _SQ), regex="groovy")
+# Groovy: строка в кавычках продолжается на следующей строке за «\\» в конце строки (multiline "cont").
+_add(("groovy", "gradle"), line=_SLASH, blocks=_C_BLOCK,
+     strings=(_T_DQ, _T_SQ, ('"', '"', "cont", "\\"), ("'", "'", "cont", "\\")), regex="groovy")
 _add(("php",), line=_SLASH + (("#", "php"),), blocks=_C_BLOCK, strings=(_DQ, _SQ), heredoc="php")
 _add(("proto", "sol"), line=_SLASH, blocks=_C_BLOCK, strings=(_DQ, _SQ))
 _add(("zig",), line=_SLASH, strings=(_DQ,), char=True, zig=True)
@@ -391,9 +402,42 @@ def _docstring_start(raw, i):
 
 
 _PRINT = frozenset(("print", "printf", "say"))
-# Функции Perl, после которых «<<ID» вплотную — heredoc.
-_PERL_TIGHT = _PRINT | {"die", "warn"}
+# Встроенные функции и операторы Perl, за которыми лексер Perl ждёт терм: «/» — регулярка, «<<» — heredoc, и через
+# пробел, и вплотную (perl -MO=Deparse, Perl 5.42). say, fc, evalbytes — функции только с feature, а feature включают
+# и модули: они тут не перечислены.
+_PERL_TERM = frozenset((
+    "abs", "accept", "alarm", "and", "atan2", "bind", "binmode", "bless", "caller", "chdir", "chmod", "chomp", "chop",
+    "chown", "chr", "chroot", "close", "closedir", "cmp", "connect", "cos", "crypt", "dbmclose", "dbmopen", "defined",
+    "delete", "die", "do", "each", "elsif", "eof", "eq", "eval", "exec", "exists", "exit", "exp", "fcntl", "fileno",
+    "flock", "formline", "ge", "getc", "getgrgid", "getgrnam", "gethostbyaddr", "gethostbyname", "getnetbyaddr",
+    "getnetbyname", "getpeername", "getpgrp", "getpriority", "getprotobyname", "getprotobynumber", "getpwnam",
+    "getpwuid", "getservbyname", "getservbyport", "getsockname", "getsockopt", "glob", "gmtime", "goto", "grep", "gt",
+    "hex", "if", "index", "int", "ioctl", "join", "keys", "kill", "last", "lc", "lcfirst", "le", "length", "link",
+    "listen", "localtime", "lock", "log", "lstat", "lt", "map", "mkdir", "msgctl", "msgget", "msgrcv", "msgsnd", "ne",
+    "next", "not", "oct", "open", "opendir", "or", "ord", "pack", "pipe", "pop", "pos", "print", "printf", "prototype",
+    "push", "quotemeta", "rand", "read", "readdir", "readline", "readlink", "readpipe", "recv", "redo", "ref", "rename",
+    "require", "reset", "return", "reverse", "rewinddir", "rindex", "rmdir", "scalar", "seek", "seekdir", "select",
+    "semctl", "semget", "semop", "send", "sethostent", "setnetent", "setpgrp", "setpriority", "setprotoent",
+    "setservent", "setsockopt", "shift", "shmctl", "shmget", "shmread", "shmwrite", "shutdown", "sin", "sleep",
+    "socket", "socketpair", "sort", "splice", "split", "sprintf", "sqrt", "srand", "stat", "study", "substr",
+    "symlink", "syscall", "sysopen", "sysread", "sysseek", "system", "syswrite", "tell", "telldir", "tie", "tied",
+    "truncate", "uc", "ucfirst", "umask", "undef", "unless", "unlink", "unpack", "unshift", "untie", "until", "utime",
+    "values", "vec", "waitpid", "warn", "while", "write", "xor"))
+# Встроенные функции Perl без аргументов и литералы __FILE__, __LINE__, __PACKAGE__: за ними лексер Perl ждёт
+# оператор — «/» деление, «<<» сдвиг.
+_PERL_VALUE = frozenset((
+    "endgrent", "endhostent", "endnetent", "endprotoent", "endpwent", "endservent", "fork", "getgrent", "gethostent",
+    "getlogin", "getnetent", "getppid", "getprotoent", "getpwent", "getservent", "setgrent", "setpwent", "time",
+    "times", "wait", "wantarray", "__FILE__", "__LINE__", "__PACKAGE__"))
+# Слова Perl, после которых «<<ID» вплотную — heredoc: _PERL_TERM и say (с feature say — функция вывода).
+_PERL_TIGHT = _PERL_TERM | {"say"}
 _PERL_HANDLE = re.compile(r"[A-Z_][A-Z0-9_]*")
+# Ключевые слова Ruby, за которыми лексер Ruby (EXPR_BEG, EXPR_MID) начинает выражение: «/» — регулярка, «<<» —
+# heredoc и вплотную. За _RUBY_VALUE (EXPR_END) — оператор: деление, сдвиг и добавление.
+_RUBY_BEG = frozenset(("if", "unless", "while", "until", "and", "or", "when", "in", "elsif", "then", "else", "return",
+                       "break", "next", "do", "case", "begin", "rescue", "ensure"))
+_RUBY_VALUE = frozenset(("self", "nil", "true", "false", "__FILE__", "__LINE__", "__ENCODING__", "end", "redo",
+                         "retry"))
 
 
 def _print_word(raw, k):
@@ -411,59 +455,73 @@ def _after_print(raw, j):
     return k < j and _print_word(raw, k)
 
 
-# Блок-дескриптор Perl ищется назад не дальше стольких знаков: разбор строки остаётся линейным.
-_BLOCK_LOOKBACK = 256
+@functools.lru_cache(maxsize=1)
+def _brace_pairs(raw):
+    """{позиция «}»: позиция парной «{»} строки raw: скобки считаются подряд, без учёта строк и литералов. Строка
+    разбирается один раз за все «<<» в ней: решение про блок-дескриптор остаётся линейным."""
+    pairs, opened = {}, []
+    for m in _BRACES.finditer(raw):
+        if m.group() == "{":
+            opened.append(m.start())
+        elif opened:
+            pairs[m.start()] = opened.pop()
+    return pairs
+
+
+_BRACES = re.compile(r"[{}]")
 
 
 def _print_block(raw, j):
     """Стоит ли перед j, на «}», блок-дескриптор Perl после print, printf, say: «{$fh}», «{$DB::OUT}»,
-    «{$self->{fh}}», «{*STDOUT}», и вплотную к слову («print{$fh}»). Блок со вложенными скобками — не длиннее
-    _BLOCK_LOOKBACK знаков."""
+    «{$self->{fh}}», «{*STDOUT}», и вплотную к слову («print{$fh}»); парная «{» — по _brace_pairs."""
     k = _back(raw, j - 1, lambda c: _is_word(c) or c == ":")
     if k < j - 1 and raw[k - 2:k] == "{$":
         return _print_word(raw, _back(raw, k - 2, str.isspace))
-    depth, b, lo = 0, j, max(0, j - _BLOCK_LOOKBACK)
-    while b > lo:
-        b -= 1
-        if raw[b] == "}":
-            depth += 1
-        elif raw[b] == "{":
-            depth -= 1
-            if not depth:
-                break
-    else:
-        return False
-    return raw[b + 1:b + 2] in ("$", "*") and _print_word(raw, _back(raw, b, str.isspace))
+    b = _brace_pairs(raw).get(j - 1)
+    return b is not None and raw[b + 1:b + 2] in ("$", "*") and _print_word(raw, _back(raw, b, str.isspace))
 
 
-def _tight_perl(raw, i):
-    """Стоит ли перед «<<» в i вплотную слово Perl, после которого идёт heredoc: print, printf, say, die,
-    warn («print<<EOT») или дескриптор из заглавных и «_» после print, printf, say («print CSS<<EOF»)."""
+def _member(raw, k):
+    """Стоит ли перед словом, начатым в k, сигил «$», «@», «%», «&», «.», «->» или «::»: это переменная, метод или
+    имя пакета, а не встроенное слово языка."""
+    return bool(k) and (raw[k - 1] in "$@%&." or raw[k - 2:k] in ("->", "::"))
+
+
+def _tight_heredoc(raw, i, perl):
+    """Стоит ли перед «<<» в i вплотную слово, после которого идёт heredoc: в Perl — из _PERL_TIGHT («print<<EOT»,
+    «lc<<EOS») или дескриптор из заглавных и «_» после print, printf, say («print CSS<<EOF»); в Ruby — из
+    _RUBY_BEG («return<<EOS»)."""
     k = _back(raw, i, _is_word)
-    if k == i or k and raw[k - 1] in "$@%&>":
+    if k == i or _member(raw, k) or k and raw[k - 1] == ">":
         return False
     word = raw[k:i]
+    if not perl:
+        return word in _RUBY_BEG
     return word in _PERL_TIGHT or bool(_PERL_HANDLE.fullmatch(word)) and _after_print(raw, k)
 
 
-def _heredoc_ok(raw, i, m, perl=False):
+def _heredoc_ok(raw, i, m, perl=False, names=frozenset()):
     """Открывает ли «<<» с совпавшим _RUBY_HEREDOC m в позиции i heredoc, а не сдвиг или добавление.
 
-    Сразу после слова или закрывающей скобки — сдвиг («1<<BITS», «a[0]<<X»). После пробела: за скобкой или
-    кавычкой — терм, сдвиг; за переменной Perl («$a», «@a») — сдвиг; за прочим словом — heredoc, если
-    идентификатор с «-», «~», в кавычках или с заглавной буквы («print <<EOF»), иначе добавление
-    («a <<b»). За любым другим знаком («=», «(», «,») и в начале строки — heredoc.
+    Сразу после слова или закрывающей скобки — сдвиг («1<<BITS», «a[0]<<X»), кроме слов _tight_heredoc. После
+    пробела: за скобкой или кавычкой — терм, сдвиг; за переменной Perl («$a», «@a») — сдвиг. За словом Ruby — как
+    лексер Ruby: за числом, локальной переменной (names из _ruby_locals, не после «.») и словом из _RUBY_VALUE —
+    сдвиг и добавление, за прочим словом (метод, константа) — heredoc. За словом Perl: из _PERL_TERM — heredoc, из
+    _PERL_VALUE — сдвиг; за прочим (своя функция, константа: решают объявления и импорт) — heredoc, если
+    идентификатор с «-», «~», в кавычках или с заглавной буквы («foo <<EOF»), иначе сдвиг («a <<b»). За любым
+    другим знаком («=», «(», «,») и в начале строки — heredoc.
 
     perl — ещё heredoc в дескриптор после print, printf, say: «$fh», STDOUT, STDERR через пробел, блок
-    «{$fh}», «{$self->{fh}}», «{*STDOUT}» через пробел и вплотную (_print_block); «<<» вплотную после print,
-    printf, say, die, warn и после дескриптора из заглавных и «_» за print, printf, say (_tight_perl); ведущие
-    «_» идентификатора не мешают заглавной букве («<<_EOUSAGE_»). В Ruby «print $fh <<EOF» — сдвиг глобальной
-    переменной, там правило не действует.
+    «{$fh}», «{$self->{fh}}», «{*STDOUT}» через пробел и вплотную (_print_block); ведущие «_» идентификатора не
+    мешают заглавной букве («<<_EOUSAGE_»). В Ruby «print $fh <<EOF» — сдвиг глобальной переменной, там правило не
+    действует.
     """
     if not i:
         return True
-    if _is_word(raw[i - 1]) or raw[i - 1] in ")]}":
-        return perl and (_tight_perl(raw, i) or raw[i - 1] == "}" and _print_block(raw, i))
+    if _is_word(raw[i - 1]) or raw[i - 1] in ")]}" or not perl and raw[i - 1] in "?!" and _is_word(raw[i - 2:i - 1]):
+        # «foo?<<x» Ruby — сдвиг за методом.
+        return _is_word(raw[i - 1]) and _tight_heredoc(raw, i, perl) or perl and raw[i - 1] == "}" and _print_block(
+            raw, i)
     j = _back(raw, i, str.isspace)
     if j == i or not j:
         return True
@@ -478,7 +536,14 @@ def _heredoc_ok(raw, i, m, perl=False):
         return perl and raw[k - 1] == "$" and _after_print(raw, k - 1)
     if perl and raw[k:j] in ("STDOUT", "STDERR") and _after_print(raw, k):
         return True
-    ident = m.group(3).lstrip("_") if perl else m.group(3)
+    word = raw[k:j]
+    if not perl:
+        if word[0].isdigit():
+            return False
+        return _member(raw, k) or word not in _RUBY_VALUE and word not in names
+    if not _member(raw, k) and (word in _PERL_TERM or word in _PERL_VALUE):
+        return word in _PERL_TERM
+    ident = m.group(3).lstrip("_")
     return bool(m.group(1) or m.group(2) or ident[:1].isupper())
 
 
@@ -494,22 +559,117 @@ def _is_ident(c):
     return _is_word(c) or c == "$"
 
 
-def _expr_start(raw, i, fresh=True):
+def _expr_start(raw, i, fresh=True, known=None):
     """Начинается ли в i выражение: перед i через пробелы — знак из _EXPR_AFTER (кроме «++» и «--» постфикса)
     или слово из _EXPR_KEYWORDS, не свойство после «.»; только пробелы — fresh, то же для конца прошлой строки
-    кода. Назад — пробелы и не больше _KEYWORD_MAX + 1 знаков слова: время — линейное по длине строки."""
+    кода. known — {конец токена: начинается ли за ним выражение} строки для токенов, которых не видно по знаку:
+    «)» заголовка оператора, блочный комментарий (_parse). Назад — пробелы и не больше _KEYWORD_MAX + 1 знаков
+    слова: время — линейное по длине строки."""
     j = _back(raw, i, str.isspace)
     if not j:
         return fresh
+    if known and j in known:
+        return known[j]
     c = raw[j - 1]
     if _is_ident(c):
         k, lo = j - 1, max(0, j - _KEYWORD_MAX - 1)
         while k > lo and _is_ident(raw[k - 1]):
             k -= 1
         return raw[k:j] in _EXPR_KEYWORDS and not (k and (_is_ident(raw[k - 1]) or raw[k - 1] == "."))
-    if c in "+-" and raw[j - 2:j - 1] == c:
+    if c in "+-" and _postfix(raw, j):
         return False
     return c in _EXPR_AFTER
+
+
+def _postfix(raw, j):
+    """Кончается ли перед j «++» или «--»: серия «+» лексер делит на «++» слева направо, «+++» — «++» и «+»."""
+    return (j - _back(raw, j, lambda c: c == raw[j - 1])) % 2 == 0
+
+
+def _js_expr_start(raw, i, fresh=True, known=None):
+    """_expr_start для JS: «/» перед i — деление, за ним выражение (конец регулярки и блочного комментария —
+    в known); «++» и «--» не меняют ответ токена перед собой (префикс за началом выражения, постфикс за значением),
+    в начале строки — префикс (постфикс перед переводом строки запрещён). Назад — серии «+», «-» и пробелы до
+    другого токена: время — линейное по длине строки."""
+    while True:
+        j = _back(raw, i, str.isspace)
+        if not j or known and j in known or raw[j - 1] not in "/+-":
+            return _expr_start(raw, i, fresh, known)
+        if raw[j - 1] == "/" or not _postfix(raw, j):
+            return True
+        i = _back(raw, j, lambda c: c == raw[j - 1])
+        if not _back(raw, i, str.isspace):
+            return True
+
+
+# Ключевые слова Groovy: лексер (GroovyLexer.g4) выдаёт их токенами и не после «.», и «/» за любым из них —
+# slashy-строка; this, null, true, false — значения.
+_GROOVY_KEYWORDS = frozenset((
+    "as", "assert", "boolean", "break", "byte", "case", "catch", "char", "class", "const", "continue", "def", "default",
+    "do", "double", "else", "enum", "extends", "final", "finally", "float", "for", "goto", "if", "implements", "import",
+    "in", "instanceof", "int", "interface", "long", "native", "new", "package", "permits", "private", "protected",
+    "public", "record", "return", "sealed", "short", "static", "strictfp", "super", "switch", "synchronized",
+    "threadsafe", "throw", "throws", "trait", "transient", "try", "var", "void", "volatile", "while", "yield"))
+_GROOVY_KEYWORD_MAX = max(map(len, _GROOVY_KEYWORDS))
+
+
+def _groovy_slashy_ok(raw, i, fresh, known):
+    """Открывает ли «/» в i slashy-строку Groovy (GroovyLexer.isRegexAllowed): перед i через пробелы — не
+    значение: не имя, число, this, null, true, false, не «)», «]», «}», кавычка, «++», «--» и не конец slashy-строки
+    (known); только пробелы — fresh. Слово просматривается не дальше _GROOVY_KEYWORD_MAX + 1 знаков."""
+    j = _back(raw, i, str.isspace)
+    if not j:
+        return fresh
+    if j in known:
+        return known[j]
+    c = raw[j - 1]
+    if _is_ident(c):
+        k, lo = j - 1, max(0, j - _GROOVY_KEYWORD_MAX - 1)
+        while k > lo and _is_ident(raw[k - 1]):
+            k -= 1
+        return raw[k:j] in _GROOVY_KEYWORDS and not (k and _is_ident(raw[k - 1]))
+    if c in "+-" and _postfix(raw, j):
+        return False
+    return c not in ")]}\"'"
+
+
+_STATEMENT_HEADS = frozenset(("if", "while", "for", "with"))
+
+
+def _word_before(raw, i, words):
+    """Слово из words перед i через пробелы, не свойство после «.»; иначе None. Назад — пробелы и не больше
+    длины самого длинного слова + 1 знаков."""
+    j = _back(raw, i, str.isspace)
+    k, lo = j, max(0, j - max(map(len, words)) - 1)
+    while k > lo and _is_ident(raw[k - 1]):
+        k -= 1
+    word = raw[k:j]
+    return word if word in words and not (k and (_is_ident(raw[k - 1]) or raw[k - 1] == ".")) else None
+
+
+def _brackets(syn, raw, i, stack, known):
+    """Скобка в i кода JS или Groovy: «(», «[», «{» кладут на stack, закрывающая снимает. «(» за if, while, for,
+    with JS — заголовок оператора: «)» его конец, за ней начинается выражение (known; так acorn). «(» за try
+    Groovy — не скобка для перевода строки (GroovyLexer.isInsideParens)."""
+    c = raw[i]
+    if c in "([{":
+        kind = None
+        if c == "(":
+            kind = _word_before(raw, i, _STATEMENT_HEADS if syn.regex == "js" else _TRY)
+        stack.append((c, kind))
+    elif stack:
+        _, kind = stack.pop()
+        if kind in _STATEMENT_HEADS:
+            known[i + 1] = True
+
+
+_TRY = frozenset(("try",))
+
+
+def _newline_hidden(stack):
+    """Пропускает ли лексер Groovy перевод строки: внутри «(» (не try) или «[» — да, внутри «{» и вне скобок —
+    нет."""
+    return bool(stack) and stack[-1][0] in "([" and stack[-1][1] != "try"
 
 
 # Регулярное выражение JS: escape, класс «[...]» (в нём «/» не закрывает), флаги. Slashy-строка Groovy: escape.
@@ -587,10 +747,10 @@ def _markup(raw, i, ctx, n, banned):
     return "skip", i + 1
 
 
-# Строки с подстановками: шаблонная строка JS «`…${…}`», строки Ruby «"…#{…}"» и «`…#{…}`». Ключ — (кавычка,
-# знак подстановки); в тексте — escape, закрывающая кавычка, открытие подстановки.
+# Строки с подстановками: шаблонная строка JS «`…${…}`», строки Ruby «"…#{…}"» и «`…#{…}`», slashy-строка Groovy
+# «/…${…}/». Ключ — (кавычка, знак подстановки); в тексте — escape, закрывающая кавычка, открытие подстановки.
 _TEMPLATE = {(q, d): re.compile("[" + re.escape(q) + r"\\]|" + re.escape(d) + r"\{")
-             for q, d in (("`", "$"), ('"', "#"), ("`", "#"))}
+             for q, d in (("`", "$"), ('"', "#"), ("`", "#"), ("/", "$"))}
 
 
 def _template(raw, i, ctx):
@@ -603,7 +763,8 @@ def _template(raw, i, ctx):
         return "skip", len(raw)
     i = m.start()
     if raw[i] == "\\":
-        return "skip", i + 2
+        # В slashy-строке Groovy обратная косая — escape только перед «/».
+        return "skip", i + 2 if top[2] != "/" or raw.startswith("/", i + 1) else i + 1
     if raw[i] == top[2]:
         ctx.pop()
         return "skip", i + 1
@@ -611,10 +772,11 @@ def _template(raw, i, ctx):
     return "skip", i + 2
 
 
-def _code(syn, raw, i, ctx, pending, unclosed, n, banned, fresh, names):
+def _code(syn, raw, i, ctx, pending, unclosed, n, banned, fresh, names, known):
     """Действие в коде: вне разметки и строк с подстановками или в фигурных скобках внутри них (вершина ctx —
-    ["code", глубина]). «`» в JS, «"» и «`» в Ruby открывают строку с подстановками, «<» в начале выражения — тег
-    JSX («<<» — сдвиг); прочее — _token."""
+    ["code", глубина]). «`» в JS, «"» и «`» в Ruby, «/» в начале выражения Groovy (_groovy_slashy_ok) открывают
+    строку с подстановками, «<» в начале выражения — тег JSX («<<» — сдвиг); прочее — _token. known — как у
+    _expr_start."""
     c = raw[i]
     if ctx and c in "{}":
         if c == "{":
@@ -631,13 +793,20 @@ def _code(syn, raw, i, ctx, pending, unclosed, n, banned, fresh, names):
             return ("skip", j) if j >= 0 else None
         ctx.append(["tpl", (n, i), c, "$" if syn.regex == "js" else "#"])
         return "skip", i + 1
+    if (c == "/" and syn.regex == "groovy" and raw[i + 1:i + 2] not in ("/", "*")
+            and _groovy_slashy_ok(raw, i, fresh, known)):
+        # Без закрытия до конца файла лексер Groovy читает «/» как деление.
+        if (n, i) in banned:
+            return None
+        ctx.append(["tpl", (n, i), "/", "$"])
+        return "skip", i + 1
     if syn.jsx and c == "<":
         if raw.startswith("<", i + 1):
             return "skip", i + 2
-        if (n, i) not in banned and _expr_start(raw, i, fresh) and _jsx_opens(raw, i):
+        if (n, i) not in banned and _js_expr_start(raw, i, fresh, known) and _jsx_opens(raw, i):
             ctx.append(["tag", (n, i)])
             return "skip", i + 1
-    return _token(syn, raw, i, pending, unclosed, n, banned, fresh, names)
+    return _token(syn, raw, i, pending, unclosed, n, banned, fresh, names, known)
 
 
 # Флаги после закрытия литерала Ruby и Perl («/a/s», «s{a}{b}gex», «%r{a}x»): «x» — режим /x, «e» — замена Perl —
@@ -671,31 +840,36 @@ def _delimited(raw, i):
 
 
 # Слова Ruby и Perl, после которых начинается выражение: «/» за ними — регулярка и вплотную, и перед пробелом
-# («split/\\s+/», «split / /», «x if /a/»).
-_TERM_WORDS = {"ruby": frozenset(("if", "unless", "while", "until", "and", "or", "not", "when", "elsif", "then")),
-               "perl": frozenset(("if", "unless", "while", "until", "and", "or", "not", "when", "elsif", "split",
-                                  "grep", "map", "join", "push", "unshift", "eq", "ne", "lt", "gt", "le", "ge",
-                                  "cmp"))}
+# («split/\\s+/», «split / /», «x if /a/»); when Perl — с feature switch.
+_TERM_WORDS = {"ruby": _RUBY_BEG, "perl": _PERL_TERM | {"when"}}
+# Слова, после которых «/» — деление и вплотную к следующему знаку («time /2», «self /a»).
+_VALUE_WORDS = {"ruby": _RUBY_VALUE, "perl": _PERL_VALUE}
 
 
 def _literal_opens(raw, i, fresh, lang, names=frozenset()):
     """Открывает ли «/» или «%» в i литерал Ruby или Perl (lang): "expr" — в начале выражения (_expr_start; после
     «}» — конец элемента хеша, деление) и после слова из _TERM_WORDS, "arg" — аргументом вызова: после слова через
-    пробел и вплотную к следующему знаку («puts /#/», «puts %w(a)»); None — деление и остаток: после числа,
-    переменной («$a /2», «@n /2») и локальной переменной Ruby из names не после «.» («a = 4» раньше, «a /b»), перед
-    пробелом и перед «=»: в Ruby всегда («a /=2»), в Perl — с пробелом за ним («$a /= 2»); символ Ruby «:/», «:%».
+    пробел и вплотную к следующему знаку («puts /#/», «puts %w(a)»); None — деление и остаток: после слова из
+    _VALUE_WORDS («time /2», «self /a»), числа, переменной («$a /2», «@n /2») и локальной переменной Ruby из names не
+    после «.» («a = 4» раньше, «a /b»), перед пробелом и перед «=»: в Ruby всегда («a /=2»), в Perl — с пробелом за
+    ним («$a /= 2»); символ Ruby «:/», «:%». Слово из _TERM_WORDS и _VALUE_WORDS после «.», «->», «::» и сигила —
+    метод или переменная.
     """
     if lang == "ruby" and i and raw[i - 1] == ":" and raw[i - 2:i - 1] != ":":
         return None
     j = _back(raw, i, str.isspace)
-    if (not j or raw[j - 1] != "}") and _expr_start(raw, i, fresh):
+    # Имя метода Ruby с «?» или «!» на конце («foo? /a/») — слово, а не тернарный оператор.
+    method = lang == "ruby" and j > 1 and raw[j - 1] in "?!" and _is_word(raw[j - 2])
+    if not method and (not j or raw[j - 1] != "}") and _expr_start(raw, i, fresh):
         return "expr"
-    if not j or not _is_word(raw[j - 1]):
+    if not j or not (_is_word(raw[j - 1]) or method):
         return None
-    k = _back(raw, j, _is_word)
-    member = k and (raw[k - 1] in "$@%&." or raw[k - 2:k] in ("->", "::"))
+    k = _back(raw, j - method, _is_word)
+    member = _member(raw, k)
     if raw[k:j] in _TERM_WORDS[lang] and not member:
         return "expr"
+    if raw[k:j] in _VALUE_WORDS[lang] and not member:
+        return None
     nxt = raw[i + 1:i + 2]
     if j == i or nxt in ("", " ", "\t") or nxt == "=" and (lang == "ruby" or raw[i + 2:i + 3] in ("", " ", "\t")):
         return None
@@ -725,9 +899,10 @@ def _ruby_locals(raw):
 
 def _quote_parts(raw, k, two, n, banned, where, regex=False):
     """Действие для литерала Ruby или Perl с открывающим разделителем в k: ("skip", конец за флагами) — закрыт в
-    строке, у оператора с двумя частями (two) — обе части; ("open", …, then, regex) — продолжается на следующих
-    строках, then у первой части оператора с двумя частями — где вторая: "same" — до того же разделителя ещё раз,
-    "pair" — со своим разделителем через пробелы (_second_part), "code" — вторая часть в «{}» (_second_part);
+    строке, у оператора с двумя частями (two) — обе части; ("await", where, конец первой части) — первая часть в
+    скобках закрыта, вторая — на следующих строках (_line_rest_empty); ("open", …, then, regex) — продолжается на
+    следующих строках, then у первой части оператора с двумя частями — где вторая: "same" — до того же разделителя
+    ещё раз, "pair" — со своим разделителем через пробелы (_second_part), "code" — вторая часть в «{}» (_second_part);
     regex — первая часть — регулярное выражение, в многострочном «#» — комментарий режима /x (_XRE_COMMENT).
     Незакрытый литерал с позицией открытия where из banned кончается с концом строки."""
     end = _delimited(raw, k)
@@ -741,6 +916,8 @@ def _quote_parts(raw, k, two, n, banned, where, regex=False):
     if not two:
         return "skip", _FLAGS.match(raw, end).end()
     if opening in _PAIRS:
+        if _line_rest_empty(raw, end):
+            return "await", where, end
         return _second_part(raw, end, n, banned, where) or ("skip", _FLAGS.match(raw, end).end())
     j = _close(raw, end, opening, "\\")
     if j >= 0:
@@ -748,6 +925,13 @@ def _quote_parts(raw, k, two, n, banned, where, regex=False):
     if where in banned:
         return "skip", len(raw)
     return "open", opening, "\\", False, k, end, None, where
+
+
+def _line_rest_empty(raw, j):
+    """Пусты ли строка с j или в ней за пробелами только комментарий «#»: вторая часть оператора s, tr, y Perl в
+    скобках тогда — на следующих строках (perlop: между частями — пробелы и комментарии)."""
+    rest = raw[j:].lstrip()
+    return not rest or rest[0] == "#"
 
 
 def _second_part(raw, j, n, banned, where):
@@ -762,7 +946,7 @@ def _second_part(raw, j, n, banned, where):
     return act[:8] + ("code", False) if act[0] == "open" and raw[j] == "{" else act
 
 
-def _token(syn, raw, i, pending, unclosed, n=0, banned=frozenset(), fresh=True, names=frozenset()):
+def _token(syn, raw, i, pending, unclosed, n=0, banned=frozenset(), fresh=True, names=frozenset(), known=None):
     """Разбор с позиции i вне литерала и комментария.
 
     ("line",) — строчный комментарий до конца строки (у _markup — ("line", начало комментария)); ("skip", j) —
@@ -771,7 +955,7 @@ def _token(syn, raw, i, pending, unclosed, n=0, banned=frozenset(), fresh=True, 
     многострочный блок или литерал; None — обычный символ.
     unclosed — открытия однострочных литералов, не закрытых в этой строке; _token дополняет его. n — номер
     строки; heredoc с позицией (n, i) из banned не открывается, многострочный литерал с ней — однострочный.
-    fresh — начинается ли выражение в начале строки (_expr_start).
+    fresh — начинается ли выражение в начале строки (_expr_start); known — как у _expr_start.
     """
     c = raw[i]
     if syn.prefix and c == syn.prefix[0] and not (
@@ -818,7 +1002,7 @@ def _token(syn, raw, i, pending, unclosed, n=0, banned=frozenset(), fresh=True, 
         m = _RUBY_HEREDOC.match(raw, i)
         # Пробел перед идентификатором в кавычках — только в Perl: в Ruby «x << "a"» — добавление.
         spaced = m and raw[i + 2 + len(m.group(1))] in " \t"
-        if m and not (spaced and syn.heredoc == "ruby") and _heredoc_ok(raw, i, m, syn.heredoc == "perl"):
+        if m and not (spaced and syn.heredoc == "ruby") and _heredoc_ok(raw, i, m, syn.heredoc == "perl", names):
             pending.append((m.group(3), "exact" if not m.group(1) else "strip", (n, i)))
             return "skip", m.end()
     if syn.lua and raw.startswith("--", i):
@@ -831,14 +1015,15 @@ def _token(syn, raw, i, pending, unclosed, n=0, banned=frozenset(), fresh=True, 
     for marker, rule in syn.line:
         if raw.startswith(marker, i) and _marker_ok(raw, i, rule):
             return ("line",)
-    if syn.regex in ("js", "groovy") and c in "/$" and _expr_start(raw, i, fresh):
-        # «//» и «/*» выше — комментарии. Незакрытый в строке литерал кончается с ней: многострочная
-        # slashy-строка Groovy дальше читается как код, а мнимая регулярка не прячет следующие строки.
-        if c == "/":
-            m = (_JS_REGEX if syn.regex == "js" else _SLASHY).match(raw, i)
-            return "skip", m.end() if m else len(raw)
-        if syn.regex == "groovy" and raw.startswith("$/", i):
-            return "open", "/$", "dollar", False, i, i + 2
+    if syn.regex == "js" and c == "/" and _js_expr_start(raw, i, fresh, known):
+        # «//» и «/*» выше — комментарии. Незакрытая в строке регулярка кончается с ней: мнимая регулярка не прячет
+        # следующие строки.
+        m = _JS_REGEX.match(raw, i)
+        return "skip", m.end() if m else len(raw)
+    if syn.regex == "groovy" and raw.startswith("$/", i) and not (i and _is_ident(raw[i - 1])) and (n, i) not in banned:
+        # Dollar-slashy лексер Groovy открывает в любом месте выражения, «a$/» — имя «a$» и деление; без закрытия до
+        # конца файла «$» — имя.
+        return "open", "/$", "dollar", False, i, i + 2, None, (n, i)
     opens = syn.regex in ("ruby", "perl") and c in "/%" and _literal_opens(raw, i, fresh, syn.regex, names)
     if opens:
         if c == "/":
@@ -873,6 +1058,16 @@ def _token(syn, raw, i, pending, unclosed, n=0, banned=frozenset(), fresh=True, 
         return None
     for opening, closing, multiline, esc in syn.strings:
         if raw.startswith(opening, i):
+            if multiline == "cont":
+                j = _close(raw, i + len(opening), closing, esc)
+                if j >= 0:
+                    return "skip", j
+                # Нечётная серия «\» в конце строки — продолжение строки, чётная — escape самих косых.
+                multiline = opening not in unclosed and (len(raw) - _back(raw, len(raw), lambda c: c == "\\")) % 2
+            if multiline and (n, i) in banned and len(opening) > 1:
+                # Тройная кавычка без закрытия до конца файла — пустая строка и кавычка, как у лексера с
+                # длиннейшим совпадением (Groovy: «"""» — «""» и «"»).
+                continue
             if multiline and (n, i) not in banned:
                 doc = _docstring_start(raw, i) if syn.docstring else None
                 return ("open", closing, esc, doc is not None, i if doc is None else doc, i + len(opening), None,
@@ -909,11 +1104,12 @@ _YAML_SCRIPT_KEYS = frozenset((
 _GITHUB_SCRIPT = re.compile(r"actions/github-script(?:@|$)")
 
 
-def _yaml_key(code, keys, uses):
+def _yaml_key(code, keys, uses, waiting=None, ready=None):
     """Ключ отображения в начале кода строки code YAML или None; keys — стек (колонка ключа, ключ) открытых
     отображений: ключ снимает со стека ключи с колонкой не меньше своей и ложится на него. uses — {колонка:
     значение ключа uses} открытых отображений: ключ снимает записи глубже себя, элемент последовательности «- » —
-    и запись своей колонки."""
+    и запись своей колонки. waiting — {колонка: [строки скрипта]} входов «script» под «with:», чей шаг ещё без
+    uses (_yaml_script_ext); ключ uses их колонки и конец их отображения переносят их в ready [(строки, синтаксис)]."""
     m = _YAML_KEY.match(code)
     if m is None:
         return None
@@ -923,8 +1119,13 @@ def _yaml_key(code, keys, uses):
     keys.append((col, key))
     for c in [c for c in uses if c > col or c == col and "-" in m.group(1)]:
         del uses[c]
+    for c in [c for c in waiting or () if c > col or c == col and "-" in m.group(1)]:
+        ready.extend((lines, "sh") for lines in waiting.pop(c))
     if key == "uses":
         uses[col] = code[m.end():].strip().strip("\"'")
+        if waiting and col in waiting:
+            ext = "js" if _GITHUB_SCRIPT.match(uses[col]) else "sh"
+            ready.extend((lines, ext) for lines in waiting.pop(col))
     return key
 
 
@@ -938,14 +1139,18 @@ def _yaml_parent(keys, col):
 
 def _yaml_script_ext(keys, uses):
     """Синтаксис скрипта в блочном скаляре ключа на вершине стека keys (_yaml_key): "js" — вход «script» под
-    «with:» шага с actions/github-script (uses — _yaml_key), "sh" — ключ из _YAML_SCRIPT_KEYS (у ключа с
-    пространством имён — последняя часть), None — данные."""
+    «with:» шага с actions/github-script (uses — _yaml_key), ("with", колонка «with») — такой вход шага, чей uses
+    ещё не встречен (ключи шага идут в любом порядке), "sh" — ключ из _YAML_SCRIPT_KEYS (у ключа с пространством
+    имён — последняя часть), None — данные."""
     if not keys:
         return None
     key = keys[-1][1].rsplit(".", 1)[-1]
-    if key == "script" and len(keys) > 1 and keys[-2][1] == "with" and _GITHUB_SCRIPT.match(
-            uses.get(keys[-2][0], "")):
-        return "js"
+    if key == "script" and len(keys) > 1 and keys[-2][1] == "with":
+        col = keys[-2][0]
+        if col not in uses:
+            return "with", col
+        if _GITHUB_SCRIPT.match(uses[col]):
+            return "js"
     return "sh" if key in _YAML_SCRIPT_KEYS else None
 
 
@@ -956,6 +1161,15 @@ def _yaml_script(lines, ext, deadline):
     indent = min((len(r) - len(r.lstrip(" ")) for r in body if r.strip()), default=0)
     found = _parse("\n".join(r[indent:] for r in body), _SYNTAX[ext], deadline, frozenset())[0]
     return [(lines[k - 1][0], c) for k, c in found]
+
+
+def _yaml_done(scalar, waiting, out, deadline):
+    """Закончен блочный скаляр-скрипт scalar (_parse): комментарии — в out, вход «script» шага без uses — в
+    waiting до его uses (_yaml_key)."""
+    if isinstance(scalar[2], tuple):
+        waiting.setdefault(scalar[2][1], []).append(scalar[1])
+    else:
+        out.extend(_yaml_script(scalar[1], scalar[2], deadline))
 
 
 def _yaml_block(code, keys):
@@ -1019,7 +1233,8 @@ def _parse(text, syn, deadline, banned, level=0):
     out = []
     # Открытый многострочный блок или литерал: (закрытие, escape, идут ли его строки в вывод, открытие
     # вложенного блока или None, глубина вложенности, позиция открытия литерала для отката или None, где вторая
-    # часть оператора Perl s, tr, y — _quote_parts — или None, регулярное выражение ли с комментариями /x).
+    # часть оператора Perl s, tr, y — _quote_parts — или None, регулярное выражение ли с комментариями /x). Вторая
+    # часть "await" — первая часть в скобках закрыта, вторая — на следующих строках (_line_rest_empty).
     state = None
     # Открытые heredoc: (терминатор, как сравнивать строку, позиция «<<» или None): тело heredoc — данные.
     pending = []
@@ -1028,14 +1243,18 @@ def _parse(text, syn, deadline, banned, level=0):
     # Стек разметки JSX (_markup) и строк с подстановками (_template); пуст — код вне них.
     ctx = []
     # Открытый блочный скаляр YAML: (отступ родителя, его строки [(номер, строка)] у скрипта или None у данных,
-    # синтаксис скрипта — _yaml_script_ext) или None; стек ключей открытых отображений YAML и значения их ключей
-    # uses (_yaml_key).
-    scalar, keys, uses = None, [], {}
+    # синтаксис скрипта — _yaml_script_ext) или None; стек ключей открытых отображений YAML, значения их ключей
+    # uses, входы «script» шагов без uses и решённые из них (_yaml_key).
+    scalar, keys, uses, waiting, ready = None, [], {}, {}, []
     # Прошла ли строка __END__ или __DATA__ Ruby и Perl: дальше данные, кроме блоков line_block.
     data = False
     # Начинается ли выражение в начале строки: в JS и Perl — по концу прошлой строки кода («a\n/ b» — деление);
-    # в Groovy и Ruby конец строки завершает оператор.
+    # в Groovy — так же внутри «(» и «[» (_newline_hidden), иначе конец строки завершает оператор, как в Ruby.
     fresh = True
+    # Стек открытых скобок кода JS и Groovy (_brackets); начинается ли выражение за открытым блочным комментарием —
+    # по токену перед ним (_expr_start, _groovy_slashy_ok).
+    stack, before = [], None
+    starts_expr = {"groovy": _groovy_slashy_ok, "js": _js_expr_start}.get(syn.regex, _expr_start)
     # Номера в out строк, чей вывод начат комментарием /x открытой многострочной регулярки (_XRE_COMMENT): без
     # флага x после закрытия литерала они снимаются; None — регулярки нет или решение принято. Строки второй части
     # s{…}{…} Perl, открытой в прошлых строках, — [(номер, текст)] или None.
@@ -1079,7 +1298,7 @@ def _parse(text, syn, deadline, banned, level=0):
                     scalar[1].append((n, raw))
                 continue
             if scalar[1]:
-                out.extend(_yaml_script(scalar[1], scalar[2], deadline))
+                _yaml_done(scalar, waiting, out, deadline)
             scalar = None
         if line_block:
             if raw.strip():
@@ -1102,12 +1321,25 @@ def _parse(text, syn, deadline, banned, level=0):
         unclosed = set()
         if syn.regex == "ruby":
             names.update(_ruby_locals(raw))
-        # Конец кода строки: начало строчного комментария или конец строки; начало и конец последнего блочного
-        # комментария строки (-1 — открыт в прошлых строках или нет).
-        cut, opened_at, closed_at = len(raw), -1, -1
+        # Конец кода строки: начало строчного комментария или конец строки; {конец токена: начинается ли за ним
+        # выражение} для токенов строки, которых не видно по знаку (_expr_start).
+        cut, known = len(raw), {}
         while i < len(raw):
             tick()
-            if state:
+            # Закрыт ли в этом шаге литерал или найдена вторая часть оператора s, tr, y Perl: then и act решают
+            # про флаги и вторую часть.
+            closed = False
+            if state and state[6] == "await":
+                # Вторая часть s{…}{…}, tr{…}{…} Perl — первый знак не пробел; «#» перед ней — комментарий.
+                j = len(raw) - len(raw[i:].lstrip())
+                if j == len(raw):
+                    break
+                if raw[j] == "#":
+                    i, act = j, ("line",)
+                else:
+                    i, then, where, state, closed = j, "pair", state[5], None, True
+                    act = _second_part(raw, j, n, banned, where)
+            elif state:
                 if state[3]:
                     j, depth = _close_nested(raw, i, state[3], state[0], state[4], state[1])
                 else:
@@ -1122,14 +1354,44 @@ def _parse(text, syn, deadline, banned, level=0):
                     state = state[:4] + (depth,) + state[5:] if state[3] else state
                     break
                 closing, esc, emit, _, _, where, then, _ = state
-                i, state, closed_at = j, None, j if emit else closed_at
+                i, state, closed = j, None, True
+                if emit and syn.regex in _BRACKETS:
+                    # Блочный комментарий прозрачен: за ним решает токен перед ним.
+                    known[j] = before
                 if syn.regex in ("ruby", "perl") and then in (None, "code"):
                     i = _FLAGS.match(raw, j).end()
                 if then == "same":
                     # Вторая часть оператора Perl «s/…/…/» — до того же разделителя.
                     state = (closing, esc, False, None, 1, where, None, False)
                     continue
+                if then == "pair" and _line_rest_empty(raw, j):
+                    state = (None, None, False, None, 1, where, "await", False)
+                    continue
                 act = _second_part(raw, j, n, banned, where) if then == "pair" else None
+            else:
+                top = ctx[-1][0] if ctx else None
+                if top == "tpl":
+                    depth, slashy = len(ctx), ctx[-1][2] == "/"
+                    act = _template(raw, i, ctx)
+                    if slashy and len(ctx) < depth:
+                        # Закрытая slashy-строка — значение, хотя кончается знаком «/».
+                        known[act[1]] = False
+                elif top and top != "code":
+                    act = _markup(raw, i, ctx, n, banned)
+                else:
+                    m = (syn.code_starts if ctx else syn.starts).search(raw, i)
+                    if m is None:
+                        break
+                    i = m.start()
+                    if syn.regex in _BRACKETS and raw[i] in _BRACKETS[syn.regex] and not (ctx and raw[i] in "{}"):
+                        _brackets(syn, raw, i, stack, known)
+                        act = None
+                    else:
+                        act = _code(syn, raw, i, ctx, pending, unclosed, n, banned, fresh, names, known)
+                        if syn.regex == "js" and raw[i] == "/" and act is not None and act[0] == "skip":
+                            # Регулярка — значение, хотя кончается знаком «/».
+                            known[act[1]] = False
+            if closed:
                 # Флаги за последним разделителем литерала; None — вторая часть оператора не закрыта в этой строке
                 # или не найдена в ней.
                 flags = None
@@ -1152,18 +1414,6 @@ def _parse(text, syn, deadline, banned, level=0):
                     xre, xre_here = None, False
                 if act is None:
                     continue
-            else:
-                top = ctx[-1][0] if ctx else None
-                if top == "tpl":
-                    act = _template(raw, i, ctx)
-                elif top and top != "code":
-                    act = _markup(raw, i, ctx, n, banned)
-                else:
-                    m = (syn.code_starts if ctx else syn.starts).search(raw, i)
-                    if m is None:
-                        break
-                    i = m.start()
-                    act = _code(syn, raw, i, ctx, pending, unclosed, n, banned, fresh, names)
             if act is None:
                 i += 1
             elif act[0] == "line":
@@ -1173,11 +1423,14 @@ def _parse(text, syn, deadline, banned, level=0):
                 break
             elif act[0] == "skip":
                 i = act[1]
+            elif act[0] == "await":
+                state, i = (None, None, False, None, 1, act[1], "await", False), act[2]
             else:
                 _, closing, esc, emit, at, end, *rest = act
                 if emit and start is None:
                     start = at
-                opened_at = at if emit else opened_at
+                if emit and syn.regex in _BRACKETS:
+                    before = starts_expr(raw, at, fresh, known)
                 rest += [None] * (4 - len(rest))
                 state, i = (closing, esc, emit, rest[0], 1, *rest[1:]), end
                 if rest[3]:
@@ -1189,27 +1442,34 @@ def _parse(text, syn, deadline, banned, level=0):
             if xre_here and xre is not None:
                 xre.append(len(out) - 1)
         if syn.block_scalar and state is None:
-            key = _yaml_key(raw[:cut], keys, uses)
+            key = _yaml_key(raw[:cut], keys, uses, waiting, ready)
+            for lines, ext in ready:
+                out.extend(_yaml_script(lines, ext, deadline))
+            ready.clear()
             parent = _yaml_block(raw[:cut], keys)
             if parent is not None:
                 if key is None:
                     _yaml_parent(keys, parent)
                 ext = _yaml_script_ext(keys, uses)
                 scalar = (parent, [] if ext else None, ext)
-        if syn.regex in ("js", "perl") and state is None and not (ctx and ctx[-1][0] != "code"):
-            # Блочный комментарий в конце строки — не код: конец кода перед ним. Строка из одних комментариев и
-            # пробелов, как и блок из прошлых строк, конец кода не меняет.
+        if syn.regex in ("js", "perl", "groovy") and state is None and not (ctx and ctx[-1][0] != "code"):
+            # Блочный комментарий в конце строки прозрачен (known); строка из одних комментариев и пробелов конец кода
+            # не меняет.
             j = _back(raw, cut, str.isspace)
-            if j and j == closed_at:
-                j = _back(raw, opened_at, str.isspace) if opened_at >= 0 else 0
-            if j:
-                fresh = _expr_start(raw, j, fresh)
+            end = starts_expr(raw, j, fresh, known) if j else fresh
+            fresh = end if syn.regex != "groovy" or _newline_hidden(stack) else True
         if syn.heredoc == "shell":
             pending = [(term, "tabs" if tabs else "exact", None) for term, tabs in depcheck.heredocs(raw)]
     if scalar is not None and scalar[1]:
-        out.extend(_yaml_script(scalar[1], scalar[2], deadline))
+        _yaml_done(scalar, waiting, out, deadline)
+    if syn.block_scalar:
+        # Входы «script» шагов без uses до конца файла — shell; их строки — раньше уже выведенных.
+        for lines in waiting.values():
+            for part in lines:
+                out.extend(_yaml_script(part, "sh", deadline))
+        out.sort(key=lambda e: e[0])
     open_ = [(None, "ctx", e[1]) for e in ctx if e[0] in ("tag", "text", "tpl")]
-    if state and state[5]:
+    if state and state[5] and state[6] != "await":
         open_.append((None, "literal", state[5]))
     return out, pending + open_
 

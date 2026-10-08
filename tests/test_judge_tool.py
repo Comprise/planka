@@ -501,6 +501,36 @@ class BashTest(unittest.TestCase):
         self.assertEqual(last["content_len"], len(command))
         self.assertEqual(last["content_sha256"], hashlib.sha256(command.encode("utf-8")).hexdigest())
 
+    def test_doubtful_dependency_add_denied(self):
+        # Менеджер и команда установки распознаны, пакет или подкоманда под сомнением: отказ с доводом и маркером.
+        for command, segment, why in [
+            ("npm --weird val i -g x", "npm --weird val i -g x", "флаг"),
+            ("pip install --target --dry-run x", "pip install --target --dry-run x", "--dry-run"),
+            ("cd app && echo x | xargs npm install", "xargs npm install", "xargs"),
+            ("eval " * 5 + "npm install x", "eval " * 5 + "npm install x", "4 уровней"),
+            ("npm install " + " " * 4096 + "left-pad", "npm install " + " " * 4096 + "left-pad", "4096"),
+        ]:
+            with self.subTest(command[:40]):
+                r = self.bash(command)
+                out = output(r)["hookSpecificOutput"]
+                reason = out["permissionDecisionReason"]
+                self.assertEqual(out["permissionDecision"], "deny")
+                self.assertTrue(reason.startswith("planka: "))
+                self.assertIn("сомнени", reason)
+                self.assertIn(why, reason)
+                self.assertIn("PLANKA_DEP_OK=1", reason)
+                self.assertIn(str(self.env.root / "rules" / "dependencies.md"), reason)
+                self.assertTrue(reason.endswith("Команда: " + segment))
+                self.assertEqual(self.env.log_lines()[-1]["verdict"], "deny-dep")
+        # npm берёт `false` значением флага: установка без сомнения.
+        reason = output(self.bash("npm --dry-run false install x"))["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertNotIn("сомнени", reason)
+
+    def test_doubtful_dependency_marker_passes(self):
+        r = self.bash("echo x | PLANKA_DEP_OK=1 xargs npm install")
+        self.assertEqual(r.stdout, "")
+        self.assertEqual(self.env.log_lines(), [])
+
     def test_dependency_log_reason_without_command(self):
         self.bash("SECRET_TOKEN=abc npm install left-pad")
         last = self.env.log_lines()[-1]
@@ -1264,6 +1294,33 @@ class ManifestBashGitTest(ManifestBashTest):
         # stash, сделанный в сессии, мог заложить агент: блок, текст не велит откатывать.
         self.stash_with(self.AFTER, "flask\n")
         self.assert_blocked(self.run_command("git stash pop -q"), "flask")
+
+    def test_old_patch_by_relative_path_from_subdir_passes(self):
+        # Патч автора старше начала сессии, команда из подкаталога с относительным путём: путь — от cwd команды
+        # (git apply в подкаталоге меняет только файлы под ним).
+        sub = self.p / "sub"
+        sub.mkdir()
+        (sub / "requirements.txt").write_text("httpx==0.27.0\n", encoding="utf-8")
+        git("add", ".", cwd=self.p)
+        git("commit", "-qm", "sub", cwd=self.p)
+        with open(sub / "requirements.txt", "a", encoding="utf-8") as f:
+            f.write("flask\n")
+        patch = subprocess.run(["git", "diff"], cwd=self.p, capture_output=True, check=True).stdout
+        git("checkout", "--", "sub/requirements.txt", cwd=self.p)
+        (self.p / "author.patch").write_bytes(patch)
+        # Начало сессии — после записи патча.
+        (self.env.data / "state" / "sess-1.start.json").write_text(json.dumps({"start": int(time.time()) + 5}),
+                                                                   encoding="utf-8")
+        command = "git apply ../author.patch"
+        for event, fields in (("PreToolUse", {}), ("PostToolUse", {"tool_response": {"stdout": "", "stderr": ""}})):
+            if event == "PostToolUse":
+                subprocess.run(["git", "apply", "../author.patch"], cwd=sub, check=True, capture_output=True)
+            r = self.env.run("judge_tool.py", self.env.hook_input(event, tool_name="Bash", cwd=str(sub),
+                                                                  tool_input={"command": command},
+                                                                  tool_use_id="b1", **fields))
+            self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("flask", (sub / "requirements.txt").read_text(encoding="utf-8"))
+        self.assertEqual(r.stdout, "", r.stderr)
 
     def test_author_stash_before_session_passes(self):
         self.stash_with(self.BEFORE, "flask\n")

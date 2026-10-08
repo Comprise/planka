@@ -1,6 +1,6 @@
 # Архитектура
 
-planka — плагин Claude Code уровня пользователя: пять скриптов хуков из `hooks/hooks.json` подмешивают
+planka — плагин Claude Code уровня пользователя: шесть скриптов хуков из `hooks/hooks.json` подмешивают
 правила из `philosophy.md` и `rules/*.md` в контекст агента и отклоняют его действия через
 вложенного судью-модель или детерминированные проверки. Пользовательское описание поведения —
 `README.md`, разделы «Как это работает» и «Известные ограничения».
@@ -13,18 +13,19 @@ planka — плагин Claude Code уровня пользователя: пя�
 
 | Файл | Роль |
 | --- | --- |
-| `hooks/hooks.json` | регистрация хуков: `UserPromptSubmit` → `remind.py`; `PreToolUse` на `^(AskUserQuestion\|ExitPlanMode\|Bash\|Write\|Edit\|MultiEdit)$` → `judge_tool.py`; `PreToolUse` на файловые инструменты записи и MCP-инструменты с `memor` или `remember` в имени в любом регистре (регулярное выражение — в `hooks/hooks.json`) → `guard_memory.py`; `Stop` → `judge_stop.py`; `PostToolUse` и `PostToolUseFailure` на `Bash` → `debug_watch.py` и `judge_tool.py` |
+| `hooks/hooks.json` | регистрация хуков: `SessionStart` и `PostModelSwitch` → `model_watch.py`; `UserPromptSubmit` → `remind.py`; `PreToolUse` на `^(AskUserQuestion\|ExitPlanMode\|Bash\|Write\|Edit\|MultiEdit)$` → `judge_tool.py`; `PreToolUse` на файловые инструменты записи и MCP-инструменты с `memor` или `remember` в имени в любом регистре (регулярное выражение — в `hooks/hooks.json`) → `guard_memory.py`; `Stop` → `judge_stop.py`; `PostToolUse` и `PostToolUseFailure` на `Bash` → `debug_watch.py` и `judge_tool.py` |
 | `planka/remind.py` | `philosophy.md` целиком как `additionalContext`; снимок дерева (`take_snapshot`); строка `NO_DOCS_LINE` об отсутствии `CLAUDE.md` |
-| `planka/judge_tool.py` | судья вопроса (`judge_question`), плана (`judge_plan`), отказ на добавление пакета (`judge_bash`, причина `DEP_REASON`) и снимок манифестов перед командой (`snapshot_manifests`); отказ правке манифеста (`judge_manifest_edit`, `MANIFEST_REASON`); после команды `Bash` — блок на новые имена в манифестах (`check_command_manifests`, `COMMAND_REASON`) |
+| `planka/judge_tool.py` | судья вопроса (`judge_question`), плана (`judge_plan`), отказ на добавление пакета и на команду установки под сомнением (`judge_bash`, причины `DEP_REASON`, `DEP_DOUBT_REASON`) и снимок манифестов перед командой (`snapshot_manifests`); отказ правке манифеста (`judge_manifest_edit`, `MANIFEST_REASON`); после команды `Bash` — блок на новые имена в манифестах (`check_command_manifests`, `COMMAND_REASON`) |
 | `planka/guard_memory.py` | судья записи в постоянную память: цель — `is_memory_path`, `is_memory_mcp`; содержимое — `render_content` |
 | `planka/judge_stop.py` | фильтры «варианты» (`looks_like_options`), «готово» (`claims_done`) по последнему сообщению, «документация» (`docs_check`) по изменениям со снимка; один вызов судьи на шаги реплики (`turn_messages`, до `prompts.MAX_TURN_CHARS`); отметка снимка проверенным после Stop без блока (`release_snapshot`) |
 | `planka/debug_watch.py` | счётчик неудач подряд одной команды `Bash` (`update`); с `REPEAT_THRESHOLD`-й неудачи — модуль `debugging.md` контекстом |
-| `planka/common.py` | барьер, чтение входа, тексты правил и рубрика, транскрипт (`read_transcript`), модель и запуск судьи (`judge_model`, `run_judge`), лимит отказов, журнал, корень проекта (`project_root`) и окружение git о нём (`git_env`), классы путей, формат ответа (`run_hook`) |
+| `planka/model_watch.py` | модель сессии из `model` входа `SessionStart` и `to_model` входа `PostModelSwitch` в состояние (`store`); агенту ничего не выводит |
+| `planka/common.py` | барьер, чтение входа, тексты правил и рубрика, транскрипт (`read_transcript`), модель и запуск судьи (`judge_model`, `stored_session_model`, `usable_model`, `run_judge`), лимит отказов, журнал, корень проекта (`project_root`) и окружение git о нём (`git_env`), классы путей, формат ответа (`run_hook`) |
 | `planka/prompts.py` | системный промпт, схема ответа `JUDGE_SCHEMA`, вопросы судье по видам проверки, сборка содержимого |
 | `planka/planparse.py` | разбор плана на волны и задачи, владение файлами (`shared_files`) |
 | `planka/manifests.py` | разбор манифестов: вид по имени (`kind`), имена внешних зависимостей (`names`), они же с транзитивными (`known_names`), имя пакета манифеста (`own_name`) |
-| `planka/manifest_watch.py` | текст манифеста после правки файловым инструментом (`edit_texts`, `check_edit`), новые имена (`fresh_names`, `edit_names`), имена версии HEAD и сторон конфликта (`head_names`), других манифестов проекта и манифестов и файлов `setup.py`, `setup.cfg`, `Pipfile` его версии HEAD (`project_names`, `_tree_names`, `source_kind`), снимок манифестов проекта и сравнение после команды (`take`, `compare`, `store`, `pop`), имена ref до начала сессии, откуда команда git возвращает файлы (`command_refs`, `restored_names`; начало сессии — `mark_start`, `session_start`), файлы вывода генераторов requirements (`generated_requirements`) |
-| `planka/depcheck.py` | разбор команды Bash: добавляет ли она пакет (`dependency_add`), маркер `DEP_OK_MARKER`, heredoc (`heredocs`), автомат кавычек `_scan` |
+| `planka/manifest_watch.py` | текст манифеста после правки файловым инструментом (`edit_texts`, `check_edit`), новые имена (`fresh_names`, `edit_names`), имена версии HEAD и сторон конфликта (`head_names`), других манифестов проекта и манифестов и файлов `setup.py`, `setup.cfg`, `Pipfile` его версии HEAD (`project_names`, `_tree_names`, `source_kind`), снимок манифестов проекта и сравнение после команды (`take`, `compare`, `store`, `pop`), имена ref до начала сессии, откуда команда git возвращает файлы, и патчей `git apply`, не менявшихся с начала сессии (`command_refs`, `command_patches`, `restored_names`; начало сессии — `mark_start`, `session_start`), файлы вывода генераторов requirements (`generated_requirements`) |
+| `planka/depcheck.py` | разбор команды Bash: добавляет ли она пакет (`dependency_add`), команда установки под сомнением (`dependency_doubt`), маркер `DEP_OK_MARKER`, heredoc (`heredocs`), автомат кавычек `_scan` |
 | `planka/snapshot.py` | снимок дерева (`capture`, `store`, `load`) и изменения с него (`changed_since`) в режимах git и walk; порог `MAX_FILES` грязных путей в git; перепривязка непроверенного снимка (`carry_over`, `mark_checked`), неудачи снимка (`mark_failed`, `failure`) |
 | `planka/comments.py` | строки комментариев изменённых файлов для судьи документации (`extract`) |
 | `philosophy.md` | ядро правил; индекс «Модули» в конце |
@@ -88,8 +89,9 @@ UTF-8 строка с кириллицей иначе не кодируется 
 `common.block_output` (им же `judge_tool.check_command_manifests` отвечает на `PostToolUse` и
 `PostToolUseFailure`: команда уже выполнена, `decision: block` отдаёт причину агенту), контекст
 `UserPromptSubmit` — `common.context_output`; `debug_watch` отвечает
-`hookSpecificOutput` с `additionalContext` своего события. Ответ запоминается до записи журнала:
-сбой записи не отменяет отказ.
+`hookSpecificOutput` с `additionalContext` своего события; `model_watch` — только `systemMessage` предупреждения:
+plain-text stdout `SessionStart` и `PostModelSwitch` Claude Code добавляет в контекст агента. Ответ запоминается до
+записи журнала: сбой записи не отменяет отказ.
 
 ## Судья
 
@@ -107,14 +109,21 @@ UTF-8 строка с кириллицей иначе не кодируется 
 судьи делится на строки только по `\n`: U+2028, U+2029 и U+0085 JSON оставляет символами внутри строки; `ValueError` при
 запуске (нулевой байт в аргументе) — пропуск «claude не запущен».
 
-Модель — `common.judge_model(data, transcript)`: `CLAUDE_PLUGIN_OPTION_JUDGE_MODEL`, по умолчанию
-`SESSION_MODEL` (`session`) — тогда модель из транскрипта. Не нашлась — `None`: судья без `--model`,
-с предупреждением раз на сессию (`warn_once`, ключ `session-model`). Модель сессии хуки иначе не
-получают: поле `model` во входе есть только у `SessionStart` (`context/deferred/session-model-from-transcript.md`).
+Модель — `common.judge_model(data, transcript)`: `CLAUDE_PLUGIN_OPTION_JUDGE_MODEL`, по умолчанию `SESSION_MODEL`
+(`session`) — тогда модель сессии из состояния `state/<session>.model.json` (`common.stored_session_model`), без неё —
+из транскрипта. Не нашлась — `None`: судья без `--model`, с предупреждением раз на сессию (`warn_once`, ключ
+`session-model`). Состояние пишет `model_watch`: документация хуков даёт поле `model` только во входе `SessionStart` и
+не всегда (его нет после `/clear` и при восстановлении сессии) — тогда известная модель не стирается; смену модели
+посреди сессии, в том числе восстановление модели при возобновлении, передаёт `to_model` входа `PostModelSwitch`
+(Claude Code v2.1.251+). Годная модель — непустая строка не вида `<synthetic>` (`common.usable_model`), так же для
+транскрипта; `to_model` не годная — предупреждение, состояние не меняется. Агенту `model_watch` ничего не выводит
+(«Ответ хука»). Состояние главнее транскрипта: событие смены модели приходит раньше ответа новой модели в транскрипте.
+Цена — пропущенный `PostModelSwitch` (хук не уложился в срок, версия Claude Code до 2.1.251) оставляет прежнюю модель
+до следующего события. Транскрипт остаётся запасным источником (`context/deferred/transcript-turn-data.md`).
 
 Транскрипт (`transcript_path` входа) читает `common.read_transcript` за один проход и отдаёт
 `common.Transcript`: `model` — `message.model` последнего ответа ассистента основной ветки, кроме
-моделей вида `<synthetic>`; `plan_file` — последний `attachment.planFilePath`; `turn_messages` —
+моделей вида `<synthetic>` (`common.usable_model`); `plan_file` — последний `attachment.planFilePath`; `turn_messages` —
 тексты ответов ассистента после последней реплики автора; `author_turn` — текст этой реплики,
 сообщений человека посреди хода и ответов автора при отклонении инструмента; `author_answers` — ответы на
 `AskUserQuestion` после неё; `message_before_author` — последнее сообщение ассистента до неё; `earlier_turns` —
@@ -186,7 +195,8 @@ author_answers, earlier_turns)`: прежние реплики автора от
 ## Сроки
 
 Таймауты хуков в `hooks/hooks.json`: `UserPromptSubmit` 10 с, `PreToolUse` 90 с у обоих хуков, `Stop` 120 с,
-`PostToolUse` и `PostToolUseFailure` — 10 с у `debug_watch` и 30 с у `judge_tool`. У `Stop` до судьи ещё
+`PostToolUse` и `PostToolUseFailure` — 10 с у `debug_watch` и 30 с у `judge_tool`, `SessionStart` и `PostModelSwitch` —
+10 с у `model_watch` (без судьи, git и процессов — только запись файла под `state_lock`). У `Stop` до судьи ещё
 `git rev-parse` и, если вершина — домашний каталог или его предок и `CLAUDE_PROJECT_DIR` ниже неё, `git ls-files`
 корня проекта (`common.project_root`, вместе до `common.GIT_ROOT_TIMEOUT`, 5 с), сверка со снимком со сроком
 `judge_stop.SNAPSHOT_BUDGET` (20 с) и извлечение комментариев со сроком `judge_stop.COMMENTS_BUDGET` (20 с) — вместе с
@@ -201,7 +211,8 @@ author_answers, earlier_turns)`: прежние реплики автора от
 или содержит его; вместе с судьёй 75 с против 90 с. У
 `judge_tool` на `Bash` снимок манифестов — `git rev-parse` корня (`common.GIT_ROOT_TIMEOUT`) и срок
 `manifest_watch.SNAPSHOT_BUDGET` (5 с) на `git ls-files` и разбор, а у команды с ref (`command_refs`) — и на
-`git cat-file --batch` и `git ls-tree` ref до начала сессии (`restored_names`; срок вышел — снимок не снят), у
+`git cat-file --batch` и `git ls-tree` ref до начала сессии, у `git apply` — и на чтение файлов патчей
+(`command_patches`; оба — `restored_names`; срок вышел — снимок не снят), у
 правки манифеста — корень проекта (`GIT_ROOT_TIMEOUT`, один раз), с ним один `git cat-file --batch` версий
 `_REPO_REFS` и сторон `_INDEX_STAGES` (`manifest_watch.HEAD_TIMEOUT`, 5 с), обход манифестов проекта и дерево HEAD
 (`judge_tool._project_names`, ещё `SNAPSHOT_BUDGET`): `HEAD_TIMEOUT` + `GIT_ROOT_TIMEOUT` + `SNAPSHOT_BUDGET`; на
@@ -213,7 +224,8 @@ cat-file --batch` изменённых манифестов, и дерево HEA
 `judge_stop.SNAPSHOT_BUDGET`, `judge_stop.COMMENTS_BUDGET`, `remind.SNAPSHOT_BUDGET`,
 `guard_memory.CHECK_IGNORE_TIMEOUT`, `manifest_watch.SNAPSHOT_BUDGET`, `CHECK_BUDGET`, `HEAD_TIMEOUT`); там же
 `test_post_tool_use_has_no_judge`: на `PostToolUse` ни `debug_watch`, ни `manifest_watch`, ни
-`judge_tool.check_command_manifests` судью не зовут. Что код передаёт именно эти константы, проверяют
+`judge_tool.check_command_manifests` судью не зовут; `test_model_watch_fits` — у `model_watch` нет вызовов судьи,
+`subprocess` и git, таймаут обоих событий 10 с. Что код передаёт именно эти константы, проверяют
 `KillGroupTest` и `ProjectRootTest` в `tests/test_common.py` и
 `DocsFilterTest.test_deadlines_passed_to_changed_since_and_extract` в `tests/test_judge_stop.py`; что
 `guard_memory._repository_file` передаёт `CHECK_IGNORE_TIMEOUT` и `git -C <проект>` — `RepositoryFileTest` в
@@ -367,7 +379,7 @@ heredoc, открытого в незакрытой кавычке (в том ч
 оболочки без скрипта — команды. Отвергнуто: держать один плоский уровень кавычек — внутренняя `"` в `"$(…)"`
 закрывает внешнюю, текст строки идёт командой (ложный отказ на `gh pr create --body "$(printf "…")"`);
 выбрасывать тело heredoc из сегмента — `_close_paren` тогда не находит терминатор или закрывает подстановку на
-`)` из тела. Дешёвая ошибка детектора — пропуск: ложный отказ останавливает обычную работу агента; на
+`)` из тела. Дешёвая ошибка разбора кавычек — пропуск: ложный отказ останавливает обычную работу агента; на
 незакрытой конструкции (bash сам падает с синтаксической ошибкой) детектор может молчать.
 
 Не добавление: пробный прогон (`depcheck._dry_run`: у npm — `_npm_dry_run`, у apt и apt-get — `_apt_parse`, у
@@ -398,9 +410,28 @@ apt-private/private-cmndline.cc) в словах остаются: их проп
 менеджеров флаг без значения: `false` следом — позиционное слово (`pip install --dry-run false x` — пробный прогон),
 `--dry-run=false` и `--no-dry-run` — ошибка разбора (optparse у pip, clap у cargo и uv, cleo у poetry, symfony
 console у composer; у `pnpm add` и `pnpm install <пакет>` 12.10 `--dry-run` нет — ошибка в любой форме). Дешёвая
-ошибка — пропуск: команда с `--dry-run` у неизвестного разбора считается пробной. Отвергнуто: один разбор
+ошибка — пропуск: команда с `--dry-run` у неизвестного разбора считается пробной, кроме `--dry-run` сразу за флагом
+со значением этого менеджера — это сомнение (ниже). Отвергнуто: один разбор
 `--dry-run false` для всех менеджеров — у pip, cargo, bun это пробный прогон с пакетом `false`, вышел бы ложный
 отказ.
+
+Сомнение — `depcheck.dependency_doubt`, второй проход тем же обходом (`_find_doubt`, `_segment_doubt`), когда
+`dependency_add` добавления не нашёл: сегмент, где менеджер и команда установки распознаны, а пакет или подкоманда
+под сомнением, — отказ `judge_tool.DEP_DOUBT_REASON` с доводом (`_WHY_*`) и обходом маркером, в журнал `deny-dep`.
+По правилу о краях эвристик (`CLAUDE.md`, «Правила проекта») это то же добавление пакета другой записью: пропуск
+открыл бы обход проверки, ложный отказ снимает маркер. `_doubt` проверяет слова команды (`_command_info`: ещё снята
+ли обёртка `xargs` и есть ли слово-не-флаг, начатое за `_WORDS_LIMIT`) по очереди: заглушка пакета `_STDIN_PACKAGE`
+в конце (xargs, хвост сегмента), `_is_add` в режимах `_MASKED` (`--dry-run` сразу за флагом со значением этого
+менеджера, `_DRY_VALUE_FLAGS`, — значение флага), `_LOOSE` (`_loosened`: первые `_LOOSE_FLAGS` пар «флаг без `=`,
+слово-не-флаг» перед подкомандой склеиваются в `--flag=value`, по варианту на k; не у `_NO_SUBCOMMAND`) и `_DEEP` (за
+`_MAX_DEPTH` у запускателей — `_flat_add`); режим переходит во вложенные `npx`, `python -m`, `… run`. На глубине
+`_MAX_DEPTH` строка `sh -c`/`eval` и подстановки проверяются `_soup_add`: кавычки и `\` сняты, команды по `;&|()`,
+обратной кавычке и переводу строки, в каждой `_flat_add` берёт первое слово после присваиваний, флагов, обёрток,
+`eval`, оболочек, запускателей и `<менеджер> run`. Отвергнуто: пропуск с предупреждением — обход проверки; спуск
+глубже `_MAX_DEPTH` без предела и перебор всех пар флагов — время квадратично; общий набор флагов со значением всех
+менеджеров для `--dry-run` — ложный отказ на `pip install -q --dry-run x` (`-q` со значением у winget). У npm
+`true`/`false` за флагом без `=` перед подкомандой — значение флага (`_npm_subcommand`): nopt берёт их и у булева, и
+у незнакомого флага, — точное решение, не сомнение. Формы и их ложные отказы — `README.md`, «Известные ограничения».
 
 ## Манифесты
 
@@ -494,10 +525,11 @@ console у composer; у `pnpm add` и `pnpm install <пакет>` 12.10 `--dry-r
   манифестов и на каждый пишет `[size, mtime_ns, имена с транзитивными или None, имя пакета манифеста или None]`:
   содержимое не хранится. Если команда возвращает файлы из ref (`manifest_watch.command_refs`), в снимок идёт поле
   `known` — `{реестр: имена}` манифестов и файлов `_LEGACY` ref, созданных до начала сессии (`restored_names`,
-  ниже). Файлы `_LEGACY` рабочего дерева в снимок не входят: их имена после команды берутся только из версии HEAD
-  (`project_of` в `compare`). Снимок с полями `cwd` (каталог команды до неё) и `known` `store` кладёт
-  в `state/<session>.manifests.json` под `tool_use_id` и там же удаляет записи старше `ENTRY_TTL`. Сбой снимка —
-  `common.warn_once` с ключом `manifest-snapshot` и `skipped` в журнал на каждую команду.
+  ниже), и слова патчей `git apply`, не менявшихся с начала сессии (`command_patches`, ниже). Файлы `_LEGACY` рабочего
+  дерева в снимок не входят: их имена после команды берутся только из версии HEAD (`project_of` в `compare`). Снимок с
+  полями `cwd` (каталог команды до неё) и `known` `store` кладёт в `state/<session>.manifests.json` под `tool_use_id` и
+  там же удаляет записи старше `ENTRY_TTL`. Сбой снимка — `common.warn_once` с ключом `manifest-snapshot` и `skipped` в
+  журнал на каждую команду.
 - После команды — `judge_tool.check_command_manifests` на `POST_EVENTS`: `manifest_watch.pop` забирает снимок; пути
   вывода генераторов requirements (`generated_requirements`) `resolve` разрешает от `cwd` снимка и от `cwd` после
   команды (`cd` внутри неё); `compare` — смена режима git/walk — `Unavailable`; манифест с тем же размером и mtime
@@ -507,30 +539,53 @@ console у composer; у `pnpm add` и `pnpm install <пакет>` 12.10 `--dry-r
   Остальное решает `fresh_names` с версиями `_REPO_REFS` и сторонами `_INDEX_STAGES`; в git остаток сверяется ещё с
   именами манифестов и `_LEGACY` версии HEAD (`project_of` в `compare`: дерево читается один раз и лениво, только если
   что-то осталось). Новые имена — `block_output(COMMAND_REASON)`: правка уже в файле, хук не знает, чья она (`git apply`
-  патча, ref моложе начала сессии), поэтому текст велит спросить автора, не откатывать вслепую и откатывать только свою
-  правку; в журнал `block-dep` с числами `manifests` и `added`. Сбой `manifest_watch.pop` (`OSError`) — предупреждение и
-  `skipped` в журнал; сбой записи журнала глотается.
+  патча из stdin или изменённого в сессии, ref моложе начала сессии), поэтому текст велит спросить автора, не откатывать
+  вслепую и откатывать только свою правку; в журнал `block-dep` с числами `manifests` и `added`. Сбой
+  `manifest_watch.pop` (`OSError`) — предупреждение и `skipped` в журнал; сбой записи журнала глотается.
 
 Имена ref до начала сессии. `manifest_watch.command_refs(command)` по сегментам (`depcheck._segments`,
 `depcheck._command`) находит, откуда команда git кладёт файлы в рабочее дерево без коммита: `git stash pop|apply
 [N|stash@{N}]` (по умолчанию `stash@{0}`), `git merge --squash <ref>…`, `git checkout <ref> [--] <пути>` (один
 операнд без `--` — ветка или путь, не ref), `git restore --source <ref>`, `git cherry-pick -n|--no-commit <ref>…`;
-`git apply` (патч), merge, cherry-pick и checkout ветки с коммитом не разбираются — их имена в HEAD или
-`_REPO_REFS`; `git -C` не учитывается. Начало сессии — `manifest_watch.mark_start`: на каждом `PreToolUse`
+merge, cherry-pick и checkout ветки с коммитом не разбираются — их имена в HEAD или `_REPO_REFS` (`git apply` —
+ниже, «Патчи»); `git -C` не учитывается. Начало сессии — `manifest_watch.mark_start`: на каждом `PreToolUse`
 `judge_tool.main` (не на `POST_EVENTS`, не внутри судьи) пишет `state/<session>.start.json` с `int(time.time())`
-при первом вызове и дальше файл не меняет; сбой каталога состояния глотается — без начала сессии ref не
-сверяются. `manifest_watch.restored_names(root, command, start, deadline)` одним `git cat-file --batch` читает
-коммиты ref (`_old_trees`) и берёт деревья тех, чьё время коммиттера меньше `start`, у stash — ещё дерево
-третьего родителя (неотслеживаемые файлы `stash -u`); для каждого дерева `git ls-tree -r -z --name-only
---full-tree` — пути манифестов и файлов `_LEGACY` (`source_kind`, не больше `MAX_MANIFESTS`) и `git cat-file --batch`
-их блобов (не больше `MAX_MANIFEST_BYTES`) — `known_names` по реестру (`_tree_names`). `start` `None`, ref моложе
-или не найден — имён нет, сравнение блокирует, как без ref. Срок вышел, манифестов в дереве ref больше `MAX_MANIFESTS`
-или git не прочитал дерево — `Unavailable`: `snapshot_manifests` снимок не сохраняет, предупреждение раз на сессию
-(`manifest-snapshot`) и `skipped` в журнал, команда идёт без проверки. Сомнение решается пропуском
-(`plugin/rules/heuristics.md`) по правилу «ошибка хука — пропуск, не блокировка»: блок после `git stash pop` автора без
-имён ref был бы ложным. `cat-file` ref вне git-корня (`_old_trees`, ответа нет) — «ref нет», не сбой. Время ref — время
-коммиттера: поддельная дата и ref прошлой сессии агента проходят как работа автора —
-`context/deferred/stash-restore-vs-agent-edit.md`.
+при первом вызове, дальше содержимое не меняет, а mtime обновляет (`os.utime`): `common.prune_state` удаляет
+файлы состояния старше `STATE_TTL` по mtime, и начало сессии, где `judge_tool` вызывался в пределах `STATE_TTL`,
+остаётся; сбой каталога состояния глотается — без начала сессии ref не сверяются.
+`manifest_watch.restored_names(root, command, start, deadline, cwd)` одним `git cat-file --batch` читает коммиты ref
+(`_old_trees`) и берёт деревья тех, чьё время коммиттера меньше `start`, у stash — ещё дерево третьего родителя
+(неотслеживаемые файлы `stash -u`); для каждого дерева `git ls-tree -r -z --name-only --full-tree` — пути манифестов и
+файлов `_LEGACY` (`source_kind`, не больше `MAX_MANIFESTS`) и `git cat-file --batch` их блобов (не больше
+`MAX_MANIFEST_BYTES`) — `known_names` по реестру (`_tree_names`). `start` `None`, ref моложе или не найден — имён нет,
+сравнение блокирует, как без ref. Срок вышел, манифестов в дереве ref больше `MAX_MANIFESTS` или git не прочитал дерево
+— `Unavailable`: `snapshot_manifests` снимок не сохраняет, предупреждение раз на сессию (`manifest-snapshot`) и
+`skipped` в журнал, команда идёт без проверки. Сомнение решается пропуском (`plugin/rules/heuristics.md`) по правилу
+«ошибка хука — пропуск, не блокировка»: блок после `git stash pop` автора без имён ref был бы ложным. `cat-file` ref вне
+git-корня (`_old_trees`, ответа нет) — «ref нет», не сбой.
+
+Патчи. `manifest_watch.command_patches(command)` — файлы патчей `git apply` по сегментам: операнды (флаги со
+значением — `_APPLY_VALUE_FLAGS`, после `--` — все) и, если операндов нет или операнд `-`, цель перенаправления `<`;
+heredoc, конвейер и `git -C` не разбираются. `_old_patch_names` открывает файл с `O_NONBLOCK` (FIFO не вешает хук),
+читает обычный файл не больше `MAX_MANIFEST_BYTES` и сверяет ctime после чтения: меньше `start` — патч не менялся с
+начала сессии. ctime ставит ядро при любой записи и смене атрибутов, `touch` назад его не ставит (POSIX,
+«Платформы»). Относительный путь — от `cwd` аргумента `restored_names`, без него — от корня; `snapshot_manifests`
+передаёт каталог команды до неё (`cwd` снимка), `cd` внутри команды не учитывается. `_patch_names` берёт блоки, чей
+файл по заголовку `---`/`+++` — манифест или `_LEGACY` (`source_kind`), считает строки блока по числам `@@` (строка
+`--- x` внутри блока — содержимое) и из строк `+` и `-` берёт слова `_TOKEN`, нормализованные по реестру
+(`_NORMALIZE`): надмножество имён, лишнее слово — пропуск, дешёвая ошибка.
+
+Предел точности. Время ref — время коммиттера; запись reflog берёт ту же `GIT_COMMITTER_DATE`
+(`GIT_COMMITTER_DATE=… git stash` пишет дату и в коммит, и в `logs/refs/stash`), mtime объекта ставит `touch`. Не
+подделать только ctime файла объекта, а он отвечает «записан в сессии», не «кем»: коммит, полученный `git fetch` в
+сессии (до `transfer.unpackLimit`, 100 объектов, — отдельным файлом объекта), и stash автора, упакованный в сессии
+`git gc` или `git maintenance`, записаны в сессии так же, как коммит агента с поддельной датой, и отказ по ctime
+блокировал бы `git fetch && git merge --squash`; признаки «пришло с remote» (reflog `fetch:`, `refs/remotes`,
+`FETCH_HEAD`) агент пишет сам. Кто создал ref или патч в прошлой сессии, не хранят ни git, ни состояние planka (по
+сессиям, `STATE_TTL`). Поэтому поддельная дата, ref и патч прошлой сессии агента проходят как работа автора
+(`README.md`, «Известные ограничения»): проверка ловит невнимательность агента, а намеренный обход и так проще —
+маркером `PLANKA_DEP_OK=1` или записью стадий индекса (выше). Патч из stdin, heredoc или конвейера не несёт ни ref,
+ни файла — блок.
 
 Генератор requirements (`manifest_watch._is_generator`) узнаётся по словам сегмента `depcheck._command` приватными
 помощниками `depcheck`: `_subcommand`, `_after_flags`, `_python_module`, `_PIP`, `_GLOBAL_FLAGS` и наборы флагов;
@@ -552,20 +607,21 @@ requirements.txt`) нет — перенаправление в другом с�
   текущей реплики (`snapshot.store`, поле `format` = `snapshot.FORMAT`, 2; блоки режима walk — строкой
   `snapshot._pack_dirs`; поле `checked` — отметил ли `Stop` снимок проверенным, `snapshot.mark_checked`; снимок
   без поля считается проверенным); `state/<session>.start.json` — начало сессии `{"start": секунды}`
-  (`manifest_watch.mark_start`, пишется один раз); `state/<session>.debug.json` — неудачи команд (`counts`) и
-  отметки показа модуля по агентам (`shown`); `state/<session>.manifests.json` — снимки манифестов перед
-  командами `Bash`, `{tool_use_id: {root, mode, ts, cwd, files: {путь: [size, mtime_ns, имена или
-  None, имя пакета или None]}, known?: {реестр: [имена]}}}` (`manifest_watch.store`, `manifest_watch.pop`;
-  запись не той формы `pop` отбрасывает; `known` — имена манифестов и файлов `_LEGACY` ref до начала сессии);
-  `state/<session>.snapfail.json` — неудачи снимка дерева `{корень: причина}` (`snapshot.mark_failed`,
-  `snapshot.failure`).
-  Имя — `common.safe_name`. Запись атомарная (`common.atomic_write_json`: временный `.tmp-*` и
-  `os.replace`); чтение — `common.read_json` (нет файла, битый JSON или значение не того типа —
-  пустое значение); чтение и запись счётчиков, предупреждений, неудач команд, снимков манифестов, неудач снимка дерева,
-  перепривязка и отметка снимка дерева (`snapshot.carry_over`, `snapshot.mark_checked`) — под `fcntl.flock` на
-  `state/.lock` (`common.state_lock`). JSON пишется через `common.dumps`: одиночный суррогат в имени
-  файла не в UTF-8 — escape `\udcXX`. Файлы `*.json` и брошенные `.tmp-*` старше `STATE_TTL` (7 дней)
-  удаляет `common.prune_state`.
+  (`manifest_watch.mark_start`: содержимое пишется один раз, mtime обновляется на каждом `PreToolUse`);
+  `state/<session>.debug.json` — неудачи команд (`counts`) и отметки показа модуля по агентам (`shown`);
+  `state/<session>.manifests.json` — снимки манифестов перед командами `Bash`, `{tool_use_id: {root, mode, ts, cwd,
+  files: {путь: [size, mtime_ns, имена или None, имя пакета или None]}, known?: {реестр: [имена]}}}`
+  (`manifest_watch.store`, `manifest_watch.pop`; запись не той формы `pop` отбрасывает; `known` — имена манифестов и
+  файлов `_LEGACY` ref до начала сессии); `state/<session>.snapfail.json` — неудачи снимка дерева `{корень: причина}`
+  (`snapshot.mark_failed`, `snapshot.failure`); `state/<session>.model.json` — модель сессии `{"model": имя}`
+  (`model_watch.store`, `common.session_model_path`; запись под `state_lock`, чтение `common.stored_session_model` — без
+  него, файл заменяется целиком). Имя — `common.safe_name`. Запись атомарная (`common.atomic_write_json`: временный
+  `.tmp-*` и `os.replace`); чтение — `common.read_json` (нет файла, битый JSON или значение не того типа — пустое
+  значение); чтение и запись счётчиков, предупреждений, неудач команд, снимков манифестов, неудач снимка дерева, запись
+  модели сессии, перепривязка и отметка снимка дерева (`snapshot.carry_over`, `snapshot.mark_checked`) — под
+  `fcntl.flock` на `state/.lock` (`common.state_lock`). JSON пишется через `common.dumps`: одиночный суррогат в имени
+  файла не в UTF-8 — escape `\udcXX`. Файлы `*.json` и брошенные `.tmp-*` старше `STATE_TTL` (7 дней) удаляет
+  `common.prune_state`.
 - `judge.log` — строка JSON на решение хука, только метаданные: содержимое — длиной и SHA-256
   (`common.log_event`). От `LOG_MAX_BYTES` (1 МиБ) переименовывается в `judge.log.1`; ротация
   и запись под `fcntl.flock` на `judge.log.lock`.
@@ -676,71 +732,91 @@ UTF-32 декодируется по нему (`comments._read`), номера �
 UTF-16 этот байт входит и в другие знаки). Heredoc Ruby и Perl (`rb`, `pl`, `pm`, `Rakefile`, `Gemfile`;
 `comments._RUBY_HEREDOC`: `<<ID`, `<<-ID`, `<<~ID`, идентификатор и в кавычках — там любые знаки, кроме этой кавычки,
 `<<'----END----'`) — данные. Сдвиг или добавление от heredoc отличает `comments._heredoc_ok`: `<<` сразу после слова или
-закрывающей скобки — сдвиг (`1<<BITS`, `a[0]<<X`, `print $fh<<EOF`); в Perl исключение (`comments._tight_perl`):
-вплотную после `print`, `printf`, `say`, `die`, `warn` (`print<<EOT`) и после дескриптора из заглавных и `_` за `print`,
-`printf`, `say` (`print CSS<<EOF`) — heredoc; слово с `$`, `@`, `%`, `&`, `>` впереди (`$fh<<`) не считается. После
-пробела за скобкой, кавычкой или переменной (`$a`, `@a`) — сдвиг; в Perl исключение — дескриптор после `print`,
-`printf`, `say` (`$fh`, `STDOUT`, `STDERR`, слово ищет `comments._after_print`; блок `{$fh}`, `{$DB::OUT}`,
-`{$self->{fh}}`, `{*STDOUT}` — и вплотную, `print{$fh}<<EOF`, — ищет `comments._print_block` назад не дальше
-`_BLOCK_LOOKBACK`, 256 знаков, чтобы разбор строки оставался линейным): `print $fh <<EOF` — heredoc, в Ruby это сдвиг;
-за прочим словом — heredoc, только если идентификатор с `-`, `~`, в кавычках или с заглавной буквы (`print <<EOF`; в
-Perl ведущие `_` идентификатора не в счёт, `<<_EOUSAGE_`), иначе добавление (`a <<b`, `puts <<eof`); после другого знака
-(`=`, `(`, `,`) и в начале строки — heredoc. Дешёвая ошибка — heredoc, принятый за сдвиг: его тело читается как код и
-показывает судье лишние строки.
+закрывающей скобки — сдвиг (`1<<BITS`, `a[0]<<X`, `print $fh<<EOF`), кроме слова из `comments._tight_heredoc`: в Ruby —
+`comments._RUBY_BEG` (`return<<EOS`; за ними лексер Ruby в состоянии EXPR_BEG/EXPR_MID), в Perl — `comments._PERL_TIGHT`
+(встроенные функции, ждущие аргумент, `comments._PERL_TERM`, и say: `print<<EOT`, `lc<<EOS`) и дескриптор из заглавных и
+`_` за `print`, `printf`, `say` (`print CSS<<EOF`); слово с сигилом, после `.`, `->`, `::` (`comments._member`) — не
+встроенное. После пробела за скобкой, кавычкой или переменной (`$a`, `@a`) — сдвиг; в Perl исключение — дескриптор
+после `print`, `printf`, `say` (`$fh`, `STDOUT`, `STDERR`, слово ищет `comments._after_print`; блок `{$fh}`,
+`{$DB::OUT}`, `{$self->{fh}}`, `{*STDOUT}` — и вплотную, `print{$fh}<<EOF`, — узнаёт `comments._print_block`, парную `{`
+берёт `comments._brace_pairs`: скобки строки считаются один раз, разбор линеен при любой длине блока): `print $fh <<EOF`
+— heredoc, в Ruby это сдвиг. За словом Ruby — как лексер Ruby: за числом, локальной переменной (`names`) и
+`comments._RUBY_VALUE` (`self`, `nil`, `true`, `false`, `end`…) — сдвиг и добавление, за методом (и после `.`, `::`, с
+`?`, `!` на конце) и константой — heredoc при любом идентификаторе (`puts <<eof`); `foo?<<x` — сдвиг. За словом Perl: из
+`_PERL_TERM` — heredoc, из `comments._PERL_VALUE` (функции без аргументов, `__LINE__`, `__FILE__`, `__PACKAGE__`) —
+сдвиг, за прочим словом — heredoc, только если идентификатор с `-`, `~`, в кавычках или с заглавной буквы (ведущие `_`
+не в счёт, `<<_EOUSAGE_`), иначе сдвиг. Таблицы встроенных слов Perl сверены с `perl -MO=Deparse` (Perl 5.42), правила
+Ruby — с Prism. После другого знака (`=`, `(`, `,`) и в начале строки — heredoc. Дешёвая ошибка — heredoc, принятый за
+сдвиг: его тело читается как код и показывает судье лишние строки.
 
 Heredoc Ruby, Perl и Terraform без строки-терминатора до конца файла — не heredoc: `_comments` повторяет
 разбор `_parse`, запретив открывать heredoc в этих позициях (`banned`); всего разборов не больше
 `comments._MAX_REPARSE` (8) — каждый следующий снимает хотя бы одно открытие; тело такого heredoc читается как
 код. Heredoc оболочки (`depcheck.heredocs`) так не повторяется. Так же откатываются строка с подстановками и
 многострочный литерал без закрытия до конца файла (строка из `_Syntax.strings`, оператор-кавычка Perl, литерал
-`%` Ruby, многострочная регулярка Ruby и Perl, сигил Elixir): позиция открытия идёт в `banned`, литерал
-читается однострочным.
+`%` Ruby, многострочная регулярка Ruby и Perl, сигил Elixir, slashy-строка и dollar-slashy Groovy): позиция открытия
+идёт в `banned`, литерал читается однострочным. Тройная кавычка без закрытия — пустая строка и кавычка, как у лексера с
+длиннейшим совпадением (Groovy).
 
 Регулярные выражения, slashy-строки и JSX — поля `comments._Syntax` `regex` и `jsx`. `regex="js"` (js, jsx, mjs, cjs,
-ts, tsx, mts, cts) и `regex="groovy"` (groovy, gradle): `/` в начале выражения (`comments._expr_start`) — литерал, `//`
-и `/*` раньше — комментарии. Начало выражения — по предыдущему токену: назад через пробелы знак из `_EXPR_AFTER` (не
-`)`, `]`, кавычка, слово; `++` и `--` — постфикс) или слово из `_EXPR_KEYWORDS` не после `.`; слово просматривается не
-дальше `_KEYWORD_MAX` + 1 знаков — время линейное. В начале строки решает `fresh`: в JS и Perl — по концу прошлой строки
-кода (`a\n/ b` — деление; блочный комментарий в конце строки и строка из одних комментариев его не меняют), в Groovy и
-Ruby всегда начало (конец строки завершает оператор). Литерал — `_JS_REGEX` (escape, класс `[...]`, флаги) или `_SLASHY`
-до конца строки, без отката; незакрытый в строке кончается с ней: многострочная slashy-строка дальше читается как код,
-мнимая регулярка не прячет следующие строки. Dollar-slashy Groovy `$/…/$` — многострочный литерал с escape `dollar`
-(`comments._close`: `$$`, `$/` — escape). `jsx=True` (js, jsx, tsx; в ts `<T>(x) => x` — обобщение) — `<` в начале
-выражения, за которым `comments._jsx_opens` видит тег (`>` фрагмента или имя, за ним `>`, `/`, `{`, атрибут или конец
-строки; `<T,>`, `<T extends X>`, `<T = X>` — обобщение), открывает разметку: `comments._markup` ведёт стек `ctx` (`text`
-— дети элемента, `tag` — открывающий тег, `close` — закрывающий, `code` — код в `{…}` со счётчиком скобок, его разбирает
+ts, tsx, mts, cts): `/` в начале выражения — литерал `_JS_REGEX` (escape, класс `[...]`, флаги), незакрытый в строке
+кончается с ней; `//` и `/*` раньше — комментарии. Начало выражения решает `comments._js_expr_start` по предыдущему
+токену: назад через пробелы знак из `_EXPR_AFTER` или `/` деления, слово из `_EXPR_KEYWORDS` не после `.`
+(`comments._expr_start`); `++` и `--` не меняют ответ токена перед собой (серию `+` лексер делит на `++` слева,
+`comments._postfix`), в начале строки — префикс. Токены, которых не видно по знаку, `_parse` пишет в `known` строки
+{конец: начинается ли выражение}: `)` заголовка `if`, `while`, `for`, `with` — да (стек скобок `comments._brackets`,
+как acorn), конец регулярки — нет, блочный комментарий — ответ токена перед ним (`before`, и для многострочного). Слово
+просматривается не дальше `_KEYWORD_MAX` + 1 знаков — время линейное. В начале строки решает `fresh`: в JS и Perl — по
+концу прошлой строки кода, в Ruby всегда начало. `regex="groovy"` (groovy, gradle) — как лексер Groovy 4
+(`GroovyLexer.isRegexAllowed`, ожидания тестов сверены с `GroovyLangLexer`): `/` — slashy-строка, если перед ней
+(`comments._groovy_slashy_ok`) не значение: имя, число, `this`, `null`, `true`, `false`, `)`, `]`, `}`, кавычка, `++`,
+`--`, конец slashy-строки (`known`); любое ключевое слово `comments._GROOVY_KEYWORDS`, и после `.`, — не значение. В
+начале строки — начало выражения, кроме строк внутри `(` (не `try (`) и `[`: там перевод строки лексер пропускает
+(`comments._newline_hidden`), решает конец прошлой строки кода. Slashy-строка — элемент `tpl` стека `ctx`
+(`comments._template`): многострочная, `${` открывает код подстановки, обратная косая — escape только перед `/`; без
+закрытия до конца файла — деление (откат `banned`). Dollar-slashy `$/…/$` — в любом месте выражения, кроме `a$/` (имя
+`a$`), многострочный литерал с escape `dollar` (`comments._close`: `$$`, `$/` — escape), без закрытия — имя `$`.
+Строка Groovy в кавычках — `strings` с многострочностью "cont": на следующую строку только за нечётной серией `\` в
+конце строки. `jsx=True` (js, jsx, tsx; в ts `<T>(x) => x` — обобщение) — `<` в начале выражения, за которым
+`comments._jsx_opens` видит тег (`>` фрагмента или имя, за ним `>`, `/`, `{`, атрибут или конец строки; `<T,>`,
+`<T extends X>`, `<T = X>` — обобщение), открывает разметку: `comments._markup` ведёт стек `ctx` (`text` — дети
+элемента, `tag` — открывающий тег, `close` — закрывающий, `code` — код в `{…}` со счётчиком скобок, его разбирает
 `comments._code`). Текст между тегами — не код; в теге `//` и `/* */` — комментарии, строки атрибутов — многострочные
 без escape. Тег или текст, не закрытые к концу файла, `_parse` возвращает в незакрытых, и `_comments` повторяет разбор,
-запретив открывать их (`banned`), как heredoc без терминатора. Шаблонная строка JS и строки Ruby `"…"`, `` `…` `` —
-элемент `tpl` того же стека (`comments._template`): кавычка закрывает строку, `${` и `#{` открывают `code` подстановки;
-комментарий в подстановке — настоящий, кавычки в ней строку не закрывают. `<<` в коде JSX — сдвиг, не тег. Остаток —
-`context/deferred/comment-syntaxes.md`.
+запретив открывать их (`banned`), как heredoc без терминатора. Шаблонная строка JS, строки Ruby `"…"`, `` `…` `` и
+slashy-строка Groovy — элемент `tpl` того же стека: кавычка закрывает строку, `${` и `#{` открывают `code`
+подстановки; комментарий в подстановке — настоящий, кавычки в ней строку не закрывают. `<<` в коде JSX — сдвиг, не
+тег. Остаток — `context/deferred/comment-syntaxes.md`.
 
 `regex="ruby"` и `regex="perl"`: `/` и `%` (Ruby) — литерал по `comments._literal_opens`: в начале выражения (не
-после `}` — это элемент хеша), после слова из `comments._TERM_WORDS` (`if`, `unless`, `and`, `or`, `when`; в Perl ещё
-`split`, `grep`, `map`, `join`, `push`, `eq`, `cmp` и подобные — и вплотную, и перед пробелом: `split/\s+/`,
-`split / /`) или аргументом вызова — после слова через пробел и вплотную к следующему знаку, кроме `=`: в Ruby `/=`
-после слова — всегда присваивание с делением (так лексер Ruby: `/=` не в начале выражения — `tOP_ASGN`; `foo /=#/` —
-`foo /=` и комментарий), в Perl — только `=` с пробелом за ним (`print /=#/` — регулярка, `$a /= 2` — присваивание);
-`puts %w(a)` — литерал; после числа, переменной (`$a /2`) и локальной переменной Ruby
-(`names` из `comments._ruby_locals`: присваивание `a = …`, `a ||= …`, `a, b = …`, параметры метода в скобках и
-блока после `do` и `{`, списки параметров не длиннее 256 знаков; не после `.`) — деление; `:/` и `:%` Ruby —
-символы. Буквы за закрывающим разделителем литерала — флаги (`comments._FLAGS`), не оператор-кавычка: `/a/s, @x` —
-не `s,…,`. Регулярка-аргумент, не закрытая в
-строке, кончается с ней; в начале выражения — многострочная. Операторы-кавычки Perl (`comments._PERL_QUOTE`: `m`,
-`s`, `qr`, `tr`, `y`, `q`, `qq`, `qw`, `qx` не после знака слова, сигила, `->`, `::`; разделитель — вплотную любой
-знак не слова, кроме закрывающих скобок, `;` и `=>`, через пробелы — `/` и открывающая скобка) и литералы `%`
-Ruby разбирает `comments._quote_parts`: скобки вкладываются, escape — обратная косая; у `s`, `tr`, `y` две части,
-вторая — тем же разделителем или своими скобками через пробелы (`comments._second_part`); многострочный литерал
-— состояние разбора с вложенностью (`comments._close_nested` с escape). Многострочная регулярка (`m`, `qr`, `s`,
-`%r`, `/…/`, сигил `~r`): `#` после пробела в ней — комментарий режима /x (`comments._XRE_COMMENT`); номера таких
-строк вывода `_parse` копит в `xre` и снимает их, если за закрытием литерала (у `s`, `tr`, `y` — за второй частью)
-нет флага `x`; флаги не видны (вторая часть `s{…}` на следующей строке) — строки остаются. Вторая часть `s{…}{…}` в
-`{}`, не закрытая в строке, — литерал со вложенностью (`then="code"`), его текст копится в `body`; при закрытии с
-флагом `e` текст разбирается как код Perl рекурсивным `_parse` (`level`, не глубже `comments._MAX_CODE_DEPTH` = 4:
-каждая строка разбирается не больше пяти раз, разбор линеен), без `e` — строка. Heredoc Perl — и с пробелами
-перед идентификатором в кавычках (`<< "DONT"`, `comments._RUBY_HEREDOC`; в Ruby `x << "a"` — добавление). `$"`, `$'`, ``
-$` `` — переменные; строка `__END__` или `__DATA__` — дальше данные, кроме POD. Строки Ruby, Perl, Julia, PowerShell
+после `}` — это элемент хеша), после слова из `comments._TERM_WORDS` (Ruby — `comments._RUBY_BEG`: `if`, `unless`,
+`and`, `or`, `when`, `return`, `else` и подобные; Perl — `comments._PERL_TERM` и `when`: встроенные функции, ждущие
+аргумент, и операторы `eq`, `cmp`, `xor`… — и вплотную, и перед пробелом: `split/\s+/`, `split / /`, `shift / 2` —
+регулярка, многострочная) или аргументом вызова — после слова через пробел и вплотную к следующему знаку, кроме `=`: в
+Ruby `/=` после слова — всегда присваивание с делением (так лексер Ruby: `/=` не в начале выражения — `tOP_ASGN`; `foo
+/=#/` — `foo /=` и комментарий), в Perl — только `=` с пробелом за ним (`print /=#/` — регулярка, `$a /= 2` —
+присваивание); `puts %w(a)` — литерал; после слова из `comments._VALUE_WORDS` (Ruby `self`, `nil`, `true`, `false`,
+`end`…; Perl `time`, `wantarray`, `__LINE__`…) — деление; имя метода Ruby с `?`, `!` на конце (`foo? /`) — слово; после
+числа, переменной (`$a /2`) и локальной переменной Ruby (`names` из `comments._ruby_locals`: присваивание `a = …`, `a
+||= …`, `a, b = …`, параметры метода в скобках и блока после `do` и `{`, списки параметров не длиннее 256 знаков; не
+после `.`) — деление; `:/` и `:%` Ruby — символы. Буквы за закрывающим разделителем литерала — флаги
+(`comments._FLAGS`), не оператор-кавычка: `/a/s, @x` — не `s,…,`. Регулярка-аргумент, не закрытая в строке, кончается с
+ней; в начале выражения — многострочная. Операторы-кавычки Perl (`comments._PERL_QUOTE`: `m`, `s`, `qr`, `tr`, `y`, `q`,
+`qq`, `qw`, `qx` не после знака слова, сигила, `->`, `::`; разделитель — вплотную любой знак не слова, кроме закрывающих
+скобок, `;` и `=>`, через пробелы — `/` и открывающая скобка) и литералы `%` Ruby разбирает `comments._quote_parts`:
+скобки вкладываются, escape — обратная косая; у `s`, `tr`, `y` две части, вторая — тем же разделителем или своими
+скобками через пробелы или на следующих строках (`comments._second_part`); многострочный литерал — состояние разбора с
+вложенностью (`comments._close_nested` с escape). Многострочная регулярка (`m`, `qr`, `s`, `%r`, `/…/`, сигил `~r`): `#`
+после пробела в ней — комментарий режима /x (`comments._XRE_COMMENT`); номера таких строк вывода `_parse` копит в `xre`
+и снимает их, если за закрытием литерала (у `s`, `tr`, `y` — за второй частью) нет флага `x`; вторая часть в скобках — и
+на следующих строках за пробелами и комментариями (perlop): закрыв первую часть, `_parse` ждёт её в состоянии `"await"`
+(`comments._line_rest_empty`; из закрытой в строке первой части — действие `("await", …)` `_quote_parts`),
+строки-комментарии между частями — настоящие; флаги неизвестны, только если второй части нет. Вторая часть `s{…}{…}` в
+`{}`, не закрытая в строке, — литерал со вложенностью (`then="code"`), его текст копится в `body`; при закрытии с флагом
+`e` текст разбирается как код Perl рекурсивным `_parse` (`level`, не глубже `comments._MAX_CODE_DEPTH` = 4: каждая
+строка разбирается не больше пяти раз, разбор линеен), без `e` — строка. Heredoc Perl — и с пробелами перед
+идентификатором в кавычках (`<< "DONT"`, `comments._RUBY_HEREDOC`; в Ruby `x << "a"` — добавление). `$"`, `$'`, `` $` ``
+— переменные; строка `__END__` или `__DATA__` — дальше данные, кроме POD. Строки Ruby, Perl, Julia, PowerShell
 многострочные (PowerShell: escape `` ` ``, here-string `@"…"@` и `@'…'@`). `sigil` — сигилы Elixir (`~r/…/`, `~w(…)`, с
 тройными кавычками), многострочные, без вложенности. `block_scalar` (yaml, yml) — `comments._yaml_block`: строка, код
 которой кончается индикатором `|` или `>` после `key:` или `-` (тег и якорь перед ним не мешают), открывает блочный
@@ -751,13 +827,15 @@ $` `` — переменные; строка `__END__` или `__DATA__` — д�
 список без отступа — в колонке ключа); пространство имён снимается (`ansible.builtin.shell` → `shell`). Синтаксис
 скрипта выбирает `comments._yaml_script_ext`: вход `script` под `with:` шага, чей `uses` — `actions/github-script`
 (`comments._GITHUB_SCRIPT`; значения `uses` открытых отображений по колонкам — словарь `uses` в `comments._yaml_key`,
-новый элемент `- ` снимает запись своей колонки), — JavaScript; скаляр под ключом из `comments._YAML_SCRIPT_KEYS`
-(GitHub Actions `run`, GitLab `script`/`before_script`/`after_script`, Travis, Ansible `shell`/`command`/`cmd`, Compose
-`command`/`entrypoint`, CircleCI, Buildkite, Drone, Azure `bash`/`pwsh`/`powershell`/`script`, Read the Docs
-`build.jobs`) — shell; его строки без общего отступа разбирает этот синтаксис (`comments._yaml_script`, heredoc shell
-— данные); под прочим ключом — данные.
-Дешёвая ошибка — однострочный литерал: многострочный, принятый по ошибке, прячет комментарии до своего закрытия, поэтому
-многострочными считаются только литералы в однозначном месте, а прочие кончаются со строкой.
+новый элемент `- ` снимает запись своей колонки), — JavaScript; ключи шага идут в любом порядке: вход шага, чей `uses`
+ещё не встречен, ждёт в `waiting` (`comments._yaml_done`), `uses` той же колонки решает js или sh, конец отображения
+шага и конец файла — sh; вывод `_parse` YAML сортируется по номерам строк; скаляр под ключом из
+`comments._YAML_SCRIPT_KEYS` (GitHub Actions `run`, GitLab `script`/`before_script`/`after_script`, Travis, Ansible
+`shell`/`command`/`cmd`, Compose `command`/`entrypoint`, CircleCI, Buildkite, Drone, Azure
+`bash`/`pwsh`/`powershell`/`script`, Read the Docs `build.jobs`) — shell; его строки без общего отступа разбирает этот
+синтаксис (`comments._yaml_script`, heredoc shell — данные); под прочим ключом — данные. Дешёвая ошибка — однострочный
+литерал: многострочный, принятый по ошибке, прячет комментарии до своего закрытия, поэтому многострочными считаются
+только литералы в однозначном месте, а прочие кончаются со строкой.
 
 Флаги стоят после литерала, поэтому решение о `#` в многострочной регулярке откладывается до закрытия: вывод строк
 до него копится и снимается задним числом, а не держится второй проход по файлу. Отвергнуто: всегда считать `#`

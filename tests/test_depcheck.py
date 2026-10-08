@@ -1,4 +1,5 @@
 import pathlib
+import shlex
 import sys
 import unittest
 
@@ -1668,3 +1669,143 @@ class BacktickInDoubleQuotesTest(unittest.TestCase):
             small, large = make(2000), make(8000)
             with self.subTest(small[:20]):
                 assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+
+
+class NpmBooleanValueTest(unittest.TestCase):
+    """npm (nopt) берёт `true`/`false` следом за флагом без `=` значением флага: подкоманда — следующее слово."""
+
+    def test_detected(self):
+        for cmd in ["npm --dry-run false install x", "npm --weird false install x", "npm -g true i x",
+                    "npm --no-dry-run true install x"]:
+            with self.subTest(cmd):
+                self.assertEqual(depcheck.dependency_add(cmd), cmd)
+
+    def test_not_adds(self):
+        for cmd in ["npm --dry-run true install x", "npm --dry-run install x", "npm --dry-run=false true install x",
+                    "npm --silent false run build"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+
+def _nest(command, levels):
+    """command внутри levels вложенных `bash -c '…'`."""
+    for _ in range(levels):
+        command = "bash -c " + shlex.quote(command)
+    return command
+
+
+class DoubtTest(unittest.TestCase):
+    """Сегмент с распознанными менеджером и командой установки, где пакет или подкоманда под сомнением, —
+    dependency_doubt: (сегмент, довод)."""
+
+    LONG = "npm install " + " " * 4096 + "left-pad"
+    NESTED = _nest("cd app && npm install x", 6)
+    FORMS = [
+        # Флаг со значением вне известных наборов перед подкомандой.
+        ("npm --weird val i -g x", "npm --weird val i -g x", "флаг"),
+        ("cd app && pip --weird val install requests", "pip --weird val install requests", "флаг"),
+        ("apt-get --weird val install jq", "apt-get --weird val install jq", "флаг"),
+        ("npm -g --a 1 --b 2 install x", "npm -g --a 1 --b 2 install x", "флаг"),
+        ("cargo +nightly --weird v install ripgrep", "cargo +nightly --weird v install ripgrep", "флаг"),
+        ("npx npm --weird val i x", "npx npm --weird val i x", "флаг"),
+        ("uv run npm --weird val i x", "uv run npm --weird val i x", "флаг"),
+        # `--dry-run` значением чужого флага.
+        ("pip install --target --dry-run x", "pip install --target --dry-run x", "--dry-run"),
+        ("cargo install --root --dry-run ripgrep", "cargo install --root --dry-run ripgrep", "--dry-run"),
+        ("brew install --cc --dry-run jq", "brew install --cc --dry-run jq", "--dry-run"),
+        ("python -m pip install --target --dry-run x", "python -m pip install --target --dry-run x", "--dry-run"),
+        ("conda run -n e pip install -t --dry-run x", "conda run -n e pip install -t --dry-run x", "--dry-run"),
+        ("pdm run pip install -t --dry-run x", "pdm run pip install -t --dry-run x", "--dry-run"),
+        # Пакеты из stdin xargs.
+        ("echo x | xargs npm install", "xargs npm install", "xargs"),
+        ("cat req.txt | xargs -n 1 pip install", "xargs -n 1 pip install", "xargs"),
+        ("echo x@1 | xargs go install", "xargs go install", "xargs"),
+        # Вложенность глубже 4 уровней.
+        ("eval " * 5 + "npm install x", "eval " * 5 + "npm install x", "4"),
+        (NESTED, NESTED, "4"),
+        ("eval " * 5 + "sudo -E env A=1 npm install x", "eval " * 5 + "sudo -E env A=1 npm install x", "4"),
+        ("npx " * 6 + "npm install x", "npx " * 6 + "npm install x", "4"),
+        ("uv run " * 6 + "pip install x", "uv run " * 6 + "pip install x", "4"),
+        ("eval " * 5 + "npx -y pnpm@9 add x", "eval " * 5 + "npx -y pnpm@9 add x", "4"),
+        ("eval " * 12 + "npm install x", "eval " * 12 + "npm install x", "4"),
+        (_nest("npm install x", 6), _nest("npm install x", 6), "4"),
+        (_nest('echo "$(npm install x)"', 4), _nest('echo "$(npm install x)"', 4), "4"),
+        ("npx " * 12 + "npm install x", "npx " * 12 + "npm install x", "4"),
+        ("python -m " * 12 + "pip install x", "python -m " * 12 + "pip install x", "4"),
+        ("uv run " * 12 + "pip install x", "uv run " * 12 + "pip install x", "4"),
+        # Пакет дальше 4096 символов сегмента.
+        (LONG, LONG, "4096"),
+    ]
+
+    def test_forms(self):
+        for cmd, segment, why in self.FORMS:
+            with self.subTest(cmd[:60]):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                found = depcheck.dependency_doubt(cmd)
+                self.assertIsNotNone(found)
+                self.assertEqual(found[0], segment)
+                self.assertIn(why, found[1])
+
+    def test_not_doubt(self):
+        for cmd in [
+            "make test", "npm --silent run build", "npm --prefix web ci", "pip -q install -r req.txt",
+            "pip -q install -e .", "uv --quiet pip install -r r.txt", "cargo --locked build --release",
+            "brew --prefix openssl", "nix-env -i --arg a b", "pacman --config c -Qi jq",
+            # Настоящий пробный прогон: `--dry-run` не значение флага.
+            "pip install --dry-run x", "pip install -q --dry-run x", "cargo install -v --dry-run ripgrep",
+            "pip install --dry-run --target t x", "pip install --target=t --dry-run x",
+            # xargs без менеджера или без команды установки.
+            "xargs grep foo", "find . -name '*.pyc' | xargs rm", "xargs npm run lint", "ls | xargs pip show",
+            "xargs -I {} pip download {}",
+            # Глубже 4 уровней — не команда установки.
+            "eval " * 5 + "echo npm install x", "eval " * 5 + "make test", "eval " * 5 + "sudo -E",
+            "npm -- val i x", "npm -- -g val i x", "npm --a=1 v i x", "npm help foo install x",
+            _nest("git commit -m 'go get coffee'", 6),
+            # Длинный сегмент не менеджера или без команды установки.
+            'git commit -m "' + "x " * 3000 + '; npm install x"', "npm run build " + "a " * 3000,
+            # За 4096 символами — продолжение значения флага или только флаги, а не новое слово.
+            'npm install --tag "' + "a b " * 2000 + '"', "npm install " + " " * 4096 + "--save >log",
+        ]:
+            with self.subTest(cmd[:60]):
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_boolean_flag_before_other_subcommand(self):
+        # README: флаг без значения перед иной подкомандой, за которой стоят слово установки и имя, — ложный отказ.
+        for cmd in ["npm -g help install x", "npm -s explain install x"]:
+            with self.subTest(cmd):
+                self.assertIn("флаг", depcheck.dependency_doubt(cmd)[1])
+
+    def test_loosened_flags_limit(self):
+        # Склеиваются первые _LOOSE_FLAGS пар «флаг значение»; пятая пара — пропуск (README).
+        self.assertEqual(depcheck._LOOSE_FLAGS, 4)
+        self.assertIsNotNone(depcheck.dependency_doubt("npm " + "--a v " * 4 + "i x"))
+        self.assertIsNone(depcheck.dependency_doubt("npm " + "--a v " * 5 + "i x"))
+
+    def test_marker(self):
+        for cmd in ["PLANKA_DEP_OK=1 npm --weird val i -g x", "PLANKA_DEP_OK=1 pip install --target --dry-run x",
+                    "echo x | PLANKA_DEP_OK=1 xargs npm install", "echo x | xargs PLANKA_DEP_OK=1 npm install",
+                    "PLANKA_DEP_OK=1 " + "eval " * 5 + "npm install x", "eval " * 5 + "PLANKA_DEP_OK=1 npm install x",
+                    "PLANKA_DEP_OK=1 " + self.LONG]:
+            with self.subTest(cmd[:60]):
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_non_string(self):
+        self.assertIsNone(depcheck.dependency_doubt(None))
+
+    def test_linear(self):
+        cases = [
+            lambda n: "npm " + "--a v " * n + "i x",
+            lambda n: "pip install " + "--target --dry-run " * n,
+            lambda n: "echo x | xargs npm install " + "-D " * n,
+            lambda n: "eval " * 5 + "npm " * n + "install x",
+            lambda n: "eval " * 5 + "a; " * n + "npm install x",
+            lambda n: "npm install " + " " * n,
+            lambda n: "npx " * n + "npm install x",
+            lambda n: "eval " * 5 + "pip install a" + " @" * n,
+            lambda n: _nest('echo "$(' + "npm " * n + 'install x)"', 4),
+            lambda n: "npm install " + " " * 4096 + "@ " * n + "x",
+        ]
+        for make in cases:
+            small, large = make(2000), make(8000)
+            with self.subTest(small[:30]):
+                assert_linear(self, lambda: depcheck.dependency_doubt(small), lambda: depcheck.dependency_doubt(large))

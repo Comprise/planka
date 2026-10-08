@@ -17,8 +17,8 @@ planka@planka` с перезапуском сессии (`README.md`, «Уста
 
 Точки входа: `remind.py` (`UserPromptSubmit`), `judge_tool.py` (`PreToolUse`; на `Bash` ещё
 `PostToolUse`, `PostToolUseFailure`), `guard_memory.py` (`PreToolUse`), `judge_stop.py` (`Stop`),
-`debug_watch.py` (`PostToolUse`, `PostToolUseFailure`). Один скрипт на нескольких событиях различает их
-по `hook_event_name` входа (`judge_tool.POST_EVENTS`).
+`debug_watch.py` (`PostToolUse`, `PostToolUseFailure`), `model_watch.py` (`SessionStart`, `PostModelSwitch`). Один
+скрипт на нескольких событиях различает их по `hook_event_name` входа (`judge_tool.POST_EVENTS`).
 
 ## Код
 

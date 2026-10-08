@@ -6,7 +6,7 @@
 источнике незавершённых merge, cherry-pick, rebase, revert и в сторонах конфликта индекса, из другого манифеста
 того же реестра в проекте и в HEAD, из файла _LEGACY в HEAD, имя пакета самого проекта (workspace, монорепозиторий) и,
 после команды, имя из манифестов ref, откуда команда git возвращает файлы (stash, ветка, коммит), если ref
-создан до начала сессии.
+создан до начала сессии, и из изменённых строк манифестов в файле патча `git apply`, не менявшемся с начала сессии.
 """
 import ast
 import configparser
@@ -666,19 +666,127 @@ def _tree_names(root, tree, deadline):
     return known
 
 
-def restored_names(root, command, start, deadline):
+_APPLY_VALUE_FLAGS = {"--exclude", "--include", "-p", "-C", "--whitespace", "--directory", "--build-fake-ancestor"}
+
+
+def command_patches(command):
+    """Файлы патчей `git apply` по сегментам: операнды и, если их нет или операнд `-`, цель перенаправления
+    `<`. Heredoc, конвейер (`cat p | git apply`) и `git -C` не разбираются: у патча из stdin файла нет."""
+    out = []
+    for segment in depcheck._segments(command):
+        words, _ = depcheck._command(segment.strip())
+        if not words or depcheck._basename(words[0]) != "git":
+            continue
+        sub = depcheck._subcommand(words, _GIT_VALUE_FLAGS)
+        if sub[1:2] != ["apply"]:
+            continue
+        args = sub[2:]
+        operands, dashdash = _operands(args, _APPLY_VALUE_FLAGS)
+        if dashdash:
+            operands += args[args.index("--") + 1:]
+        files = [o for o in operands if o != "-"]
+        if len(files) < len(operands) or not operands:
+            pairs = depcheck._split(segment)
+            for i, (word, lead) in enumerate(pairs):
+                m = depcheck._REDIRECT.match(lead)
+                if m and m.group(0).lstrip("0123456789") == "<" and m.group(0)[:-1] in ("", "0"):
+                    target = word[m.end():] or (pairs[i + 1][0] if i + 1 < len(pairs) else "")
+                    if target:
+                        files.append(target)
+        out += files
+    return out
+
+
+_HUNK = re.compile(r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
+_TOKEN = re.compile(r"[A-Za-z0-9@_][A-Za-z0-9._/@~-]*")
+# Нормализация имён реестра, как в manifests.names: имя из патча сравнивается с именами манифеста после команды.
+_NORMALIZE = {"pypi": manifests._pep503, "packagist": str.lower, "crates.io": manifests._crate}
+
+
+def _patch_names(text):
+    """{реестр: слова} изменённых строк (`+` и `-`) блоков патча, чей файл — манифест или файл _LEGACY
+    (source_kind по путям заголовков `---`/`+++`). Слова — надмножество имён: строка `"left-pad": "^1"` даёт и
+    `left-pad`, и `1`; лишнее слово только пропускает имя, которое и так есть в патче. Строки блока считаются по
+    числам заголовка `@@`: строка `--- x` внутри блока — содержимое, не заголовок файла."""
+    known, kind, old, new = {}, None, 0, 0
+    for line in text.splitlines():
+        if old > 0 or new > 0:
+            tag = line[:1]
+            if tag in (" ", ""):
+                old, new = old - 1, new - 1
+            elif tag in ("-", "+"):
+                old, new = (old - 1, new) if tag == "-" else (old, new - 1)
+                if kind is not None:
+                    registry = _registry(kind)
+                    normalize = _NORMALIZE.get(registry, str)
+                    known.setdefault(registry, set()).update(
+                        normalize(t.rstrip("._-/")) for t in _TOKEN.findall(line[1:]))
+            if tag in (" ", "", "-", "+", "\\"):
+                continue
+            # Блок оборвался раньше чисел заголовка: строка — заголовок.
+            old = new = 0
+        if line.startswith("diff "):
+            kind = None
+        elif line.startswith(("--- ", "+++ ")):
+            path = line[4:].split("\t")[0].strip().strip('"')
+            if path != "/dev/null":
+                kind = source_kind(path)
+        else:
+            m = _HUNK.match(line)
+            if m:
+                old, new = int(m.group(1) or 1), int(m.group(2) or 1)
+    return known
+
+
+def _old_patch_names(patches, start, base, deadline):
+    """{реестр: слова} патчей (_patch_names), чей файл не менялся с start: ctime файла меньше start. ctime
+    ставит ядро при любой записи и смене атрибутов, `touch` назад его не ставит. ctime сверяется после чтения:
+    правка во время чтения его сдвигает. Не обычный файл (FIFO не открывается в
+    блокирующем режиме), больше MAX_MANIFEST_BYTES, не прочитан — пропуск."""
+    known = {}
+    for patch in patches:
+        _remaining(deadline)
+        try:
+            fd = os.open(os.path.join(base, os.path.expanduser(patch)), os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            continue
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_MANIFEST_BYTES:
+                continue
+            data = b""
+            while chunk := os.read(fd, MAX_MANIFEST_BYTES + 1 - len(data)):
+                data += chunk
+                if len(data) > MAX_MANIFEST_BYTES:
+                    break
+            if os.fstat(fd).st_ctime >= start or len(data) > MAX_MANIFEST_BYTES:
+                continue
+        except OSError:
+            continue
+        finally:
+            os.close(fd)
+        for registry, names in _patch_names(data.decode("utf-8", "replace")).items():
+            known.setdefault(registry, set()).update(names)
+    return known
+
+
+def restored_names(root, command, start, deadline, cwd=None):
     """{реестр: имена с транзитивными} манифестов и файлов _LEGACY ref, откуда command возвращает файлы
-    (command_refs), если ref создан до start — начала сессии (session_start); это работа до сессии, после
-    команды такие имена не новые. start None, ref моложе или не найден — имена не добавляются: сравнение
-    блокирует, как без ref. Unavailable — имена ref не прочитаны: срок deadline вышел, манифестов в дереве больше
-    MAX_MANIFESTS или git не прочитал дерево.
+    (command_refs), если ref создан до start — начала сессии (session_start), и слова изменённых строк
+    манифестов в файлах патчей `git apply` (command_patches), не менявшихся с start; относительный путь патча —
+    от cwd, без него — от root. Это работа до сессии, после команды такие имена не новые. start None, ref
+    моложе или не найден, патч изменён в сессии — имена не добавляются: сравнение блокирует, как без ref.
+    Unavailable — имена ref не прочитаны: срок deadline вышел, манифестов в дереве больше MAX_MANIFESTS или git
+    не прочитал дерево.
 
     Время ref — время коммиттера: коммит с поддельной датой (GIT_COMMITTER_DATE) проходит как старый."""
     refs = command_refs(command)
-    if not refs or start is None:
+    patches = command_patches(command)
+    if not refs and not patches or start is None:
         return {}
     known = {}
     try:
+        known = _old_patch_names(patches, start, root if cwd is None else cwd, deadline)
         for tree in _old_trees(root, refs, start, deadline):
             names = _tree_names(root, tree, deadline)
             if names is None:
@@ -842,12 +950,17 @@ def _start_path(state_dir, session):
 
 
 def mark_start(session):
-    """Начало сессии — целые секунды вниз — в state/<session>.start.json при первом вызове; дальше файл не
-    меняется. Зовётся на каждом PreToolUse judge_tool: до первого вызова агент не запускал ни Bash, ни правок."""
+    """Начало сессии — целые секунды вниз — в state/<session>.start.json при первом вызове; дальше содержимое не
+    меняется, а mtime обновляется на каждом вызове: common.prune_state удаляет файлы старше STATE_TTL по mtime,
+    начало сессии, где judge_tool звался в пределах STATE_TTL, он не удаляет. Зовётся на каждом PreToolUse
+    judge_tool: до первого вызова агент не запускал ни Bash, ни правок."""
     state_dir = common.data_dir() / "state"
     path = _start_path(state_dir, session)
-    if path.exists():
+    try:
+        os.utime(path)
         return
+    except FileNotFoundError:
+        pass
     state_dir.mkdir(exist_ok=True)
     with common.state_lock(state_dir):
         if not path.exists():

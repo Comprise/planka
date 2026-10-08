@@ -18,8 +18,8 @@ import remind  # noqa: E402
 
 PLUGIN = REPO / "plugin"
 # Обратное направление: разделы и модули, которые код обязан брать (имена выводит из кода _code_names);
-# «Границы» называют guard_memory и тексты отказа judge_tool (DEP_REASON, MANIFEST_REASON, COMMAND_REASON),
-# dependencies — те же тексты judge_tool.
+# «Границы» называют guard_memory и тексты отказа judge_tool (DEP_REASON, DEP_DOUBT_REASON, MANIFEST_REASON,
+# COMMAND_REASON), dependencies — те же тексты judge_tool.
 SECTIONS = ("Решения", "Планы", "Границы")
 MODULES = ("planning", "subagents", "verification", "docs", "comments", "dependencies",
            "refactoring", "design-patterns", "heuristics", "debugging", "memory")
@@ -174,8 +174,8 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(unresolved, [], "аргумент с именами, которые сборщик не видит")
         # Сборщик находит каждое имя ручных списков: пустое множество — сбой разбора.
         self.assertGreaterEqual(sections, set(SECTIONS))
-        # dependencies код называет только в текстах judge_tool DEP_REASON, MANIFEST_REASON, COMMAND_REASON, не
-        # вызовом.
+        # dependencies код называет только в текстах judge_tool DEP_REASON, DEP_DOUBT_REASON, MANIFEST_REASON,
+        # COMMAND_REASON, не вызовом.
         self.assertGreaterEqual(modules, set(MODULES) - {"dependencies"})
         headings = set(re.findall(r"^## (.+)$", self.core, re.MULTILINE))
         for name in sorted(sections):
@@ -363,6 +363,15 @@ class TimeoutsTest(unittest.TestCase):
         for event in ("PostToolUse", "PostToolUseFailure"):
             for timeout in self.timeouts[(event, "judge_tool")]:
                 self.assertLess(manifest_watch.CHECK_BUDGET, timeout, event)
+
+    def test_model_watch_fits(self):
+        # model_watch не зовёт ни судью, ни git, ни других процессов: срок — запись файла под state_lock.
+        tree = ast.parse((PLANKA_DIR / "model_watch.py").read_text(encoding="utf-8"))
+        names = {n.attr if isinstance(n, ast.Attribute) else n.id for n in ast.walk(tree)
+                 if isinstance(n, (ast.Attribute, ast.Name))}
+        self.assertTrue(names.isdisjoint({"run_judge", "subprocess", "project_root", "_git_out"}))
+        for event in ("SessionStart", "PostModelSwitch"):
+            self.assertEqual(self.timeouts[(event, "model_watch")], [10], event)
 
     def test_post_tool_use_has_no_judge(self):
         # PostToolUse на Bash — debug_watch и сравнение манифестов judge_tool.check_command_manifests: ни один

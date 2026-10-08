@@ -455,6 +455,28 @@ class JudgeModelTest(unittest.TestCase):
             self.assertIsNone(self.model(path, session_id=f"s{n}"))
             self.assertEqual(common._messages, [text])
 
+    def store(self, session_id, text):
+        state = self.env.data / "state"
+        state.mkdir(exist_ok=True)
+        (state / f"{session_id}.model.json").write_text(text, encoding="utf-8")
+
+    def test_stored_session_model_wins_over_given_transcript(self):
+        # Модель из событий сессии (model_watch) — первой, в том числе над транскриптом, прочитанным хуком.
+        self.store("s", json.dumps({"model": "claude-opus-5"}))
+        data = {"transcript_path": None, "session_id": "s"}
+        with mock.patch.dict(os.environ, self.base, clear=True):
+            self.assertEqual(common.judge_model(data, common.Transcript(model="claude-sonnet-5")), "claude-opus-5")
+            self.assertEqual(common.judge_model(data, common.Transcript()), "claude-opus-5")
+            self.assertEqual(common.judge_model({"session_id": 7}, common.Transcript(model="m")), "m")
+        self.assertEqual(common._messages, [])
+
+    def test_broken_stored_model_falls_back_to_transcript(self):
+        t = self.transcript([{"type": "assistant", "message": {"model": "claude-sonnet-5"}}])
+        for text in ("не json", "[]", '{"model": null}', '{"model": "<synthetic>"}', '{"model": ""}', '{}'):
+            self.store("s", text)
+            self.assertEqual(self.model(t), "claude-sonnet-5", text)
+        self.assertEqual(common._messages, [])
+
     def test_warning_once_per_session(self):
         common._reset()
         self.assertIsNone(self.model(None))
