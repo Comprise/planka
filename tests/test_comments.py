@@ -80,9 +80,6 @@ class CommentLinesTest(unittest.TestCase):
         for ext in ("tf", "nix", "r", "jl", "ex", "exs"):
             self.assertEqual(comments.comment_lines("x = 1 # c\n", ext), ["# c"], ext)
 
-    def test_erl_has_no_family(self):
-        self.assertEqual(comments.comment_lines("% c\n", "erl"), [])
-
     def test_unknown_ext_is_empty(self):
         self.assertEqual(comments.comment_lines("// x\n# y\n", "bin"), [])
         self.assertEqual(comments.comment_lines("", "go"), [])
@@ -166,6 +163,149 @@ class CommentLinesTest(unittest.TestCase):
     def test_line_numbers(self):
         self.assertEqual(comments._comments("x = 1\n# a\n\n/* no */\n'\"\"\"'\n# b\n", "py"),
                          [(2, "# a"), (6, "# b")])
+
+
+class LanguageSyntaxTest(unittest.TestCase):
+    """Каждый язык: маркер комментария внутри литерала — код, настоящий комментарий, блок."""
+
+    def check(self, ext, src, expected):
+        self.assertEqual(comments.comment_lines(src, ext), expected, ext)
+
+    def test_erlang(self):
+        self.check("erl", 'io:format("100%~n"), A = \'50%\', % c\n%% doc\n', ["% c", "%% doc"])
+        # «$%» и «$"» — символьные литералы.
+        self.check("erl", 'X = $%, Y = $", Z = "a%b". % c\n', ["% c"])
+        self.check("erl", 'S = """\n% not\n""". % c\n', ["% c"])
+
+    def test_clojure(self):
+        self.check("clj", '(def s "a;b") ; c\n;; doc\n', ["; c", ";; doc"])
+        # «\;» и «\"» — символьные литералы, строка многострочная, «#"…"» — регулярное выражение.
+        self.check("clj", '(str \\; \\" #"a;\\"b") ; c\n', ["; c"])
+        self.check("clj", '(defn f\n  "Doc ; not\n  more"\n  [x]) ; c\n', ["; c"])
+        # «#_» убирает форму из чтения, это код, а не текст комментария.
+        self.check("clj", "#_(foo) (bar) ; c\n", ["; c"])
+
+    def test_fsharp(self):
+        self.check("fs", 'let s = "// not" // c\n(* a\n (* inner *) b\n*)\nlet x = 1\n',
+                   ["// c", "(* a", "(* inner *) b", "*)"])
+        # «(*)» — оператор умножения, символ «'"'», verbatim и тройные строки.
+        self.check("fs", "let m = (*) 2 3 // c\nlet q = '\"' // d\n", ["// c", "// d"])
+        self.check("fs", 'let v = @"a ""//"" b" // c\nlet t = """\n// not\n""" // d\n', ["// c", "// d"])
+
+    def test_visual_basic(self):
+        self.check("vb", 'Dim s = "it\'s ""REM"" x" \' c\nREM block\nx = 1 : rem tail\n',
+                   ["' c", "REM block", "rem tail"])
+        # «Remove» и «REM» внутри строки — код.
+        self.check("vb", 'Remove(x)\ny = "REM"\n', [])
+
+    def test_nim(self):
+        self.check("nim", 'let s = "# not" # c\nlet c = \'#\' # d\n', ["# c", "# d"])
+        self.check("nim", '#[ a\n #[ inner ]# b\n]#\nlet x = 1\n', ["#[ a", "#[ inner ]# b", "]#"])
+        self.check("nim", '##[ doc\nmore ]##\nlet x = 1 ## d\n', ["##[ doc", "more ]##", "## d"])
+        # Сырые строки: «r"a\"» закрывается второй кавычкой, удвоенная кавычка — escape.
+        self.check("nim", 'let r = r"a\\" # c\nlet g = fmt"x""#""y" # d\nlet t = """\n# not\n""" # e\n',
+                   ["# c", "# d", "# e"])
+
+    def test_emacs_lisp(self):
+        self.check("el", '(setq s "a;b") ; c\n;;; Commentary\n', ["; c", ";;; Commentary"])
+        self.check("el", '(list ?; ?\\" ?\\;) ; c\n', ["; c"])
+        self.check("el", '(defun f ()\n  "Doc ; not\nmore"\n  1) ; c\n', ["; c"])
+
+    def test_vim(self):
+        self.check("vim", '" top\n  :" colon\nlet s = "a \\" b" " tail\necho \'it\'\'s "\' " c\n',
+                   ['" top', '" colon', '" tail', '" c'])
+        # Строка с закрывающей кавычкой — литерал; регистр «"a» после слова — код.
+        self.check("vim", 'echo "hi"\nnormal! x"ay\n', [])
+        # vim9script: «#» после пробела — комментарий, «#{» — словарь, «#» внутри слова — автозагрузка.
+        self.check("vim", "var d = #{a: 1} # c\ncall foo#bar()\n# top\n", ["# c", "# top"])
+
+    def test_batch(self):
+        for ext in ("bat", "cmd"):
+            self.check(ext, '@echo off\nREM c\n@rem at\n:: colons\necho a & rem tail\n',
+                       ["REM c", "rem at", ":: colons", "rem tail"])
+            # REM внутри строки, в чужом слове и как аргумент — код; метка «:x» — не комментарий.
+            self.check(ext, 'echo "a & rem b"\necho rem x\nset remark=1\n:label\necho a::b\n', [])
+
+
+    def test_language_variants(self):
+        for ext in ("cljs", "edn"):
+            self.check(ext, '{:a "x;y"} \\; ; c\n', ["; c"])
+        for ext in ("fsx", "fsi"):
+            self.check(ext, 'let s = "// not" // c\n(* a (* b *) *)\n', ["// c", "(* a (* b *) *)"])
+        self.check("vbs", 'x = "\'REM" \' c\nREM d\n', ["' c", "REM d"])
+
+    def test_common_lisp(self):
+        # «#\;» — символьный литерал, «#| |#» вкладываются.
+        self.check("lisp", '(format t "a;b" #\\;) ; c\n#| a\n#| b |#\nstill |#\n(x)\n',
+                   ["; c", "#| a", "#| b |#", "still |#"])
+
+
+class NestedAndDocTest(unittest.TestCase):
+    def test_nested_blocks(self):
+        cases = {"rs": "/* a /* b */\nstill */\nlet x = 1;\n",
+                 "swift": "/* a /* b */\nstill */\nlet x = 1\n",
+                 "kt": "/* a /* b */\nstill */\nval x = 1\n",
+                 "scala": "/* a /* b */\nstill */\nval x = 1\n",
+                 "dart": "/* a /* b */\nstill */\nvar x = 1;\n",
+                 "hs": "{- a {- b -}\nstill -}\nx = 1\n",
+                 "jl": "#= a #= b =#\nstill =#\nx = 1\n"}
+        for ext, src in cases.items():
+            lines = comments.comment_lines(src, ext)
+            self.assertEqual(len(lines), 2, ext)
+            self.assertTrue(lines[1].startswith("still"), ext)
+
+    def test_c_block_does_not_nest(self):
+        self.check_lines("c", "/* a /* b */\nint x; // c\n", ["/* a /* b */", "// c"])
+        self.check_lines("groovy", "/* a /* b */\nint x // c\n", ["/* a /* b */", "// c"])
+
+    def check_lines(self, ext, src, expected):
+        self.assertEqual(comments.comment_lines(src, ext), expected, ext)
+
+    def test_nested_close_and_open_on_one_line(self):
+        line = "/* a */ x(); /* b /* c */ d */ y(); // e"
+        self.check_lines("rs", line + "\n", [line])
+        self.check_lines("rs", "let a = 1; /* b /* c */ d */\nlet x = 1;\n", ["/* b /* c */ d */"])
+
+    def test_ruby_begin_end(self):
+        src = "x = 1\n=begin\n# inside\ntext\n=end\ny = 2 # c\n"
+        self.check_lines("rb", src, ["=begin", "# inside", "text", "=end", "# c"])
+        # «=begin» не с начала строки — не блок.
+        self.check_lines("rb", "x = 1\n  =begin\n", [])
+
+    def test_perl_pod(self):
+        src = "my $x = 1;\n=pod\n\nDoc # x\n\n=cut\nmy $y = 2; # c\n"
+        self.check_lines("pl", src, ["=pod", "Doc # x", "=cut", "# c"])
+        self.check_lines("pl", "=head1 NAME\n\nfoo\n=cut\n", ["=head1 NAME", "foo", "=cut"])
+        # «= 5» и «=~» в начале строки — продолжение выражения.
+        self.check_lines("pl", "my $x\n= 5; # c\n", ["# c"])
+
+    def test_php_heredoc(self):
+        src = ("<?php\n$s = <<<EOT\n// not\n# not\nEOT;\n$t = <<<'NOW'\n/* not */\n  NOW;\n"
+               "$u = <<<\"Q\"\n// not\n    Q . 'x'; // c\n")
+        self.check_lines("php", src, ["// c"])
+        # Без терминатора до конца файла — не heredoc.
+        self.check_lines("php", "<?php\n$s = <<<EOT\n// c\n", ["// c"])
+
+    def test_elixir_doc_attributes(self):
+        src = ('@moduledoc """\nModule # doc\n"""\n@doc "One line"\ndef f, do: 1 # c\n'
+               '@typedoc ~S"""\nT\n"""\ns = """\n# not\n"""\n@doc false\n')
+        self.check_lines("ex", src, ['@moduledoc """', "Module # doc", '"""', '@doc "One line"', "# c",
+                                     '@typedoc ~S"""', "T", '"""'])
+
+    def test_question_mark_char_literal(self):
+        self.check_lines("ex", "x = ?#\ny = ?\" <> \"#\" # c\n", ["# c"])
+        self.check_lines("rb", "x = ?# \ny = c ? 1 : 2 # c\nz = valid? # d\n", ["# c", "# d"])
+
+    def test_swift_raw_strings(self):
+        self.check_lines("swift", 'let s = #"a " // not"#; // c\nlet t = ##"x"#y"##\n', ["// c"])
+        self.check_lines("swift", 'let s = #"""\n// not\n"""#\nlet x = 1 // c\n', ["// c"])
+
+    def test_perl_heredoc_into_braced_filehandle(self):
+        for src in ("print{$fh} <<END;\n# not\nEND\n# real\n", "print {$self->{fh}} <<END;\n# not\nEND\n# real\n",
+                    "print {*STDOUT} <<END;\n# not\nEND\n# real\n", "printf{$fh}<<END;\n# not\nEND\n# real\n"):
+            self.check_lines("pl", src, ["# real"])
+        # Элемент хеша перед «<<» без print — сдвиг.
+        self.check_lines("pl", "my $x = $h->{$k} <<B; # c1\n# c2\nB\n", ["# c1", "# c2"])
 
 
 class ParserEdgeTest(unittest.TestCase):
@@ -350,9 +490,9 @@ class ExtractTest(unittest.TestCase):
         self.write("z.bin", "// x\n")
         self.write("a.foo", "# y\n")
         self.write("b.py", "# two\n")
-        lines, truncated, unknown, _ = comments.extract(self.root, ["z.bin", "b.py", "a.foo", "x.erl"])
+        lines, truncated, unknown, _ = comments.extract(self.root, ["z.bin", "b.py", "a.foo", "x.dat"])
         self.assertEqual(lines, ["b.py: # two"])
-        self.assertEqual(unknown, ["a.foo", "x.erl", "z.bin"])
+        self.assertEqual(unknown, ["a.foo", "x.dat", "z.bin"])
 
     def test_manifests_by_file_name(self):
         self.write("web/tsconfig.json", "{ // ts\n}\n")
@@ -734,6 +874,21 @@ class LinearParseTest(unittest.TestCase):
         for text, ext, expected in cases:
             started = time.monotonic()
             self.assertEqual(comments._comments(text, ext, time.monotonic() + 30), expected, ext)
+            self.assertLess(time.monotonic() - started, 1, ext)
+
+    def test_new_language_constructs_are_linear(self):
+        # Вложенные блоки, символьные литералы, REM, «"» Vim, heredoc PHP, @doc Elixir, блок-дескриптор Perl.
+        cases = (("/* " * 100000 + "*/ " * 100000 + "\n", "rs"), ("(* " + "(*)" * 100000 + "\n", "fs"),
+                 ("/* " + "*/ /*" * 100000 + "\n", "kt"), ("#[" + " #[ ]#" * 50000 + "\n", "nim"),
+                 ("$" * 200000, "erl"), ("\\" * 200000, "clj"), ("?" * 200000, "el"), ("?#" * 100000, "rb"),
+                 ("remx " * 50000, "bat"), (" " * 100000 + "a ::" * 20000, "cmd"), ("x rem" * 50000, "vb"),
+                 (' "a' * 50000, "vim"), ('x"' * 50000 + ' "', "vim"), ("<<<A " * 50000, "php"),
+                 ("@doc " * 50000, "ex"), ("{" * 100000 + "} <<B" * 20000, "pl"),
+                 ("print " + "{$a->{b}}<<B " * 20000, "pl"), ('#' * 100000 + '"', "swift"),
+                 ('r"' * 100000, "nim"))
+        for text, ext in cases:
+            started = time.monotonic()
+            comments._comments(text, ext, time.monotonic() + 30)
             self.assertLess(time.monotonic() - started, 1, ext)
 
     def test_deadline_during_parse_files_without_check(self):

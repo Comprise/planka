@@ -1,0 +1,28 @@
+{
+    "//": "источник: формы getcomposer.org/doc/04-schema.md (require, require-dev, платформенные пакеты php, ext-*, lib-*, composer-plugin-api); имена в смешанном регистре — Composer сравнивает их без регистра",
+    "name": "acme/app",
+    "description": "Пример схемы",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.1",
+        "php-64bit": "*",
+        "ext-mbstring": "*",
+        "ext-intl": "*",
+        "lib-curl": ">=7.0",
+        "composer-plugin-api": "^2.0",
+        "composer-runtime-api": "^2.2",
+        "monolog/monolog": "^3.0",
+        "Symfony/Console": "^6.4"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.5",
+        "ext-xdebug": "*"
+    },
+    "autoload": {
+        "psr-4": {"Acme\\": "src/"}
+    },
+    "scripts": {
+        "test": "phpunit"
+    }
+}

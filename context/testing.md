@@ -40,16 +40,35 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
     из одного `thinking` и `tool_result` списком блоков; `test_common` (`ReadTranscriptTest`)
     прогоняет корпус и его префиксы;
   - `bash-failure-errors.jsonl` — поле `error` упавшего Bash во входе `PostToolUseFailure`;
-    `test_debug_watch` прогоняет хук на каждом образце.
+    `test_debug_watch` прогоняет хук на каждом образце;
+  - `manifests/<образец>/<манифест>` — настоящие `package.json`, `composer.json`, `pyproject.toml`,
+    `requirements*.txt`, `Cargo.toml`, `go.mod`, `Gemfile` (источник — комментарием, в JSON — ключом
+    `"//"`); `test_manifests` (`CorpusTest`) сверяет имена каждого с `CORPUS` (ожидание есть у
+    каждого файла корпуса), имя пакета самого манифеста с `OWN`, новые имена без старого текста и с тем же
+    текстом (помощник `_added` — через `manifest_watch.edit_names`), и добавление одной строки в настоящий
+    манифест — ровно одно имя. Образцы местных источников — `pyproject-uv-workspace`, `gemfile-path`,
+    `gomod-replace-local`. Сгенерированные файлы требований (pip-compile, `uv export`)
+    ожидают пустое множество, `go.mod` — только прямые зависимости, без `// indirect`.
 - Тесты в git-репозитории (`GitCaptureTest`, `ChangedSinceGitTest`, git-тесты `test_comments`,
-  `test_judge_stop`, `test_remind`, `test_common`, `test_hostile_git`,
+  `test_judge_stop`, `test_remind`, `test_common`, `test_hostile_git`, `ManifestEditGitTest`,
+  `ManifestBashGitTest`,
   `MemoryHookTest.test_auto_memory_directory_in_repository`, `…_above_project`, `…_in_home_project`,
   `…_nested_repository`, `…_in_foreign_repository`) создают временный репозиторий
   и пропускаются без `git`.
+- Проверка манифестов: разбор — `tests/test_manifests.py` (корпус, по классу на вид манифеста,
+  `AddedContractTest`); хук — `tests/test_judge_tool.py`: `ManifestEditTest` (правка `Write`, `Edit`,
+  `MultiEdit`), `ManifestEditGitTest` (версии `_REPO_REFS` — база), `ManifestBashTest` и его наследник
+  `ManifestBashGitTest` (снимок и сравнение вне git и в git: генераторы, `tee`, маркер,
+  `PostToolUseFailure`, параллельные команды по `tool_use_id`, `mv`, `cp`, `git mv`; блок с безопасным
+  текстом на `git stash pop` — `test_stash_pop_blocked_with_safe_reason`),
+  `ManifestProjectUnderFixturesTest` (`FOREIGN_DIRS` — от проекта), `GeneratedRequirementsTest` (файлы
+  вывода генераторов), `ManifestWatchStateTest` (файл состояния снимков: срок записей, удаление пустого файла,
+  предел обхода вне git, повторно не читаются файлы с тем же размером и mtime).
 - `tests/test_hostile_git.py` передаёт враждебный конфиг явно — `GIT_CONFIG_GLOBAL` на временный файл —
   только вызовам плагина (`snapshot.capture`, `snapshot.changed_since`, `comments.extract`,
-  `common.project_root` через `mock.patch.dict(os.environ)`, хукам `remind.py` и `judge_stop.py` через
-  `Env.run`); git подготовки репозитория идёт под изолированным конфигом. Настройки `HOSTILE` не должны
+  `common.project_root`, `guard_memory.is_memory_path`, `manifest_watch.list_manifests` и
+  `manifest_watch.head_names` через `mock.patch.dict(os.environ)`, хукам `remind.py` и `judge_stop.py`
+  через `Env.run`); git подготовки репозитория идёт под изолированным конфигом. Настройки `HOSTILE` не должны
   менять результат: каждая — отдельный `subTest` против ожидаемого результата под изолированным
   конфигом, все вместе — отдельный тест и тест хуков. Внешний diff, пейджер, монитор файловой системы и
   textconv-драйвер `diff.junk.textconv` — скрипт, печатающий строки вида diff и завершающийся с
@@ -110,11 +129,23 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
   `core.excludesFile` — `ExcludesFileTest.test_user_excluded_file_is_memory`; срок вызова —
   `RepositoryFileTest` в `tests/test_guard_memory.py`; ответ 128 (проект не репозиторий) —
   `MemoryHookTest.test_auto_memory_directory_in_project_without_git`;
-- сторож судьи вне Linux — `common.run_judge` с `sys.platform` = `darwin` (`WatchdogTest`); смерть
-  судьи вместе с хуком на Linux — `JudgeDiesWithHookTest`, только на Linux.
+- сторож судьи — `WatchdogTest` в `tests/test_common.py`: `common.run_judge` в процессе тестов (ответ,
+  таймаут, нет `claude`); `test_judge_group_killed_with_hook` — хук подпроцессом, `claude` — скрипт с
+  потомком: после `SIGKILL` хука оба умирают за `WATCHDOG_POLL` + 3 с; хук `Stop` целиком —
+  `JudgeDiesWithHookTest` в `tests/test_judge_stop.py`, только на Linux (живость процесса — по `/proc`);
+- сроки проверки манифестов — `ManifestDeadlineTest` в `tests/test_judge_tool.py`: `manifest_watch.take` и
+  `compare` подменены, проверяется срок, который им передаёт `judge_tool.main`, и `HEAD_TIMEOUT` вызова
+  `manifest_watch._git`; сумма сроков правки манифеста `HEAD_TIMEOUT` + `GIT_ROOT_TIMEOUT` +
+  `SNAPSHOT_BUDGET` против таймаута хука — `TimeoutsTest`; сбой снимка (больше `MAX_MANIFESTS`, недоступный
+  каталог данных; предупреждение раз, `skipped` на каждую команду) — `ManifestSnapshotFailureTest`;
+- манифесты под враждебным git-конфигом — `HostileManifestTest` в `tests/test_hostile_git.py`:
+  `git ls-files` (отслеживаемые, неотслеживаемые, исключённые `.gitignore`, пути с пробелом и кириллицей,
+  `FOREIGN_DIRS`) и `git cat-file --batch` версий `_REPO_REFS` при textconv-драйвере на манифесте и незавершённом
+  слиянии
+  (`MERGE_HEAD`).
 
 Локаль с кодировкой ascii проверяет `NonUtf8LocaleTest` своим скриптом `_LOCALE_HOOK` подпроцессом
-(`LC_ALL=C`, `PYTHONUTF8=0`): судья с русским промптом на Linux и через сторож, корень проекта и
+(`LC_ALL=C`, `PYTHONUTF8=0`): судья с русским промптом через сторож, корень проекта и
 транскрипт по путям с кириллицей. Если кодировка файловой системы там не ascii, тест пропускается. Цель
 записи в память и `cwd` с кириллицей в той же локали — `MemoryHookTest.test_non_utf8_locale_cyrillic_paths`
 в `tests/test_guard_memory.py`, хуком подпроцессом, с тем же пропуском.
@@ -132,10 +163,11 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
   `test_names_taken_by_code_exist`), заголовок и строка условия «Читай» каждого модуля, только
   известные метки, пункты «Решения» 7 и «Планы» 9, полнота индекса «Модули», метки языков. Там же
   `TimeoutsTest`: сроки внутри хуков против таймаутов `hooks/hooks.json`
-  (`context/architecture.md`, «Сроки»), в сумме — `guard_memory.CHECK_IGNORE_TIMEOUT`.
-- Живой `claude`: вызов судьи, показ `systemMessage`, хуки `guard_memory` и `debug_watch` в
-  настоящей сессии проверяются только вручную.
-- Сторож судьи на платформе не Linux: проверен только подменой `sys.platform`.
+  (`context/architecture.md`, «Сроки»), в сумме — `guard_memory.CHECK_IGNORE_TIMEOUT` и сроки
+  `manifest_watch`.
+- Живой `claude`: вызов судьи, показ `systemMessage`, хуки `guard_memory` и `debug_watch`, проверка
+  манифестов (отказ правке и блок `PostToolUse`) в настоящей сессии проверяются только вручную.
+- Сторож судьи на платформе не Linux не запускался.
 - Вложения с `attachment.planFilePath` в корпусе `transcript-shapes.jsonl` нет: тесты собирают его
   сами (`type: plan_mode`), с настоящего транскрипта форма не снята.
 - Набор целиком без UTF-8 mode не гоняется: в `test-hostile` в кодировке ascii работают только хуки

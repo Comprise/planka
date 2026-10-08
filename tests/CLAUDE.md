@@ -16,14 +16,16 @@ unittest плагина; запуск — `make test` из корня.
   Изоляцию проверяет `make test-hostile`.
 - Устойчивость плагина к чужому git-конфигу — `test_hostile_git.py`: враждебный `GIT_CONFIG_GLOBAL`
   передаётся явно только вызовам плагина, git подготовки репозитория — под изолированным конфигом.
-  Новый вызов git в плагине проверяется там же (`git check-ignore` в `guard_memory` — `HostileMemoryTest`).
+  Новый вызов git в плагине проверяется там же (`git check-ignore` в `guard_memory` — `HostileMemoryTest`,
+  `git ls-files` и `git cat-file --batch` в `manifest_watch` — `HostileManifestTest`).
 - Тест не импортирует другой тест: помощники, нужные нескольким файлам (`run_in_process`, `fill_budget`,
   `assert_not_logged`, `author_block`), — в `helpers.py`.
 - Вход хука — `Env.hook_input(event, **fields)`: `cwd` — каталог проекта `Env`, `transcript_path` —
   `Env.transcript` с ответом ассистента модели `claude-test-model`.
 - `fixtures/` — корпуса настоящих форм входа: `plan-*.md` (`test_planparse`, ожидаемая структура
   каждого плана — `CORPUS`), `transcript-shapes.jsonl` (`test_common`), `bash-failure-errors.jsonl`
-  (`test_debug_watch`); новый край разборщика — образцом в корпус.
+  (`test_debug_watch`), `manifests/` (`test_manifests`, имена каждого манифеста — `CORPUS`, имя его пакета — `OWN`);
+  новый край разборщика — образцом в корпус.
 
 ## Читать перед правкой
 

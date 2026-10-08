@@ -205,13 +205,14 @@ class RunJudgeTest(unittest.TestCase):
         self.judge(None, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         self.assertNotIn("--model", self.argv_of(rec.read_text(encoding="utf-8")))
 
-    def test_non_executable_binary_is_error(self):
+    def test_non_executable_binary_is_not_found(self):
+        """Неисполняемый claude в PATH не находится, как в оболочке."""
         fake = self.env.root / "bin"
         fake.mkdir()
         (fake / "claude").write_text("#!/bin/sh\n")
         v = self.judge(PATH=str(fake))
         self.assertTrue(v.ok)
-        self.assertTrue(v.error.startswith("claude не запущен"), v.error)
+        self.assertEqual(v.error, "claude не найден в PATH")
 
     def test_missing_binary_is_error(self):
         v = self.judge(PATH="/nonexistent")
@@ -224,8 +225,8 @@ class RunJudgeTest(unittest.TestCase):
         self.assertTrue(v.ok)
         self.assertTrue(v.error.startswith("claude не запущен"), v.error)
 
-    def test_preexec_failure_is_skip(self):
-        with mock.patch("subprocess.Popen", side_effect=subprocess.SubprocessError("Exception occurred in preexec_fn.")):
+    def test_popen_failure_is_skip(self):
+        with mock.patch("subprocess.Popen", side_effect=subprocess.SubprocessError("сбой запуска")):
             v = self.judge()
         self.assertTrue(v.ok)
         self.assertTrue(v.error.startswith("claude не запущен"), v.error)
@@ -672,19 +673,25 @@ def _pid_alive(pid):
     return True
 
 
-# Процесс «хука»: запускает судью через сторож и ждёт, пока его убьют.
+# Процесс «хука»: судья через common.run_judge, хук ждёт ответа, пока его не убьют.
 _HOOK = """
-import subprocess, sys, time
+import sys
 sys.path.insert(0, sys.argv[1])
 import common
-common._start_judge(["claude"], "darwin", stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL)
-time.sleep(100)
+common.run_judge("SYS", "USER", None, timeout=100)
+"""
+
+# claude с потомком: свой PID и PID потомка — в файл PLANKA_PIDS, затем ожидание потомка.
+_FORKING_CLAUDE = """#!/bin/sh
+cat > /dev/null
+sleep 100 &
+echo "$$ $!" > "$PLANKA_PIDS"
+wait
 """
 
 
 class WatchdogTest(unittest.TestCase):
-    """Сторож судьи — механизм вне Linux; здесь он проверяется на любой POSIX."""
+    """Судья через сторож _WATCHDOG на платформе, где идут тесты."""
 
     def setUp(self):
         self.env = Env()
@@ -694,8 +701,7 @@ class WatchdogTest(unittest.TestCase):
         self.env.close()
 
     def judge(self, **extra):
-        with mock.patch.dict(os.environ, {**self.base, **extra}, clear=True), \
-             mock.patch.object(sys, "platform", "darwin"):
+        with mock.patch.dict(os.environ, {**self.base, **extra}, clear=True):
             return common.run_judge("SYS", "USER", "haiku", timeout=3)
 
     @staticmethod
@@ -734,24 +740,35 @@ class WatchdogTest(unittest.TestCase):
         self.assertIn("таймаут", v.error)
         self.assertTrue(self.wait_dead(self.stub_pid(rec), 5), "судья жив после таймаута")
 
-    def test_judge_killed_with_hook(self):
-        rec = self.env.data / "rec.txt"
+    def test_judge_group_killed_with_hook(self):
+        """Хук убит SIGKILL — умирают claude и его потомок."""
+        bin_dir = self.env.project / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "claude").write_text(_FORKING_CLAUDE, encoding="utf-8")
+        (bin_dir / "claude").chmod(0o755)
+        pids_file = self.env.data / "pids.txt"
+        env = {**self.base, "PATH": f"{bin_dir}:{self.base['PATH']}", "PLANKA_PIDS": str(pids_file)}
         hook = subprocess.Popen([sys.executable, "-c", _HOOK, str(PLANKA_DIR)], stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                env=self.env.environ(PLANKA_STUB="hang", PLANKA_STUB_RECORD=str(rec)))
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        pids = []
         try:
             deadline = time.monotonic() + 10
-            while not (rec.exists() and "PID " in rec.read_text(encoding="utf-8")):
+            while not (pids_file.exists() and pids_file.read_text(encoding="utf-8").endswith("\n")):
                 self.assertLess(time.monotonic(), deadline, "судья не запустился")
                 time.sleep(0.05)
-            judge_pid = self.stub_pid(rec)
-            self.assertTrue(_pid_alive(judge_pid))
+            pids = [int(p) for p in pids_file.read_text(encoding="utf-8").split()]
+            self.assertTrue(all(map(_pid_alive, pids)))
             hook.kill()
             hook.wait()
-            self.assertTrue(self.wait_dead(judge_pid, 5), "судья пережил хук")
+            # Сторож замечает смерть хука за WATCHDOG_POLL; запас — на загруженную машину.
+            for pid, name in zip(pids, ("claude", "потомок claude")):
+                self.assertTrue(self.wait_dead(pid, common.WATCHDOG_POLL + 3), f"{name} пережил хук")
         finally:
             hook.kill()
             hook.wait()
+            for pid in pids:
+                if _pid_alive(pid):
+                    os.kill(pid, signal.SIGKILL)
 
 
 def run_captured(main):
@@ -842,8 +859,8 @@ class RunHookEncodingTest(unittest.TestCase):
         self.assertEqual(json.loads(r.stdout.decode("utf-8"))["hookSpecificOutput"]["additionalContext"], "привет ✓")
 
 
-# Хук в подпроцессе: судья с русским промптом (platform "darwin" — через сторож), корень проекта и транскрипт
-# по путям с кириллицей из входа.
+# Хук в подпроцессе: судья с русским промптом через сторож, корень проекта и транскрипт по путям с кириллицей
+# из входа.
 # cwd после input_path в локали ascii несёт байты UTF-8 суррогатами, судье он уходит исходными байтами.
 # Код только ASCII: аргумент -c с кириллицей Python в локали ascii не декодирует.
 _LOCALE_HOOK = """
@@ -852,7 +869,6 @@ sys.path.insert(0, sys.argv[1])
 import common
 def main():
     data = common.read_input()
-    sys.platform = data["platform"] or sys.platform
     cwd = common.input_path(data["cwd"])
     v = common.run_judge(data["sys"] + cwd, data["user"] + cwd, data["model"], timeout=10)
     root = common.project_root(data["cwd"])
@@ -886,28 +902,26 @@ class NonUtf8LocaleTest(unittest.TestCase):
             {"type": "attachment", "attachment": {"type": "plan_mode", "planFilePath": str(plan)}},
             {"type": "assistant", "message": {"model": "claude-test-model", "content": []}})) + "\n",
             encoding="utf-8")
-        for platform in ("", "darwin"):
-            with self.subTest(platform=platform or sys.platform):
-                rec = self.env.data / f"rec-{platform}.txt"
-                data = {"sys": "Ты судья решений", "user": "Проверь", "model": "модель", "cwd": str(sub),
-                        "transcript_path": str(transcript), "platform": platform}
-                r = subprocess.run([sys.executable, "-c", _LOCALE_HOOK, str(PLANKA_DIR)],
-                                   input=json.dumps(data).encode("utf-8"), capture_output=True, timeout=30,
-                                   env=self.env.environ(LC_ALL="C", PYTHONUTF8="0", PYTHONIOENCODING="latin-1",
-                                                        PLANKA_STUB_RECORD=str(rec)))
-                self.assertEqual(r.stderr, b"")
-                out = json.loads(r.stdout.decode("utf-8"))
-                if out.get("fsenc") not in ("ascii", None):
-                    self.skipTest(f"кодировка файловой системы {out['fsenc']}: локаль C здесь не ascii")
-                self.assertNotIn("systemMessage", out)
-                self.assertEqual((out["ok"], out["error"]), (True, None))
-                text = rec.read_text(encoding="utf-8")
-                argv = text.split("ARGV\n", 1)[1].split("\nSTDIN\n", 1)[0].split("\n")
-                self.assertEqual(argv[argv.index("--system-prompt") + 1], f"Ты судья решений{sub}")
-                self.assertEqual(argv[argv.index("--model") + 1], "модель")
-                self.assertIn(f"STDIN\nПроверь{sub}ENV", text)
-                self.assertEqual(bytes.fromhex(out["root"]), bytes(project.resolve()))
-                self.assertEqual((out["model"], out["plan"]), ("claude-test-model", True))
+        rec = self.env.data / "rec.txt"
+        data = {"sys": "Ты судья решений", "user": "Проверь", "model": "модель", "cwd": str(sub),
+                "transcript_path": str(transcript)}
+        r = subprocess.run([sys.executable, "-c", _LOCALE_HOOK, str(PLANKA_DIR)],
+                           input=json.dumps(data).encode("utf-8"), capture_output=True, timeout=30,
+                           env=self.env.environ(LC_ALL="C", PYTHONUTF8="0", PYTHONIOENCODING="latin-1",
+                                                PLANKA_STUB_RECORD=str(rec)))
+        self.assertEqual(r.stderr, b"")
+        out = json.loads(r.stdout.decode("utf-8"))
+        if out.get("fsenc") not in ("ascii", None):
+            self.skipTest(f"кодировка файловой системы {out['fsenc']}: локаль C здесь не ascii")
+        self.assertNotIn("systemMessage", out)
+        self.assertEqual((out["ok"], out["error"]), (True, None))
+        text = rec.read_text(encoding="utf-8")
+        argv = text.split("ARGV\n", 1)[1].split("\nSTDIN\n", 1)[0].split("\n")
+        self.assertEqual(argv[argv.index("--system-prompt") + 1], f"Ты судья решений{sub}")
+        self.assertEqual(argv[argv.index("--model") + 1], "модель")
+        self.assertIn(f"STDIN\nПроверь{sub}ENV", text)
+        self.assertEqual(bytes.fromhex(out["root"]), bytes(project.resolve()))
+        self.assertEqual((out["model"], out["plan"]), ("claude-test-model", True))
 
 
 class OutputsTest(unittest.TestCase):
@@ -1107,6 +1121,8 @@ class PathKindTest(unittest.TestCase):
             "deno.json": "code", "mod/go.mod": "code", "Cargo.toml": "code", "pyproject.toml": "code",
             "setup.cfg": "code", "pom.xml": "code", "build.gradle": "code",
             "package-lock.json": "other", "tsconfig.base.json": "other", "docs/package.json": "code",
+            "a.cljs": "code", "deps.edn": "code", "a.fsx": "code", "a.fsi": "code", "a.vbs": "code",
+            "a.lisp": "code",
         }
         for path, kind in cases.items():
             self.assertEqual(common.path_kind(path), kind, path)
@@ -1115,6 +1131,8 @@ class PathKindTest(unittest.TestCase):
         import comments
         names = {n.lower() for n in comments._NAMES}
         self.assertLessEqual(set(comments._SYNTAX) - names, common.CODE_EXTS)
+        # Каждое расширение кода — с синтаксисом комментариев: иначе его файлы судятся по самоотчёту.
+        self.assertLessEqual(common.CODE_EXTS, set(comments._SYNTAX))
         self.assertLessEqual(names, set(comments._SYNTAX))
         self.assertEqual(comments._NAMES, common.CODE_NAMES)
         for ext in ("php", "r", "jl", "ex", "exs", "erl", "clj", "fs", "vb", "nim", "zig", "sol",

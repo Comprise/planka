@@ -1,0 +1,41 @@
+# источник: пример pip.pypa.io/en/stable/reference/requirements-file-format/ и формы VCS и --hash из
+# pip.pypa.io/en/stable/topics/vcs-support/ и secure-installs/
+###### Requirements without Version Specifiers ######
+pytest
+pytest-cov
+beautifulsoup4
+
+###### Requirements with Version Specifiers ######
+#   See https://www.python.org/dev/peps/pep-0440/#version-specifiers
+docopt == 0.6.1             # Version Matching. Must be version 0.6.1
+keyring >= 4.1.1            # Minimum version 4.1.1
+coverage != 3.5             # Version Exclusion. Anything except version 3.5
+Mopidy-Dirble ~= 1.1        # Compatible release. Same as >= 1.1, == 1.*
+
+###### Refer to other requirements files ######
+-r other-requirements.txt
+-c constraints.txt
+
+###### Options ######
+--index-url https://pypi.org/simple
+--extra-index-url https://example.com/simple
+
+###### A particular file ######
+./downloads/numpy-1.9.2-cp34-none-win32.whl
+http://wxpython.org/Phoenix/snapshot-builds/wxPython_Phoenix-3.0.3.dev1820+49a8884-cp34-none-win_amd64.whl
+
+###### VCS ######
+-e git+https://git.example.com/MyProject#egg=MyProject
+-e ./local/project
+MyProject @ git+https://git.example.com/MyProject
+urllib3 @ https://github.com/urllib3/urllib3/archive/refs/tags/1.26.8.zip
+requests [security] >= 2.8.1, == 2.8.* ; python_version < "2.7"
+
+###### Hashes ######
+FooProject == 1.2 --hash=sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824 \
+                  --hash=sha256:486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7
+
+###### Additional Requirements without Version Specifiers ######
+#   Same as 1st section, just here to show that you can put things in any order.
+rejected
+green

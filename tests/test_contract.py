@@ -11,11 +11,13 @@ sys.path.insert(0, str(PLANKA_DIR))
 import common  # noqa: E402
 import guard_memory  # noqa: E402
 import judge_stop  # noqa: E402
+import manifest_watch  # noqa: E402
 import remind  # noqa: E402
 
 PLUGIN = REPO / "plugin"
 # Обратное направление: разделы и модули, которые код обязан брать (имена выводит из кода _code_names);
-# «Границы» называют judge_tool.DEP_REASON и guard_memory, dependencies — judge_tool.DEP_REASON.
+# «Границы» называют guard_memory и тексты отказа judge_tool (DEP_REASON, MANIFEST_REASON, COMMAND_REASON),
+# dependencies — те же тексты judge_tool.
 SECTIONS = ("Решения", "Планы", "Границы")
 MODULES = ("planning", "subagents", "verification", "docs", "comments", "dependencies",
            "refactoring", "design-patterns", "heuristics", "debugging", "memory")
@@ -97,7 +99,8 @@ class ContractTest(unittest.TestCase):
         sections, modules = _code_names()
         # Сборщик находит каждое имя ручных списков: пустое множество — сбой разбора.
         self.assertGreaterEqual(sections, set(SECTIONS))
-        # dependencies код называет только в тексте judge_tool.DEP_REASON, не вызовом.
+        # dependencies код называет только в текстах judge_tool DEP_REASON, MANIFEST_REASON, COMMAND_REASON, не
+        # вызовом.
         self.assertGreaterEqual(modules, set(MODULES) - {"dependencies"})
         headings = set(re.findall(r"^## (.+)$", self.core, re.MULTILINE))
         for name in sorted(sections):
@@ -172,10 +175,32 @@ class TimeoutsTest(unittest.TestCase):
         for timeout in self.timeouts[("UserPromptSubmit", "remind")]:
             self.assertLess(remind.SNAPSHOT_BUDGET, timeout)
 
+    def test_bash_manifest_snapshot_fits(self):
+        # Снимок манифестов перед командой Bash: корень проекта git rev-parse, затем срок снимка; правка
+        # манифеста файловым инструментом — git cat-file версии из HEAD, затем корень проекта и обход
+        # манифестов проекта (judge_tool._project_names).
+        for timeout in self.timeouts[("PreToolUse", "judge_tool")]:
+            self.assertLess(common.GIT_ROOT_TIMEOUT + manifest_watch.SNAPSHOT_BUDGET, timeout)
+            self.assertLess(manifest_watch.HEAD_TIMEOUT + common.GIT_ROOT_TIMEOUT + manifest_watch.SNAPSHOT_BUDGET,
+                            timeout)
+
+    def test_post_tool_use_fits(self):
+        for event in ("PostToolUse", "PostToolUseFailure"):
+            for timeout in self.timeouts[(event, "judge_tool")]:
+                self.assertLess(manifest_watch.CHECK_BUDGET, timeout, event)
+
     def test_post_tool_use_has_no_judge(self):
-        tree = ast.parse((PLANKA_DIR / "debug_watch.py").read_text(encoding="utf-8"))
-        calls = {n.func.attr for n in ast.walk(tree)
-                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
-        self.assertNotIn("run_judge", calls)
+        # PostToolUse на Bash — debug_watch и сравнение манифестов judge_tool.check_command_manifests: ни один
+        # не зовёт судью.
+        def calls(node):
+            return {n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", None)
+                    for n in ast.walk(node) if isinstance(n, ast.Call)}
+        for name in ("debug_watch", "manifest_watch"):
+            tree = ast.parse((PLANKA_DIR / f"{name}.py").read_text(encoding="utf-8"))
+            self.assertNotIn("run_judge", calls(tree), name)
+        tree = ast.parse((PLANKA_DIR / "judge_tool.py").read_text(encoding="utf-8"))
+        post = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}["check_command_manifests"]
+        self.assertTrue(calls(post).isdisjoint({"run_judge", "_judge_and_emit", "judge_question", "judge_plan"}))
         for event in ("PostToolUse", "PostToolUseFailure"):
             self.assertIn((event, "debug_watch"), self.timeouts)
+            self.assertIn((event, "judge_tool"), self.timeouts)

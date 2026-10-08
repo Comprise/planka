@@ -1,0 +1,30 @@
+{
+  "//": "источник: формы docs.npmjs.com (package.json: file:, git, npm:-псевдоним, bundleDependencies, overrides) и pnpm.io/workspaces (workspace:, link:)",
+  "name": "app",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "shared": "workspace:*",
+    "utils": "file:../utils",
+    "linked": "link:../linked",
+    "sibling": "../sibling",
+    "lodash": "^4.17.21",
+    "my-fork": "github:user/repo#v1.0.0",
+    "react18": "npm:react@^18.3.1",
+    "scoped-alias": "npm:@types/node@^20"
+  },
+  "devDependencies": {
+    "@scope/tool": "^2.0.0"
+  },
+  "peerDependencies": {
+    "react-dom": ">=18"
+  },
+  "optionalDependencies": {
+    "fsevents": "^2.3.3"
+  },
+  "bundleDependencies": ["lodash"],
+  "overrides": {
+    "semver": "7.5.4"
+  }
+}

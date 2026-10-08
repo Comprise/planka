@@ -264,7 +264,7 @@ class StopHookTest(unittest.TestCase):
 
 
 class JudgeDiesWithHookTest(unittest.TestCase):
-    @unittest.skipUnless(sys.platform.startswith("linux"), "PR_SET_PDEATHSIG — только Linux")
+    @unittest.skipUnless(sys.platform.startswith("linux"), "/proc — только Linux")
     def test_judge_killed_with_hook(self):
         env = Env()
         proc, judge_pid = None, None
@@ -486,13 +486,13 @@ class DocsFilterTest(unittest.TestCase):
         self.assertIn("При отказе назови файл, который нужно сверить, или строку комментария, "
                       "которую нужно переписать.", text)
 
-    def test_unknown_syntax_named_not_none_added(self):
+    def test_comment_in_subdirectory_listed_not_none_added(self):
         self.snap()
         (self.project / "pkg" / "data.erl").write_text("% x\n", encoding="utf-8")
         rec = self.env.data / "rec.txt"
         self.stop("Поправил.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         text = rec.read_text(encoding="utf-8")
-        self.assertIn("Файлы без известного синтаксиса комментариев, судятся по самоотчёту: pkg/data.erl", text)
+        self.assertIn("- pkg/data.erl: % x", text)
         self.assertNotIn("комментарии не добавлены", text)
 
     def test_absent_prompt_id_matches_empty_snapshot(self):
@@ -572,7 +572,7 @@ class DocsFilterTest(unittest.TestCase):
                                   "- gone.json — прочее, удалён", "- old.erl — код, удалён",
                                   "- old.go — код, удалён"])
         self.assertIn("a.py: # new", text)
-        self.assertIn("Файлы без известного синтаксиса комментариев, судятся по самоотчёту: b.erl\n", text)
+        self.assertIn("b.erl: % x", text)
         self.assertEqual(self.env.log_lines()[-1]["files"],
                          ["a.py", "b.erl", "c.json", "d.md", "gone.json", "old.erl", "old.go"])
 

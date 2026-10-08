@@ -1,5 +1,4 @@
 """Общее для хуков planka: барьеры, вход, транскрипт, судья, счётчик отказов, журнал, форматы ответа."""
-import ctypes
 import contextlib
 import dataclasses
 import datetime
@@ -90,7 +89,7 @@ CODE_EXTS = {
     "sql", "lua", "hs",
     "html", "xml", "vue", "svelte", "css", "scss", "sass", "less",
     "php", "r", "jl", "ex", "exs", "erl", "clj", "fs", "vb", "nim", "zig", "sol", "proto", "gradle",
-    "groovy", "tf", "nix", "el", "vim", "bat", "cmd",
+    "groovy", "tf", "nix", "el", "vim", "bat", "cmd", "cljs", "edn", "fsx", "fsi", "vbs", "lisp",
 }
 # Манифесты по имени: остальные *.json и go.sum — прочее.
 CODE_NAMES = {"Makefile", "makefile", "GNUmakefile", "CMakeLists.txt", "Dockerfile", "Justfile", "Rakefile",
@@ -215,22 +214,9 @@ def _kill_group(proc):
         pass
 
 
-_PR_SET_PDEATHSIG = 1
-
-
-def _die_with_hook(hook_pid):
-    """preexec_fn судьи на Linux: SIGKILL процессу судьи, когда умирает процесс хука; потомкам судьи
-    PR_SET_PDEATHSIG не наследуется."""
-    def set_signal():
-        ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_PDEATHSIG, signal.SIGKILL)
-        # Хук умер до prctl — сигнала не будет.
-        if os.getppid() != hook_pid:
-            os.kill(os.getpid(), signal.SIGKILL)
-    return set_signal
-
-
-# Сторож судьи вне Linux: лидер группы судьи, запускает claude потомком и раз в WATCHDOG_POLL с сверяет
-# своего родителя с PID хука; хук умер — SIGKILL всей группе. Аргументы: PID хука, команда claude с путём.
+# Сторож судьи: лидер группы судьи, запускает claude потомком и раз в WATCHDOG_POLL с сверяет своего родителя
+# с PID хука; хук умер — SIGKILL всей группе, себе и потомкам claude тоже. Сторож умирает только с группой:
+# убитый отдельно, он оставляет группу таймауту судьи (_kill_group). Аргументы: PID хука, команда claude с путём.
 WATCHDOG_POLL = 0.5
 _WATCHDOG = f"""
 import os, signal, subprocess, sys
@@ -249,18 +235,14 @@ while True:
 """
 
 
-def _start_judge(cmd, platform, **popen_kwargs):
-    """Popen судьи лидером своей группы процессов. Вместе с хуком умирает: на Linux — процесс судьи
-    (PR_SET_PDEATHSIG), его потомков убивает только _kill_group по таймауту; на других платформах — вся группа
-    через сторож _WATCHDOG. FileNotFoundError — нет cmd[0] в PATH окружения popen_kwargs["env"]."""
-    hook_pid = os.getpid()
-    if platform.startswith("linux"):
-        return subprocess.Popen(cmd, start_new_session=True, preexec_fn=_die_with_hook(hook_pid), **popen_kwargs)
+def _start_judge(cmd, **popen_kwargs):
+    """Popen сторожа _WATCHDOG с судьёй cmd лидером своей группы процессов: вместе с хуком умирает вся группа.
+    FileNotFoundError — нет cmd[0] в PATH окружения popen_kwargs["env"]."""
     env = popen_kwargs.get("env") or os.environ
     exe = shutil.which(cmd[0], path=env.get("PATH"))
     if exe is None:
         raise FileNotFoundError(cmd[0])
-    return subprocess.Popen([sys.executable, "-I", "-c", _WATCHDOG, str(hook_pid), exe, *cmd[1:]],
+    return subprocess.Popen([sys.executable, "-I", "-c", _WATCHDOG, str(os.getpid()), exe, *cmd[1:]],
                             start_new_session=True, **popen_kwargs)
 
 
@@ -439,7 +421,7 @@ def run_judge(system_prompt, user_prompt, model, *, timeout=JUDGE_TIMEOUT):
     cmd = ["claude", *map(_utf8, args)]
     env = dict(os.environ, PLANKA_JUDGE="1")
     try:
-        proc = _start_judge(cmd, sys.platform, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        proc = _start_judge(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, env=env, cwd=str(data_dir()))
     except FileNotFoundError:
         return _skipped("claude не найден в PATH")

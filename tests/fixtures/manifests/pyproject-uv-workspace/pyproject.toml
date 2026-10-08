@@ -1,0 +1,19 @@
+# источник: формы документации uv, «Workspaces» и «Dependency sources» (workspace = true, path, git)
+[project]
+name = "albatross"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["bird-feeder", "seeds", "tqdm>=4,<5"]
+
+[tool.uv.sources]
+bird-feeder = { workspace = true }
+seeds = { path = "packages/seeds", editable = true }
+tqdm = { git = "https://github.com/tqdm/tqdm" }
+
+[tool.uv.workspace]
+members = ["packages/*"]
+exclude = ["packages/seeds"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

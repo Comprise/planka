@@ -15,12 +15,14 @@ planka@planka` с перезапуском сессии (`README.md`, «Уста
 `python3 "${CLAUDE_PLUGIN_ROOT}/planka/<скрипт>.py"`; модули `planka/` импортируют друг друга
 по имени (`import common`), каталог скрипта — первый в `sys.path`.
 
-Точки входа: `remind.py` (`UserPromptSubmit`), `judge_tool.py` и `guard_memory.py` (`PreToolUse`),
-`judge_stop.py` (`Stop`), `debug_watch.py` (`PostToolUse`, `PostToolUseFailure`).
+Точки входа: `remind.py` (`UserPromptSubmit`), `judge_tool.py` (`PreToolUse`; на `Bash` ещё
+`PostToolUse`, `PostToolUseFailure`), `guard_memory.py` (`PreToolUse`), `judge_stop.py` (`Stop`),
+`debug_watch.py` (`PostToolUse`, `PostToolUseFailure`). Один скрипт на нескольких событиях различает их
+по `hook_event_name` входа (`judge_tool.POST_EVENTS`).
 
 ## Код
 
-- Только стандартная библиотека Python; новый пакет — вопрос автору.
+- Только стандартная библиотека Python 3.11+ (`tomllib` в `manifests.py`); новый пакет — вопрос автору.
 - Новая точка входа хука — регистрация в `plugin/hooks/hooks.json` с таймаутом, тело `main()` через
   `common.run_hook(main)`, первой строкой `main` — `common.barrier_active()`; тесты — подпроцессом
   через `tests.helpers.Env` (`context/testing.md`); строка в таблицах хуков `README.md`, «Как это

@@ -27,24 +27,34 @@ class _Syntax:
 
     line — (маркер, правило) строчного комментария: правило "any" — маркер везде, "word" — в начале строки
     или после пробела, "code" — не сразу после «$», «{» и «\\», "php" — «#» не перед «[», "css" — не сразу после
-    «:» (url(http://…) без кавычек). blocks — (открытие,
-    закрытие) блочного комментария. strings — (открытие, закрытие, многострочный ли, escape): escape "\\" —
-    обратная косая, "double" — удвоенная закрывающая кавычка, "nix" — escape строк '' Nix, None — нет;
-    однострочный литерал без закрывающей кавычки в той же строке литералом не считается.
+    «:» (url(http://…) без кавычек), "start" — только пробелы перед маркером, "vim" и "vim9" — по _vim_quote и
+    _marker_ok. blocks — (открытие, закрытие) блочного комментария; nested — блоки вкладываются (счётчик
+    глубины). strings — (открытие, закрытие, многострочный ли, escape): escape "\\" — обратная косая,
+    "double" — удвоенная закрывающая кавычка, "nix" — escape строк '' Nix, None — нет; однострочный литерал
+    без закрывающей кавычки в той же строке литералом не считается. prefix — (первый знак, регулярка, нужно ли
+    не-слово перед ним) символьного литерала с особым знаком: «$%» Erlang, «?#» Ruby, «\\;» Clojure. rem —
+    знаки, после которых (и пробелов) слово REM открывает комментарий, None — REM не комментарий.
+    line_block — (начало, конец) блока из целых строк с первой колонки (=begin/=end Ruby, POD Perl).
+    exdoc — атрибуты @doc, @moduledoc, @typedoc Elixir со строкой — документация, в вывод.
     """
 
     def __init__(self, line=(), blocks=(), strings=(), char=False, quote_word=False, docstring=False,
-                 heredoc=None, lua=False, raw=None, zig=False, shebang=False):
+                 heredoc=None, lua=False, raw=None, zig=False, shebang=False, nested=False, prefix=None,
+                 rem=None, line_block=None, exdoc=False):
         self.line, self.blocks, self.char, self.quote_word = line, blocks, char, quote_word
         # Длинное открытие проверяется раньше короткого: «"""» раньше «"».
         self.strings = sorted(strings, key=lambda s: -len(s[0]))
         self.docstring, self.heredoc, self.lua, self.raw, self.zig, self.shebang = (
             docstring, heredoc, lua, raw, zig, shebang)
+        self.nested, self.prefix, self.rem, self.line_block, self.exdoc = nested, prefix, rem, line_block, exdoc
         firsts = {m[0] for m, _ in line} | {o[0] for o, _ in blocks} | {s[0][0] for s in strings}
         firsts |= {"'"} if char else set()
-        firsts |= {"<"} if heredoc in ("tf", "ruby", "perl") else set()
+        firsts |= {"<"} if heredoc in ("tf", "ruby", "perl", "php") else set()
         firsts |= {"-", "["} if lua else set()
         firsts |= {"\\"} if zig else set()
+        firsts |= {prefix[0]} if prefix else set()
+        firsts |= {"r", "R"} if rem is not None else set()
+        firsts |= {"@"} if exdoc else set()
         self.starts = re.compile("[" + "".join(re.escape(c) for c in sorted(firsts)) + "]")
 
 
@@ -61,6 +71,19 @@ _SLASH = (("//", "any"),)
 _C_BLOCK = (("/*", "*/"),)
 _H = (("#", "code"),)
 
+# Символьные литералы: «$c» Erlang, «\c» Clojure, «?c» Emacs Lisp, «#\c» Common Lisp, «?c» Ruby и Elixir
+# (за ним не буква: «?a b» — литерал, «c ?abc» — тернарный оператор). Escape — обратная косая и следующий знак.
+_DOLLAR_CHAR = re.compile(r"\$(?:\\.|.)")
+_BACKSLASH_CHAR = re.compile(r"\\.")
+_ELISP_CHAR = re.compile(r"\?(?:\\.|.)")
+_HASH_CHAR = re.compile(r"#\\.")
+_QUESTION_CHAR = re.compile(r"\?(?:\\.|[^\s\\])(?!\w)")
+# Блоки из целых строк с первой колонки: =begin … =end Ruby, POD Perl от «=слово» до «=cut».
+_RUBY_BEGIN = re.compile(r"=begin(?:\s|$)")
+_RUBY_END = re.compile(r"=end(?:\s|$)")
+_POD_START = re.compile(r"=[A-Za-z]")
+_POD_CUT = re.compile(r"=cut(?:\s|$)")
+
 _SYNTAX = {}
 
 
@@ -72,23 +95,28 @@ def _add(exts, **kw):
 _add(("c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx", "m", "mm"),
      line=_SLASH, blocks=_C_BLOCK, strings=(_DQ,), char=True, raw="cpp")
 _add(("java",), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ, _DQ), char=True)
-_add(("kt", "kts", "scala"), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ_RAW, _DQ), char=True)
-_add(("swift",), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ, _DQ))
+# Блоки «/* */» Kotlin, Scala, Swift, Rust, Dart вкладываются; в C, Java, JS, Go, C#, Groovy — нет.
+_add(("kt", "kts", "scala"), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ_RAW, _DQ), char=True, nested=True)
+_add(("swift",), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ, _DQ), raw="swift", nested=True)
 _add(("cs",), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ_RAW, _DQ), char=True, raw="cs")
-_add(("rs",), line=_SLASH, blocks=_C_BLOCK, strings=(('"', '"', True, "\\"),), char=True, raw="rust")
+_add(("rs",), line=_SLASH, blocks=_C_BLOCK, strings=(('"', '"', True, "\\"),), char=True, raw="rust",
+     nested=True)
 _add(("go",), line=_SLASH, blocks=_C_BLOCK, strings=(("`", "`", True, None), _DQ), char=True)
 _add(("js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"),
      line=_SLASH, blocks=_C_BLOCK, strings=(("`", "`", True, "\\"), _DQ, _SQ))
-_add(("dart", "groovy", "gradle"), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ, _T_SQ, _DQ, _SQ))
-_add(("php",), line=_SLASH + (("#", "php"),), blocks=_C_BLOCK, strings=(_DQ, _SQ))
+_add(("dart",), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ, _T_SQ, _DQ, _SQ), nested=True)
+_add(("groovy", "gradle"), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ, _T_SQ, _DQ, _SQ))
+_add(("php",), line=_SLASH + (("#", "php"),), blocks=_C_BLOCK, strings=(_DQ, _SQ), heredoc="php")
 _add(("proto", "sol"), line=_SLASH, blocks=_C_BLOCK, strings=(_DQ, _SQ))
 _add(("zig",), line=_SLASH, strings=(_DQ,), char=True, zig=True)
 _add(("py", "pyi"), line=_H, strings=(_T_DQ, _T_SQ, _DQ, _SQ), docstring=True, shebang=True)
 _add(("sh", "bash", "zsh"), line=(("#", "word"),), strings=(_DQ, _SQ_RAW), heredoc="shell", shebang=True)
 _RUBY_NAMES = ("rakefile", "gemfile")
-_add(("rb",) + _RUBY_NAMES, line=_H, strings=(_DQ, _SQ), quote_word=True, shebang=True, heredoc="ruby")
+_add(("rb",) + _RUBY_NAMES, line=_H, strings=(_DQ, _SQ), quote_word=True, shebang=True, heredoc="ruby",
+     prefix=("?", _QUESTION_CHAR, True), line_block=(_RUBY_BEGIN, _RUBY_END))
 # Perl — heredoc Ruby и ещё heredoc в дескриптор: «print $fh <<EOF».
-_add(("pl",), line=_H, strings=(_DQ, _SQ), quote_word=True, shebang=True, heredoc="perl")
+_add(("pl",), line=_H, strings=(_DQ, _SQ), quote_word=True, shebang=True, heredoc="perl",
+     line_block=(_POD_START, _POD_CUT))
 _add(("r", "mk", "makefile", "cmake") + tuple(n.lower() for n in _HASH_NAMES if n.lower() not in _RUBY_NAMES),
      line=_H, strings=(_DQ, _SQ), quote_word=True, shebang=True)
 _add(("toml",), line=_H, strings=(_T_DQ, _T_SQ_RAW, _DQ, _SQ_RAW))
@@ -97,11 +125,12 @@ _add(("ini", "cfg"), line=_H + ((";", "word"),), strings=(_DQ, _SQ), quote_word=
 _add(("ps1",), line=_H, blocks=(("<#", "#>"),), strings=(_DQ_RAW, _SQ_RAW), quote_word=True)
 _add(("tf",), line=_H + _SLASH, blocks=_C_BLOCK, strings=(_DQ,), heredoc="tf")
 _add(("nix",), line=_H, blocks=_C_BLOCK, strings=(("''", "''", True, "nix"), ('"', '"', True, "\\")))
-_add(("jl",), line=_H, blocks=(("#=", "=#"),), strings=(_T_DQ, _DQ), char=True, shebang=True)
-_add(("ex", "exs"), line=_H, strings=(_T_DQ, _T_SQ, _DQ, _SQ), shebang=True)
+_add(("jl",), line=_H, blocks=(("#=", "=#"),), strings=(_T_DQ, _DQ), char=True, shebang=True, nested=True)
+_add(("ex", "exs"), line=_H, strings=(_T_DQ, _T_SQ, _DQ, _SQ), shebang=True, prefix=("?", _QUESTION_CHAR, True),
+     exdoc=True)
 _add(("sql",), line=(("--", "any"),), blocks=_C_BLOCK, strings=(_DQ, _SQ))
 _add(("lua",), line=(("--", "any"),), strings=(_DQ, _SQ), lua=True)
-_add(("hs",), line=(("--", "any"),), blocks=(("{-", "-}"),), strings=(_DQ,), char=True)
+_add(("hs",), line=(("--", "any"),), blocks=(("{-", "-}"),), strings=(_DQ,), char=True, nested=True)
 _add(("html", "xml"), blocks=(("<!--", "-->"),))
 _add(("css",), blocks=_C_BLOCK, strings=(_DQ, _SQ))
 _add(("scss", "sass", "less"), line=(("//", "css"),), blocks=_C_BLOCK, strings=(_DQ, _SQ))
@@ -110,6 +139,28 @@ _add(_JSONC_NAMES, line=_SLASH, blocks=_C_BLOCK, strings=(_DQ,))
 _add(_GOMOD_NAMES, line=_SLASH, strings=(_DQ, ("`", "`", False, None)))
 _add(("vue", "svelte"), line=_SLASH, blocks=(("<!--", "-->"),) + _C_BLOCK, strings=(_DQ, _SQ, _BT),
      quote_word=True)
+# Erlang: «$%» и «$"» — символьные литералы; тройная строка OTP 27 — без escape.
+_add(("erl",), line=(("%", "any"),), strings=(_T_DQ_RAW, _DQ, _SQ), prefix=("$", _DOLLAR_CHAR, False))
+# Clojure и Emacs Lisp: строки многострочные (docstring — тоже строка, не в вывод); «\;» Clojure и «?;» Emacs
+# Lisp — символьные литералы. «#_» Clojure убирает форму из чтения — это код, не текст.
+_LISP_STR = ('"', '"', True, "\\")
+_add(("clj", "cljs", "edn"), line=((";", "any"),), strings=(_LISP_STR,), prefix=("\\", _BACKSLASH_CHAR, False))
+_add(("el",), line=((";", "any"),), strings=(_LISP_STR,), prefix=("?", _ELISP_CHAR, True))
+# Common Lisp: «#\;» — символьный литерал, «#| |#» вкладываются.
+_add(("lisp",), line=((";", "any"),), blocks=(("#|", "|#"),), strings=(_LISP_STR,),
+     prefix=("#", _HASH_CHAR, False), nested=True)
+# F#: «(* *)» вкладываются, «(*)» — оператор; @"…" — verbatim, как в C#.
+_add(("fs", "fsx", "fsi"), line=_SLASH, blocks=(("(*", "*)"),), strings=(_T_DQ_RAW, ('"', '"', True, "\\")), char=True,
+     raw="cs", nested=True)
+# Visual Basic: «'» — комментарий везде вне строки, REM — в начале оператора.
+_add(("vb", "vbs"), line=(("'", "any"),), strings=(('"', '"', False, "double"),), rem=":")
+# Nim: «#[ ]#» и «##[ ]##» вкладываются; «r"…"» и «ident"…"» — сырые строки с удвоенной кавычкой.
+_add(("nim",), line=(("#", "any"),), blocks=(("##[", "]##"), ("#[", "]#")), strings=(_T_DQ_RAW, _DQ), char=True,
+     raw="nim", nested=True)
+# Vim: «"» — и комментарий, и строка (_vim_quote); «#» vim9script — после пробела, не «#{».
+_add(("vim",), line=(('"', "vim"), ("#", "vim9")), strings=(_DQ, ("'", "'", False, "double")))
+# Batch: REM — в начале команды, после «&», «|», «(» и «@»; «::» — только в начале строки.
+_add(("bat", "cmd"), line=(("::", "start"),), strings=(_DQ_RAW,), rem="&|(@")
 
 _KNOWN = set(_SYNTAX)
 _LUA_BLOCK = re.compile(r"--\[(=*)\[")
@@ -118,6 +169,10 @@ _CPP_RAW = re.compile(r'"([^()\\\s]{0,16})\(')
 _TF_HEREDOC = re.compile(r"<<(-?)([A-Za-z_][\w-]*)")
 # Heredoc Ruby и Perl: «<<ID», «<<-ID», «<<~ID», идентификатор и в кавычках.
 _RUBY_HEREDOC = re.compile(r"<<([-~]?)([\"'`]?)([A-Za-z_]\w*)\2")
+# Heredoc и nowdoc PHP: «<<<ID», «<<<"ID"», «<<<'ID'», за ними конец строки.
+_PHP_HEREDOC = re.compile(r"<<<[ \t]*([\"']?)([A-Za-z_]\w*)\1[ \t]*$")
+# Документация Elixir: @doc, @moduledoc, @typedoc со строкой, тройной или обычной, и с сигилом ~s, ~S.
+_EX_DOC = re.compile(r'@(?:module|type)?doc[ \t]+(~([sS]))?("""|\'\'\'|")')
 # Символьный литерал: один символ или escape; «'a» без закрывающей кавычки — время жизни Rust, штрих Haskell.
 _CHAR = re.compile(r"'(?:[^'\\]|\\(?:u\{[0-9a-fA-F]{1,6}\}|x[0-9a-fA-F]{2}|[0-7]{1,3}|.))'")
 
@@ -135,7 +190,31 @@ def _marker_ok(raw, i, rule):
         return not raw.startswith("[", i + 1)
     if rule == "css":
         return i == 0 or raw[i - 1] != ":"
+    if rule == "start":
+        return _back(raw, i, str.isspace) == 0
+    if rule == "vim":
+        return _vim_quote(raw, i)
+    if rule == "vim9":
+        return (i == 0 or raw[i - 1].isspace()) and not raw.startswith("{", i + 1)
     return True
+
+
+def _vim_quote(raw, i):
+    """Открывает ли «"» в i комментарий Vim: в начале строки (после пробелов и «:») — да; после пробела — да,
+    если до конца строки нет закрывающей кавычки; иначе это строка. Время — линейное по хвосту строки: «"»
+    с закрывающей кавычкой разбор пропускает до неё как строку."""
+    if _back(raw, i, lambda c: c.isspace() or c == ":") == 0:
+        return True
+    return raw[i - 1].isspace() and _close(raw, i + 1, '"', "\\") < 0
+
+
+def _rem(raw, i, seps):
+    """Открывает ли слово REM в i комментарий: за ним пробел или конец строки, перед ним — начало строки или
+    знак из seps, через пробелы."""
+    if raw[i:i + 3].lower() != "rem" or raw[i + 3:i + 4] not in ("", " ", "\t"):
+        return False
+    k = _back(raw, i, str.isspace)
+    return k == 0 or raw[k - 1] in seps
 
 
 def _close(raw, i, close, esc):
@@ -162,6 +241,38 @@ def _close(raw, i, close, esc):
         return j + len(close)
 
 
+def _block_opens(raw, i, opening):
+    """Открывает ли opening в i блочный комментарий: «(*)» F# — оператор умножения, а не открытие."""
+    return raw.startswith(opening, i) and not (opening == "(*" and raw.startswith(")", i + 2))
+
+
+def _close_nested(raw, i, opening, closing, depth):
+    """(индекс за закрытием внешнего блока, 0) или (-1, глубина к концу строки) для вложенных блоков: открытие
+    добавляет уровень, закрытие снимает. Время — линейное по длине строки."""
+    end = len(raw) + 1
+    o = c = -1
+    while True:
+        # Найденные o и c остаются первыми от i, пока i до них не дошёл.
+        if o < i:
+            o = raw.find(opening, i)
+            o = end if o < 0 else o
+        if c < i:
+            c = raw.find(closing, i)
+            c = end if c < 0 else c
+        if o < c:
+            if _block_opens(raw, o, opening):
+                i, depth = o + len(opening), depth + 1
+            else:
+                # «(*)» F#: оператор, глубину не меняет.
+                i = o + 3
+        elif c < end:
+            i, depth = c + len(closing), depth - 1
+            if not depth:
+                return i, 0
+        else:
+            return -1, depth
+
+
 def _raw_string(mode, raw, i):
     """(закрытие, escape, конец открытия) raw-строки, чья кавычка стоит в i; None, если это не raw-строка."""
     if mode == "rust":
@@ -178,6 +289,16 @@ def _raw_string(mode, raw, i):
                 return ")" + m.group(1) + '"', None, m.end()
     elif mode == "cs":
         if raw[i - 1:i] == "@" or raw[max(0, i - 2):i] == "@$":
+            return '"', "double", i + 1
+    elif mode == "swift":
+        # «#"…"#», «##"…"##», «#"""…"""#»: закрытие — кавычки и столько же «#».
+        k = _back(raw, i, lambda c: c == "#")
+        if k < i:
+            quote = '"""' if raw.startswith('"""', i) else '"'
+            return quote + "#" * (i - k), None, i + len(quote)
+    elif mode == "nim":
+        # «r"…"» и «ident"…"» — сырые однострочные, удвоенная кавычка — escape; тройные — обычные строки.
+        if i and _is_word(raw[i - 1]) and not raw.startswith('"""', i):
             return '"', "double", i + 1
     return None
 
@@ -204,16 +325,44 @@ _PERL_TIGHT = _PRINT | {"die", "warn"}
 _PERL_HANDLE = re.compile(r"[A-Z_][A-Z0-9_]*")
 
 
-def _after_print(raw, j):
-    """Стоит ли перед j через пробел отдельное слово print, printf или say Perl."""
-    k = _back(raw, j, str.isspace)
-    if k == j:
-        return False
+def _print_word(raw, k):
+    """Кончается ли перед k отдельное слово print, printf или say Perl."""
     # Слово длиннее «printf» — не из _PRINT: дальше назад не идём.
     start = k
     while start and _is_word(raw[start - 1]) and k - start <= 6:
         start -= 1
     return raw[start:k] in _PRINT
+
+
+def _after_print(raw, j):
+    """Стоит ли перед j через пробел отдельное слово print, printf или say Perl."""
+    k = _back(raw, j, str.isspace)
+    return k < j and _print_word(raw, k)
+
+
+# Блок-дескриптор Perl ищется назад не дальше стольких знаков: разбор строки остаётся линейным.
+_BLOCK_LOOKBACK = 256
+
+
+def _print_block(raw, j):
+    """Стоит ли перед j, на «}», блок-дескриптор Perl после print, printf, say: «{$fh}», «{$DB::OUT}»,
+    «{$self->{fh}}», «{*STDOUT}», и вплотную к слову («print{$fh}»). Блок со вложенными скобками — не длиннее
+    _BLOCK_LOOKBACK знаков."""
+    k = _back(raw, j - 1, lambda c: _is_word(c) or c == ":")
+    if k < j - 1 and raw[k - 2:k] == "{$":
+        return _print_word(raw, _back(raw, k - 2, str.isspace))
+    depth, b, lo = 0, j, max(0, j - _BLOCK_LOOKBACK)
+    while b > lo:
+        b -= 1
+        if raw[b] == "}":
+            depth += 1
+        elif raw[b] == "{":
+            depth -= 1
+            if not depth:
+                break
+    else:
+        return False
+    return raw[b + 1:b + 2] in ("$", "*") and _print_word(raw, _back(raw, b, str.isspace))
 
 
 def _tight_perl(raw, i):
@@ -234,21 +383,21 @@ def _heredoc_ok(raw, i, m, perl=False):
     идентификатор с «-», «~», в кавычках или с заглавной буквы («print <<EOF»), иначе добавление
     («a <<b»). За любым другим знаком («=», «(», «,») и в начале строки — heredoc.
 
-    perl — ещё heredoc в дескриптор после print, printf, say: «$fh», «{$fh}», «{$DB::OUT}», STDOUT, STDERR
-    через пробел; «<<» вплотную после print, printf, say, die, warn и после дескриптора из заглавных и «_»
-    за print, printf, say (_tight_perl); ведущие «_» идентификатора не мешают заглавной букве
-    («<<_EOUSAGE_»). В Ruby «print $fh <<EOF» — сдвиг глобальной переменной, там правило не действует.
+    perl — ещё heredoc в дескриптор после print, printf, say: «$fh», STDOUT, STDERR через пробел, блок
+    «{$fh}», «{$self->{fh}}», «{*STDOUT}» через пробел и вплотную (_print_block); «<<» вплотную после print,
+    printf, say, die, warn и после дескриптора из заглавных и «_» за print, printf, say (_tight_perl); ведущие
+    «_» идентификатора не мешают заглавной букве («<<_EOUSAGE_»). В Ruby «print $fh <<EOF» — сдвиг глобальной
+    переменной, там правило не действует.
     """
     if not i:
         return True
     if _is_word(raw[i - 1]) or raw[i - 1] in ")]}":
-        return perl and _tight_perl(raw, i)
+        return perl and (_tight_perl(raw, i) or raw[i - 1] == "}" and _print_block(raw, i))
     j = _back(raw, i, str.isspace)
     if j == i or not j:
         return True
     if perl and raw[j - 1] == "}":
-        k = _back(raw, j - 1, lambda c: _is_word(c) or c == ":")
-        return k < j - 1 and raw[k - 2:k] == "{$" and _after_print(raw, k - 2)
+        return _print_block(raw, j)
     if raw[j - 1] in ")]}\"'`":
         return False
     k = _back(raw, j, _is_word)
@@ -266,11 +415,28 @@ def _token(syn, raw, i, pending, unclosed, n=0, banned=frozenset()):
     """Разбор с позиции i вне литерала и комментария.
 
     ("line",) — строчный комментарий до конца строки; ("skip", j) — литерал до j; ("open", закрытие,
-    escape, в вывод ли, начало вывода, конец открытия) — многострочный блок или литерал; None — обычный символ.
+    escape, в вывод ли, начало вывода, конец открытия[, открытие вложенного блока]) — многострочный блок или
+    литерал; None — обычный символ.
     unclosed — открытия однострочных литералов, не закрытых в этой строке; _token дополняет его. n — номер
     строки; heredoc с позицией (n, i) из banned не открывается.
     """
     c = raw[i]
+    if syn.prefix and c == syn.prefix[0] and not (
+            syn.prefix[2] and i and (_is_word(raw[i - 1]) or raw[i - 1] in ")]}")):
+        m = syn.prefix[1].match(raw, i)
+        if m:
+            return "skip", m.end()
+    if syn.heredoc == "php" and raw.startswith("<<<", i) and (n, i) not in banned:
+        m = _PHP_HEREDOC.match(raw, i)
+        if m:
+            pending.append((m.group(2), "php", (n, i)))
+            return "skip", m.end()
+    if syn.exdoc and c == "@":
+        m = _EX_DOC.match(raw, i)
+        if m:
+            return "open", m.group(3), None if m.group(2) == "S" else "\\", True, i, m.end()
+    if syn.rem is not None and c in "rR" and _rem(raw, i, syn.rem):
+        return ("line",)
     if syn.heredoc == "tf" and raw.startswith("<<", i):
         m = _TF_HEREDOC.match(raw, i)
         if m:
@@ -287,8 +453,8 @@ def _token(syn, raw, i, pending, unclosed, n=0, banned=frozenset()):
         if m:
             return "open", "]" + m.group(1) + "]", None, True, i, m.end()
     for opening, closing in syn.blocks:
-        if raw.startswith(opening, i):
-            return "open", closing, None, True, i, i + len(opening)
+        if _block_opens(raw, i, opening):
+            return "open", closing, None, True, i, i + len(opening), opening if syn.nested else None
     for marker, rule in syn.line:
         if raw.startswith(marker, i) and _marker_ok(raw, i, rule):
             return ("line",)
@@ -300,6 +466,9 @@ def _token(syn, raw, i, pending, unclosed, n=0, banned=frozenset()):
         return "skip", len(raw)
     if c == '"' and syn.raw:
         found = _raw_string(syn.raw, raw, i)
+        if found and syn.raw == "nim":
+            j = _close(raw, found[2], found[0], found[1])
+            return ("skip", j) if j >= 0 else None
         if found:
             return "open", found[0], found[1], False, i, found[2]
     if c == "'" and syn.char:
@@ -326,7 +495,7 @@ def _token(syn, raw, i, pending, unclosed, n=0, banned=frozenset()):
 
 # Срок разбора проверяется раз на столько шагов; шаг — строка или позиция разбора внутри строки.
 _DEADLINE_EVERY = 1000
-# Повторов разбора без незакрытых heredoc; каждый повтор отбрасывает хотя бы один.
+# Разборов файла не больше стольких; каждый следующий отбрасывает хотя бы один незакрытый heredoc.
 _MAX_REPARSE = 8
 
 
@@ -338,21 +507,25 @@ def _comments(text, ext, deadline=None):
     if syn is None:
         return []
     banned = frozenset()
-    for _ in range(_MAX_REPARSE):
-        out, open_ = _parse(text, syn, deadline, banned)
+    out, open_ = _parse(text, syn, deadline, banned)
+    for _ in range(_MAX_REPARSE - 1):
         if not open_ or syn.heredoc == "shell":
             break
         banned |= {where for _, _, where in open_}
+        out, open_ = _parse(text, syn, deadline, banned)
     return out
 
 
 def _parse(text, syn, deadline, banned):
     """(комментарии, heredoc без терминатора к концу файла); banned — позиции heredoc, не открывающихся."""
     out = []
-    # Открытый многострочный блок или литерал: (закрытие, escape, идут ли его строки в вывод).
+    # Открытый многострочный блок или литерал: (закрытие, escape, идут ли его строки в вывод, открытие
+    # вложенного блока или None, глубина вложенности).
     state = None
     # Открытые heredoc: (терминатор, как сравнивать строку, позиция «<<» или None): тело heredoc — данные.
     pending = []
+    # Конец открытого блока из целых строк (line_block) или None.
+    line_block = None
     steps = 0
 
     def tick():
@@ -368,18 +541,43 @@ def _parse(text, syn, deadline, banned):
         # BOM UTF-8 в начале файла — не текст: иначе «#!» первой строки не узнаётся.
         if n == 1 and raw.startswith("\ufeff"):
             raw = raw[1:]
+        i = 0
         if pending:
             term, mode, _ = pending[0]
-            if (raw.strip() if mode == "strip" else raw.lstrip("\t") if mode == "tabs" else raw) == term:
+            if mode == "php":
+                # Терминатор PHP — с отступом, за ним код той же строки («EOT;», «EOT . 'x'; // c»).
+                body = raw.lstrip()
+                if not body.startswith(term) or _is_word(body[len(term):len(term) + 1]):
+                    continue
                 pending.pop(0)
-            continue
+                i = len(raw) - len(body) + len(term)
+            else:
+                if (raw.strip() if mode == "strip" else raw.lstrip("\t") if mode == "tabs" else raw) == term:
+                    pending.pop(0)
+                continue
         if n == 1 and syn.shebang and raw.startswith("#!"):
             continue
+        if line_block:
+            if raw.strip():
+                out.append((n, raw.strip()))
+            if line_block.match(raw):
+                line_block = None
+            continue
+        if state is None and syn.line_block and syn.line_block[0].match(raw):
+            out.append((n, raw.strip()))
+            line_block = None if syn.line_block[1].match(raw) else syn.line_block[1]
+            continue
         start = 0 if state and state[2] else None
-        i = 0
         unclosed = set()
         while i < len(raw):
             tick()
+            if state and state[3]:
+                j, depth = _close_nested(raw, i, state[3], state[0], state[4])
+                if j < 0:
+                    state = state[:4] + (depth,)
+                    break
+                i, state = j, None
+                continue
             if state:
                 j = _close(raw, i, state[0], state[1])
                 if j < 0:
@@ -399,10 +597,10 @@ def _parse(text, syn, deadline, banned):
             elif act[0] == "skip":
                 i = act[1]
             else:
-                _, closing, esc, emit, at, end = act
+                _, closing, esc, emit, at, end, *nest = act
                 if emit and start is None:
                     start = at
-                state, i = (closing, esc, emit), end
+                state, i = (closing, esc, emit, nest[0] if nest else None, 1), end
         if start is not None and raw[start:].strip():
             out.append((n, raw[start:].strip()))
         if syn.heredoc == "shell":

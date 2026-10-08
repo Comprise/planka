@@ -2,7 +2,8 @@
 
 tests/__init__.py изолирует процесс тестов от git-настроек машины. Здесь враждебный конфиг передаётся
 явно — GIT_CONFIG_GLOBAL на временный файл — только вызовам плагина: snapshot.capture,
-snapshot.changed_since, comments.extract, common.project_root, guard_memory.is_memory_path (git check-ignore)
+snapshot.changed_since, comments.extract, common.project_root, guard_memory.is_memory_path (git check-ignore),
+manifest_watch.list_manifests (git ls-files) и manifest_watch.head_names (git cat-file --batch)
 и хукам remind.py и judge_stop.py подпроцессом. Git-команды подготовки репозитория идут под изолированным
 конфигом процесса.
 
@@ -17,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -26,6 +28,7 @@ sys.path.insert(0, str(PLANKA_DIR))
 import comments  # noqa: E402
 import common  # noqa: E402
 import guard_memory  # noqa: E402
+import manifest_watch  # noqa: E402
 import snapshot  # noqa: E402
 
 GIT = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
@@ -245,6 +248,57 @@ class HostileMemoryTest(HostileCase):
 
     def test_all_settings_together_keep_result(self):
         self.assertEqual(self.memory_scenario(self.config(HOSTILE)), EXPECTED_MEMORY)
+
+
+# Ожидаемый результат HostileManifestTest.manifest_scenario под изолированным конфигом: режим, манифесты
+# проекта и имена версий из HEAD.
+# Версия package.json из HEAD объединена с версией из MERGE_HEAD (lodash) незавершённого слияния.
+EXPECTED_MANIFESTS = ("git", ["new/requirements.txt", "package.json", "sp ace/Cargo.toml", "ü/requirements.txt"],
+                      {"package.json": ["lodash", "react"], "ü/requirements.txt": ["rich"], "new/requirements.txt": None})
+
+
+class HostileManifestTest(HostileCase):
+    """Манифесты проекта (git ls-files) и их версии в HEAD (git cat-file) под враждебным конфигом."""
+
+    def manifest_scenario(self, cfg):
+        root = self.repo()
+        write(root, ".gitignore", "ign/\n")
+        # Драйвер junk из HOSTILE для манифеста: версия из HEAD читается без textconv.
+        write(root, ".gitattributes", "package.json diff=junk\n")
+        write(root, "package.json", '{"dependencies": {"react": "^18"}}\n')
+        write(root, "ü/requirements.txt", "rich\n")
+        write(root, "sp ace/Cargo.toml", "[dependencies]\nserde = \"1\"\n")
+        git("add", ".", cwd=root)
+        git("commit", "-qm", "m", cwd=root)
+        git("checkout", "-qb", "feat", cwd=root)
+        write(root, "package.json", '{"dependencies": {"react": "^18", "lodash": "^4"}}\n')
+        git("commit", "-qam", "feat", cwd=root)
+        git("checkout", "-q", "-", cwd=root)
+        # Незавершённое слияние feat: git пишет MERGE_HEAD файлом, update-ref псевдоссылку не создаёт.
+        sha = subprocess.run([*GIT, "rev-parse", "feat"], cwd=root, check=True, capture_output=True, text=True)
+        (root / ".git" / "MERGE_HEAD").write_text(sha.stdout, encoding="utf-8")
+        write(root, "package.json", '{"dependencies": {"react": "^18", "axios": "^1"}}\n')
+        write(root, "new/requirements.txt", "flask\n")
+        write(root, "ign/requirements.txt", "flask\n")
+        write(root, "tests/fixtures/x/package.json", "{}\n")
+        with hostile(cfg):
+            mode, found = manifest_watch.list_manifests(root, time.monotonic() + 30)
+            heads = {}
+            for rel in ("package.json", "ü/requirements.txt", "new/requirements.txt"):
+                names = manifest_watch.head_names(str(root / rel), manifest_watch.watched_kind(rel), 10)
+                heads[rel] = None if names is None else sorted(names)
+        return mode, sorted(found), heads
+
+    def test_baseline(self):
+        self.assertEqual(self.manifest_scenario(os.devnull), EXPECTED_MANIFESTS)
+
+    def test_each_setting_keeps_result(self):
+        for key, value in HOSTILE.items():
+            with self.subTest(setting=key):
+                self.assertEqual(self.manifest_scenario(self.config({key: value})), EXPECTED_MANIFESTS)
+
+    def test_all_settings_together_keep_result(self):
+        self.assertEqual(self.manifest_scenario(self.config(HOSTILE)), EXPECTED_MANIFESTS)
 
 
 class ExcludesFileTest(HostileCase):
