@@ -24,16 +24,79 @@ class RemindTest(unittest.TestCase):
     def tearDown(self):
         self.env.close()
 
-    def test_emits_whole_philosophy(self):
-        r = self.env.run("remind.py", self.env.hook_input("UserPromptSubmit", prompt="привет"))
-        self.assertEqual(r.returncode, 0, r.stderr)
-        out = output(r)
-        ctx = out["hookSpecificOutput"]["additionalContext"]
-        self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit")
-        expected = PHILOSOPHY.replace("{RULES}", str(self.env.root / "rules")) \
+    def run_part(self, *args, environ=None):
+        """remind.py с аргументами args подпроцессом, как его зовёт hooks.json; environ — добавка к окружению."""
+        hook_input = self.env.hook_input("UserPromptSubmit", prompt="привет")
+        return subprocess.run([sys.executable, str(PLANKA_DIR / "remind.py"), *args], input=json.dumps(hook_input),
+                              capture_output=True, text=True, encoding="utf-8", env=self.env.environ(**(environ or {})),
+                              timeout=30)
+
+    def all_parts(self, environ=None):
+        """Склейка additionalContext всех частей ядра; проверяет, что предупреждений нет."""
+        contexts = []
+        for k in range(1, remind.PARTS + 1):
+            r = self.run_part(str(k), environ=environ)
+            self.assertEqual(messages(r), [])
+            contexts.append(output(r)["hookSpecificOutput"]["additionalContext"])
+        return "\n\n".join(contexts)
+
+    def expected_core(self):
+        return PHILOSOPHY.replace("{RULES}", str(self.env.root / "rules")) \
             .replace("{COMMENT_LANG}", "ru").replace("{DOC_LANG}", "ru")
+
+    def test_parts_cover_philosophy(self):
         no_docs = f"Проект без документации: предложи автору инициализацию по {self.env.root / 'rules'}/docs.md."
-        self.assertEqual(ctx, expected + "\n\n" + no_docs)
+        parts = remind.split_core(self.expected_core(), remind.PARTS)
+        contexts = []
+        for k in range(1, remind.PARTS + 1):
+            r = self.run_part(str(k))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(messages(r), [])
+            out = output(r)["hookSpecificOutput"]
+            self.assertEqual(out["hookEventName"], "UserPromptSubmit")
+            contexts.append(out["additionalContext"])
+        self.assertEqual(contexts[0], parts[0].rstrip() + "\n\n" + no_docs)
+        for k in range(2, remind.PARTS + 1):
+            self.assertEqual(contexts[k - 1],
+                             remind.CONTINUATION.format(k=k, n=remind.PARTS) + "\n\n" + parts[k - 1].rstrip())
+        self.assertEqual("".join(parts), self.expected_core())
+        self.assertTrue(all(p.strip() for p in parts))
+
+    def test_split_core_balanced_by_sections(self):
+        text = "# T\n\n## A\n\n" + "a" * 50 + "\n\n## B\n\n" + "b" * 10 + "\n\n## C\n\n" + "c" * 40 + "\n"
+        self.assertEqual(remind.split_core(text, 2),
+                         ["# T\n\n## A\n\n" + "a" * 50 + "\n\n",
+                          "## B\n\n" + "b" * 10 + "\n\n## C\n\n" + "c" * 40 + "\n"])
+
+    def test_split_core_fewer_sections_than_parts(self):
+        self.assertEqual(remind.split_core("# T\n\n## A\n", 3), ["# T\n\n", "## A\n", ""])
+
+    def test_no_argument_is_first_part(self):
+        r = self.env.run("remind.py", self.env.hook_input("UserPromptSubmit", prompt="привет"))
+        ctx = output(r)["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(ctx.startswith("# Философия работы"))
+        self.assertTrue((self.env.data / "state" / "sess-1.snap.json").exists())
+
+    def test_later_part_takes_no_snapshot_and_no_docs_line(self):
+        (self.env.project / "a.py").write_text("x\n", encoding="utf-8")
+        r = self.run_part("2")
+        self.assertEqual(messages(r), [])
+        ctx = output(r)["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(ctx.startswith(remind.CONTINUATION.format(k=2, n=remind.PARTS)))
+        self.assertNotIn("Проект без документации", ctx)
+        self.assertFalse((self.env.data / "state").exists())
+
+    def test_bad_part_number_warns(self):
+        for arg in ("0", str(remind.PARTS + 1), "x"):
+            r = self.run_part(arg)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(messages(r), [f"planka: неверный номер части ядра: {arg!r}"], arg)
+            self.assertNotIn("hookSpecificOutput", json.loads(r.stdout))
+
+    def test_part_over_limit_warned_and_emitted(self):
+        msgs, out = self.run_in_process(mock.patch.object(remind, "CONTEXT_LIMIT", 10))
+        self.assertTrue(out["additionalContext"].startswith("# Философия работы"))
+        self.assertEqual(msgs, ["planka: часть 1 ядра длиннее 10 символов: Claude Code отдаст агенту только её начало"])
 
     def test_barrier(self):
         (self.env.project / "a.py").write_text("x\n", encoding="utf-8")
@@ -64,8 +127,7 @@ class RemindTest(unittest.TestCase):
         self.assertEqual(r.stdout, "")
 
     def test_rules_dir_substituted(self):
-        r = self.env.run("remind.py", self.env.hook_input("UserPromptSubmit", prompt="привет"))
-        ctx = output(r)["hookSpecificOutput"]["additionalContext"]
+        ctx = self.all_parts()
         self.assertNotIn("{RULES}", ctx)
         self.assertIn(str(self.env.root / "rules"), ctx)
 
@@ -124,12 +186,8 @@ class RemindTest(unittest.TestCase):
         self.assertFalse((self.env.data / "state" / "sess-1.snap.json").exists())
 
     def test_languages_default_ru_without_warning(self):
-        r1 = self.prompt()
-        self.assertEqual(messages(r1), [])
-        self.assertIn("Язык комментариев: ru; язык документации: ru.",
-                      output(r1)["hookSpecificOutput"]["additionalContext"])
-        r2 = self.prompt(CLAUDE_PLUGIN_OPTION_COMMENT_LANG="en", CLAUDE_PLUGIN_OPTION_DOC_LANG="en")
-        ctx = output(r2)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Язык комментариев: ru; язык документации: ru.", self.all_parts())
+        ctx = self.all_parts({"CLAUDE_PLUGIN_OPTION_COMMENT_LANG": "en", "CLAUDE_PLUGIN_OPTION_DOC_LANG": "en"})
         self.assertIn("Язык комментариев: en; язык документации: en.", ctx)
 
     def run_in_process(self, *patches, **environ):
@@ -250,6 +308,30 @@ class RemindTest(unittest.TestCase):
         self.assertFalse(finished.exists())
         self.assertIn("# Философия работы", out["additionalContext"])
         self.assertEqual(msgs, ["planka: git не уложился в срок снимка, сверка документации не проверяется"])
+
+    def test_null_session_id_snapshot_written(self):
+        (self.env.project / "a.py").write_text("x\n", encoding="utf-8")
+        hook_input = self.env.hook_input("UserPromptSubmit", prompt="x", session_id=None)
+        reply = helpers.run_in_process(self.env, remind.main, hook_input)
+        self.assertNotIn("systemMessage", reply)
+        self.assertIsNotNone(snapshot.load(self.env.data / "state", ""))
+
+    def test_snapshot_pack_counts_in_budget(self):
+        # Обход уложился, упаковка блоков walk — уже за сроком: снимок не пишется, неудача запоминается.
+        (self.env.project / "a.py").write_text("x\n", encoding="utf-8")
+        real = snapshot.capture
+
+        def slow_capture(root, deadline):
+            snap = real(root, deadline)
+            time.sleep(max(0.0, deadline - time.monotonic()) + 0.01)
+            return snap
+        msgs, out = self.run_in_process(mock.patch.object(remind, "SNAPSHOT_BUDGET", 0.3),
+                                        mock.patch.object(snapshot, "capture", slow_capture))
+        self.assertEqual(msgs, ["planka: снимок не уложился в срок, сверка документации не проверяется"])
+        self.assertIn("# Философия работы", out["additionalContext"])
+        self.assertFalse((self.env.data / "state" / "sess-1.snap.json").exists())
+        self.assertIn(str(self.env.project), json.loads(
+            (self.env.data / "state" / "sess-1.snapfail.json").read_text(encoding="utf-8")))
 
     def test_reminder_survives_snapshot_error(self):
         msgs, out = self.run_in_process(mock.patch.object(snapshot, "capture", side_effect=ValueError("сбой")))

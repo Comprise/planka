@@ -69,17 +69,20 @@
 
 ## `plugin/planka/`
 
-Код хуков: точки входа `remind.py`, `judge_tool.py` (`PreToolUse`, а на `Bash` ещё `PostToolUse` и
+Код хуков: точки входа `remind.py` (`UserPromptSubmit`, хук на каждую часть ядра, номер части — аргументом),
+`judge_tool.py` (`PreToolUse`, а на `Bash` ещё `PostToolUse` и
 `PostToolUseFailure` — проверка манифестов), `guard_memory.py`, `judge_stop.py`, `debug_watch.py`, `model_watch.py`
 (`SessionStart`, `PostModelSwitch` — модель сессии для судьи); остальное —
-их модули, среди них `manifests.py` (разбор манифестов) и `manifest_watch.py` (правка манифеста, снимок и
+их модули, среди них `manifests.py` (разбор манифестов) и `manifest_watch.py` (правка манифеста, в том числе через
+ссылку, члены workspace корня, снимок и
 сравнение после команды, стороны конфликта в индексе, имена `setup.py`, `setup.cfg`, `Pipfile` как известные,
 имена ref до начала сессии, откуда команда git возвращает файлы, и патчей `git apply`, не менявшихся с начала сессии).
 
 Инварианты:
 
 - Модули импортируют друг друга по имени (`import common`), без пакета.
-- Точка входа: `common.run_hook(main)`; `main` начинается с `common.barrier_active()`.
+- Точка входа: `common.run_hook(main)` (`remind.py` передаёт аргументы: `run_hook(lambda: main(sys.argv[1:]))`);
+  `main` начинается с `common.barrier_active()`.
 - Вывод — только через `common.emit` и `common.warn`; `print` и stderr не используются.
 - Отказ запоминается через `common.emit` до записи журнала: сбой записи не отменяет отказ.
 - Запись файлов состояния — атомарная, через `common.atomic_write_json` (временный файл и

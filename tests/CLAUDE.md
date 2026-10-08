@@ -21,15 +21,18 @@ unittest плагина; запуск — `make test` из корня.
   `git ls-files`, `git cat-file --batch` (версии ref, стороны конфликта индекса, дерево HEAD в `project_names` и
   `compare`) и `git ls-tree` в `manifest_watch` — `HostileManifestTest`).
 - Тест не импортирует другой тест: помощники, нужные нескольким файлам (`run_in_process`, `fill_budget`,
-  `assert_not_logged`, `author_block`, `cpu_seconds`, `assert_linear`), — в `helpers.py`.
+  `assert_not_logged`, `author_block`, `cpu_seconds`, `assert_linear`, `comment_lines`), — в `helpers.py`.
 - Вход хука — `Env.hook_input(event, **fields)`: `cwd` — каталог проекта `Env`, `transcript_path` —
   `Env.transcript` с ответом ассистента модели `claude-test-model`.
 - `fixtures/` — корпуса настоящих форм входа: `plan-*.md` (`test_planparse`, ожидаемая структура
   каждого плана — `CORPUS`), `transcript-shapes.jsonl` (`test_common`; в том числе отказы
   инструмента `user-rejected`, `permission-rule`, `automode-blocked`), `bash-failure-errors.jsonl`
-  (`test_debug_watch`), `manifests/` (`test_manifests`, имена каждого манифеста — `CORPUS`, имя его пакета — `OWN`;
+  (`test_debug_watch`), `bash-commands.jsonl` (`test_depcheck`, `CorpusTest`: `source` — `transcript` или `edge`,
+  `expect` — `add`, `doubt` или `pass`), `manifests/` (`test_manifests`, имена каждого манифеста — `CORPUS`, имя его
+  пакета — `OWN`;
   файлы `setup.py`, `setup.cfg`, `Pipfile` в `legacy-*/` — `LEGACY_CORPUS`, первая строка — источник), `comments/`
-  (`test_comments`, номера строк комментариев каждого файла — `CORPUS`);
+  (`test_comments`, номера строк комментариев каждого файла — `CORPUS`); корпус форм импорта `@путь` памяти —
+  `ImportParseTest.CORPUS` в `test_guard_memory.py`;
   новый край разборщика — образцом в корпус.
 
 ## Читать перед правкой

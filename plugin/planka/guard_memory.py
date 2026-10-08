@@ -1,5 +1,6 @@
 """PreToolUse: судья записи в постоянную память — автопамять, память субагентов, пользовательские
-CLAUDE.md и rules/, MCP-память; запись проходит только с явным согласием автора на этот факт."""
+CLAUDE.md и rules/, CLAUDE.local.md проекта, файлы, которые память подключает импортом @путь, MCP-память;
+запись проходит только с явным согласием автора на этот факт."""
 import glob
 import json
 import os
@@ -24,6 +25,26 @@ MEMORY_WORDS = {"memory", "memories", "memorize", "memorise", "remember"}
 # Срок git check-ignore в _repository_file, секунды; входит в сумму срока хука (tests/test_contract.py,
 # TimeoutsTest).
 CHECK_IGNORE_TIMEOUT = 5
+# Личные инструкции проекта: Claude Code читает их из каталога запуска, каталогов над ним и подкаталогов.
+LOCAL_MEMORY = "CLAUDE.local.md"
+# Импорты @путь памяти — как у Claude Code: не больше четырёх переходов от файла памяти, файл больше 4 МиБ он не
+# читает и его импорты не разбирает.
+IMPORT_DEPTH = 4
+MAX_IMPORT_FILE = 4 * 1024 * 1024
+# Пределы разбора импортов на вызов хука — файлов и байт всего: время разбора до судьи ограничено и при раздутой
+# памяти; сверх предела остаток не разбирается, с предупреждением.
+MAX_IMPORT_FILES = 200
+MAX_IMPORT_BYTES = 16 * 1024 * 1024
+# Начало ограждённого блока кода Markdown: импорт в нём Claude Code не разбирает.
+FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
+# Серия обратных кавычек: код в строке идёт от серии до следующей серии той же длины.
+BACKTICKS = re.compile(r"`+")
+# Импорт: @ и путь до пробела, «\ » — пробел пути. Claude Code ищет @ в начале текста узла Markdown или после
+# пробела; узел начинается и после разметки (*@a.md*), поэтому здесь @ годится после любого знака, кроме буквы и
+# цифры: почта a@b.md не импорт.
+IMPORT = re.compile(r"(?<![^\W_])@((?:[^\s\\]|\\ )+)")
+# Хвост разметки и пунктуации, который мог прилипнуть к пути: путь берётся и с ним, и без него.
+IMPORT_TAIL = "*_~)]>.,;:!?\"'"
 
 
 def config_dir():
@@ -176,16 +197,197 @@ def _memory_places(project):
     return files, md_dirs, projects, memory_dirs, overrides
 
 
+def _strip_code(text):
+    """Текст Markdown без ограждённых блоков кода (незакрытый — до конца текста), кода в строке и комментариев
+    HTML: импорты в них Claude Code не разбирает."""
+    kept, fence = [], None
+    for line in text.splitlines():
+        if fence:
+            if re.fullmatch(rf" {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}\s*", line):
+                fence = None
+            continue
+        match = FENCE.match(line)
+        if match:
+            fence = match.group(1)
+            continue
+        kept.append(line)
+    return _strip_code_spans(_strip_html_comments("\n".join(kept)))
+
+
+def _strip_html_comments(text):
+    """Текст без комментариев HTML <!-- … -->, каждый заменён пробелом. Незакрытый остаётся текстом, и за ним
+    закрытых нет: поиск закрытия от него дошёл до конца текста."""
+    parts, pos = [], 0
+    while True:
+        start = text.find("<!--", pos)
+        end = text.find("-->", start + 4) if start >= 0 else -1
+        if end < 0:
+            parts.append(text[pos:])
+            return " ".join(parts)
+        parts.append(text[pos:start])
+        pos = end + 3
+
+
+def _strip_code_spans(text):
+    """Текст без кода в строке, каждый заменён пробелом: серия обратных кавычек открывает код, следующая серия той
+    же длины закрывает; серия без пары остаётся текстом. Пара каждой серии находится одним обходом с конца."""
+    runs = [(m.start(), m.end()) for m in BACKTICKS.finditer(text)]
+    pair, last = [None] * len(runs), {}
+    for i in range(len(runs) - 1, -1, -1):
+        length = runs[i][1] - runs[i][0]
+        pair[i] = last.get(length)
+        last[length] = i
+    parts, pos, i = [], 0, 0
+    while i < len(runs):
+        if pair[i] is None:
+            i += 1
+            continue
+        parts.append(text[pos:runs[i][0]])
+        pos = runs[pair[i]][1]
+        i = pair[i] + 1
+    parts.append(text[pos:])
+    return " ".join(parts)
+
+
+def _accepted_import(spec):
+    """Путь импорта, который Claude Code принимает: ./, ~/, абсолютный кроме «/», иначе начало с буквы, цифры, «.»,
+    «_» или «-»."""
+    return (spec.startswith(("./", "~/")) or (spec.startswith("/") and spec != "/")
+            or bool(re.match(r"[A-Za-z0-9._-]", spec)))
+
+
+def _imports(text, base):
+    """Абсолютные нормализованные пути импортов @путь текста файла памяти из каталога base: «#…» отрезан, «\\ » —
+    пробел, ~/ — от домашнего каталога, относительный — от base, как разрешает Claude Code."""
+    found = set()
+    for match in IMPORT.finditer(_strip_code(text)):
+        spec = match.group(1).split("#", 1)[0].replace("\\ ", " ")
+        for variant in {spec, spec.rstrip(IMPORT_TAIL)}:
+            if not variant or not _accepted_import(variant):
+                continue
+            variant = common.input_path(variant)
+            if variant.startswith("~/"):
+                variant = os.path.join(os.path.expanduser("~"), variant[2:])
+            found.add(os.path.normpath(os.path.join(base, variant)))
+    return found
+
+
+def _read_memory_file(path):
+    """Байты обычного файла памяти не длиннее MAX_IMPORT_FILE; нет, не обычный файл (FIFO заблокировал бы хук),
+    ошибка чтения или длиннее — None: такой файл Claude Code не читает."""
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            data = f.read(MAX_IMPORT_FILE + 1)
+    except OSError:
+        return None
+    return data if len(data) <= MAX_IMPORT_FILE else None
+
+
+def _import_roots(project):
+    """Файлы памяти, импорты которых Claude Code загружает при запуске: CLAUDE.md и rules/**.md каталога настроек,
+    CLAUDE.local.md проекта и каталогов над ним. CLAUDE.local.md подкаталогов Claude Code читает по требованию,
+    обход всего проекта на каждый вызов хука не делается."""
+    config = os.path.abspath(os.path.expanduser(config_dir()))
+    roots = [os.path.join(config, "CLAUDE.md")]
+    seen = set()
+    for base, dirs, names in os.walk(os.path.join(config, "rules"), followlinks=True):
+        # Ссылки на каталоги проходятся, цикл ссылок — нет.
+        real = os.path.realpath(base)
+        if real in seen:
+            dirs[:] = []
+            continue
+        seen.add(real)
+        dirs.sort()
+        roots += [os.path.join(base, name) for name in sorted(names) if name.endswith(".md")]
+    base = project
+    while True:
+        roots.append(os.path.join(base, LOCAL_MEMORY))
+        if os.path.dirname(base) == base:
+            return roots
+        base = os.path.dirname(base)
+
+
+def _imported_files(project):
+    """Файлы, которые импортами @путь подключают файлы памяти _import_roots, прямо или через импортированные, не
+    дальше IMPORT_DEPTH переходов; каждый — в формах _forms. Файл не обязан существовать: его создание тоже
+    запись в память. Сверх MAX_IMPORT_FILES файлов или MAX_IMPORT_BYTES байт остаток не разбирается, с
+    предупреждением."""
+    found, seen = set(), set()
+    level = [(root, 0) for root in _import_roots(project)]
+    files = size = 0
+    while level:
+        following = []
+        for path, depth in level:
+            if depth:
+                found |= _forms(path)
+            real = os.path.realpath(path)
+            if depth >= IMPORT_DEPTH or real in seen:
+                continue
+            seen.add(real)
+            data = _read_memory_file(path)
+            if data is None:
+                continue
+            files, size = files + 1, size + len(data)
+            if files > MAX_IMPORT_FILES or size > MAX_IMPORT_BYTES:
+                common.warn("импорты памяти не разобраны до конца: слишком много файлов, запись в остальные "
+                            "импортированные файлы не проверяется")
+                return found
+            text = data.decode("utf-8", "surrogateescape")
+            following += [(child, depth + 1) for child in sorted(_imports(text, os.path.dirname(path)))]
+        level = following
+    return found
+
+
+def _local_memory(form, projects, fold):
+    """form — CLAUDE.local.md в каталоге проекта, над ним или в его подкаталоге (любая форма проекта projects);
+    fold — свёртка регистра, которой свёрнуты form и projects (is_memory_path)."""
+    if os.path.basename(form) != fold(LOCAL_MEMORY):
+        return False
+    directory = os.path.dirname(form)
+    return any(_inside(p, directory) or _inside(form, p) for p in projects)
+
+
+def _case_insensitive(path):
+    """Файловая система пути не различает регистр: путь или его предок находится и по имени с обращённым регистром,
+    и это тот же файл (os.path.samefile). Проверяется каждый уровень: том без учёта регистра монтируется и внутрь
+    чувствительного к нему."""
+    base = path
+    while True:
+        name = os.path.basename(base)
+        swapped = name.swapcase()
+        if swapped != name:
+            try:
+                if os.path.samefile(base, os.path.join(os.path.dirname(base), swapped)):
+                    return True
+            except (OSError, ValueError):
+                pass
+        parent = os.path.dirname(base)
+        if parent == base:
+            return False
+        base = parent
+
+
 def is_memory_path(path, project):
     """Абсолютный нормализованный путь — файл автопамяти, памяти субагента, CLAUDE.md или rules/ каталога
-    настроек; project — каталог проекта сессии (_project_dir). path и project — строки в кодировке файловой
-    системы (target_path, _project_dir приводят пути входа через common.input_path). Путь и места памяти
-    сравниваются в обеих формах (_forms): запись через символьную ссылку в каталоге настроек и запись прямо
-    в её цель — запись в память. В каталоге autoMemoryDirectory или cowork, который содержит проект project
-    или равен ему, файл репозитория проекта (_repository_file) — не память; в каталоге строго внутри проекта
-    и вне проекта git не спрашивается, запись — память."""
-    files, md_dirs, projects, memory_dirs, overrides = _memory_places(project)
-    for form in _forms(path):
+    настроек, CLAUDE.local.md проекта или файл, который память подключает импортом (_imported_files); project —
+    каталог проекта сессии (_project_dir). path и project — строки в кодировке файловой системы (target_path,
+    _project_dir приводят пути входа через common.input_path). Путь и места памяти сравниваются в обеих формах
+    (_forms): запись через символьную ссылку в каталоге настроек и запись прямо в её цель — запись в память. На
+    файловой системе без учёта регистра (_case_insensitive) сравнение — без учёта регистра. CLAUDE.local.md и
+    импортированный файл, которые оказались файлом репозитория проекта (_repository_file), — не память, как
+    проектный CLAUDE.md. В каталоге autoMemoryDirectory или cowork, который содержит проект project или равен ему,
+    файл репозитория проекта — не память; в каталоге строго внутри проекта и вне проекта git не спрашивается,
+    запись — память."""
+    fold = str.casefold if _case_insensitive(path) else str
+
+    def folded(paths):
+        return {fold(p) for p in paths}
+
+    files, md_dirs, projects, memory_dirs, overrides = (folded(s) for s in _memory_places(project))
+    forms = folded(_forms(path))
+    for form in forms:
         if form in files:
             return True
         if any(_inside(form, d) and form != d and form.endswith(".md") for d in md_dirs):
@@ -197,17 +399,28 @@ def is_memory_path(path, project):
                     return True
         if any(_inside(form, d) and form != d for d in memory_dirs):
             return True
-    forms, projects = _forms(path), _forms(project)
+    projects = folded(_forms(project))
+    # git спрашивается не больше одного раза: его срок входит в срок хука один раз (TimeoutsTest).
+    answers = []
+
+    def repository_file():
+        if not answers:
+            answers.append(_repository_file(path, project))
+        return answers[0]
+
+    if ((any(_local_memory(form, projects, fold) for form in forms) or forms & folded(_imported_files(project)))
+            and not repository_file()):
+        return True
     hits = {d for form in forms for d in overrides if _inside(form, d) and form != d}
     if not hits:
         return False
     # Каталог памяти, содержащий проект или равный ему: файл репозитория проекта — не память. Любой другой
     # каталог памяти — память, git не спрашивается. Каталог содержит проект, если любая его форма содержит
     # любую форму проекта: ссылка на проект и сам проект — один каталог.
-    if not all(any(_inside(p, f) for f in _forms(d) for p in projects) for d in hits):
+    if not all(any(_inside(p, f) for f in folded(_forms(d)) for p in projects) for d in hits):
         return True
     in_project = any(_inside(form, p) for form in forms for p in projects)
-    return not (in_project and _repository_file(path, project))
+    return not (in_project and repository_file())
 
 
 def _input_cwd(data):
@@ -237,12 +450,18 @@ def target_path(data):
     path = os.path.expanduser(common.input_path(raw))
     if not os.path.isabs(path):
         path = os.path.join(_input_cwd(data) or os.getcwd(), path)
+    # «..» схлопывается до разрешения ссылок, как у Claude Code: он сам нормализует путь инструмента лексически
+    # (path.resolve) и пишет в нормализованный, а не туда, куда «..» привело бы ядро после ссылки.
     return os.path.normpath(path)
 
 
 def _words(name):
-    """Слова имени по порядку: разделители не буквы и не цифры, границы camelCase; нижний регистр."""
+    """Слова имени по порядку: разделители не буквы и не цифры, границы camelCase, конец аббревиатуры перед
+    словом (saveLTMemory), граница буквы и цифры (storeMemory2); нижний регистр."""
     spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name)
+    spaced = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", spaced)
+    spaced = re.sub(r"([A-Za-z])([0-9])", r"\1 \2", spaced)
+    spaced = re.sub(r"([0-9])([A-Za-z])", r"\1 \2", spaced)
     return [w.lower() for w in re.split(r"[^A-Za-z0-9]+", spaced) if w]
 
 

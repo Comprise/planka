@@ -91,8 +91,9 @@ def docs_check(data):
 
 
 def turn_messages(data, transcript, message):
-    """Шаги агента за реплику по порядку — сообщения и вызовы инструментов с выводом (Transcript.turn_steps),
-    последним — message (last_assistant_message входа: транскрипт к Stop может его ещё не содержать). Реплики в
+    """Шаги агента за реплику по порядку (prompts.Step) — сообщения и вызовы инструментов с выводом
+    (Transcript.turn_steps), последним — текстовый шаг message (last_assistant_message входа: транскрипт к Stop
+    может его ещё не содержать), если последний текстовый шаг транскрипта не он. Реплики в
     транскрипте нет — только message, с предупреждением раз на сессию."""
     found = list(transcript.turn_steps)
     if not found and message:
@@ -100,9 +101,9 @@ def turn_messages(data, transcript, message):
         common.warn_once(session if isinstance(session, str) else "", "turn-messages",
                          "сообщения реплики не найдены в транскрипте, судья видит последнее сообщение")
     # Последний текстовый шаг: после него в транскрипте может стоять вызов инструмента.
-    last_text = next((s for s in reversed(found) if not s.startswith("⟦вызов ")), None)
-    if message and (last_text is None or last_text.strip() != message.strip()):
-        found.append(message)
+    last_text = next((s for s in reversed(found) if s.call is None), None)
+    if message and (last_text is None or last_text.text.strip() != message.strip()):
+        found.append(prompts.Step(text=message))
     return found
 
 
@@ -123,12 +124,18 @@ def main():
     data = common.read_input()
     if not data:
         return
-    if not judge(data):
-        release_snapshot(data)
+    blocked = []
+    try:
+        judge(data, blocked)
+    finally:
+        # Внутренняя ошибка после вердикта ok или пропуска — тоже Stop без блока.
+        if not blocked:
+            release_snapshot(data)
 
 
-def judge(data):
-    """Фильтры и судья Stop; True — Stop заблокирован."""
+def judge(data, blocked=None):
+    """Фильтры и судья Stop; True — Stop заблокирован. В список blocked, если он передан, при блоке до записи
+    журнала ложится True: исключение после блока не делает его непроверенным."""
     message = data.get("last_assistant_message") or ""
     # Фильтры «варианты» и «готово» — по последнему сообщению; судья видит всю реплику.
     options = looks_like_options(message)
@@ -187,6 +194,8 @@ def judge(data):
     violated = f" (нарушено: {', '.join(verdict.violated)})" if verdict.violated else ""
     # Ответ запоминается до записи журнала: сбой записи не отменяет отказ.
     common.emit(common.block_output(f"planka: {verdict.reason}{violated}"))
+    if blocked is not None:
+        blocked.append(True)
     common.log_event("stop", session, verdict="deny", **log)
     return True
 

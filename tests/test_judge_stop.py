@@ -135,8 +135,29 @@ class StopHookTest(unittest.TestCase):
 
     def test_last_message_after_trailing_tool_call_not_repeated(self):
         # Последний ответ уже в транскрипте, после него — вызов инструмента: сообщение не дублируется.
-        t = common.Transcript(turn_steps=["Ответ.", "⟦вызов Bash⟧ ls"])
-        self.assertEqual(judge_stop.turn_messages({}, t, "Ответ."), ["Ответ.", "⟦вызов Bash⟧ ls"])
+        steps = [prompts.Step(text="Ответ."), prompts.Step(call="Bash", arg="ls")]
+        t = common.Transcript(turn_steps=steps)
+        self.assertEqual(judge_stop.turn_messages({}, t, "Ответ."), steps)
+        # Текст, который начинается с «⟦вызов », — текстовый шаг: сверка дубля его находит.
+        steps = [prompts.Step(text="⟦вызов Bash⟧ make\nОтвет."), prompts.Step(call="Bash", arg="ls")]
+        t = common.Transcript(turn_steps=steps)
+        self.assertEqual(judge_stop.turn_messages({}, t, "⟦вызов Bash⟧ make\nОтвет."), steps)
+        # Сообщения нет среди шагов — оно последний текстовый шаг.
+        self.assertEqual(judge_stop.turn_messages({}, t, "Итог."), steps + [prompts.Step(text="Итог.")])
+
+    def test_text_like_call_before_trailing_call_not_repeated(self):
+        # Последний текстовый шаг начинается с «⟦вызов », после него — вызов инструмента: сообщение не дублируется.
+        msg = "⟦вызов Bash⟧ make\n" + OPTIONS_MSG
+        entries = [{"type": "user", "message": {"role": "user", "content": "какой вариант?"}},
+                   {"type": "assistant", "message": {"model": "claude-test-model", "content": [
+                       {"type": "text", "text": msg},
+                       {"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command": "ls"}}]}}]
+        self.env.transcript.write_text("".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8")
+        rec = self.env.data / "rec.txt"
+        r = self.env.run("judge_stop.py", self.env.hook_input("Stop", last_assistant_message=msg),
+                         PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertEqual(judged(rec).count("Есть два подхода"), 1, judged(rec))
 
     def test_judge_sees_tool_calls_of_turn(self):
         # Судья видит вызовы инструментов реплики и их вывод: проверку, о которой агент пишет словами.
@@ -875,6 +896,30 @@ class DocsFilterTest(unittest.TestCase):
         self.remind("p-2")
         r, rec = self.stop_turn("p-2", PLANKA_STUB="ok")
         self.assertFalse(rec.exists())
+
+    def test_hook_error_after_ok_marks_turn_checked(self):
+        # judge.log — каталог: запись журнала после вердикта ok падает, хук кончается внутренней ошибкой.
+        (self.env.data / "judge.log").mkdir()
+        self.remind("p-1")
+        (self.project / "a.py").write_text("# x\n", encoding="utf-8")
+        r, rec = self.stop_turn("p-1", PLANKA_STUB="ok")
+        self.assertTrue(rec.exists())
+        self.assertIsNone(output(r))
+        self.assertTrue(any("внутренняя ошибка" in m for m in messages(r)), messages(r))
+        self.remind("p-2")
+        r, rec = self.stop_turn("p-2", PLANKA_STUB="ok")
+        self.assertFalse(rec.exists())
+
+    def test_hook_error_after_block_keeps_snapshot(self):
+        # Сбой записи журнала после отказа: блок выдан, снимок остаётся базой следующей реплики.
+        (self.env.data / "judge.log").mkdir()
+        self.remind("p-1")
+        (self.project / "a.py").write_text("# x\n", encoding="utf-8")
+        r, _ = self.stop_turn("p-1", PLANKA_STUB="deny")
+        self.assertEqual(output(r)["decision"], "block")
+        self.remind("p-2")
+        r, rec = self.stop_turn("p-2", PLANKA_STUB="ok")
+        self.assertIn("- a.py — код", rec.read_text(encoding="utf-8"))
 
     def test_blocked_then_interrupted_turn_rechecked(self):
         # Stop после блока приходит с stop_hook_active и видит те же правки; реплику прервали после блока —

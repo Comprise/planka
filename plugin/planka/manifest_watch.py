@@ -4,9 +4,10 @@
 манифестов проекта перед ней (state/<session>.manifests.json по tool_use_id) и сравнение после.
 Новым не считается имя из текста до правки вместе с транзитивными, из версии манифеста в HEAD, в
 источнике незавершённых merge, cherry-pick, rebase, revert и в сторонах конфликта индекса, из другого манифеста
-того же реестра в проекте и в HEAD, из файла _LEGACY в HEAD, имя пакета самого проекта (workspace, монорепозиторий) и,
-после команды, имя из манифестов ref, откуда команда git возвращает файлы (stash, ветка, коммит), если ref
-создан до начала сессии, и из изменённых строк манифестов в файле патча `git apply`, не менявшемся с начала сессии.
+того же реестра в проекте и в HEAD, из файла _LEGACY в HEAD, имя пакета самого проекта — манифеста в HEAD или
+члена workspace корня (монорепозиторий) — и, после команды, имя из манифестов ref, откуда команда git возвращает
+файлы (stash, ветка, коммит), если ref создан до начала сессии, и из изменённых строк манифестов в файле патча
+`git apply`, не менявшемся с начала сессии.
 """
 import ast
 import configparser
@@ -58,6 +59,31 @@ def watched_kind(path):
     if FOREIGN_DIRS.intersection(parts[:-1]):
         return None
     return manifests.kind(path)
+
+
+def _relative(path, root):
+    """path от root, если path под root; иначе path как есть."""
+    if root is None:
+        return path
+    rel = os.path.relpath(path, root)
+    return path if rel == os.pardir or rel.startswith(os.pardir + os.sep) else rel
+
+
+def edit_target(path, root):
+    """(путь, вид) манифеста, который правит файловый инструмент по пути path; None — не манифест. Вид —
+    watched_kind пути от корня проекта root() (None — путь как есть) и пути с разрешёнными символическими ссылками
+    от root() с разрешёнными ссылками: манифест хоть по одному из них — манифест. Путь — разрешённый, если манифест
+    он: ссылка `deps.json -> package.json` и каталог-ссылка `build -> .` правят манифест проекта. root зовётся,
+    только если имя файла по одному из путей — манифест (manifests.kind)."""
+    real = os.path.realpath(path)
+    if manifests.kind(path) is None and manifests.kind(real) is None:
+        return None
+    root = root()
+    kind = watched_kind(_relative(real, None if root is None else os.path.realpath(root)))
+    if kind is not None:
+        return real, kind
+    kind = watched_kind(_relative(path, root))
+    return None if kind is None else (path, kind)
 
 
 # Файлы зависимостей PyPI, которые не проверяются как манифест: их имена только известные — перенос в
@@ -166,14 +192,20 @@ def _known(kind, text):
 
 
 def _read(path):
-    """Текст файла в UTF-8 с заменой, переводы строк как есть; None — нет файла; Unavailable — больше
-    MAX_MANIFEST_BYTES или не прочитан."""
+    """Текст файла в UTF-8 с заменой, переводы строк как есть; None — нет файла; Unavailable — не обычный файл,
+    больше MAX_MANIFEST_BYTES или не прочитан. Файл открывается с O_NONBLOCK: FIFO не вешает хук."""
     try:
-        with open(path, "rb") as f:
-            data = f.read(MAX_MANIFEST_BYTES + 1)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except FileNotFoundError:
         return None
     except (OSError, ValueError) as e:
+        raise Unavailable(f"не прочитан: {e!r}") from None
+    try:
+        with open(fd, "rb") as f:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise Unavailable("не обычный файл")
+            data = f.read(MAX_MANIFEST_BYTES + 1)
+    except OSError as e:
         raise Unavailable(f"не прочитан: {e!r}") from None
     if len(data) > MAX_MANIFEST_BYTES:
         raise Unavailable(f"больше {MAX_MANIFEST_BYTES} байт")
@@ -339,13 +371,63 @@ def edit_names(kind, before, after, head, project=frozenset):
     return fresh_names(old, new, head, project)
 
 
+def _glob(pattern):
+    """Регулярное выражение шаблона каталога workspace от корня: `*` и `?` — в пределах части пути, `**` — любые
+    части; `./` в начале и `/` в конце не значат."""
+    out, i = [], 0
+    pattern = pattern.strip().removeprefix("./").rstrip("/")
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        else:
+            out.append({"*": "[^/]*", "?": "[^/]"}.get(pattern[i], re.escape(pattern[i])))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+# Корневой манифест реестра, чей workspace (manifests.workspace_members) ставит членов из их каталогов по имени.
+_WORKSPACE_ROOTS = {"npm": "package.json", "pypi": "pyproject.toml"}
+
+
+def _workspace(root):
+    """{реестр: [(шаблон каталога, исключение)]} workspace корневых манифестов root рабочего дерева."""
+    out = {}
+    for registry, name in _WORKSPACE_ROOTS.items():
+        text = _text(os.path.join(root, name))
+        patterns = [] if text is None else manifests.workspace_members(manifests.kind(name), text)
+        out[registry] = [(_glob(p.removeprefix("!")), p.startswith("!")) for p in patterns]
+    return out
+
+
+def _member(workspace, rel):
+    """Манифест rel — член workspace корня (_workspace) своего реестра: каталог совпал с последним подходящим
+    шаблоном без `!`. Зависимость по имени члена npm и uv ставят из его каталога, не из реестра: имя — пакет
+    проекта."""
+    kind = watched_kind(rel)
+    if os.path.basename(rel) != _WORKSPACE_ROOTS.get(manifests.registry(kind)):
+        return False
+    directory = os.path.dirname(rel.replace(os.sep, "/"))
+    member = False
+    for pattern, exclude in workspace.get(manifests.registry(kind), ()):
+        if pattern.match(directory):
+            member = not exclude
+    return member
+
+
 def project_names(root, kind, deadline):
     """Имена манифестов реестра вида kind (manifests.registry) под root и, в git, манифестов и файлов _LEGACY
-    версии HEAD (_tree_names) с транзитивными и имена пакетов самого проекта этого реестра; файлы _LEGACY
-    рабочего дерева имён не дают. Не разобранный и больший MAX_MANIFEST_BYTES манифест не даёт ничего.
-    Unavailable и TimeoutError — как у list_manifests и _tree_names."""
+    версии HEAD (_tree_names) с транзитивными и имена пакетов самого проекта этого реестра: манифестов версии HEAD
+    и членов workspace корня (_member). Имя свежего манифеста вне workspace — не пакет проекта: его пишет кто угодно,
+    а проверяется только объявление зависимости. Файлы _LEGACY рабочего дерева имён не дают. Не разобранный и
+    больший MAX_MANIFEST_BYTES манифест не даёт ничего. Unavailable и TimeoutError — как у list_manifests и
+    _tree_names."""
     mode, found = list_manifests(root, deadline)
     registry = manifests.registry(kind)
+    workspace = _workspace(root)
     out = set()
     for rel in found:
         _remaining(deadline)
@@ -354,7 +436,8 @@ def project_names(root, kind, deadline):
             continue
         known, own = _parse(os.path.join(root, rel), other)
         out.update(known or ())
-        out.add(own)
+        if _member(workspace, rel):
+            out.add(own)
     out.discard(None)
     if mode == "git":
         out.update((_tree_names(root, "HEAD", deadline) or {}).get(registry, ()))
@@ -415,12 +498,13 @@ def list_manifests(root, deadline):
 
 
 def _stat(path):
-    """[size, mtime_ns] обычного файла; None — нет файла или не обычный файл."""
+    """[size, mtime_ns, ctime_ns] обычного файла; None — нет файла или не обычный файл. ctime ставит ядро при
+    любой записи: размер и mtime возвращает `touch -r`, ctime — нет."""
     try:
         st = os.stat(path)
     except (OSError, ValueError):
         return None
-    return [st.st_size, st.st_mtime_ns] if stat.S_ISREG(st.st_mode) else None
+    return [st.st_size, st.st_mtime_ns, st.st_ctime_ns] if stat.S_ISREG(st.st_mode) else None
 
 
 def _text(path):
@@ -440,7 +524,7 @@ def _parse(path, kind):
 
 
 def take(root, deadline):
-    """Снимок: {"root", "mode", "ts", "files": {путь: [size, mtime_ns, имена с транзитивными или None,
+    """Снимок: {"root", "mode", "ts", "files": {путь: [size, mtime_ns, ctime_ns, имена с транзитивными или None,
     имя пакета манифеста или None]}}; поле "known" (restored_names) добавляет вызывающий. Файлы _LEGACY
     рабочего дерева в снимок не входят."""
     mode, found = list_manifests(root, deadline)
@@ -456,36 +540,36 @@ def take(root, deadline):
     return entry
 
 
-def compare(entry, deadline, skip=frozenset()):
+def compare(entry, deadline):
     """({путь: новые имена}, [пути, которые не проверить]) после команды против снимка entry.
 
-    Новый манифест сравнивается с пустым; пропавший — ничего; манифест с тем же size и mtime не
-    перечитывается; манифест, чей realpath в skip, не проверяется. Имя из любого манифеста того же реестра
-    (manifests.registry) в снимке, из ref до начала сессии (entry["known"], restored_names), в git — из
-    манифестов и файлов _LEGACY версии HEAD (_tree_names, читается, только если после old и версий файла
-    что-то осталось) и имя пакета самого проекта (в снимке или в манифесте после команды) — не новое: перенос,
-    копия, член workspace, возврат работы автора. Unavailable — снимок другого режима."""
+    Новый манифест сравнивается с пустым; пропавший — ничего; манифест с тем же size, mtime и ctime не
+    перечитывается. Имя из любого манифеста того же реестра
+    (manifests.registry) в снимке, из ref до начала сессии (entry["known"], restored_names, с именами пакетов их
+    манифестов), в git — из манифестов и файлов _LEGACY версии HEAD и имена пакетов её манифестов (_tree_names,
+    читается, только если после old и версий файла что-то осталось) и имя пакета члена workspace корня после
+    команды (_member; в снимке или в манифесте после команды) — не новое: перенос, копия, член workspace, возврат
+    работы автора. Unavailable — снимок другого режима."""
     root = entry["root"]
     mode, found = list_manifests(root, deadline)
     if mode != entry["mode"]:
         raise Unavailable("за команду корень проекта " +
                           ("стал git-репозиторием" if mode == "git" else "перестал быть git-репозиторием"))
     before = entry["files"]
+    workspace = _workspace(root)
     project = {registry: set(names) for registry, names in entry.get("known", {}).items()}
-    for rel, (_, _, known, own) in before.items():
+    for rel, (*_, known, own) in before.items():
         names = project.setdefault(manifests.registry(watched_kind(rel)), set())
         names.update(known or ())
-        if own is not None:
+        if own is not None and _member(workspace, rel):
             names.add(own)
     changed, unknown = [], []
     for rel in found:
         _remaining(deadline)
         path = os.path.join(root, rel)
-        if os.path.realpath(path) in skip:
-            continue
         st = _stat(path)
         was = before.get(rel)
-        if st is None or isinstance(was, list) and was[:2] == st:
+        if st is None or isinstance(was, list) and was[:3] == st:
             continue
         kind = watched_kind(rel)
         text = _text(path)
@@ -493,7 +577,7 @@ def compare(entry, deadline, skip=frozenset()):
         if new is None:
             unknown.append(rel)
             continue
-        own = manifests.own_name(kind, text)
+        own = manifests.own_name(kind, text) if _member(workspace, rel) else None
         project.setdefault(manifests.registry(kind), set()).update(() if own is None else (own,))
         changed.append((rel, path, kind, new, was))
     head_tree = []
@@ -508,7 +592,7 @@ def compare(entry, deadline, skip=frozenset()):
         if was is None:
             old = frozenset()
         else:
-            old = None if was[2] is None else frozenset(was[2])
+            old = None if was[3] is None else frozenset(was[3])
 
         def head(path=path, kind=kind):
             return head_names(path, kind, _remaining(deadline), root) if mode == "git" else None
@@ -638,9 +722,9 @@ def _old_trees(root, refs, start, deadline):
 
 
 def _tree_names(root, tree, deadline):
-    """{реестр: имена с транзитивными} манифестов и файлов _LEGACY (source_kind) дерева tree — ref или SHA
-    дерева; None — git не прочитал дерево (нет HEAD, не репозиторий). Пути с переводом строки не ложатся в
-    построчный ввод --batch и пропускаются. Unavailable — манифестов в дереве больше MAX_MANIFESTS;
+    """{реестр: имена с транзитивными и имена пакетов манифестов} манифестов и файлов _LEGACY (source_kind) дерева
+    tree — ref или SHA дерева; None — git не прочитал дерево (нет HEAD, не репозиторий). Пути с переводом строки не
+    ложатся в построчный ввод --batch и пропускаются. Unavailable — манифестов в дереве больше MAX_MANIFESTS;
     TimeoutError — срок deadline."""
     listed = _git(root, _remaining(deadline), "ls-tree", "-r", "-z", "--name-only", "--full-tree", tree, root=root)
     if listed is None:
@@ -660,7 +744,11 @@ def _tree_names(root, tree, deadline):
         if obj is None or obj[0] != b"blob" or len(obj[1]) > MAX_MANIFEST_BYTES:
             continue
         kind = source_kind(path)
-        names = _known(kind, obj[1].decode("utf-8", "replace"))
+        text = obj[1].decode("utf-8", "replace")
+        names = set(_known(kind, text) or ())
+        if kind not in _LEGACY:
+            names.add(manifests.own_name(kind, text))
+        names.discard(None)
         if names:
             known.setdefault(_registry(kind), set()).update(names)
     return known
@@ -771,8 +859,8 @@ def _old_patch_names(patches, start, base, deadline):
 
 
 def restored_names(root, command, start, deadline, cwd=None):
-    """{реестр: имена с транзитивными} манифестов и файлов _LEGACY ref, откуда command возвращает файлы
-    (command_refs), если ref создан до start — начала сессии (session_start), и слова изменённых строк
+    """{реестр: имена с транзитивными и имена пакетов} манифестов и файлов _LEGACY ref, откуда command возвращает
+    файлы (command_refs), если ref создан до start — начала сессии (session_start), и слова изменённых строк
     манифестов в файлах патчей `git apply` (command_patches), не менявшихся с start; относительный путь патча —
     от cwd, без него — от root. Это работа до сессии, после команды такие имена не новые. start None, ref
     моложе или не найден, патч изменён в сессии — имена не добавляются: сравнение блокирует, как без ref.
@@ -796,109 +884,6 @@ def restored_names(root, command, start, deadline, cwd=None):
     except TimeoutError:
         raise Unavailable("имена ref команды не прочитаны за срок") from None
     return {registry: sorted(names) for registry, names in known.items()}
-
-
-# Подкоманды, печатающие установленные или зафиксированные пакеты в формате requirements: у pip и `uv pip` —
-# freeze, у uv, poetry, pdm — export, у pipenv — requirements.
-_GENERATORS = {"uv": {"export"}, "poetry": {"export"}, "pdm": {"export"}, "pipenv": {"requirements"}}
-_OUTPUT_FLAGS = ("--output", "--output-file", "-o")
-
-
-def _is_generator(words):
-    """Слова команды (depcheck._command) — генератор requirements: `pip freeze`, `python -m pip freeze`,
-    `uv pip freeze`, `uv export`, `poetry export`, `pdm export`, `pipenv requirements`."""
-    if not words:
-        return False
-    name = depcheck._basename(words[0])
-    if depcheck._PYTHON.match(name):
-        module = depcheck._python_module(words)
-        if not module or module[0] != "pip":
-            return False
-        words, name = ["pip", *module[1:]], "pip"
-    if depcheck._PIP.match(name):
-        return depcheck._subcommand(words, depcheck._PIP_GLOBAL_VALUE_FLAGS)[1:2] == ["freeze"]
-    if name not in _GENERATORS:
-        return False
-    sub = depcheck._subcommand(words, depcheck._GLOBAL_FLAGS.get(name, depcheck._NO_VALUE_FLAGS))
-    if name == "uv" and sub[1:2] == ["pip"]:
-        return depcheck._after_flags(sub[2:], depcheck._UV_PIP_VALUE_FLAGS)[:1] == ["freeze"]
-    return sub[1:2] != [] and sub[1] in _GENERATORS[name]
-
-
-def _outputs(segment, words):
-    """Файлы вывода сегмента: цели перенаправлений stdout (`>`, `>>`, `>|`, `&>`) и значения `-o`, `--output`,
-    `--output-file`."""
-    out = []
-    pairs = depcheck._split(segment)
-    for i, (word, lead) in enumerate(pairs):
-        m = depcheck._REDIRECT.match(lead)
-        if not m:
-            continue
-        op = m.group(0)
-        fd = op.rstrip("<>&|")
-        if "<" in op or op.endswith(">&") or fd not in ("", "1", "&"):
-            continue
-        target = word[m.end():] if len(word) > m.end() else (pairs[i + 1][0] if i + 1 < len(pairs) else "")
-        out.append(target)
-    for i, w in enumerate(words):
-        for flag in _OUTPUT_FLAGS:
-            if w == flag and i + 1 < len(words):
-                out.append(words[i + 1])
-            elif w.startswith(flag + "=") or flag == "-o" and w.startswith("-o") and len(w) > 2:
-                out.append(w[len(flag) + 1:] if w.startswith(flag + "=") else w[2:])
-    return [t for t in out if t]
-
-
-def _tee_outputs(segment, words):
-    """Файлы `tee` сегмента без своего ввода (`<`, heredoc); не tee — []."""
-    if not words or depcheck._basename(words[0]) != "tee":
-        return []
-    for _, lead in depcheck._split(segment):
-        m = depcheck._REDIRECT.match(lead)
-        if m and "<" in m.group(0):
-            return []
-    out, flags = [], True
-    for w in words[1:]:
-        if flags and w == "--":
-            flags = False
-        elif not (flags and w.startswith("-")):
-            out.append(w)
-    return out
-
-
-def generated_requirements(command):
-    """Пути файлов requirements, как написаны в команде, куда пишет генератор (_is_generator) своего сегмента
-    или `tee` сегмента сразу за генератором (`pip freeze | tee requirements.txt`).
-
-    Генератор, направленный в рукописный файл, снимает с него проверку. tee сразу за генератором через `;`
-    или `&&` тоже узнаётся. Конвейер с фильтром (`pip freeze | sort > requirements.txt`) не узнаётся:
-    перенаправление не в сегменте генератора и не в tee за ним, файл проверяется."""
-    targets = []
-    after_generator = False
-    for segment in depcheck._segments(command):
-        segment = segment.strip()
-        if not segment:
-            continue
-        words, _ = depcheck._command(segment)
-        if _is_generator(words):
-            outputs = _outputs(segment, words)
-            after_generator = True
-        else:
-            outputs = _tee_outputs(segment, words) if after_generator else []
-            after_generator = False
-        targets += [t for t in outputs if manifests.kind(t) == "requirements"]
-    return targets
-
-
-def resolve(targets, cwds):
-    """realpath каждого пути targets от каждого каталога cwds (относительный путь) или сам (абсолютный)."""
-    out = set()
-    for target in targets:
-        target = os.path.expanduser(target)
-        for cwd in cwds:
-            if os.path.isabs(target) or isinstance(cwd, str) and cwd:
-                out.add(os.path.realpath(os.path.join(cwd or "", target)))
-    return frozenset(out)
 
 
 def _state_path(state_dir, session):
@@ -938,8 +923,8 @@ def pop(session, tool_use_id):
             path.unlink(missing_ok=True)
     valid = (isinstance(entry, dict) and isinstance(entry.get("root"), str) and entry.get("mode") in ("git", "walk")
              and isinstance(entry.get("files"), dict)
-             and all(isinstance(v, list) and len(v) == 4 and (v[2] is None or isinstance(v[2], list))
-                     and (v[3] is None or isinstance(v[3], str)) for v in entry["files"].values())
+             and all(isinstance(v, list) and len(v) == 5 and (v[3] is None or isinstance(v[3], list))
+                     and (v[4] is None or isinstance(v[4], str)) for v in entry["files"].values())
              and isinstance(entry.get("known", {}), dict)
              and all(isinstance(v, list) for v in entry.get("known", {}).values()))
     return entry if valid else None

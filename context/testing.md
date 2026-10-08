@@ -49,6 +49,10 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
     вызовы, их вывод, отклонённые вызовы) сверяет `test_corpus_service_entries_are_not_author_turn`;
   - `bash-failure-errors.jsonl` — поле `error` упавшего Bash во входе `PostToolUseFailure`;
     `test_debug_watch` прогоняет хук на каждом образце;
+  - `bash-commands.jsonl` — команды `Bash` строкой JSON: `source` — `transcript` (настоящие команды из транскриптов,
+    пути и сессии заменены) или `edge` (образец края), `expect` — `add`, `doubt` или `pass`; `test_depcheck`
+    (`CorpusTest`) сверяет с ожиданием `dependency_add`, затем `dependency_doubt` каждой команды; настоящих команд в
+    корпусе больше 1000 — тест держит это число;
   - `manifests/<образец>/<манифест>` — настоящие `package.json`, `composer.json`, `pyproject.toml`, `requirements*.txt`,
     `Cargo.toml`, `go.mod`, `Gemfile` (источник — комментарием, в JSON — ключом `"//"`); `test_manifests` (`CorpusTest`)
     сверяет имена каждого с `CORPUS` (ожидание есть у каждого файла корпуса), имя пакета самого манифеста с `OWN`, новые
@@ -67,7 +71,8 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
     `Makefile` (и рецепт с `@#` — CPython), `Dockerfile`, toml, dart, kts; источник — первой строкой-комментарием
     файла, модули Perl — с расширением `.pl`); `test_comments` (`CorpusTest`) сверяет номера строк комментариев
     каждого файла с `CORPUS` (ожидание есть у каждого файла корпуса), что каждая строка вывода — хвост своей строки, и
-    тот же вывод `comments.extract` вне git;
+    тот же вывод `comments.extract` вне git; однофайловые компоненты — `create-vite-vue/HelloWorld.vue`,
+    `sveltekit-sverdle/page.svelte`;
 - Тесты в git-репозитории (`GitCaptureTest`, `ChangedSinceGitTest`, git-тесты `test_comments`,
   `test_judge_stop`, `test_remind`, `test_common`, `test_hostile_git`, `ManifestEditGitTest`,
   `ManifestBashGitTest`, `ManifestConflictTest`, `ManifestTransferEditTest`,
@@ -76,11 +81,15 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
   и пропускаются без `git`.
 - Проверка манифестов: разбор — `tests/test_manifests.py` (корпус, по классу на вид манифеста,
   `AddedContractTest`, `LegacySourcesTest` — разбор `_LEGACY` на корпусе `legacy-*`, края: цикл присваиваний,
-  цепочка из 30 имён, `test_setup_py_references_linear`; патчи `git apply` до начала сессии — `OldPatchTest` и
+  цепочка из 30 имён, `test_setup_py_references_linear`; источник не по умолчанию и `index <url>` — `SourceTest`,
+  операторы строки Gemfile — `StatementsTest`, имя пакета только из HEAD или члена workspace корня —
+  `OwnNameTrustTest`, FIFO под именем манифеста — `FifoManifestTest`; патчи `git apply` до начала сессии —
+  `OldPatchTest` и
   `OldPatchGitTest`, mtime `start.json` в долгой сессии — `SessionStartTtlTest`); хук — `tests/test_judge_tool.py`:
   `ManifestEditTest` (правка `Write`, `Edit`, `MultiEdit`), `ManifestEditGitTest` (версии `_REPO_REFS` — база),
-  `ManifestBashTest` и его наследник `ManifestBashGitTest` (снимок и сравнение вне git и в git: генераторы, `tee`,
-  маркер, `PostToolUseFailure`, параллельные команды по `tool_use_id`, `mv`, `cp`, `git mv`; ref до начала сессии: stash
+  `ManifestBashTest` и его наследник `ManifestBashGitTest` (снимок и сравнение вне git и в git: генератор requirements и
+  заголовок генератора — блок, с маркером — нет, маркер, `PostToolUseFailure`, параллельные команды по `tool_use_id`,
+  `mv`, `cp`, `git mv`; ref до начала сессии: stash
   и ref `checkout`, `restore --source`, `merge --squash`, `cherry-pick -n` старше начала — пропуск
   (`test_author_stash_before_session_passes`, `test_author_stash_untracked_manifest_passes`,
   `test_restore_from_old_ref_passes`), моложе, в ту же секунду или без записи начала — блок с безопасным текстом
@@ -102,7 +111,10 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
   `ManifestProjectUnderFixturesTest` (`FOREIGN_DIRS` — от проекта), `ManifestProjectUnderHomeRepoTest` (проект без
   своего git под `HOME`-репозиторием с `status.showUntrackedFiles=no` и `.gitignore` `*`: `list_manifests` — режим
   `walk`, правка и команда с новым именем — отказ и блок, имена версии HEAD и stash `~` не известны; файл вне корня
-  читает версии своего репозитория), `GeneratedRequirementsTest` (файлы вывода генераторов), `ManifestWatchStateTest`
+  читает версии своего репозитория), `ManifestBypassTest` (имя свежего манифеста вне workspace, правка через ссылку на
+  файл и каталог, FIFO,
+  `FOREIGN_DIRS` выше репозитория, возвращённые размер и mtime, запись в файл генератора до и после него),
+  `ManifestWatchStateTest`
   (файл состояния снимков: срок записей, удаление пустого файла, предел обхода вне git, повторно не читаются файлы с тем
   же размером и mtime, та же длина с новым mtime перечитывается, смена режима git/walk — `Unavailable`; `start.json`
   пишет первый `PreToolUse` один раз, `PostToolUse` и хук внутри судьи — нет); старый патч по относительному пути из
@@ -146,7 +158,11 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
   незакрытая до конца команды, на многих строках), `DoubtTest.test_linear` там же (формы сомнения детектора),
   `RobustnessTest.test_adversarial_input_is_linear`
   (`tests/test_planparse.py`: каждый враждебный пункт и строка при множителе 1 и 4),
-  `SegmentsTest.test_unclosed_test_brackets_linear` (`tests/test_debug_watch.py`);
+  `SegmentsTest.test_unclosed_test_brackets_linear` (`tests/test_debug_watch.py`),
+  `Code1IsAnswerTest.test_long_word_linear` там же (слово длиннее `_HEAD_LIMIT`),
+  `UserAndWatchWrappersTest.test_linear` в `tests/test_depcheck.py` (цепочки `su`/`runuser`/`watch`),
+  `GemfileTest.test_linear_on_long_line` в `tests/test_manifests.py` (строки Gemfile из кавычек и пробелов),
+  `ImportParseTest.test_strip_code_linear` в `tests/test_guard_memory.py` (незакрытые `<!--`, серии обратных кавычек);
   `WalkCaptureTest.test_walk_cost_independent_of_ext_count` — обход при 1 и 2000 расширениях `.gitignore` через
   `helpers.cpu_seconds`, порог 4. Часы стены и абсолютный порог в секундах под нагрузкой машины флакуют.
 - Окружение `Env.environ` вычищает `PLANKA_*`, `CLAUDE_PLUGIN_OPTION_*`, `CLAUDE_PROJECT_DIR`,
@@ -162,7 +178,8 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
 
 `tests/stub/claude` ведёт себя по `PLANKA_STUB`: `ok`, `deny` (причина из `PLANKA_STUB_REASON`), `violated` (`violated`
 из `PLANKA_STUB_VIOLATED`, сырой JSON), `hang` (через `exec sleep`: висит сам процесс заглушки), `garbage` (не JSON),
-`nostructured` (JSON без `structured_output`), `noOk` (`structured_output` без `ok`), `unparsed` (строка с `{`, но не
+`nostructured` (JSON без `structured_output`), `noOk` (`structured_output` без `ok`), `raw` (`structured_output`
+целиком из `PLANKA_STUB_SO`, сырой JSON: ответы не по схеме), `unparsed` (строка с `{`, но не
 JSON), `notlogged` (`is_error`). При `PLANKA_STUB_RECORD=<файл>` пишет туда аргументы, stdin, `PLANKA_JUDGE`, `cwd` и
 PID процесса. Ответ с текстом собирает `python3` с `PYTHONUTF8=1` и `PYTHONIOENCODING=utf-8`: аргументы и вывод в UTF-8
 в любой локали и кодировке вывода; не-ASCII не экранируется (`ensure_ascii=False`), как у `JSON.stringify` claude. Новый
@@ -196,6 +213,9 @@ PID процесса. Ответ с текстом собирает `python3` с
 - `judge_stop.changed_this_turn` с подменой `snapshot` — `DocsFilterTest.in_process`; сроки сверки и
   разбора комментариев, переданные в `snapshot.changed_since` и `comments.extract`, —
   `DocsFilterTest.test_deadlines_passed_to_changed_since_and_extract`;
+- разбор импортов `@путь` памяти — `ImportParseTest` в `tests/test_guard_memory.py`: корпус `CORPUS` — строки из
+  примеров документации Claude Code о памяти с ожидаемыми путями; файл больше `MAX_IMPORT_FILE`, предел
+  `MAX_IMPORT_FILES` с предупреждением, циклы импортов и ссылок `rules/`, FIFO, проба регистра `_case_insensitive`;
 - `autoMemoryDirectory` из managed-настроек — `guard_memory.is_memory_path` с подменой
   `guard_memory.managed_dir` на временный каталог (`ManagedSettingsTest`): системный каталог тест не пишет;
 - `git check-ignore` в `guard_memory._repository_file` под чужим git-конфигом — `HostileMemoryTest` в
@@ -250,7 +270,9 @@ PID процесса. Ответ с текстом собирает `python3` с
   модули, которые код берёт по имени (ручные `SECTIONS`, `MODULES` и имена, выведенные из кода, —
   `test_names_taken_by_code_exist`), заголовок и строка условия «Читай» каждого модуля, только
   известные метки (без учёта регистра), ссылки `{RULES}/<имя>.md` в правилах и коде, согласие правил с
-  вопросами судьи (`RulesMatchJudgeTest`), разбор форм вызова сборщиком (`CodeNamesTest`), пункты
+  вопросами судьи (`RulesMatchJudgeTest`), разбор форм вызова сборщиком (`CodeNamesTest`), части ядра
+  (`CorePartsTest`: каждая с путём `{RULES}` в 200 символов и строкой `NO_DOCS_LINE` не длиннее
+  `remind.CONTEXT_LIMIT`, склейка частей — ядро, хук на каждый номер части в `hooks/hooks.json`), пункты
   «Решения» 7 и «Планы» 9, полнота индекса «Модули», метки языков. Там же
   `TimeoutsTest`: сроки внутри хуков против таймаутов `hooks/hooks.json`
   (`context/architecture.md`, «Сроки»), в сумме — `common.GIT_ROOT_TIMEOUT`, `guard_memory.CHECK_IGNORE_TIMEOUT` и сроки

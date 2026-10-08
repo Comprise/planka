@@ -10,6 +10,11 @@ MODULE = "debugging"
 # Неудача с этого номера подряд подмешивает модуль.
 REPEAT_THRESHOLD = 2
 MAX_SHOWN_COMMAND = 200
+# В файле состояния хранятся последние MAX_COUNTS ключей счётчика и последние MAX_SHOWN отметок показа.
+MAX_COUNTS = 500
+MAX_SHOWN = 100
+# Имя команды, обёртки и подкоманда git разбираются только по началу сегмента, до _HEAD_LIMIT символов.
+_HEAD_LIMIT = 4096
 
 # Код выхода 1 этих команд — ответ «не найдено», «ложно» или «различаются», не сбой; код 2 и выше — сбой.
 CODE1_ANSWERS = frozenset({"grep", "egrep", "fgrep", "zgrep", "rg", "test", "[", "[[", "diff", "cmp",
@@ -144,15 +149,30 @@ def _segments(command):
     return [(sep, text) for sep, text in texts if text.strip()]
 
 
+def _head_words(text):
+    """Слова начала text (до _HEAD_LIMIT символов) по правилам shlex; None — не разбирается. Слово, которое
+    обрезал предел, отбрасывается; кавычка, не закрытая в пределах, у обрезанной строки не ошибка."""
+    head = text[:_HEAD_LIMIT]
+    cut = len(text) > len(head)
+    lexer = shlex.shlex(head, posix=True)
+    lexer.whitespace_split = True
+    words = []
+    try:
+        words.extend(lexer)
+    except ValueError:
+        # Недочитанное слово в кавычках shlex не отдаёт — отбрасывать нечего.
+        return words if cut else None
+    if cut and words and not head[-1].isspace():
+        words.pop()
+    return words
+
+
 def _passes_code(text):
     """Команда не возвращает 1 сама: первое слово из PASS_THROUGH и вне кавычек и экранирования нет
     «<» и «>» (перенаправление может не открыться и дать 1; «echo "a > b"» — не перенаправление)."""
     if re.search(r"[<>]", UNQUOTED.sub("", text)):
         return False
-    try:
-        words = shlex.split(text)
-    except ValueError:
-        return False
+    words = _head_words(text)
     return bool(words) and words[0] in PASS_THROUGH
 
 
@@ -187,9 +207,8 @@ def code1_is_answer(command):
     substitution = SUBSTITUTION_ASSIGNMENT.fullmatch(last)
     if substitution:
         return code1_is_answer(substitution.group(2))
-    try:
-        words = shlex.split(last)
-    except ValueError:
+    words = _head_words(last)
+    if words is None:
         return False
     i = 0
     while i < len(words):
@@ -243,7 +262,13 @@ def _shown_marks(state):
     return {k: v for k, v in shown.items() if isinstance(v, str)}
 
 
+def _recent(d, limit):
+    """Последние limit записей: словарь хранит порядок вставки, свежие записи переставляются в конец."""
+    return dict(list(d.items())[-limit:]) if len(d) > limit else d
+
+
 def _state(counts, shown):
+    counts, shown = _recent(counts, MAX_COUNTS), _recent(shown, MAX_SHOWN)
     return {"counts": counts, "shown": shown} if shown else {"counts": counts}
 
 
@@ -267,12 +292,13 @@ def update(session, prompt_id, key, failed, agent_id=""):
             del counts[key]
             common.atomic_write_json(path, _state(counts, shown))
             return None, None
-        counts[key] = counts.get(key, 0) + 1
-        n = counts[key]
+        n = counts.pop(key, 0) + 1
+        counts[key] = n
         text = None
         if n >= REPEAT_THRESHOLD and shown.get(agent_id) != prompt_id:
             text = common.rule_texts(MODULE)
             if text is not None:
+                shown.pop(agent_id, None)
                 shown[agent_id] = prompt_id
         common.atomic_write_json(path, _state(counts, shown))
     common.prune_state(state_dir)

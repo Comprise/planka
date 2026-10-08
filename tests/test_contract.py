@@ -156,6 +156,48 @@ def _hook_timeouts():
     return found
 
 
+def _core_part_hooks():
+    """{номер части ядра: timeout} хуков remind.py на UserPromptSubmit в plugin/hooks/hooks.json."""
+    hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text(encoding="utf-8"))["hooks"]
+    found = {}
+    for group in hooks["UserPromptSubmit"]:
+        for hook in group["hooks"]:
+            m = re.search(r"planka/remind\.py\"?\s*(\S*)$", hook["command"])
+            if m:
+                found[m.group(1)] = hook["timeout"]
+    return found
+
+
+class CorePartsTest(unittest.TestCase):
+    """Ядро уходит частями, каждая — отдельный additionalContext не длиннее remind.CONTEXT_LIMIT."""
+
+    def setUp(self):
+        self.core = (PLUGIN / "philosophy.md").read_text(encoding="utf-8")
+
+    def test_parts_fit_context_limit(self):
+        # Худший случай подстановки: длинный путь кэша плагина и длинные значения языков.
+        rules = "/" + "r" * 199
+        core = self.core.replace("{RULES}", rules).replace("{COMMENT_LANG}", "x" * 20).replace("{DOC_LANG}", "x" * 20)
+        contexts = remind.core_parts(core)
+        self.assertEqual(len(contexts), remind.PARTS)
+        contexts[0] += "\n\n" + remind.NO_DOCS_LINE.replace("{RULES}", rules)
+        for k, ctx in enumerate(contexts, 1):
+            self.assertLessEqual(len(ctx), remind.CONTEXT_LIMIT, f"часть {k}")
+
+    def test_parts_keep_every_section_once(self):
+        parts = remind.split_core(self.core, remind.PARTS)
+        self.assertEqual("".join(parts), self.core)
+        self.assertTrue(all(p.strip() for p in parts))
+        headings = re.findall(r"^## .+$", self.core, re.MULTILINE)
+        self.assertEqual([h for p in parts for h in re.findall(r"^## .+$", p, re.MULTILINE)], headings)
+        for p in parts[1:]:
+            self.assertTrue(p.startswith("## "), p[:40])
+
+    def test_hooks_json_has_every_part(self):
+        timeouts = _core_part_hooks()
+        self.assertEqual(sorted(timeouts, key=int), [str(k) for k in range(1, remind.PARTS + 1)])
+
+
 class ContractTest(unittest.TestCase):
     def setUp(self):
         self.core = (PLUGIN / "philosophy.md").read_text(encoding="utf-8")
@@ -346,9 +388,8 @@ class TimeoutsTest(unittest.TestCase):
             self.assertLess(spent, timeout)
 
     def test_user_prompt_submit_fits(self):
-        # Срок снимка отсчитывается от старта хука, определение корня входит в него.
-        for timeout in self.timeouts[("UserPromptSubmit", "remind")]:
-            self.assertLess(remind.SNAPSHOT_BUDGET, timeout)
+        # Срок снимка отсчитывается от старта хука, определение корня входит в него; снимок снимает только часть 1.
+        self.assertLess(remind.SNAPSHOT_BUDGET, _core_part_hooks()["1"])
 
     def test_bash_manifest_snapshot_fits(self):
         # Снимок манифестов перед командой Bash: корень проекта git rev-parse, затем срок снимка; правка

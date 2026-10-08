@@ -20,6 +20,9 @@ IGNORED_DIRS = frozenset({".git", "node_modules", "__pycache__", ".venv", "venv"
 MAX_FILES = 50_000
 # Срок проверяется раз в столько файлов при lstat.
 STAT_CHECK_EVERY = 256
+# Байт блока каталога, которые _pack_dirs сжимает между проверками срока: каталог с множеством файлов — один
+# большой блок.
+PACK_CHUNK = 1 << 20
 # Версия формата файла снимка; файл другой версии load отвергает.
 FORMAT = 2
 
@@ -371,14 +374,20 @@ def _snap_path(state_dir, session_id):
     return state_dir / f"{common.safe_name(session_id)}.snap.json"
 
 
-def _pack_dirs(dirs):
-    """Блоки _walk_dirs одной строкой: base64 от zlib записей «каталог в байтах ФС, NUL, длина блока, блок»."""
+def _pack_dirs(dirs, deadline=None):
+    """Блоки _walk_dirs одной строкой: base64 от zlib записей «каталог в байтах ФС, NUL, длина блока, блок»;
+    TimeoutError по сроку deadline."""
     # Сжатие по каталогу: несжатая запись целиком в памяти не собирается.
     z = zlib.compressobj(1)
     parts = []
     for rel, block in dirs.items():
+        _remaining(deadline)
         parts.append(z.compress(os.fsencode(rel) + b"\0" + _LEN.pack(len(block))))
-        parts.append(z.compress(block))
+        view = memoryview(block)
+        for i in range(0, len(view), PACK_CHUNK):
+            if i:
+                _remaining(deadline)
+            parts.append(z.compress(view[i:i + PACK_CHUNK]))
     parts.append(z.flush())
     return base64.b64encode(b"".join(parts)).decode("ascii")
 
@@ -399,12 +408,13 @@ def _unpack_dirs(text):
     return dirs
 
 
-def store(state_dir, session_id, prompt_id, root, snap):
+def store(state_dir, session_id, prompt_id, root, snap, deadline=None):
     """Снимок capture в state_dir/<session>.snap.json вместе с репликой, корнем, версией формата FORMAT и
-    "checked": False; блоки режима walk — строкой _pack_dirs."""
+    "checked": False; блоки режима walk — строкой _pack_dirs. TimeoutError — упаковка не уложилась в срок
+    deadline (time.monotonic), файл не пишется."""
     data = {**snap, "format": FORMAT, "prompt_id": prompt_id, "root": str(root), "checked": False}
     if snap.get("mode") == "walk":
-        data["dirs"] = _pack_dirs(snap["dirs"])
+        data["dirs"] = _pack_dirs(snap["dirs"], deadline)
     common.atomic_write_json(_snap_path(state_dir, session_id), data)
 
 

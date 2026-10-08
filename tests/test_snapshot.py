@@ -707,6 +707,22 @@ class StoreLoadDiffTest(unittest.TestCase):
         self.assertEqual(files_of(got["dirs"]), {"a.py": (1, 2), "b/c.go": (3, 4), "b/d.go": (0, -5)})
         self.assertEqual([p.name for p in self.state.iterdir()], ["sess_1.snap.json"])
 
+    def test_store_past_deadline_writes_nothing(self):
+        dirs = {"": self.block(("a.py", 1, 2))}
+        with self.assertRaisesRegex(TimeoutError, "снимок не уложился в срок"):
+            snapshot.store(self.state, "s", "p", self.root, self.walk(dirs), time.monotonic() - 1)
+        self.assertEqual(list(self.state.iterdir()), [])
+
+    def test_pack_checks_deadline_inside_large_block(self):
+        # Один каталог с множеством файлов — один большой блок: срок проверяется и внутри него.
+        names = [(f"f{i:07}.py", i, i) for i in range(3 * snapshot.PACK_CHUNK // 20)]
+        dirs = {"": self.block(*names)}
+        self.assertGreater(len(dirs[""]), 2 * snapshot.PACK_CHUNK)
+        with mock.patch.object(snapshot, "_remaining", wraps=snapshot._remaining) as remaining:
+            snapshot.store(self.state, "s", "p", self.root, self.walk(dirs), time.monotonic() + 60)
+        self.assertGreaterEqual(remaining.call_count, 3)
+        self.assertEqual(snapshot.load(self.state, "s")["dirs"], dirs)
+
     def test_roundtrip_non_utf8_name(self):
         dirs = {"d\udcfe": self.block(("bad\udcff.py", 1, 2))}
         snapshot.store(self.state, "s", "p", self.root, self.walk(dirs, "abc"))

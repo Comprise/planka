@@ -15,7 +15,8 @@ planka@planka` с перезапуском сессии (`README.md`, «Уста
 `python3 "${CLAUDE_PLUGIN_ROOT}/planka/<скрипт>.py"`; модули `planka/` импортируют друг друга
 по имени (`import common`), каталог скрипта — первый в `sys.path`.
 
-Точки входа: `remind.py` (`UserPromptSubmit`), `judge_tool.py` (`PreToolUse`; на `Bash` ещё
+Точки входа: `remind.py` (`UserPromptSubmit`; хук на каждую часть ядра, `python3 …/remind.py <номер>`), `judge_tool.py`
+(`PreToolUse`; на `Bash` ещё
 `PostToolUse`, `PostToolUseFailure`), `guard_memory.py` (`PreToolUse`), `judge_stop.py` (`Stop`),
 `debug_watch.py` (`PostToolUse`, `PostToolUseFailure`), `model_watch.py` (`SessionStart`, `PostModelSwitch`). Один
 скрипт на нескольких событиях различает их по `hook_event_name` входа (`judge_tool.POST_EVENTS`).

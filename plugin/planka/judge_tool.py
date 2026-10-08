@@ -201,17 +201,17 @@ def judge_manifest_edit(data):
     path = guard_memory.target_path(data)
     if path is None:
         return
-    # Каталоги FOREIGN_DIRS ищутся в пути от проекта: проект сам может лежать под fixtures/.
+    # Корень проекта: проект неизвестен (нет CLAUDE_PROJECT_DIR и абсолютного cwd) — None. Каталоги FOREIGN_DIRS
+    # ищутся в пути от корня: проект сам может лежать под fixtures/ или build/.
     cwd = data.get("cwd")
     project = os.environ.get("CLAUDE_PROJECT_DIR") or common.input_path(cwd) or ""
-    rel = os.path.relpath(path, project) if isinstance(project, str) and os.path.isabs(project) else path
-    kind = manifest_watch.watched_kind(path if rel.startswith("..") else rel)
-    if kind is None:
-        return
-    session = _session(data)
-    # Корень проекта: проект неизвестен (нет CLAUDE_PROJECT_DIR и абсолютного cwd) — None.
     known_project = isinstance(project, str) and os.path.isabs(project)
     root = functools.cache(lambda: common.project_root(cwd) if known_project else None)
+    target = manifest_watch.edit_target(path, root)
+    if target is None:
+        return
+    path, kind = target
+    session = _session(data)
     try:
         names = manifest_watch.check_edit(tool, tool_input, path, kind, lambda: _project_names(root, kind), root)
     except manifest_watch.Unavailable as e:
@@ -254,11 +254,10 @@ def snapshot_manifests(data):
     try:
         root = common.project_root(cwd)
         entry = manifest_watch.take(root, deadline)
-        # Каталог команды до неё: от него разрешаются пути вывода генераторов requirements и патчей git apply.
-        entry["cwd"] = common.input_path(cwd)
-        # Имена ref до начала сессии, откуда команда git возвращает файлы, и старых патчей — работа автора.
+        # Имена ref до начала сессии, откуда команда git возвращает файлы, и старых патчей — работа автора;
+        # относительный путь патча — от каталога команды до неё.
         known = manifest_watch.restored_names(root, command, manifest_watch.session_start(session), deadline,
-                                              cwd=entry["cwd"])
+                                              cwd=common.input_path(cwd))
         if known:
             entry["known"] = known
         manifest_watch.store(session, tool_use_id, entry)
@@ -300,12 +299,7 @@ def check_command_manifests(data):
     if entry is None or manifest_watch.has_marker(command):
         return
     try:
-        # Файл requirements, который пишет генератор (pip freeze, poetry export и др.), не проверяется: пути
-        # вывода — от каталога до команды и после неё (cd внутри команды).
-        cwd = data.get("cwd")
-        skip = manifest_watch.resolve(manifest_watch.generated_requirements(command),
-                                      [entry.get("cwd"), common.input_path(cwd) if isinstance(cwd, str) else None])
-        added, unknown = manifest_watch.compare(entry, deadline, skip)
+        added, unknown = manifest_watch.compare(entry, deadline)
     except (manifest_watch.Unavailable, OSError) as e:
         _manifest_skip(session, f"манифесты после команды не проверены: {e}")
         return

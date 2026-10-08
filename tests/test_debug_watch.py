@@ -267,6 +267,46 @@ class DebugWatchTest(unittest.TestCase):
         self.assertFalse(stale.exists())
         self.assertTrue(self.state_file().exists())
 
+    def test_counts_and_shown_bounded(self):
+        key, _ = debug_watch.command_key("make test")
+        counts = {f"k{i}": 1 for i in range(debug_watch.MAX_COUNTS * 3)}
+        counts[key] = 1
+        shown = {f"a{i}": "p" for i in range(debug_watch.MAX_SHOWN * 3)}
+        self.state_file().parent.mkdir(parents=True, exist_ok=True)
+        self.state_file().write_text(json.dumps({"counts": counts, "shown": shown}), encoding="utf-8")
+        self.assertIsNotNone(self.context(self.failure()))
+        state = json.loads(self.state_file().read_text(encoding="utf-8"))
+        self.assertLessEqual(len(state["counts"]), debug_watch.MAX_COUNTS)
+        self.assertLessEqual(len(state["shown"]), debug_watch.MAX_SHOWN)
+        self.assertIn(key, state["counts"])
+        self.assertIn("", state["shown"])
+        self.assertNotIn("k0", state["counts"])
+        self.assertNotIn("a0", state["shown"])
+
+    def test_recent_failure_kept_over_old(self):
+        self.failure("make a")
+        state = {"counts": {f"k{i}": 1 for i in range(debug_watch.MAX_COUNTS - 1)}}
+        key, _ = debug_watch.command_key("make a")
+        state["counts"][key] = 1
+        self.state_file().write_text(json.dumps(state), encoding="utf-8")
+        self.failure("make b")
+        self.failure("make a")
+        kept = json.loads(self.state_file().read_text(encoding="utf-8"))["counts"]
+        self.assertEqual(kept[key], 2)
+        self.assertNotIn("k0", kept)
+
+    def test_repeated_key_moves_to_end_and_survives_eviction(self):
+        self.failure("make a")
+        key, _ = debug_watch.command_key("make a")
+        counts = {key: 1}
+        counts.update({f"k{i}": 1 for i in range(debug_watch.MAX_COUNTS - 1)})
+        self.state_file().write_text(json.dumps({"counts": counts}), encoding="utf-8")
+        self.failure("make a")
+        self.failure("make b")
+        kept = json.loads(self.state_file().read_text(encoding="utf-8"))["counts"]
+        self.assertEqual(kept[key], 2)
+        self.assertNotIn("k0", kept)
+
 
 class StateLockRaceTest(unittest.TestCase):
     """Параллельные неудачи разных команд одной сессии: каждая доходит до counts файла состояния."""
@@ -425,3 +465,23 @@ class Code1IsAnswerTest(unittest.TestCase):
                         "cat <<EOF $((1<<2))\ngrep x f\nEOF"):
             with self.subTest(command=command):
                 self.assertFalse(debug_watch.code1_is_answer(command))
+
+    def test_long_word_linear(self):
+        for prefix in ("grep ", "git diff --quiet ", "echo ok && "):
+            with self.subTest(prefix=prefix):
+                small, large = (prefix + "a" * n + " f" for n in (100000, 400000))
+                assert_linear(self, lambda: debug_watch.code1_is_answer(small),
+                              lambda: debug_watch.code1_is_answer(large))
+
+    def test_word_cut_by_head_limit_not_taken_as_flag(self):
+        # Слово «--quietzzz», разрезанное пределом на «--quiet», не флаг git diff.
+        head = "git diff "
+        pad = "x" * (debug_watch._HEAD_LIMIT - len(head) - len("--quiet") - 1)
+        self.assertTrue(debug_watch.code1_is_answer(f"{head}{pad} --quiet"))
+        self.assertFalse(debug_watch.code1_is_answer(f"{head}{pad} --quietzzz"))
+
+    def test_long_word_keeps_verdict(self):
+        self.assertTrue(debug_watch.code1_is_answer("grep " + "a" * 100000 + " f"))
+        self.assertTrue(debug_watch.code1_is_answer("grep '" + "a b" * 50000 + "' f"))
+        self.assertFalse(debug_watch.code1_is_answer("make " + "a" * 100000))
+        self.assertFalse(debug_watch.code1_is_answer("echo " + "a" * 100000 + " && make"))

@@ -248,19 +248,20 @@ def parse_plan(text):
     wave, wave_level = None, None
     current = None
     collecting, blank, head_seen = False, False, False
+    skip_indent = None
     lines = list(_structure_lines(text.removeprefix("\ufeff")))
     i = 0
     while i < len(lines):
         line = lines[i]
         if line is None:
-            collecting = False
+            collecting, skip_indent = False, None
             i += 1
             continue
         heading = _heading(lines, i)
         if heading:
             level, title, size = heading
             i += size
-            current, collecting, head_seen = None, False, False
+            current, collecting, head_seen, skip_indent = None, False, False, None
             if m := _WAVE.match(title):
                 wave, wave_level = int(m.group(1)), level
             elif m := _TASK.match(title):
@@ -278,10 +279,18 @@ def parse_plan(text):
                 i += 1
                 continue
             item = _ITEM.match(line)
+            indent = len(line.expandtabs()) - len(line.expandtabs().lstrip())
             # Пункт без префикса — владение, только если он целиком из путей; иной пункт сразу под списком
-            # пропускается, после пустой строки — заканчивает список.
+            # пропускается, после пустой строки — заканчивает список. Вложенные пункты пропущенного пункта
+            # («Не трогать:» и его пути) ему принадлежат, а не списку файлов задачи.
             owned = item and (_PREFIX.match(item.group(1).strip()) or _is_whole_path(item.group(1).strip()))
+            if owned and skip_indent is not None and indent > skip_indent:
+                owned = False
+            elif item:
+                skip_indent = None
             if owned or item and not blank:
+                if item and not owned and skip_indent is None:
+                    skip_indent = indent
                 if owned:
                     current.files.extend(_paths(item.group(1)))
                 blank = False
@@ -295,7 +304,7 @@ def parse_plan(text):
             # Повторная строка файлов, за путями которой идёт предложение, — описание задачи.
             if not (head_seen and _continues_description(tail)):
                 current.files.extend(paths)
-                collecting, blank = True, False
+                collecting, blank, skip_indent = True, False, None
             head_seen = True
         i += 1
     tasks = [t for t in tasks if t.files]

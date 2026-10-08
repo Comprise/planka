@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tests.helpers import PHILOSOPHY, PLANKA_DIR, STUB_DIR, Env, messages, output
+from tests.helpers import PHILOSOPHY, PLANKA_DIR, STUB_DIR, Env, assert_linear, messages, output
 
 sys.path.insert(0, str(PLANKA_DIR))
 import common  # noqa: E402
@@ -530,6 +530,87 @@ class MemoryHookTest(unittest.TestCase):
             self.assertEqual(r.stdout, "", path)
         self.assertIsNone(self.judged())
 
+    def assert_judged(self, paths, **extra):
+        for path in paths:
+            self.rec.unlink(missing_ok=True)
+            r = self.write_mem(path, PLANKA_STUB="deny", **extra)
+            self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny", path)
+            self.assertIsNotNone(self.judged(), path)
+
+    def assert_not_judged(self, paths, **extra):
+        self.rec.unlink(missing_ok=True)
+        for path in paths:
+            r = self.write_mem(path, PLANKA_STUB="deny", **extra)
+            self.assertEqual(r.stdout, "", path)
+        self.assertIsNone(self.judged())
+
+    def test_dotdot_after_link_resolved_lexically(self):
+        # Claude Code схлопывает «..» в пути файлового инструмента лексически (path.resolve) до записи и до хука:
+        # sub/rl/../CLAUDE.md пишется в sub/CLAUDE.md проекта, а не в каталог настроек над целью ссылки rl.
+        (self.config / "rules").mkdir()
+        (self.env.project / "sub").mkdir()
+        (self.env.project / "sub" / "rl").symlink_to(self.config / "rules")
+        self.assert_not_judged([f"{self.env.project}/sub/rl/../CLAUDE.md"])
+        self.assert_judged([f"{self.env.project}/sub/rl/../rl/a.md"])
+
+    def test_user_memory_imports(self):
+        # Файл, который пользовательская память подключает импортом @путь, — память: путь от файла с импортом,
+        # ~/ — от домашнего каталога, абсолютный; импорты в коде, комментарии HTML и почтовые адреса не
+        # импорты. Глубина — четыре перехода от корня.
+        shared = self.home / "shared"
+        absolute = self.env.root.parent / "abs"
+        (self.config / "notes").mkdir()
+        (self.config / "rules").mkdir()
+        (self.config / "CLAUDE.md").write_text(
+            "См. @notes/style.md и @~/shared/team.md,\n"
+            f"абсолютный @{absolute}/x.md, с пробелом @Design\\ Docs/api.md#раздел.\n"
+            "- *@emph.md*\n"
+            "`@span.md` и ``@span2.md``\n"
+            "```\n@fenced.md\n```\n"
+            "<!-- @comment.md -->\n"
+            "почта a@mail.md\n", encoding="utf-8")
+        chain = [self.config / "notes" / "style.md"] + [self.config / "notes" / f"d{i}.md" for i in range(2, 6)]
+        for cur, nxt in zip(chain, chain[1:]):
+            cur.write_text(f"@{nxt.name}\n", encoding="utf-8")
+        (self.config / "rules" / "r.md").write_text("@../from-rule.md\n", encoding="utf-8")
+        self.assert_judged(chain[:4] + [shared / "team.md", absolute / "x.md", self.config / "Design Docs" / "api.md",
+                                        self.config / "emph.md", self.config / "from-rule.md"])
+        self.assert_not_judged([chain[4], self.config / "span.md", self.config / "span2.md",
+                                self.config / "fenced.md", self.config / "comment.md", self.config / "mail.md",
+                                self.config / "notes.md"])
+
+    def test_claude_local_md(self):
+        # CLAUDE.local.md — личные инструкции проекта, Claude Code читает его из проекта, каталогов над ним и
+        # подкаталогов: память, если git проекта его исключает или git нет; файл репозитория — не память.
+        # Его импорты — так же; импорты проектного CLAUDE.md — документация.
+        proj = self.env.project
+        (proj / "CLAUDE.local.md").write_text("@priv/notes.md\n", encoding="utf-8")
+        (proj / "CLAUDE.md").write_text("@docs/x.md\n", encoding="utf-8")
+        self.assert_judged([proj / "CLAUDE.local.md", proj.parent / "CLAUDE.local.md",
+                            proj / "sub" / "CLAUDE.local.md", proj / "priv" / "notes.md"])
+        self.assert_not_judged([proj / "docs" / "x.md", proj / "CLAUDE.md",
+                                self.env.root.parent / "elsewhere" / "CLAUDE.local.md"])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_claude_local_md_in_repository(self):
+        proj = self.env.project
+        subprocess.run(["git", "init", "-q", str(proj)], check=True)
+        (proj / ".gitignore").write_text("CLAUDE.local.md\npriv/\n", encoding="utf-8")
+        (proj / "CLAUDE.local.md").write_text("@priv/notes.md\n@docs/y.md\n", encoding="utf-8")
+        self.assert_judged([proj / "CLAUDE.local.md", proj / "priv" / "notes.md"])
+        (proj / ".gitignore").write_text("", encoding="utf-8")
+        self.assert_not_judged([proj / "CLAUDE.local.md", proj / "docs" / "y.md"])
+
+    def test_case_insensitive_file_system(self):
+        # На файловой системе без учёта регистра ~/.claude/claude.md — тот же CLAUDE.md. Linux различает регистр:
+        # такую систему подменяет ссылка .CLAUDE на .claude — каталог находится и по имени с другим регистром.
+        (self.config / "rules").mkdir()
+        paths = [self.config / "claude.md", self.config / "Rules" / "a.md",
+                 self.config / "projects" / "-home-u-proj" / "Memory" / "M.md"]
+        self.assert_not_judged(paths)
+        (self.home / ".CLAUDE").symlink_to(self.config)
+        self.assert_judged(paths)
+
     def test_deny_survives_log_failure(self):
         (self.env.data / "judge.log").mkdir()
         r = self.write_mem(PLANKA_STUB="deny")
@@ -776,6 +857,137 @@ class OverrideSymlinkTest(unittest.TestCase):
         self.assertTrue(self.is_memory(other / "x.md", self.proj, other))
 
 
+class ImportParseTest(unittest.TestCase):
+    """Разбор импортов @путь памяти (guard_memory._imports) и пределы обхода импортов."""
+
+    # Корпус: строки из примеров документации Claude Code о памяти (code.claude.com/docs/en/memory) → пути
+    # импортов от каталога /m. Лишний путь стоит лишнего вызова судьи, пропущенный — записи в память без него.
+    CORPUS = {
+        "See @README for project overview and @package.json for available npm commands for this project.":
+            {"/m/README", "/m/package.json"},
+        "- git workflow @docs/git-instructions.md": {"/m/docs/git-instructions.md"},
+        "- @~/.claude/my-project-instructions.md": {"/h/.claude/my-project-instructions.md"},
+        "- API conventions @Design\\ Docs/api-conventions.md": {"/m/Design Docs/api-conventions.md"},
+        "writing `@README` keeps the text literal": set(),
+        "@AGENTS.md": {"/m/AGENTS.md"},
+        # Ссылка с якорем, абсолютный путь и путь вверх; почта и «@» без пути — не импорт.
+        "@./a.md#part @/etc/x.md @../up.md": {"/m/a.md", "/etc/x.md", "/up.md"},
+        "mail me@host.md, @ alone, @/ root, @@x, @#tag": set(),
+        # Пунктуация и разметка у пути: путь и с хвостом, и без него.
+        "See @README.": {"/m/README.", "/m/README"},
+        "**@bold.md**": {"/m/bold.md**", "/m/bold.md"},
+        "```md\n@fenced.md\n```\n@after.md": {"/m/after.md"},
+        "~~~\n@open.md": set(),
+        "<!-- @hidden.md -->\n@shown.md": {"/m/shown.md"},
+    }
+
+    def test_corpus(self):
+        with mock.patch.dict(os.environ, {"HOME": "/h"}):
+            for text, expected in self.CORPUS.items():
+                with self.subTest(text):
+                    self.assertEqual(guard_memory._imports(text, "/m"), expected)
+
+    def test_strip_code_edges(self):
+        # Незакрытый комментарий и серия кавычек без пары той же длины — текст: импорты за ними разбираются.
+        cases = {
+            "<!-- open @a.md": "<!-- open @a.md",
+            "<!-- x --> @a.md <!-- y": "  @a.md <!-- y",
+            "<!--->@a.md-->": " ",
+            "``code ` inside`` @a.md": "  @a.md",
+            "` one `` two @a.md": "` one `` two @a.md",
+            "t ```` x `` y ` z ```` `a` ``": "t     ``",
+            # Комментарий снимается раньше кода в строке.
+            "`<!--` @a.md -->": "` ",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text):
+                self.assertEqual(guard_memory._strip_code(text), expected)
+
+    def test_strip_code_linear(self):
+        # Файл памяти — до MAX_IMPORT_FILE байт. Время разбора на вчетверо большем входе: незакрытые комментарии —
+        # около 4 раз (предел 8), серии кавычек разной длины без пары — около 2,5 раза, потому что серий вдвое
+        # больше (предел 6).
+        def runs(size):
+            text, length = "", 1
+            while len(text) < size:
+                text, length = text + "`" * length + "a", length + 1
+            return text
+
+        for make, size, ratio in ((lambda n: "<!--" * (n // 4), 4000, 8), (runs, 20000, 6)):
+            small, large = make(size), make(4 * size)
+            with self.subTest(small[:10]):
+                assert_linear(self, lambda: guard_memory._strip_code(small), lambda: guard_memory._strip_code(large),
+                              ratio)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.config = self.root / "cfg"
+        (self.config / "rules").mkdir(parents=True)
+        self.project = self.root / "proj"
+        self.project.mkdir()
+        patch = mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.config), "HOME": str(self.root)})
+        patch.start()
+        self.addCleanup(patch.stop)
+        common._messages.clear()
+        self.addCleanup(common._messages.clear)
+
+    def imported(self):
+        return guard_memory._imported_files(str(self.project))
+
+    def test_oversized_file_imports_not_followed(self):
+        # Файл больше предела Claude Code не читает: он сам — импорт, его импорты — нет.
+        (self.config / "CLAUDE.md").write_text("@big.md\n", encoding="utf-8")
+        (self.config / "big.md").write_text("@next.md\n" + "x" * 64, encoding="utf-8")
+        with mock.patch.object(guard_memory, "MAX_IMPORT_FILE", 32):
+            found = self.imported()
+        self.assertIn(str(self.config / "big.md"), found)
+        self.assertNotIn(str(self.config / "next.md"), found)
+
+    def test_file_limit_warns(self):
+        (self.config / "CLAUDE.md").write_text("@a.md\n", encoding="utf-8")
+        (self.config / "a.md").write_text("@b.md\n", encoding="utf-8")
+        (self.config / "b.md").write_text("@c.md\n", encoding="utf-8")
+        with mock.patch.object(guard_memory, "MAX_IMPORT_FILES", 2):
+            found = self.imported()
+        self.assertIn(str(self.config / "b.md"), found)
+        self.assertNotIn(str(self.config / "c.md"), found)
+        self.assertEqual(len(common._messages), 1)
+        self.assertIn("импорты памяти", common._messages[0])
+
+    def test_byte_limit_warns(self):
+        (self.config / "CLAUDE.md").write_text("@a.md\n", encoding="utf-8")
+        (self.config / "a.md").write_text("@b.md\n" + "x" * 20, encoding="utf-8")
+        (self.config / "b.md").write_text("@c.md\n", encoding="utf-8")
+        with mock.patch.object(guard_memory, "MAX_IMPORT_BYTES", 20):
+            found = self.imported()
+        self.assertIn(str(self.config / "a.md"), found)
+        self.assertNotIn(str(self.config / "b.md"), found)
+        self.assertEqual(len(common._messages), 1)
+        self.assertIn("импорты памяти", common._messages[0])
+
+    def test_cycles_and_special_files(self):
+        # Взаимный импорт и цикл ссылок rules/ не зацикливают обход; FIFO не читается (иначе хук ждал бы писателя).
+        (self.config / "CLAUDE.md").write_text("@a.md @fifo\n", encoding="utf-8")
+        (self.config / "a.md").write_text("@CLAUDE.md\n", encoding="utf-8")
+        (self.config / "rules" / "loop").symlink_to(self.config / "rules")
+        (self.config / "rules" / "r.md").write_text("@from-rule.md\n", encoding="utf-8")
+        os.mkfifo(self.config / "fifo")
+        found = self.imported()
+        for name in ("a.md", "fifo", "CLAUDE.md", "rules/from-rule.md"):
+            self.assertIn(str(self.config / name), found, name)
+        self.assertEqual(common._messages, [])
+
+    def test_case_insensitive_probe(self):
+        # Каталог находится и по имени с обращённым регистром — тот же файл: файловая система без учёта регистра.
+        # Linux различает регистр, такую систему подменяет ссылка.
+        (self.root / "Data").mkdir()
+        self.assertFalse(guard_memory._case_insensitive(str(self.root / "Data" / "new" / "x.md")))
+        (self.root / "dATA").symlink_to(self.root / "Data")
+        self.assertTrue(guard_memory._case_insensitive(str(self.root / "Data" / "new" / "x.md")))
+
+
 class ManagedDirTest(unittest.TestCase):
     def test_platform_paths(self):
         for platform, expected in (("linux", "/etc/claude-code"),
@@ -787,6 +999,8 @@ class ManagedDirTest(unittest.TestCase):
 class MemoryMcpNameTest(unittest.TestCase):
     def test_words(self):
         self.assertEqual(guard_memory._words("addMemories_now"), ["add", "memories", "now"])
+        self.assertEqual(guard_memory._words("saveLTMemory2x"), ["save", "lt", "memory", "2", "x"])
+        self.assertEqual(guard_memory._words("SAVEMemory"), ["save", "memory"])
         self.assertFalse(guard_memory.is_memory_mcp("mcp__memory__address_lookup"))
 
     def test_memory_word_is_whole_word(self):
@@ -822,6 +1036,11 @@ class MemoryMcpNameTest(unittest.TestCase):
         "mcp__redis_memorystore__set_key": False, "mcp__gcp__memorystore_create_instance": False,
         # Глагол перед словом памяти, которое определяет другое существительное: имя судится как запись.
         "mcp__x__set_memory_limit": True, "mcp__x__clear_memory_cache": True,
+        # Аббревиатура перед словом памяти и цифра после него — границы слов.
+        "mcp__x__saveLTMemory": True, "mcp__x__SAVEMemory": True, "mcp__x__storeMemory2": True,
+        "mcp__x__getLTMemory": False,
+        # Глагол через два слова до слова памяти — вне окна _writes_memory (add, to, ai, memory).
+        "mcp__x__addToAIMemory": False,
     }
 
     def test_corpus(self):
@@ -836,7 +1055,8 @@ class MemoryMcpNameTest(unittest.TestCase):
         matcher = next(h["matcher"] for h in hooks["hooks"]["PreToolUse"]
                        if any("guard_memory.py" in c["command"] for c in h["hooks"]))
         for tool in ("Write", "Edit", "MultiEdit", "NotebookEdit", "mcp__memory__create_entities",
-                     "mcp__x__save_MEMORY", "mcp__x__Memorise_fact", "mcp__x__remember", "mcp__x__REMEMBER_this"):
+                     "mcp__x__save_MEMORY", "mcp__x__Memorise_fact", "mcp__x__remember", "mcp__x__REMEMBER_this",
+                     "mcp__x__saveLTMemory", "mcp__x__addToAIMemory", "mcp__x__SAVEMemory", "mcp__x__storeMemory2"):
             self.assertRegex(tool, matcher)
         for tool in ("WriteFile", "Bash", "mcp__github__create_issue"):
             self.assertIsNone(re.search(matcher, tool), tool)

@@ -2,7 +2,6 @@
 import contextlib
 import dataclasses
 import datetime
-import fcntl
 import hashlib
 import json
 import os
@@ -14,7 +13,12 @@ import sys
 import tempfile
 import time
 
-from prompts import JUDGE_SCHEMA
+try:
+    import fcntl
+except ImportError:  # не POSIX: run_hook отвечает предупреждением и не вызывает хук
+    fcntl = None
+
+from prompts import JUDGE_SCHEMA, STEP_ERROR, STEP_OUTPUT, STEP_REJECTED, Step
 
 MAX_DENIES = 2
 JUDGE_TIMEOUT = 60
@@ -220,8 +224,10 @@ def _kill_group(proc):
 
 
 # Сторож судьи: лидер группы судьи, запускает claude потомком и раз в WATCHDOG_POLL с сверяет своего родителя
-# с PID хука; хук умер — SIGKILL всей группе, себе и потомкам claude тоже. Сторож умирает только с группой:
-# убитый отдельно, он оставляет группу таймауту судьи (_kill_group). Аргументы: PID хука, команда claude с путём.
+# с PID хука; хук умер — SIGKILL всей группе, себе и потомкам claude тоже. Claude завершился — то же: потомок,
+# отпустивший каналы судьи, умирает с группой. Код возврата claude не читается: ответ уже в каналах.
+# Сторож умирает только с группой: убитый отдельно, он оставляет группу таймауту судьи (_kill_group).
+# Аргументы: PID хука, команда claude с путём.
 WATCHDOG_POLL = 0.5
 _WATCHDOG = f"""
 import os, signal, subprocess, sys
@@ -234,9 +240,10 @@ while True:
     if os.getppid() != hook:
         os.killpg(0, signal.SIGKILL)
     try:
-        sys.exit(proc.wait(timeout={WATCHDOG_POLL}))
+        proc.wait(timeout={WATCHDOG_POLL})
     except subprocess.TimeoutExpired:
-        pass
+        continue
+    os.killpg(0, signal.SIGKILL)
 """
 
 
@@ -262,7 +269,8 @@ class Transcript:
     тексты ответов на вызовы AskUserQuestion после неё; message_before_author — последнее непустое сообщение
     ассистента до неё; earlier_turns — непустые прежние реплики основной ветки от старых к новым, каждая
     собрана как author_turn, ответы на AskUserQuestion дописаны к ней через перевод строки; turn_steps — шаги
-    той же реплики по порядку: тексты ответов и вызовы инструментов основной ветки с их выводом (_tool_step).
+    той же реплики по порядку (prompts.Step): тексты ответов и вызовы инструментов основной ветки с их выводом
+    (_tool_step).
     """
     model: str | None = None
     plan_file: pathlib.Path | None = None
@@ -292,17 +300,16 @@ def _result_text(content):
 
 
 def _tool_step(block):
-    """Шаг вызова инструмента: «⟦вызов <имя>⟧ <аргумент>» одной строкой — команда Bash (переводы строки — «⏎»),
-    путь файлового инструмента, иначе вход JSON; длиннее STEP_ARG символов — начало с числом опущенных."""
+    """Шаг вызова инструмента (Step): имя и аргумент одной строкой — команда Bash (переводы строки — «⏎»), путь
+    файлового инструмента, иначе вход JSON; длиннее STEP_ARG символов — начало с числом опущенных."""
     data = block.get("input") if isinstance(block.get("input"), dict) else {}
     arg = data.get("command") or data.get("file_path") or data.get("notebook_path")
     if not isinstance(arg, str):
         arg = dumps(data)
-    # Метки вывода начинаются с перевода строки: в строке вызова их нет.
     arg = arg.replace("\n", " ⏎ ")
     if len(arg) > STEP_ARG:
         arg = f"{arg[:STEP_ARG]} … опущено символов: {len(arg) - STEP_ARG}"
-    return f"⟦вызов {block.get('name')}⟧ {arg}"
+    return Step(call=str(block.get("name")), arg=arg)
 
 
 def _step_output(text):
@@ -428,16 +435,18 @@ def read_transcript(path):
                     out.author_turn = _join(out.author_turn, _rejection_feedback(entry))
                     for b in content if isinstance(content, list) else []:
                         if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") in calls:
-                            out.turn_steps[calls.pop(b["tool_use_id"])] += "\n⟦отклонено⟧"
+                            i = calls.pop(b["tool_use_id"])
+                            out.turn_steps[i] = dataclasses.replace(out.turn_steps[i], mark=STEP_REJECTED)
                 elif entry.get("type") == "user" and isinstance(content, list):
                     out.author_answers += [_result_text(b.get("content")) for b in content
                                            if isinstance(b, dict) and b.get("type") == "tool_result"
                                            and b.get("tool_use_id") in asked]
                     for b in content:
                         if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") in calls:
-                            mark = "⟦ошибка⟧" if b.get("is_error") else "⟦вывод⟧"
                             i = calls.pop(b["tool_use_id"])
-                            out.turn_steps[i] += f"\n{mark} {_step_output(_result_text(b.get('content')))}"
+                            out.turn_steps[i] = dataclasses.replace(
+                                out.turn_steps[i], mark=STEP_ERROR if b.get("is_error") else STEP_OUTPUT,
+                                output=_step_output(_result_text(b.get("content"))))
                 elif entry.get("type") == "assistant":
                     if isinstance(content, list):
                         asked.update(b.get("id") for b in content if isinstance(b, dict)
@@ -452,7 +461,7 @@ def read_transcript(path):
                     for b in content if isinstance(content, list) else [content]:
                         if isinstance(b, dict) and b.get("type") == "tool_use":
                             if "".join(pending).strip():
-                                out.turn_steps.append("".join(pending))
+                                out.turn_steps.append(Step(text="".join(pending)))
                             pending = []
                             if isinstance(b.get("id"), str):
                                 calls[b["id"]] = len(out.turn_steps)
@@ -460,7 +469,7 @@ def read_transcript(path):
                         else:
                             pending += _text_blocks(b if isinstance(b, str) else [b])
                     if "".join(pending).strip():
-                        out.turn_steps.append("".join(pending))
+                        out.turn_steps.append(Step(text="".join(pending)))
     except (OSError, ValueError):
         return Transcript()
     out.plan_file = pathlib.Path(input_path(plan)) if plan else None
@@ -573,12 +582,14 @@ def run_judge(system_prompt, user_prompt, model, *, timeout=JUDGE_TIMEOUT):
     so = result.get("structured_output")
     if not isinstance(so, dict) or "ok" not in so:
         return _skipped("в ответе судьи нет structured_output", repr(line[:200]))
-    reason = str(so.get("reason") or "")
+    ok, reason, violated = so["ok"], so.get("reason", ""), so.get("violated", [])
+    # Ответ, где ok не bool, reason не строка или violated не список строк, — пропуск проверки с предупреждением.
+    if (not isinstance(ok, bool) or not isinstance(reason, str)
+            or not isinstance(violated, list) or not all(isinstance(v, str) for v in violated)):
+        return _skipped("ответ судьи не по схеме", repr(line[:200]))
     if len(reason) > MAX_REASON:
         reason = reason[:MAX_REASON - 1] + "…"
-    violated = so.get("violated")
-    violated = [str(v) for v in violated] if isinstance(violated, list) else []
-    return Verdict(ok=bool(so["ok"]), violated=violated, reason=reason)
+    return Verdict(ok=ok, violated=violated, reason=reason)
 
 
 def dumps(obj):
@@ -752,15 +763,18 @@ def path_kind(relpath):
 
 def warn_once(session_id, key, msg):
     """Предупреждение один раз на сессию и ключ; факт записан в state/<session>.warned.json."""
-    state_dir = data_dir() / "state"
-    state_dir.mkdir(exist_ok=True)
-    path = state_dir / f"{safe_name(session_id)}.warned.json"
-    with state_lock(state_dir):
-        seen = read_json(path, list)
-        if key in seen:
-            return False
-        seen.append(key)
-        atomic_write_json(path, seen)
+    try:
+        state_dir = data_dir() / "state"
+        state_dir.mkdir(exist_ok=True)
+        path = state_dir / f"{safe_name(session_id)}.warned.json"
+        with state_lock(state_dir):
+            seen = read_json(path, list)
+            if key in seen:
+                return False
+            seen.append(key)
+            atomic_write_json(path, seen)
+    except OSError:
+        pass  # факт не записан: предупреждение покажется снова, хук не падает
     warn(msg)
     return True
 
@@ -820,7 +834,10 @@ def run_hook(main):
     из ответа и systemMessage или пусто; stderr не пишется."""
     _reset()
     try:
-        main()
+        if fcntl is None:
+            warn("хуки работают только на POSIX (Linux, macOS, WSL): блокировки состояния нужен fcntl")
+        else:
+            main()
     except Exception as e:
         warn(f"внутренняя ошибка: {e!r}")
     out = dict(_output or {})

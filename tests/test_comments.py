@@ -22,6 +22,7 @@ FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures" / "comments"
 CORPUS = {
     "cpython-makefile/Makefile": [1, 8, 9, 29, 32, 34, 36, 40],
     "create-vite-react/App.jsx": [1],
+    "create-vite-vue/HelloWorld.vue": [1],
     "esp-idf-ci/idf_ci.toml": [1, 10, 26],
     "esp-idf-gitlab/pre_check.yml": [1, 3, 4, 10, 11, 22, 34, 44, 54],
     "ffmpeg-doc/libswscale.html": [1, 4],
@@ -54,6 +55,7 @@ CORPUS = {
     "python-shlex/shlex.py": [1, 2, *range(4, 10), 20, 59, 61, 63],
     "react-virtual/index.tsx": [1, *range(9, 14), *range(22, 44), *range(45, 55)],
     "ruby-rjit/insn_compiler.rb": [1, 4, 7, 21, 48, 52, 53],
+    "sveltekit-sverdle/page.svelte": [1, 79],
     "rubygems-specification/specification.rb": [1, 4, 6, 8, 12, *range(31, 35)],
     "ts-dedent/index.ts": [1, 8, 14, 25, 32, 35, 39, 43],
 }
@@ -89,36 +91,36 @@ class CorpusTest(unittest.TestCase):
 class CommentLinesTest(unittest.TestCase):
     def test_c_family(self):
         src = "x := 1 // trailing\n// line one\n/* block\n   two */\ns := \"// not\"\n"
-        self.assertEqual(comments.comment_lines(src, "go"),
+        self.assertEqual(helpers.comment_lines(src, "go"),
                          ["// trailing", "// line one", "/* block", "two */"])
 
     def test_hash_and_docstring(self):
         src = "#!/usr/bin/env python3\n# note\ndef f():\n    \"\"\"Doc line.\"\"\"\n    s = '#'\n    return 1  # tail\n"
-        self.assertEqual(comments.comment_lines(src, "py"),
+        self.assertEqual(helpers.comment_lines(src, "py"),
                          ["# note", '"""Doc line."""', "# tail"])
 
     def test_shell_hash_expansions_are_code(self):
         src = "echo $#\necho ${#a[@]}\necho $# # c\n"
         for ext in ("sh", "bash", "zsh"):
-            self.assertEqual(comments.comment_lines(src, ext), ["# c"])
+            self.assertEqual(helpers.comment_lines(src, ext), ["# c"])
 
     def test_shell_hash_inside_word_is_code(self):
-        self.assertEqual(comments.comment_lines("x=${var#prefix}\ny=a#b # c\n", "sh"), ["# c"])
+        self.assertEqual(helpers.comment_lines("x=${var#prefix}\ny=a#b # c\n", "sh"), ["# c"])
 
     def test_triple_quoted_string_is_not_docstring(self):
         src = 'q = """SELECT"""\nsql = """\n# not a comment\n"""\n# real\ndef f():\n    r"""Doc."""\n'
-        self.assertEqual(comments.comment_lines(src, "py"), ["# real", 'r"""Doc."""'])
+        self.assertEqual(helpers.comment_lines(src, "py"), ["# real", 'r"""Doc."""'])
 
     def test_triple_quote_inside_comment(self):
         src = 'x = 1  # see the """ quoting\ny = 2\n# real comment\n'
-        self.assertEqual(comments.comment_lines(src, "py"), ['# see the """ quoting', "# real comment"])
+        self.assertEqual(helpers.comment_lines(src, "py"), ['# see the """ quoting', "# real comment"])
 
     def test_backticks_and_raw_strings_are_strings(self):
-        self.assertEqual(comments.comment_lines("const u = `https://e.com/x`; // c\n", "ts"), ["// c"])
-        self.assertEqual(comments.comment_lines('let s = r#"a " // not"#; // yes\n', "rs"), ["// yes"])
+        self.assertEqual(helpers.comment_lines("const u = `https://e.com/x`; // c\n", "ts"), ["// c"])
+        self.assertEqual(helpers.comment_lines('let s = r#"a " // not"#; // yes\n', "rs"), ["// yes"])
 
     def test_yaml_hash_inside_word_is_value(self):
-        self.assertEqual(comments.comment_lines("url: http://a/b#frag\nk: 1 # c\n", "yaml"), ["# c"])
+        self.assertEqual(helpers.comment_lines("url: http://a/b#frag\nk: 1 # c\n", "yaml"), ["# c"])
 
     def test_make_recipe_and_dockerfile_hash_inside_word(self):
         # Строка рецепта Make уходит в shell; в Dockerfile «#» внутри слова — значение. Формы — Makefile ядра
@@ -127,9 +129,9 @@ class CommentLinesTest(unittest.TestCase):
                "\t((c) > 255 ? 255 : (c)))';  \\\n\techo \\#define LINUX_VERSION_MAJOR $(VERSION)\nendef\n"
                "x := 1 # c1\nall:\n\t@echo hi # c2\n")
         for name in ("Makefile", "GNUmakefile", "rules.mk"):
-            self.assertEqual(comments.comment_lines(src, comments._ext(name)), ["# c1", "# c2"], name)
+            self.assertEqual(helpers.comment_lines(src, comments._ext(name)), ["# c1", "# c2"], name)
         src = "ARG DELVE_SUPPORTED=${TARGETPLATFORM#linux/amd64}\nRUN make # c1\n# c2\n"
-        self.assertEqual(comments.comment_lines(src, comments._ext("Dockerfile")), ["# c1", "# c2"])
+        self.assertEqual(helpers.comment_lines(src, comments._ext("Dockerfile")), ["# c1", "# c2"])
 
     def test_make_recipe_prefixes_and_hash_outside_recipe(self):
         # Make снимает со строки рецепта префиксы «@», «-», «+» и отдаёт shell «# текст»; вне рецепта «#» — комментарий
@@ -143,51 +145,74 @@ class CommentLinesTest(unittest.TestCase):
 
     def test_shell_heredoc_body_is_data(self):
         src = "cat <<EOF > s.md\n# Heading\nEOF\n# real\n"
-        self.assertEqual(comments.comment_lines(src, "sh"), ["# real"])
+        self.assertEqual(helpers.comment_lines(src, "sh"), ["# real"])
 
     def test_block_comments_lua_haskell(self):
-        self.assertEqual(comments.comment_lines("--[[ block\nline two\n]]\nx = 1 -- tail\n", "lua"),
+        self.assertEqual(helpers.comment_lines("--[[ block\nline two\n]]\nx = 1 -- tail\n", "lua"),
                          ["--[[ block", "line two", "]]", "-- tail"])
-        self.assertEqual(comments.comment_lines("{- block\nline -}\nx = 1 -- tail\n", "hs"),
+        self.assertEqual(helpers.comment_lines("{- block\nline -}\nx = 1 -- tail\n", "hs"),
                          ["{- block", "line -}", "-- tail"])
 
     def test_vue_script_comments(self):
         src = "<template>\n<!-- html -->\n</template>\n<script>\n// js comment\n</script>\n"
-        self.assertEqual(comments.comment_lines(src, "vue"), ["<!-- html -->", "// js comment"])
+        self.assertEqual(helpers.comment_lines(src, "vue"), ["<!-- html -->", "// js comment"])
+
+    def test_vue_and_svelte_blocks(self):
+        # Однофайловый компонент: вне «<script>» и «<style>» — разметка, «//» в тексте — не комментарий; «<script>» —
+        # JS или TS по lang, «<style>» — CSS или препроцессор по lang; «</script» закрывает блок и внутри строки.
+        src = ("<template>\n  <a href=x>see http://example.com</a> /* not */\n  <!-- c1 -->\n</template>\n"
+               "<script setup lang=\"ts\" generic=\"T extends Record<string, unknown>\">\n"
+               "const re = /\\/\\//; // c2\nlet t: T // c3\n</script>\n"
+               "<style lang=\"scss\">\n.a { b: url(http://x) } // c4\n</style>\n<style>\n.b {} // not\n</style>\n")
+        for ext in ("vue", "svelte"):
+            self.assertEqual(comments._comments(src, ext),
+                             [(3, "<!-- c1 -->"), (6, "// c2"), (7, "// c3"), (10, "// c4")], ext)
+        self.assertEqual(helpers.comment_lines("<p>a // b</p>\n<script>let s = '</script>'; // c\n", "svelte"), [])
+        self.assertEqual(helpers.comment_lines("<!-- <script> -->\n<p>a // b</p>\n", "vue"), ["<!-- <script> -->"])
+        self.assertEqual(helpers.comment_lines("<SCRIPT>// a\n</Script>// b\n<script\n", "vue"), ["// a"])
+
+    def test_vue_and_svelte_markup_code(self):
+        # Код разметки — «{…}» Svelte (и в теге) и «{{…}}» Vue; «{/if}», «{:else}» Svelte, одиночная «{» Vue и пустой
+        # элемент HTML без закрытия («<br>») разбор кода не сбивают.
+        src = ("<br>\n{#if a}<p on:click={() => { // c1\n}}>x // y {/if}</p>\n{:else}\n<p>{a /* c2 */} // z</p>\n"
+               "{/if} // w\n")
+        self.assertEqual(comments._comments(src, "svelte"), [(2, "// c1"), (5, "/* c2 */} // z</p>")])
+        src = "<p>{ a // x</p>\n<p>{{ a /* c1 */ }} // y</p>\n<p :a=\"{b}\">{{ '}}' }} http://e.com</p>\n"
+        self.assertEqual(comments._comments(src, "vue"), [(2, "/* c1 */ }} // y</p>")])
 
     def test_sql_and_html(self):
-        self.assertEqual(comments.comment_lines("select 1 -- c\n", "sql"), ["-- c"])
-        self.assertEqual(comments.comment_lines("<a>\n<!-- hidden -->\n", "html"), ["<!-- hidden -->"])
+        self.assertEqual(helpers.comment_lines("select 1 -- c\n", "sql"), ["-- c"])
+        self.assertEqual(helpers.comment_lines("<a>\n<!-- hidden -->\n", "html"), ["<!-- hidden -->"])
 
     def test_slash_families(self):
         for ext in ("php", "groovy", "gradle", "proto", "sol", "zig"):
-            self.assertEqual(comments.comment_lines("x = 1 // c\n", ext), ["// c"], ext)
+            self.assertEqual(helpers.comment_lines("x = 1 // c\n", ext), ["// c"], ext)
 
     def test_language_variants(self):
         for ext in ("mjs", "cjs", "mts", "cts", "cxx", "hh", "hxx"):
-            self.assertEqual(comments.comment_lines("x = 1 // c\n", ext), ["// c"], ext)
-        self.assertEqual(comments.comment_lines('# c\ndef f():\n    """Doc."""\n', "pyi"), ["# c", '"""Doc."""'])
-        self.assertEqual(comments.comment_lines("set(X 1) # c\n", "cmake"), ["# c"])
+            self.assertEqual(helpers.comment_lines("x = 1 // c\n", ext), ["// c"], ext)
+        self.assertEqual(helpers.comment_lines('# c\ndef f():\n    """Doc."""\n', "pyi"), ["# c", '"""Doc."""'])
+        self.assertEqual(helpers.comment_lines("set(X 1) # c\n", "cmake"), ["# c"])
 
     def test_hash_families(self):
         for ext in ("tf", "nix", "r", "jl", "ex", "exs"):
-            self.assertEqual(comments.comment_lines("x = 1 # c\n", ext), ["# c"], ext)
+            self.assertEqual(helpers.comment_lines("x = 1 # c\n", ext), ["# c"], ext)
 
     def test_unknown_ext_is_empty(self):
-        self.assertEqual(comments.comment_lines("// x\n# y\n", "bin"), [])
-        self.assertEqual(comments.comment_lines("", "go"), [])
+        self.assertEqual(helpers.comment_lines("// x\n# y\n", "bin"), [])
+        self.assertEqual(helpers.comment_lines("", "go"), [])
 
     def test_code_after_closed_string_is_scanned(self):
-        self.assertEqual(comments.comment_lines('s = """a\n# not\n"""  # yes\n', "py"), ["# yes"])
-        self.assertEqual(comments.comment_lines('x = 1 /* a */ y = 2 // b\n', "c"), ["/* a */ y = 2 // b"])
+        self.assertEqual(helpers.comment_lines('s = """a\n# not\n"""  # yes\n', "py"), ["# yes"])
+        self.assertEqual(helpers.comment_lines('x = 1 /* a */ y = 2 // b\n', "c"), ["/* a */ y = 2 // b"])
 
     def test_second_block_after_closed_block(self):
-        self.assertEqual(comments.comment_lines("/* a */ /* b\nmid\n*/\nint x;\n", "c"),
+        self.assertEqual(helpers.comment_lines("/* a */ /* b\nmid\n*/\nint x;\n", "c"),
                          ["/* a */ /* b", "mid", "*/"])
 
     def test_docstring_line_reported_once(self):
         src = 'def f():\n    """Doc."""  # tail\n    """Open # x\n    more\n    """\n'
-        self.assertEqual(comments.comment_lines(src, "py"), ['"""Doc."""  # tail', '"""Open # x', "more", '"""'])
+        self.assertEqual(helpers.comment_lines(src, "py"), ['"""Doc."""  # tail', '"""Open # x', "more", '"""'])
 
     def test_multiline_strings_are_data(self):
         cases = {
@@ -204,54 +229,54 @@ class CommentLinesTest(unittest.TestCase):
             "cs": ('var s = @"a ""q""\n// not\n"; // yes\n', "// yes"),
         }
         for ext, (src, expected) in cases.items():
-            self.assertEqual(comments.comment_lines(src, ext), [expected], ext)
+            self.assertEqual(helpers.comment_lines(src, ext), [expected], ext)
 
     def test_rust_raw_string_spans_lines(self):
-        self.assertEqual(comments.comment_lines('let s = r#"a\n// not "\n"#; // yes\n', "rs"), ["// yes"])
+        self.assertEqual(helpers.comment_lines('let s = r#"a\n// not "\n"#; // yes\n', "rs"), ["// yes"])
 
     def test_apostrophe_is_not_a_string(self):
-        self.assertEqual(comments.comment_lines("fn f<'a>(x: &'a str) // it's a comment\n", "rs"),
+        self.assertEqual(helpers.comment_lines("fn f<'a>(x: &'a str) // it's a comment\n", "rs"),
                          ["// it's a comment"])
-        self.assertEqual(comments.comment_lines("let c = '/'; // c\n", "rs"), ["// c"])
-        self.assertEqual(comments.comment_lines("key: don't # it's here\nq: 'it''s # not'\n", "yaml"),
+        self.assertEqual(helpers.comment_lines("let c = '/'; // c\n", "rs"), ["// c"])
+        self.assertEqual(helpers.comment_lines("key: don't # it's here\nq: 'it''s # not'\n", "yaml"),
                          ["# it's here"])
-        self.assertEqual(comments.comment_lines("<p>Don't</p><!-- it's a note -->\n", "html"),
+        self.assertEqual(helpers.comment_lines("<p>Don't</p><!-- it's a note -->\n", "html"),
                          ["<!-- it's a note -->"])
-        self.assertEqual(comments.comment_lines("<p>Don't</p><!-- it's a note -->\n", "vue"),
+        self.assertEqual(helpers.comment_lines("<p>Don't</p><!-- it's a note -->\n", "vue"),
                          ["<!-- it's a note -->"])
-        self.assertEqual(comments.comment_lines("f x' = x' -- it's\n", "hs"), ["-- it's"])
+        self.assertEqual(helpers.comment_lines("f x' = x' -- it's\n", "hs"), ["-- it's"])
 
     def test_more_syntaxes(self):
-        self.assertEqual(comments.comment_lines("; top\nk = v ; tail\nurl = a;b\n# h\n", "ini"),
+        self.assertEqual(helpers.comment_lines("; top\nk = v ; tail\nurl = a;b\n# h\n", "ini"),
                          ["; top", "; tail", "# h"])
-        self.assertEqual(comments.comment_lines("; c\n", "cfg"), ["; c"])
+        self.assertEqual(helpers.comment_lines("; c\n", "cfg"), ["; c"])
         for ext in ("sql", "tf", "nix"):
-            self.assertEqual(comments.comment_lines("/* a\nb */\nx\n", ext), ["/* a", "b */"], ext)
-        self.assertEqual(comments.comment_lines("x = 1 // c\n", "tf"), ["// c"])
-        self.assertEqual(comments.comment_lines("<?php\n#[Attr]\n$x = 1; # c\n", "php"), ["# c"])
-        self.assertEqual(comments.comment_lines("<# a\nb #>\n$x = 1 # c\n", "ps1"), ["<# a", "b #>", "# c"])
-        self.assertEqual(comments.comment_lines("#= a\nb =#\nx = 1 # c\n", "jl"), ["#= a", "b =#", "# c"])
-        self.assertEqual(comments.comment_lines("x = <<EOT\n# not\n  EOT\n# c\n", "tf"), ["# c"])
-        self.assertEqual(comments.comment_lines('const s = \\\\ // not\n// c\n', "zig"), ["// c"])
+            self.assertEqual(helpers.comment_lines("/* a\nb */\nx\n", ext), ["/* a", "b */"], ext)
+        self.assertEqual(helpers.comment_lines("x = 1 // c\n", "tf"), ["// c"])
+        self.assertEqual(helpers.comment_lines("<?php\n#[Attr]\n$x = 1; # c\n", "php"), ["# c"])
+        self.assertEqual(helpers.comment_lines("<# a\nb #>\n$x = 1 # c\n", "ps1"), ["<# a", "b #>", "# c"])
+        self.assertEqual(helpers.comment_lines("#= a\nb =#\nx = 1 # c\n", "jl"), ["#= a", "b =#", "# c"])
+        self.assertEqual(helpers.comment_lines("x = <<EOT\n# not\n  EOT\n# c\n", "tf"), ["# c"])
+        self.assertEqual(helpers.comment_lines('const s = \\\\ // not\n// c\n', "zig"), ["// c"])
 
     def test_styles(self):
         src = 'a { b: url(http://x/y); c: "/* no */"; } /* c */\n'
-        self.assertEqual(comments.comment_lines(src, "css"), ["/* c */"])
-        self.assertEqual(comments.comment_lines("a { b: 1 } // not css\n", "css"), [])
+        self.assertEqual(helpers.comment_lines(src, "css"), ["/* c */"])
+        self.assertEqual(helpers.comment_lines("a { b: 1 } // not css\n", "css"), [])
         src = '// one\n$u: url(http://y); // two\n$s: "// no";\n/* b\n   c */\n'
         for ext in ("scss", "sass", "less"):
-            self.assertEqual(comments.comment_lines(src, ext), ["// one", "// two", "/* b", "c */"], ext)
+            self.assertEqual(helpers.comment_lines(src, ext), ["// one", "// two", "/* b", "c */"], ext)
 
     def test_json_manifests(self):
         src = '{\n  "a": "// no /* no */" // yes\n  /* b */\n}\n'
         for name in ("package.json", "composer.json"):
-            self.assertEqual(comments.comment_lines(src, name), [], name)
+            self.assertEqual(helpers.comment_lines(src, name), [], name)
         for name in ("tsconfig.json", "jsconfig.json", "deno.json"):
-            self.assertEqual(comments.comment_lines(src, name), ["// yes", "/* b */"], name)
-        self.assertEqual(comments.comment_lines('module x // m\nreplace a => "// no"\n', "go.mod"), ["// m"])
+            self.assertEqual(helpers.comment_lines(src, name), ["// yes", "/* b */"], name)
+        self.assertEqual(helpers.comment_lines('module x // m\nreplace a => "// no"\n', "go.mod"), ["// m"])
 
     def test_shebang_only_on_first_line(self):
-        self.assertEqual(comments.comment_lines("#!/bin/sh\n#!not shebang\n", "sh"), ["#!not shebang"])
+        self.assertEqual(helpers.comment_lines("#!/bin/sh\n#!not shebang\n", "sh"), ["#!not shebang"])
 
     def test_line_numbers(self):
         self.assertEqual(comments._comments("x = 1\n# a\n\n/* no */\n'\"\"\"'\n# b\n", "py"),
@@ -262,7 +287,7 @@ class LanguageSyntaxTest(unittest.TestCase):
     """Каждый язык: маркер комментария внутри литерала — код, настоящий комментарий, блок."""
 
     def check(self, ext, src, expected):
-        self.assertEqual(comments.comment_lines(src, ext), expected, ext)
+        self.assertEqual(helpers.comment_lines(src, ext), expected, ext)
 
     def test_erlang(self):
         self.check("erl", 'io:format("100%~n"), A = \'50%\', % c\n%% doc\n', ["% c", "%% doc"])
@@ -390,7 +415,7 @@ class NestedAndDocTest(unittest.TestCase):
                  "hs": "{- a {- b -}\nstill -}\nx = 1\n",
                  "jl": "#= a #= b =#\nstill =#\nx = 1\n"}
         for ext, src in cases.items():
-            lines = comments.comment_lines(src, ext)
+            lines = helpers.comment_lines(src, ext)
             self.assertEqual(len(lines), 2, ext)
             self.assertTrue(lines[1].startswith("still"), ext)
 
@@ -399,7 +424,7 @@ class NestedAndDocTest(unittest.TestCase):
         self.check_lines("groovy", "/* a /* b */\nint x // c\n", ["/* a /* b */", "// c"])
 
     def check_lines(self, ext, src, expected):
-        self.assertEqual(comments.comment_lines(src, ext), expected, ext)
+        self.assertEqual(helpers.comment_lines(src, ext), expected, ext)
 
     def test_nested_close_and_open_on_one_line(self):
         line = "/* a */ x(); /* b /* c */ d */ y(); // e"
@@ -452,58 +477,66 @@ class ParserEdgeTest(unittest.TestCase):
     """Края разборщика: каждый тест держит одну ветвь _token, _close или _comments."""
 
     def test_backslash_escaped_quote_keeps_string_open(self):
-        self.assertEqual(comments.comment_lines('const a = "a \\" // not"; // yes\n', "js"), ["// yes"])
-        self.assertEqual(comments.comment_lines("s = 'it\\'s # x' # c\n", "py"), ["# c"])
+        self.assertEqual(helpers.comment_lines('const a = "a \\" // not"; // yes\n', "js"), ["// yes"])
+        self.assertEqual(helpers.comment_lines("s = 'it\\'s # x' # c\n", "py"), ["# c"])
 
     def test_char_literal_quote_does_not_open_string(self):
         cases = {"c": "char q = '\"'; s = \"//x\"; // c\n",
                  "go": "q := '\"'; s := \"//x\" // c\n",
                  "rs": "let q = '\"'; let s = \"//x\"; // c\n"}
         for ext, src in cases.items():
-            self.assertEqual(comments.comment_lines(src, ext), ["// c"], ext)
+            self.assertEqual(helpers.comment_lines(src, ext), ["// c"], ext)
 
     def test_csharp_verbatim_interpolated_string(self):
-        self.assertEqual(comments.comment_lines('var s = @$"C:\\{d}\\"; var t = "// x"; // c\n', "cs"), ["// c"])
+        self.assertEqual(helpers.comment_lines('var s = @$"C:\\{d}\\"; var t = "// x"; // c\n', "cs"), ["// c"])
 
     def test_cpp_prefixed_raw_string(self):
-        self.assertEqual(comments.comment_lines('auto s = u8R"(a " // not)"; // yes\n', "cpp"), ["// yes"])
+        self.assertEqual(helpers.comment_lines('auto s = u8R"(a " // not)"; // yes\n', "cpp"), ["// yes"])
         # Закрытие — с разделителем: «)"» без него строку не закрывает.
         self.assertEqual(comments._comments('R"x(\n)" // not\n)x"; // yes', "cpp"), [(3, "// yes")])
 
     def test_rust_byte_raw_string(self):
-        self.assertEqual(comments.comment_lines('let s = br"a\\"; // c\nlet t = 1;\n', "rs"), ["// c"])
+        self.assertEqual(helpers.comment_lines('let s = br"a\\"; // c\nlet t = 1;\n', "rs"), ["// c"])
 
     def test_hash_after_dollar_or_brace_is_code(self):
-        self.assertEqual(comments.comment_lines("my $n = $#a; # c\n", "pl"), ["# c"])
-        self.assertEqual(comments.comment_lines("t:\n\techo $${#PATH} # c\n", "makefile"), ["# c"])
+        self.assertEqual(helpers.comment_lines("my $n = $#a; # c\n", "pl"), ["# c"])
+        self.assertEqual(helpers.comment_lines("t:\n\techo $${#PATH} # c\n", "makefile"), ["# c"])
 
     def test_escaped_hash_is_code(self):
-        self.assertEqual(comments.comment_lines("x := a\\#b # c\n", "makefile"), ["# c"])
-        self.assertEqual(comments.comment_lines("set(X a\\#b) # c\n", "cmake"), ["# c"])
+        self.assertEqual(helpers.comment_lines("x := a\\#b # c\n", "makefile"), ["# c"])
+        self.assertEqual(helpers.comment_lines("set(X a\\#b) # c\n", "cmake"), ["# c"])
 
     def test_crlf_heredoc_terminator(self):
-        self.assertEqual(comments.comment_lines("cat <<EOF > s.md\r\n# body\r\nEOF\r\n# real\r\n", "sh"), ["# real"])
+        self.assertEqual(helpers.comment_lines("cat <<EOF > s.md\r\n# body\r\nEOF\r\n# real\r\n", "sh"), ["# real"])
 
     def test_dash_heredoc_with_tab_indented_terminator(self):
-        self.assertEqual(comments.comment_lines("cat <<-EOF\n\t# body\n\tEOF\n# real\n", "sh"), ["# real"])
+        self.assertEqual(helpers.comment_lines("cat <<-EOF\n\t# body\n\tEOF\n# real\n", "sh"), ["# real"])
+
+    def test_shebang_in_hash_comment_languages(self):
+        # Shebang первой строки — не комментарий и в php, ps1, nim, nix: интерпретатор пропускает строку.
+        for ext, src in (("php", "#!/usr/bin/env php\n<?php\n$x = 1; # c\n"),
+                         ("ps1", "#!/usr/bin/env pwsh\n$x = 1 # c\n"),
+                         ("nim", "#!/usr/bin/env -S nim r\nlet x = 1 # c\n"),
+                         ("nix", "#!/usr/bin/env nix-instantiate --eval\n1 # c\n")):
+            self.assertEqual(helpers.comment_lines(src, ext), ["# c"], ext)
 
     def test_bom_before_shebang(self):
-        self.assertEqual(comments.comment_lines("\ufeff#!/usr/bin/env python3\n# c\n", "py"), ["# c"])
-        self.assertEqual(comments.comment_lines("\ufeff# c\n", "py"), ["# c"])
+        self.assertEqual(helpers.comment_lines("\ufeff#!/usr/bin/env python3\n# c\n", "py"), ["# c"])
+        self.assertEqual(helpers.comment_lines("\ufeff# c\n", "py"), ["# c"])
 
     def test_ruby_heredoc_body_is_data(self):
         src = "sql = <<~SQL\n  # not\n  SQL\nq = <<-'EOS'.strip # tail\n# not\n    EOS\nt = <<EOF\n# not\nEOF\n# real\n"
-        self.assertEqual(comments.comment_lines(src, "rb"), ["# tail", "# real"])
-        self.assertEqual(comments.comment_lines("execute <<~SQL\n  # not\nSQL\n# real\n", "rakefile"), ["# real"])
-        self.assertEqual(comments.comment_lines('print <<"EOT";\n# not\nEOT\n# real\n', "pl"), ["# real"])
+        self.assertEqual(helpers.comment_lines(src, "rb"), ["# tail", "# real"])
+        self.assertEqual(helpers.comment_lines("execute <<~SQL\n  # not\nSQL\n# real\n", "rakefile"), ["# real"])
+        self.assertEqual(helpers.comment_lines('print <<"EOT";\n# not\nEOT\n# real\n', "pl"), ["# real"])
 
     def test_shift_is_not_ruby_heredoc(self):
         src = "x = 1<<BITS # a\nclass << self # b\n  arr << ITEM # c\nend\n"
-        self.assertEqual(comments.comment_lines(src, "rb"), ["# a", "# b", "# c"])
+        self.assertEqual(helpers.comment_lines(src, "rb"), ["# a", "# b", "# c"])
 
     def test_shift_after_closer_is_not_heredoc(self):
         for src in ("a[0]<<X # a\n# b\nX\n", "h{1}<<X # a\n# b\nX\n", "f(1)<<X # a\n# b\nX\n"):
-            self.assertEqual(comments.comment_lines(src, "rb"), ["# a", "# b"], src)
+            self.assertEqual(helpers.comment_lines(src, "rb"), ["# a", "# b"], src)
 
     def test_shift_after_space_is_not_heredoc(self):
         # Переменная Perl перед пробелом и строчный идентификатор после слова Ruby — сдвиг и добавление.
@@ -525,15 +558,15 @@ class ParserEdgeTest(unittest.TestCase):
         for src in ("print $fh <<EOF;\n# not\nEOF\n# real\n", "printf $out <<\"EOT\", 1;\n# not\nEOT\n# real\n",
                     "say {$fh} <<~EOT;\n  # not\n  EOT\n# real\n", "print STDERR <<eof;\n# not\neof\n# real\n",
                     "if ($x) { print  $log  <<'END' }\n# not\nEND\n# real\n"):
-            self.assertEqual(comments.comment_lines(src, "pl"), ["# real"], src)
+            self.assertEqual(helpers.comment_lines(src, "pl"), ["# real"], src)
 
     def test_perl_long_block_filehandle(self):
         # Блок-дескриптор узнаётся любой длины и вложенности; скобки перед ним не мешают.
         name = "a" * 300
         for src in ("print {$self->{" + name + "}} <<EOF;\n# not\nEOF\n# c\n",
                     "f({}); print {$h{x}{" + name + "}} <<EOF;\n# not\nEOF\n# c\n"):
-            self.assertEqual(comments.comment_lines(src, "pl"), ["# c"], src[:40])
-        self.assertEqual(comments.comment_lines("f({" + name + "}} <<EOF); # c1\n# c2\nEOF\n", "pl"), ["# c1", "# c2"])
+            self.assertEqual(helpers.comment_lines(src, "pl"), ["# c"], src[:40])
+        self.assertEqual(helpers.comment_lines("f({" + name + "}} <<EOF); # c1\n# c2\nEOF\n", "pl"), ["# c1", "# c2"])
 
     def test_perl_heredoc_real_corpus_forms(self):
         # Идентификатор с ведущим «_», «::» в имени дескриптора, «<<» вплотную после функции вывода.
@@ -542,7 +575,7 @@ class ParserEdgeTest(unittest.TestCase):
                     "warn<<EOF;\n# not\nEOF\n# real\n", "print<<EOT;\n# not\nEOT\n# real\n",
                     "printf<<EOT, 1;\n# not\nEOT\n# real\n", "say<<EOT;\n# not\nEOT\n# real\n",
                     "print CSS<<EOF;\n# not\nEOF\n# real\n", "print STDERR<<EOF;\n# not\nEOF\n# real\n"):
-            self.assertEqual(comments.comment_lines(src, "pl"), ["# real"], src)
+            self.assertEqual(helpers.comment_lines(src, "pl"), ["# real"], src)
 
     def test_perl_tight_shift_is_not_heredoc(self):
         # Вплотную после прочего слова, переменной или константы вне print — сдвиг; в Ruby print<<EOT — сдвиг.
@@ -550,10 +583,10 @@ class ParserEdgeTest(unittest.TestCase):
                          ("foo CSS<<EOF; # c1\n# c2\nEOF\n", "pl"), ("$h->print<<EOF; # c1\n# c2\nEOF\n", "pl"),
                          ("reprint<<EOF; # c1\n# c2\nEOF\n", "pl"), ("print<<EOF # c1\n# c2\nEOF\n", "rb"),
                          ("print CSS<<EOF # c1\n# c2\nEOF\n", "rb")):
-            self.assertEqual(comments.comment_lines(src, ext), ["# c1", "# c2"], src)
+            self.assertEqual(helpers.comment_lines(src, ext), ["# c1", "# c2"], src)
         # Ruby: за методом через пробел — heredoc и со строчным идентификатором; Perl: за print — тоже.
-        self.assertEqual(comments.comment_lines("puts <<_eof # c1\n# c2\n_eof\n", "rb"), ["# c1"])
-        self.assertEqual(comments.comment_lines("print <<_ # c1\n# c2\n_\n", "pl"), ["# c1"])
+        self.assertEqual(helpers.comment_lines("puts <<_eof # c1\n# c2\n_eof\n", "rb"), ["# c1"])
+        self.assertEqual(helpers.comment_lines("print <<_ # c1\n# c2\n_\n", "pl"), ["# c1"])
 
     def test_ruby_heredoc_by_word_before(self):
         # Лексер Ruby: «<<» вплотную за словом — сдвиг, кроме ключевых слов, за которыми начинается выражение
@@ -568,7 +601,7 @@ class ParserEdgeTest(unittest.TestCase):
                  ("1 <<eof # c1\n# c2\neof\n", ["# c1", "# c2"]),
                  ("x.return<<EOS # c1\n# c2\nEOS\n", ["# c1", "# c2"]))
         for src, expected in cases:
-            self.assertEqual(comments.comment_lines(src, "rb"), expected, src)
+            self.assertEqual(helpers.comment_lines(src, "rb"), expected, src)
 
     def test_perl_builtins_decide_slash_and_heredoc(self):
         # За встроенной функцией Perl, ждущей аргумент, «/» — регулярка и через пробел (и многострочная), «<<» —
@@ -582,7 +615,7 @@ class ParserEdgeTest(unittest.TestCase):
                  ("my $n = __LINE__ <<EOF; # c1\n# c2\nEOF\n", ["# c1", "# c2"]),
                  ("$o->length / #/; # c\n", ["#/; # c"]))
         for src, expected in cases:
-            self.assertEqual(comments.comment_lines(src, "pl"), expected, src)
+            self.assertEqual(helpers.comment_lines(src, "pl"), expected, src)
 
     def test_perl_hash_element_before_shift(self):
         # «}» закрывает элемент хеша, а не «{$дескриптор}» после print.
@@ -594,21 +627,21 @@ class ParserEdgeTest(unittest.TestCase):
     def test_shift_after_quoted_term_is_not_heredoc(self):
         for src in ('puts "a" <<EOF # c1\n# c2\nEOF\n', "puts 'a' <<EOF # c1\n# c2\nEOF\n",
                     "puts `a` <<EOF # c1\n# c2\nEOF\n"):
-            self.assertEqual(comments.comment_lines(src, "rb"), ["# c1", "# c2"], src)
+            self.assertEqual(helpers.comment_lines(src, "rb"), ["# c1", "# c2"], src)
 
     def test_lowercase_heredoc_after_operator_or_line_start(self):
         # Строчный идентификатор без «-», «~» и кавычек — heredoc там, где добавление невозможно.
-        self.assertEqual(comments.comment_lines("x = <<eof\n# not\neof\n# real\n", "rb"), ["# real"])
-        self.assertEqual(comments.comment_lines("  <<'eof'\n# not\neof\n# real\n", "rb"), ["# real"])
-        self.assertEqual(comments.comment_lines("puts <<'eof'\n# not\neof\n# real\n", "rb"), ["# real"])
-        self.assertEqual(comments.comment_lines("puts <<`eof`\n# not\neof\n# real\n", "rb"), ["# real"])
+        self.assertEqual(helpers.comment_lines("x = <<eof\n# not\neof\n# real\n", "rb"), ["# real"])
+        self.assertEqual(helpers.comment_lines("  <<'eof'\n# not\neof\n# real\n", "rb"), ["# real"])
+        self.assertEqual(helpers.comment_lines("puts <<'eof'\n# not\neof\n# real\n", "rb"), ["# real"])
+        self.assertEqual(helpers.comment_lines("puts <<`eof`\n# not\neof\n# real\n", "rb"), ["# real"])
 
     def test_perl_filehandle_branch_needs_print_and_dollar(self):
-        self.assertEqual(comments.comment_lines("print STDOUT <<eof;\n# not\neof\n# real\n", "pl"), ["# real"])
-        self.assertEqual(comments.comment_lines("print STDERR <<eof;\n# not\neof\n# real\n", "pl"), ["# real"])
+        self.assertEqual(helpers.comment_lines("print STDOUT <<eof;\n# not\neof\n# real\n", "pl"), ["# real"])
+        self.assertEqual(helpers.comment_lines("print STDERR <<eof;\n# not\neof\n# real\n", "pl"), ["# real"])
         for src in ("foo STDOUT <<eof; # c1\n# c2\neof\n", "foo STDERR <<eof; # c1\n# c2\neof\n",
                     "print @a <<EOF; # c1\n# c2\nEOF\n"):
-            self.assertEqual(comments.comment_lines(src, "pl"), ["# c1", "# c2"], src)
+            self.assertEqual(helpers.comment_lines(src, "pl"), ["# c1", "# c2"], src)
 
     def test_many_unterminated_heredocs_are_all_rolled_back(self):
         # Каждый откат снимает открытие, поглотившее остаток файла: четыре подряд — пять разборов.
@@ -622,7 +655,7 @@ class ParserEdgeTest(unittest.TestCase):
         for src in ("x = <<EOF\n# not\nEOF\n# real\n", "foo(<<EOF)\n# not\nEOF\n# real\n",
                     "print <<EOF;\n# not\nEOF\n# real\n", "puts <<~sql\n# not\nsql\n# real\n",
                     "foo a, <<EOF\n# not\nEOF\n# real\n", "<<EOF\n# not\nEOF\n# real\n"):
-            self.assertEqual(comments.comment_lines(src, "rb"), ["# real"], src)
+            self.assertEqual(helpers.comment_lines(src, "rb"), ["# real"], src)
 
     def test_unterminated_heredoc_is_rolled_back(self):
         self.assertEqual(comments._comments("x = <<EOF\n# c2\n# c3\n", "rb"), [(2, "# c2"), (3, "# c3")])
@@ -633,7 +666,7 @@ class ParserEdgeTest(unittest.TestCase):
 
     def test_indented_terminator_of_plain_heredoc_is_not_terminator(self):
         src = "x = <<ID\n  ID\n# not\nID\n# real\n"
-        self.assertEqual(comments.comment_lines(src, "rb"), ["# real"])
+        self.assertEqual(helpers.comment_lines(src, "rb"), ["# real"])
 
 
 class ExpressionLiteralTest(unittest.TestCase):
@@ -653,13 +686,13 @@ class ExpressionLiteralTest(unittest.TestCase):
     def test_js_division_stays_division(self):
         for src in ("x = a / b // c\n", "y = x[i] / 2 // c\n", "z = f() / 3 // c\n", ")/2 // c\n",
                     "n = i++ / 2 // c\n", "q = this.return / 2 // c\n", "w = 1 /2/ 3 // c\n"):
-            self.assertEqual(comments.comment_lines(src, "js"), ["// c"], src)
+            self.assertEqual(helpers.comment_lines(src, "js"), ["// c"], src)
 
     def test_division_continues_previous_line(self):
         # Начало строки — начало выражения, только если им кончилась прошлая строка кода.
         src = "s = a[u] // c1\n// c2\n/ b.c // c3\n/ d; // c4\nx = (\n/a\\//.test(y)) // c5\n"
-        self.assertEqual(comments.comment_lines(src, "js"), ["// c1", "// c2", "// c3", "// c4", "// c5"])
-        self.assertEqual(comments.comment_lines("f() /* c1 */\n/ 2 // c2\n", "ts"), ["/* c1 */", "// c2"])
+        self.assertEqual(helpers.comment_lines(src, "js"), ["// c1", "// c2", "// c3", "// c4", "// c5"])
+        self.assertEqual(helpers.comment_lines("f() /* c1 */\n/ 2 // c2\n", "ts"), ["/* c1 */", "// c2"])
 
     def test_unclosed_regex_ends_at_line_end(self):
         # Мнимая регулярка без закрытия прячет только остаток своей строки.
@@ -784,10 +817,10 @@ class ExpressionLiteralTest(unittest.TestCase):
         for src in ("if (a <b) f() // c\n", "const x: Array<string> = [] // c\n",
                     "const f = <T,>(x: T) => x // c\n", "const g = <T extends X>(x: T) => x // c\n",
                     "useState<string>(null) // c\n"):
-            self.assertEqual(comments.comment_lines(src, "tsx"), ["// c"], src)
+            self.assertEqual(helpers.comment_lines(src, "tsx"), ["// c"], src)
 
     def test_plain_ts_has_no_jsx(self):
-        self.assertEqual(comments.comment_lines("const f = <T>(x: T) => x // c\n", "ts"), ["// c"])
+        self.assertEqual(helpers.comment_lines("const f = <T>(x: T) => x // c\n", "ts"), ["// c"])
 
     def test_multiline_opening_tag(self):
         src = 'return (\n  <a\n    href="x"\n  >\n    see http://x.y\n  </a>\n);\n// c\n'
@@ -842,49 +875,49 @@ class RubyPerlElixirLiteralTest(unittest.TestCase):
         self.assertEqual(comments._comments(src, "pl"), [(1, "# strip comments")])
         src = ("my @w = qw(a #b c); # c1\nmy $r = qr{#\\d+}x; # c2\n$s =~ tr/#/ /; # c3\n$s =~ s{#}{ }g; # c4\n"
                "my $q = q#not#; # c5\nmy $t = qq (#(a)#); # c6\n$s =~ m<#>; # c7\n")
-        self.assertEqual(comments.comment_lines(src, "pl"), [f"# c{i}" for i in range(1, 8)])
+        self.assertEqual(helpers.comment_lines(src, "pl"), [f"# c{i}" for i in range(1, 8)])
 
     def test_perl_division_and_barewords_are_code(self):
         src = ("my $x = $a / $b; # c1\nmy %h = (s => 1, y => 2); # c2\nprint $h{s}; # c3\n$x = $n /2; # c4\n"
                "$x = 10 /2; # c5\n$o->s(1); # c6\nmy $d = $a // 0; # c7\n")
-        self.assertEqual(comments.comment_lines(src, "pl"), [f"# c{i}" for i in range(1, 8)])
+        self.assertEqual(helpers.comment_lines(src, "pl"), [f"# c{i}" for i in range(1, 8)])
 
     def test_ruby_regex_and_percent_literals(self):
         self.assertEqual(comments._comments('s = line.sub(/#.*/, "")\nparts = s.split(/#/)', "rb"), [])
         src = ("w = %w(a #b) # c1\nr = %r{#\\d+#{x}}x # c2\nx = a % b # c3\ny = a / 2 # c4\nn = 10 /2 # c5\n"
                "puts /#/ # c6\nr = /#{x}/ # c7\n")
-        self.assertEqual(comments.comment_lines(src, "rb"), [f"# c{i}" for i in range(1, 8)])
+        self.assertEqual(helpers.comment_lines(src, "rb"), [f"# c{i}" for i in range(1, 8)])
 
     def test_elixir_sigils(self):
         src = '~r/#\\d+/ # c1\nx = ~w(a #b) # c2\ns = ~S"""\n# not\n""" # c3\nl = ~w(\n#a\n) # c4\n'
-        self.assertEqual(comments.comment_lines(src, "ex"), ["# c1", "# c2", "# c3", "# c4"])
+        self.assertEqual(helpers.comment_lines(src, "ex"), ["# c1", "# c2", "# c3", "# c4"])
 
     def test_perl_multiline_quote_operators(self):
         # Многострочные операторы-кавычки; «#» в многострочной регулярке — комментарий режима /x; вторая часть
         # s{…}{…}e в скобках — код.
         src = ("my @w = qw(\n  a #b\n); # c1\n$s =~ s{\n  a # c2\n}{b}x; # c3\n$s =~ s{a}{\n  f(1); # c4\n}e; # c5\n"
                "my $q = q[\n# not\n]; # c6\n$s =~ tr/a\n#/b/; # c7\n$t =~\n  /^(?:  # c8\n    a\n  )$/x; # c9\n")
-        self.assertEqual(comments.comment_lines(src, "pl"), [f"# c{i}" for i in range(1, 10)])
+        self.assertEqual(helpers.comment_lines(src, "pl"), [f"# c{i}" for i in range(1, 10)])
 
     def test_perl_special_variables_backticks_and_delimiters(self):
         # «$"» — переменная, а не строка; `…` — строка; «m,…,» и «m$…$» — операторы-кавычки.
         src = ("local $\" = ')(';\nmy $x = \"a\"; # c1\nmy $o = `echo \"\n# not\n\"`; # c2\n"
                "if (m,/, ) { f(\"x\"); } # c3\nmy @a = $t =~ m$a\"b$g; # c4\nmy $r = $h{a} / 2; # c5\n")
-        self.assertEqual(comments.comment_lines(src, "pl"), [f"# c{i}" for i in range(1, 6)])
+        self.assertEqual(helpers.comment_lines(src, "pl"), [f"# c{i}" for i in range(1, 6)])
 
     def test_data_section_and_quoted_heredoc_ids(self):
         # После __END__ — данные, POD в них — документация; идентификатор heredoc в кавычках — любые знаки.
-        self.assertEqual(comments.comment_lines("print 1; # c1\n__END__\ndon't # not\n=pod\n\nDoc\n\n=cut\n", "pl"),
+        self.assertEqual(helpers.comment_lines("print 1; # c1\n__END__\ndon't # not\n=pod\n\nDoc\n\n=cut\n", "pl"),
                          ["# c1", "=pod", "Doc", "=cut"])
-        self.assertEqual(comments.comment_lines("x = 1 # c1\n__END__\nit's # not\n", "rb"), ["# c1"])
-        self.assertEqual(comments.comment_lines("print <<'----END----';\n'# not\n----END----\n# c\n", "pl"), ["# c"])
-        self.assertEqual(comments.comment_lines('x = <<~"END OF TEXT"\n  "# not\n  END OF TEXT\n# c\n', "rb"), ["# c"])
+        self.assertEqual(helpers.comment_lines("x = 1 # c1\n__END__\nit's # not\n", "rb"), ["# c1"])
+        self.assertEqual(helpers.comment_lines("print <<'----END----';\n'# not\n----END----\n# c\n", "pl"), ["# c"])
+        self.assertEqual(helpers.comment_lines('x = <<~"END OF TEXT"\n  "# not\n  END OF TEXT\n# c\n', "rb"), ["# c"])
 
     def test_ruby_interpolation_and_line_start(self):
         # Кавычки внутри «#{…}» не закрывают строку; строка Ruby начинает выражение: «/» в её начале — регулярка.
         src = ('s = "a #{h["k"]} b" # c1\nt = "#{x ? "\\"" : \'"\'}" # c2\ncmd = `echo #{"a"}` # c3\n'
                "if x\n  /a:/ =~ y # c4\nend\nr = %r{\n  a # c5\n}x # c6\nw = %w(\n  a #b\n) # c7\n")
-        self.assertEqual(comments.comment_lines(src, "rb"), [f"# c{i}" for i in range(1, 8)])
+        self.assertEqual(helpers.comment_lines(src, "rb"), [f"# c{i}" for i in range(1, 8)])
 
     def test_ruby_slash_after_local_variable_is_division(self):
         # После локальной переменной Ruby «/» и «%» — деление и остаток; после метода — литерал-аргумент.
@@ -927,7 +960,7 @@ class RubyPerlElixirLiteralTest(unittest.TestCase):
                  ("rb", "x << \"a\" # c1\n# c2\n", ["# c1", "# c2"]),
                  ("rb", "x << \"EOS\" # c1\n# c2\nEOS\n# c3\n", ["# c1", "# c2", "# c3"]))
         for ext, src, expected in cases:
-            self.assertEqual(comments.comment_lines(src, ext), expected, src)
+            self.assertEqual(helpers.comment_lines(src, ext), expected, src)
 
     def test_ruby_slash_after_keywords(self):
         # За return, else и подобными «/» — регулярка и через пробел; за self, nil — деление; not — как метод.
@@ -955,8 +988,8 @@ class RubyPerlElixirLiteralTest(unittest.TestCase):
         # Буквы за закрывающим разделителем — флаги: «s,» после «/…/» — не оператор s с разделителем «,».
         src = ("for my $feep (grep /^\\$pw_/s, @EXPORT_OK) { # c1\nmy @a = m!a!s, 1; # c2\n"
                "$x = qr{\n  a\n}s, 1; # c3\n$s =~ s{a}{b}s, 1; # c4\n")
-        self.assertEqual(comments.comment_lines(src, "pl"), [f"# c{i}" for i in range(1, 5)])
-        self.assertEqual(comments.comment_lines("r = %r{\n  a\n}s # c1\n", "rb"), ["# c1"])
+        self.assertEqual(helpers.comment_lines(src, "pl"), [f"# c{i}" for i in range(1, 5)])
+        self.assertEqual(helpers.comment_lines("r = %r{\n  a\n}s # c1\n", "rb"), ["# c1"])
 
     def test_perl_second_part_on_later_line(self):
         # Вторая часть s{…}{…}, tr{…}{…} в скобках — и на следующих строках, за пробелами и комментариями (perlop,
@@ -984,6 +1017,34 @@ class RubyPerlElixirLiteralTest(unittest.TestCase):
         # Незакрытая в строке регулярка прячет только остаток своей строки.
         self.assertEqual(comments._comments("x = split /a # b\n# c\n", "pl"), [(2, "# c")])
         self.assertEqual(comments._comments("x = %w(a # b\n# c\n", "rb"), [(2, "# c")])
+
+
+    def test_ruby_begin_inside_string_is_data(self):
+        # Строка «"…"» Ruby многострочна: «=begin» с первой колонки внутри неё — текст строки.
+        src = 'x = "abc\n=begin not a comment\n"\ny = 1 # real\nz = 2\n=end\n'
+        self.assertEqual(comments._comments(src, "rb"), [(4, "# real")])
+        src = "x = 'abc\n=begin not\n'\ny = 1 # real\n"
+        self.assertEqual(comments._comments(src, "rb"), [(4, "# real")])
+
+    def test_perl_pod_only_where_statement_starts(self):
+        # perl (toke.c, PL_expect == XSTATE): «=слово» с первой колонки — POD, только где ждётся новый оператор:
+        # в начале файла, после «;», «{», «}» и метки; посреди оператора — присваивание (perl -MO=Deparse, 5.42).
+        self.assertEqual(comments._comments("my $x\n=shift; # c\nprint $x;\n", "pl"), [(2, "# c")])
+        self.assertEqual(comments._comments("my $x = 1 # c\n=foo;\n", "pl"), [(1, "# c")])
+        for head in ("", "my $x = 1;\n", "sub f {\n", "sub f { 1 }\n", "FOO:\n", "my $x = 1; # c\n\n",
+                     "print <<EOT;\nbody\nEOT\n", "=pod\n\n=cut\n"):
+            src = head + "=head1 NAME\n\nx\n\n=cut\n"
+            found = [c for _, c in comments._comments(src, "pl")]
+            self.assertEqual(found[-3:], ["=head1 NAME", "x", "=cut"], head)
+
+    def test_perl_filetest_s_is_not_substitution(self):
+        # «-s» и знак не слова за ним — файловый тест (perl -MO=Deparse: «-s($f)» — «-s $f»); «-m(a)», «-q(a)»,
+        # «-y(a)(b)» — минус и оператор-кавычка; «--s/a/b/» — декремент и замена.
+        self.assertEqual(comments._comments("my $n = -s($f); # size\nmy $m = 1; # two\n", "pl"),
+                         [(1, "# size"), (2, "# two")])
+        self.assertEqual(comments._comments('my $n = -s ("a") + -e("b"); # size\n', "pl"), [(1, "# size")])
+        self.assertEqual(comments._comments("my $n = -q(# a); # c\n", "pl"), [(1, "# c")])
+        self.assertEqual(comments._comments("$i--s{a # b}{c}; # c\n", "pl"), [(1, "# c")])
 
 
 class MultilineStringTest(unittest.TestCase):
@@ -1015,9 +1076,9 @@ class MultilineStringTest(unittest.TestCase):
         self.assertEqual(comments._comments("value: |\n  # heading\n  text\nk: v # real", "yaml"), [(4, "# real")])
         src = ("steps:\n  - text: >-  # c1\n      # not\n    name: x # c2\n  - |\n    # not\n  - y # c3\n"
                "k: !!str &a |\n  # not\n\n  # not\n# c4\n")
-        self.assertEqual(comments.comment_lines(src, "yaml"), ["# c1", "# c2", "# c3", "# c4"])
+        self.assertEqual(helpers.comment_lines(src, "yaml"), ["# c1", "# c2", "# c3", "# c4"])
         # «|» и «>» внутри значения — не индикатор.
-        self.assertEqual(comments.comment_lines("a: x | y\n  # c1\nb: x >\n  # c2\n", "yaml"), ["# c1", "# c2"])
+        self.assertEqual(helpers.comment_lines("a: x | y\n  # c1\nb: x >\n  # c2\n", "yaml"), ["# c1", "# c2"])
 
     def test_yaml_script_block_scalars_are_shell(self):
         # Блочный скаляр под ключом скрипта — shell: «#» в начале слова вне кавычек — комментарий.
@@ -1186,6 +1247,32 @@ class ExtractTest(unittest.TestCase):
             self.commit(name)
             (self.root / name).write_bytes(bom + (old + "# new\n").encode(codec))
         self.assertEqual(comments.extract(self.root, ["le.py", "be.py"])[0], ["le.py: # new", "be.py: # new"])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_utf16_change_after_newline_byte_inside_line(self):
+        # «上» (U+4E0A) и «Њ» (U+040A) несут байт 0x0A: git делит строку текста на две, правка после знака — во
+        # второй git-строке той же строки текста.
+        self.git("init", "-q")
+        for name, bom, codec, old, new in (
+                ("u.ps1", codecs.BOM_UTF16_LE, "utf-16-le", "$x = 1  # 上 old\n", "$x = 1  # 上 new comment\n"),
+                ("b.py", codecs.BOM_UTF16_BE, "utf-16-be", "x = 1\ny = 2  # Њ old\n", "x = 1\ny = 2  # Њ new\n")):
+            (self.root / name).write_bytes(bom + old.encode(codec))
+            self.commit(name)
+            (self.root / name).write_bytes(bom + new.encode(codec))
+        self.assertEqual(comments.extract(self.root, ["u.ps1", "b.py"])[0],
+                         ["u.ps1: # 上 new comment", "b.py: # Њ new"])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_utf16_change_in_last_line_without_final_newline(self):
+        # Последняя строка без завершающего перевода строки содержит знак с байтом 0x0A («Њ»): номер за ней
+        # считается по числу этих байтов, а не прибавкой единицы.
+        self.git("init", "-q")
+        for name, bom, codec in (("l.py", codecs.BOM_UTF16_LE, "utf-16-le"),
+                                 ("b.py", codecs.BOM_UTF16_BE, "utf-16-be")):
+            (self.root / name).write_bytes(bom + "x = 1\ny = 2  # Њ old".encode(codec))
+            self.commit(name)
+            (self.root / name).write_bytes(bom + "x = 1\ny = 2  # Њ new".encode(codec))
+        self.assertEqual(comments.extract(self.root, ["l.py", "b.py"])[0], ["l.py: # Њ new", "b.py: # Њ new"])
 
     def test_no_lines_after_byte_truncation(self):
         self.write("a.py", ("# " + "x" * 1000 + "\n") * 20)
@@ -1551,14 +1638,14 @@ class LinearParseTest(unittest.TestCase):
                                   lambda: comments._comments(large, ext, time.monotonic() + 30), msg=(ext, make(2)))
 
     def test_unclosed_quotes_and_backslashes(self):
-        self.assertEqual(comments.comment_lines('"\\' * 20000 + " // c", "js"), ["// c"])
-        self.assertEqual(comments.comment_lines("'\\" * 20000, "js"), [])
-        self.assertEqual(comments.comment_lines('"' + "\\a" * 20000 + '" // c', "js"), ["// c"])
+        self.assertEqual(helpers.comment_lines('"\\' * 20000 + " // c", "js"), ["// c"])
+        self.assertEqual(helpers.comment_lines("'\\" * 20000, "js"), [])
+        self.assertEqual(helpers.comment_lines('"' + "\\a" * 20000 + '" // c', "js"), ["// c"])
         self.assert_linear(((lambda k: '"\\' * k + " // c", "js", 5000), (lambda k: "'\\" * k, "js", 2500),
                             (lambda k: '"' + "\\a" * k + '" // c', "js", 5000)))
 
     def test_many_triple_quotes_on_one_line(self):
-        self.assertEqual(comments.comment_lines('x = """a""" ' * 250000, "py"), [])
+        self.assertEqual(helpers.comment_lines('x = """a""" ' * 250000, "py"), [])
         self.assert_linear(((lambda k: 'x = """a""" ' * k, "py", 1500),))
 
     def test_long_prefix_before_many_heredoc_openers(self):
@@ -1638,6 +1725,23 @@ class LinearParseTest(unittest.TestCase):
              1000),
             (lambda k: "".join(" " * d + "- with:\n" + " " * d + "    script: |\n" + " " * d + "      # a\n"
                                for d in range(k)), "yml", 100)))
+
+    def test_groovy_unclosed_quote_before_escaped_quotes(self):
+        # За незакрытой «"» или «'» строки Groovy каждая следующая такая же кавычка экранирована: хвост строки не
+        # просматривается заново.
+        self.assertEqual(helpers.comment_lines('x = "' + '\\"' * 2000 + " // c\n", "groovy"), ["// c"])
+        self.assert_linear(((lambda k: 'x = "' + '\\"' * k + "\n", "groovy", 1000),
+                            (lambda k: "x = '" + "\\'" * k + "\n", "gradle", 1000)))
+
+    def test_single_file_components_are_linear(self):
+        # Блоки «<script>», «<style>» и комментарии разметки ищутся одним проходом; теги без «>» и блоки без закрытия.
+        self.assert_linear((
+            (lambda k: "<script" * k, "vue", 5000), (lambda k: '<script a="' * k, "vue", 5000),
+            (lambda k: "<!--" * k, "svelte", 5000), (lambda k: "<script></script>" * k, "svelte", 1000),
+            (lambda k: "<style lang=scss>a{}</style><!-- c -->\n" * k, "vue", 500),
+            (lambda k: "{" * k, "svelte", 5000), (lambda k: "{{" * k, "vue", 5000),
+            (lambda k: "<a " * k, "svelte", 2000), (lambda k: "{/" * k, "svelte", 5000),
+            (lambda k: "<br>{a}\n" * k, "svelte", 2000)))
 
     def test_deadline_during_parse_files_without_check(self):
         common._reset()

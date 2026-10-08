@@ -183,6 +183,24 @@ def _structure(plan):
     return [(t.wave, t.number, t.files) for t in planparse.parse_plan(plan) or []]
 
 
+class NestedNonOwnershipTest(unittest.TestCase):
+    def test_nested_items_under_non_owning_item_are_not_owned(self):
+        for head in ("**Не трогать:**", "Только чтение:", "**Читает:**", "Read-only:"):
+            with self.subTest(head):
+                plan = ("## Волна 1\n### Задача 1: A\n- **Файлы:** `a.py`\n- " + head + "\n  - `shared.py`\n"
+                        "### Задача 2: B\n- **Файлы:** `b.py`\n- " + head + "\n  - `shared.py`\n")
+                self.assertEqual(_structure(plan), [(1, "1", ["a.py"]), (1, "2", ["b.py"])])
+                self.assertEqual(planparse.shared_files(planparse.parse_plan(plan)), [])
+
+    def test_nested_items_under_files_head_stay_owned(self):
+        plan = "## Волна 1\n### Задача 1: A\n- **Файлы:**\n  - `a.py`\n  - Test: `t.py`\n"
+        self.assertEqual(_structure(plan), [(1, "1", ["a.py", "t.py"])])
+
+    def test_sibling_item_after_nested_skip_is_owned_again(self):
+        plan = "### Задача 1: A\n- Файлы: `a.py`\n- Не трогать:\n  - `s.py`\n- Create: `b.py`\n"
+        self.assertEqual(_structure(plan), [(None, "1", ["a.py", "b.py"])])
+
+
 class HeadingScopeTest(unittest.TestCase):
     def test_other_heading_closes_task(self):
         plan = ("## Волна 1\n### Задача 1: A\nФайлы: `a.py`\n### Схождение волны 1\nФайлы: `b.py`\n"
@@ -577,6 +595,11 @@ CORPUS = {
          (1, "2", ["planka/cache_store.py", "tests/test_cache_store.py"]),
          (2, "4", ["planka/common.py", "tests/test_common.py"]),
          (2, "5", ["README.md", "context/architecture.md"])],
+        []),
+    "plan-readonly-nested.md": (
+        [(1, "1", ["src/bucket.py", "tests/test_bucket.py"]),
+         (1, "2", ["src/store.py", "tests/test_store.py"]),
+         (1, "3", ["docs/limiter.md"])],
         []),
 }
 

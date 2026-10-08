@@ -1,9 +1,11 @@
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -31,8 +33,9 @@ CORPUS = {
         react-dom react-i18next react-markdown react-router-dom reactflow recharts rehype-highlight
         rehype-raw remark-gfm tailwind-merge tailwindcss tailwindcss-animate tsx typescript vite
         vite-plugin-electron vite-plugin-electron-renderer wait-on zustand""".split()),
-    "npm-local/package.json": {"lodash", "my-fork", "react", "@types/node", "@scope/tool", "react-dom",
-                               "fsevents"},
+    # Пакет не из реестра — имя с источником: `my-fork @ github:user/repo`.
+    "npm-local/package.json": {"lodash", "my-fork @ github:user/repo", "react", "@types/node", "@scope/tool",
+                               "react-dom", "fsevents"},
     "composer-docs/composer.json": {"monolog/monolog", "symfony/console", "phpunit/phpunit"},
     "pyproject-uv-bff/pyproject.toml": {"fastapi", "httpx", "pydantic", "pydantic-settings",
                                         "prometheus-client", "pytest", "strawberry-graphql", "uvicorn",
@@ -42,21 +45,41 @@ CORPUS = {
                                                       "pytest-cov"},
     # poetry-core и hatchling в `build-system.requires` — стандартные бэкенды сборки, не зависимости.
     "pyproject-poetry-tcat/pyproject.toml": {"bleak", "pytest", "cryptography", "pyreadline3"},
-    # Сгенерированные файлы (uv export, pip-compile) перечисляют транзитивные пакеты — не объявление.
-    "requirements-uv-export/requirements.txt": set(),
-    "requirements-pip-compile/requirements.txt": set(),
+    # Файлы uv export и pip-compile проверяются, как любой файл требований: заголовок генератора и `# via` не
+    # снимают проверку.
+    "requirements-uv-export/requirements.txt": set("""
+        annotated-types asgiref certifi cffi charset-normalizer colorama cryptography deprecation django
+        django-filter django-ipware django-polymorphic django-simple-history django-structlog django-waffle
+        djangorestframework execnet factory-boy faker idna iniconfig jwcrypto packaging pika pluggy
+        prometheus-client psycopg2-binary pycparser pydantic pydantic-core pygments pytest pytest-django
+        pytest-xdist python-ipware python-keycloak requests requests-toolbelt sqlparse structlog
+        typing-extensions typing-inspection tzdata urllib3""".split()),
+    "requirements-pip-compile/requirements.txt": set("""
+        alabaster babel breathe certifi charset-normalizer click docutils idna imagesize importlib-metadata
+        jinja2 markdown-it-py markupsafe mdurl packaging pygments pyyaml readthedocs-cli requests rich
+        snowballstemmer sphinx sphinx-rtd-theme sphinxcontrib-applehelp sphinxcontrib-devhelp
+        sphinxcontrib-htmlhelp sphinxcontrib-jquery sphinxcontrib-jsmath sphinxcontrib-qthelp
+        sphinxcontrib-serializinghtml tomli urllib3 zipp""".split()),
     "requirements-esp-idf/requirements/core.txt": set("""
         click construct cryptography esp-coredump esp-idf-diag esp-idf-kconfig esp-idf-monitor
         esp-idf-nvs-partition-gen esp-idf-panic-decoder esp-idf-size esptool freertos-gdb
         idf-component-manager packaging psutil pyclang pyelftools pyparsing pyserial rich rich-click
         setuptools tree-sitter tree-sitter-c""".split()),
     "requirements-pip-docs/requirements.txt": {"pytest", "pytest-cov", "beautifulsoup4", "docopt", "keyring",
-                                               "coverage", "mopidy-dirble", "wxpython-phoenix", "myproject",
-                                               "urllib3", "requests", "fooproject", "rejected", "green"},
+                                               "coverage", "mopidy-dirble", "requests",
+                                               "index https://example.com/simple",
+                                               # Источник архива — каталог URL, версия в имени файла.
+                                               "wxpython-phoenix @ http://wxpython.org/Phoenix/snapshot-builds/",
+                                               "myproject @ git+https://git.example.com/MyProject",
+                                               "urllib3 @ https://github.com/urllib3/urllib3/archive/refs/tags/",
+                                               "fooproject", "rejected", "green"},
     "cargo-libgit-rs/Cargo.toml": {"autocfg"},
     "cargo-libgit-sys/Cargo.toml": {"libz-sys", "autocfg", "make-cmd"},
-    "cargo-book/Cargo.toml": {"rand", "time", "regex", "some-crate", "foo", "foo-core", "serde", "libz-sys",
-                              "winhttp", "openssl", "mio", "tempdir", "cc"},
+    # Источник не из crates.io — имя с источником (`git`, `registry`).
+    "cargo-book/Cargo.toml": {"rand", "time", "regex @ git+https://github.com/rust-lang/regex.git",
+                              "some-crate @ registry:my-registry", "foo",
+                              "foo @ git+https://github.com/example/project.git", "foo-core @ registry:custom", "serde",
+                              "libz-sys", "winhttp", "openssl", "mio", "tempdir", "cc"},
     # `// indirect` — транзитивные, их дописывает `go mod tidy`; в имена не входят.
     "gomod-grpc/go.mod": set("""
         cloud.google.com/go/auth cloud.google.com/go/compute/metadata github.com/cespare/xxhash/v2
@@ -76,8 +99,8 @@ CORPUS = {
     "gemfile-cmock/Gemfile": {"bundler", "rake", "minitest", "require_all", "constructor", "diy"},
     # Местные зависимости: `{ workspace = true }` и `{ path = … }` в `tool.uv.sources`, `path:` и блок
     # `path … do` Gemfile, `replace` на путь в go.mod.
-    "pyproject-uv-workspace/pyproject.toml": {"tqdm"},
-    "gemfile-path/Gemfile": {"rails", "puma", "debug", "rspec-rails"},
+    "pyproject-uv-workspace/pyproject.toml": {"tqdm @ git+https://github.com/tqdm/tqdm"},
+    "gemfile-path/Gemfile": {"rails", "puma", "debug", "rspec-rails @ git+https://github.com/rspec/rspec-rails"},
     "gomod-replace-local/go.mod": {"github.com/go-chi/chi/v5", "google.golang.org/grpc"},
     # Зависимости `[project.optional-dependencies]` — имена; meson-python и wheel — бэкенды сборки.
     "pyproject-gyp-next/pyproject.toml": {"packaging", "setuptools", "pytest", "ruff"},
@@ -87,8 +110,8 @@ CORPUS = {
         pyiceberg tables pyreadstat sqlalchemy psycopg2 adbc-driver-postgresql pymysql adbc-driver-sqlite
         beautifulsoup4 html5lib lxml matplotlib jinja2 tabulate pyqt5 qtpy zstandard pytz fastparquet""".split()),
     # Директива `tool` называет команду модуля из `require`; сама не объявляет зависимость.
-    "gomod-tool/go.mod": {"golang.org/x/net", "golang.org/x/tools", "golang.org/x/text", "github.com/golang/mock",
-                          "honnef.co/go/tools"},
+    "gomod-tool/go.mod": {"example.com/fork/net", "golang.org/x/net", "golang.org/x/tools", "golang.org/x/text",
+                          "github.com/golang/mock", "honnef.co/go/tools"},
 }
 
 # Имя самого пакета манифеста корпуса (manifests.own_name); не перечисленные — None.
@@ -147,8 +170,7 @@ class CorpusTest(unittest.TestCase):
                 self.assertEqual(manifests.own_name(kind, text), OWN.get(rel))
 
     def test_corpus_one_added_line(self):
-        # Добавление одной зависимости в настоящий манифест видно ровно одним именем; в сгенерированный файл
-        # требований — ни одним: его пакеты транзитивные.
+        # Добавление одной зависимости в настоящий манифест видно ровно одним именем.
         cases = {
             "npm-cc-harness/package.json": ('"zustand": "^4.5.5"', '"zustand": "^4.5.5",\n    "left-pad": "1.3.0"',
                                             ["left-pad"]),
@@ -157,7 +179,7 @@ class CorpusTest(unittest.TestCase):
             "pyproject-poetry-fetchartifact/pyproject.toml": ('aiohttp = "^3.8.4"', 'aiohttp = "^3.8.4"\nrich = "*"',
                                                               ["rich"]),
             "requirements-esp-idf/requirements/core.txt": ("\nrich\n", "\nrich\nleft_pad\n", ["left-pad"]),
-            "requirements-pip-compile/requirements.txt": ("sphinx==", "left-pad==1.0\nsphinx==", []),
+            "requirements-pip-compile/requirements.txt": ("sphinx==", "left-pad==1.0\nsphinx==", ["left-pad"]),
             "cargo-libgit-sys/Cargo.toml": ('libz-sys = "1.1.19"', 'libz-sys = "1.1.19"\nserde = "1"', ["serde"]),
             "gomod-grpc/go.mod": ("\tgonum.org/v1/gonum v0.17.0",
                                   "\tgonum.org/v1/gonum v0.17.0\n\tgithub.com/evil/pkg v1.0.0", ["github.com/evil/pkg"]),
@@ -332,7 +354,8 @@ line-length = 88
             ("[tool.ruff]", '[tool.uv]\ndev-dependencies = ["coverage"]\n\n[tool.ruff]', "coverage"),
             ("[tool.ruff]", '[tool.pdm.dev-dependencies]\ntest = ["hypothesis"]\n\n[tool.ruff]', "hypothesis"),
             ('cli = ["click"]', 'cli = ["click"]\nnew = ["Zope.Interface"]', "zope-interface"),
-            ('dependencies = ["requests>=2",', 'dependencies = ["requests>=2", "pkg @ https://x/pkg.zip",', "pkg"),
+            ('dependencies = ["requests>=2",', 'dependencies = ["requests>=2", "pkg @ https://x/pkg.zip",',
+             "pkg @ https://x/"),
         ]
         for old, new, name in cases:
             with self.subTest(name):
@@ -382,7 +405,8 @@ ruff = "*"
         cases = [
             ('requests = "^2"', 'requests = "^2"\nFlask_Login = { version = "^0.6", extras = ["x"] }', ["flask-login"]),
             ('ruff = "*"', 'ruff = "*"\n\n[tool.poetry.group.docs.dependencies]\nmkdocs = "*"', ["mkdocs"]),
-            ('pytest = "^8"', 'pytest = "^8"\nevil = { git = "https://x/evil.git" }', ["evil"]),
+            ('pytest = "^8"', 'pytest = "^8"\nevil = { git = "https://x/evil.git" }',
+             ["evil @ git+https://x/evil.git"]),
             ('requests = "^2"', 'requests = "^3"', []),
             ('python = "^3.11"', 'python = "^3.12"', []),
             ('python = "^3.11"', 'Python = "^3.11"', []),
@@ -423,7 +447,7 @@ ruff = "*"
     def test_uv_sources_remote_is_package(self):
         text = self.OLD.replace('dependencies = ["requests>=2",', 'dependencies = ["requests>=2", "gitpkg",', 1)
         text = text.replace("[tool.ruff]", '[tool.uv.sources]\ngitpkg = { git = "https://x/gitpkg" }\n\n[tool.ruff]')
-        self.assertEqual(_added("pyproject.toml", self.OLD, text), ["gitpkg"])
+        self.assertEqual(_added("pyproject.toml", self.OLD, text), ["gitpkg @ git+https://x/gitpkg"])
 
     def test_odd_shapes_ignored(self):
         text = """\
@@ -451,12 +475,13 @@ class RequirementsTest(unittest.TestCase):
             ("flask", ["flask"]),
             ("Flask_Login[extra]>=1", ["flask-login"]),
             ("numpy ; sys_platform == 'linux'", ["numpy"]),
-            ("pkg@https://x/pkg.zip", ["pkg"]),
-            ("-e git+https://x/repo.git@v1#egg=Evil_Pkg&subdirectory=sub", ["evil-pkg"]),
-            ("git+https://x/repo.git#subdirectory=sub&egg=evil4", ["evil4"]),
-            ("--editable=git+https://x/repo.git#egg=evil2", ["evil2"]),
-            ("git+https://x/repo.git#egg=evil3", ["evil3"]),
-            ("https://x/files/Some_Pkg-1.0-py3-none-any.whl", ["some-pkg"]),
+            ("pkg@https://x/pkg.zip", ["pkg @ https://x/"]),
+            ("-e git+https://x/repo.git@v1#egg=Evil_Pkg&subdirectory=sub", ["evil-pkg @ git+https://x/repo.git"]),
+            ("git+https://x/repo.git#subdirectory=sub&egg=evil4", ["evil4 @ git+https://x/repo.git"]),
+            ("--editable=git+https://x/repo.git#egg=evil2", ["evil2 @ git+https://x/repo.git"]),
+            ("git+https://x/repo.git#egg=evil3", ["evil3 @ git+https://x/repo.git"]),
+            ("https://x/files/Some_Pkg-1.0-py3-none-any.whl",
+             ["some-pkg @ https://x/files/"]),
             ("a \\\n  >= 1", ["a"]),
             ("b==1 --hash=sha256:00 \\\n    --hash=sha256:11", ["b"]),
             ("c==1  # comment with requests-two", ["c"]),
@@ -470,7 +495,7 @@ class RequirementsTest(unittest.TestCase):
         for new in [
             "requests==2.32\ndjango>=5\n",
             "",
-            "-r base.txt\n-r other.txt\n-c constraints.txt\n--index-url https://x\n-i https://x\n--pre\n",
+            "-r base.txt\n-r other.txt\n-c constraints.txt\n--pre\n",
             "requests==2.31\n# flask\n   # numpy\n\n",
             "requests\nDJANGO\n",
             "-e .\n-e ./sub\n./dist/x-1.0-py3-none-any.whl\n/abs/y.tar.gz\n../z\nfile:///tmp/q\n~/w\n",
@@ -500,24 +525,23 @@ class RequirementsTest(unittest.TestCase):
     PDM = "# This file is @generated by PDM.\n# Please do not edit it manually.\n\nidna==3.7\nrequests==2.32.3\n"
     NO_HEADER = "idna==3.7\n    # via requests\nrequests==2.32.3  # via -r requirements.in\n"
 
-    def test_generated_files_not_declarations(self):
+    def test_generated_header_checked_like_any(self):
+        # Заголовок генератора и `# via` агент впишет сам вместе с пакетом: файл проверяется по содержимому.
         for text in [self.PIP_COMPILE, self.UV, self.PDM, self.NO_HEADER]:
             with self.subTest(text):
-                self.assertEqual(manifests.names("requirements", text), frozenset())
-                # Перегенерация с новым транзитивным пакетом — не добавление.
-                self.assertEqual(_added("requirements.txt", text, text + "urllib3==2.2\n    # via requests\n"), [])
-                self.assertEqual(_added("requirements.txt", None, text), [])
+                self.assertEqual(manifests.names("requirements", text), frozenset({"idna", "requests"}))
+                self.assertEqual(_added("requirements.txt", text, text + "urllib3==2.2\n    # via requests\n"),
+                                 ["urllib3"])
+                self.assertEqual(_added("requirements.txt", None, text), ["idna", "requests"])
+        plain = "idna==3.7\nrequests==2.32.3\n"
+        self.assertEqual(_added("requirements.txt", plain, self.PIP_COMPILE), [])
+        self.assertEqual(_added("requirements.txt", plain, "# This file is @generated by PDM.\n" + plain + "flask\n"),
+                         ["flask"])
 
     def test_header_removed_names_known(self):
-        # Снятый заголовок не делает добавлением пакеты, которые уже были в файле.
         plain = "idna==3.7\nrequests==2.32.3\n"
         self.assertEqual(_added("requirements.txt", self.PIP_COMPILE, plain), [])
         self.assertEqual(_added("requirements.txt", self.PIP_COMPILE, plain + "flask\n"), ["flask"])
-
-    def test_header_only_at_top(self):
-        # Строка заголовка ниже первого требования — обычный комментарий.
-        text = "flask\n# This file is autogenerated by pip-compile\n"
-        self.assertEqual(manifests.names("requirements", text), frozenset({"flask"}))
 
     def test_new_file(self):
         self.assertEqual(_added("/p/requirements/dev.txt", None, "pytest\nblack\n"), ["black", "pytest"])
@@ -545,7 +569,7 @@ tempfile = "3"
             ("[dev-dependencies]", '[target.\'cfg(unix)\'.dependencies]\nnix = "0.29"\n\n[dev-dependencies]', ["nix"]),
             ("[dev-dependencies]", '[target.wasm32-unknown-unknown.build-dependencies]\nwb = "1"\n\n[dev-dependencies]',
              ["wb"]),
-            ('tempfile = "3"', 'tempfile = "3"\nx = { git = "https://x/x" }', ["x"]),
+            ('tempfile = "3"', 'tempfile = "3"\nx = { git = "https://x/x" }', ["x @ git+https://x/x"]),
             ('serde = { version = "1", features = ["derive"] }',
              'serde = { version = "1", features = ["derive"] }\nsj = { version = "1", package = "serde_json" }',
              ["serde-json"]),
@@ -605,9 +629,9 @@ replace github.com/a/one => ../one
             ("go 1.22", "go 1.22\nrequire github.com/g/h v1 // indirectly needed", ["github.com/g/h"]),
             ("go 1.22", 'go 1.22\n\nrequire "github.com/q/quoted" v1.0.0', ["github.com/q/quoted"]),
             ("go 1.22", "go 1.22\nrequire(\n\tgithub.com/f/nospace v1\n)", ["github.com/f/nospace"]),
-            # Замена каталога модулем делает модуль внешним.
+            # Замена каталога модулем делает модуль внешним, модуль-замена — тоже имя.
             ("replace github.com/a/one => ../one", "replace github.com/a/one => github.com/evil/one v1.0.0",
-             ["github.com/a/one"]),
+             ["github.com/a/one", "github.com/evil/one"]),
         ]
         for old, new, expected in cases:
             with self.subTest(new):
@@ -649,7 +673,7 @@ replace github.com/a/one => ../one
 
     def test_replace_to_module_is_package(self):
         new = self.OLD.replace("go 1.22", "go 1.22\nrequire example.com/x v1\nreplace example.com/x => example.com/y v1")
-        self.assertEqual(_added("go.mod", self.OLD, new), ["example.com/x"])
+        self.assertEqual(_added("go.mod", self.OLD, new), ["example.com/x", "example.com/y"])
 
     def test_indirect_not_in_names(self):
         # github.com/a/one заменён каталогом `../one` — местный.
@@ -675,11 +699,13 @@ end
             "gem 'pg', '~> 1.5', require: false",
             "  gem('pg')",
             'gem "pg" # db',
-            'gem "pg", git: "https://github.com/ged/ruby-pg"',
         ]
         for line in cases:
             with self.subTest(line):
                 self.assertEqual(_added("Gemfile", self.OLD, self.OLD + line + "\n"), ["pg"])
+        line = 'gem "pg", git: "https://github.com/ged/ruby-pg"'
+        self.assertEqual(_added("Gemfile", self.OLD, self.OLD + line + "\n"),
+                         ["pg @ git+https://github.com/ged/ruby-pg"])
 
     def test_not_added(self):
         for new in [
@@ -720,6 +746,53 @@ end
         for text in cases:
             with self.subTest(text):
                 self.assertEqual(manifests.names("gemfile", text), frozenset({"rails"}))
+
+    def test_nested_source_blocks(self):
+        # Источник гема — ближайший блок `path`, `git`, `github`, `source` на любой глубине; `path` — местный.
+        cases = {
+            'source "https://gems.example" do\n  path "x" do\n    gem "local"\n  end\n  gem "a"\nend\n':
+                {"a @ https://gems.example"},
+            'source "https://gems.example" do\n  git "https://g/r" do\n    gem "b"\n  end\nend\n':
+                {"b @ git+https://g/r"},
+            'group :dev do\n  source "https://gems.example" do\n    gem "c"\n  end\n  gem "d"\nend\n':
+                {"c @ https://gems.example", "d"},
+            'source "https://gems.example" do\n  group :dev do\n    path "x" do\n      gem "local"\n    end\n'
+            '    gem "e"\n  end\nend\ngem "rails"\n': {"e @ https://gems.example", "rails"},
+        }
+        for text, expected in cases.items():
+            with self.subTest(text):
+                self.assertEqual(manifests.names("gemfile", text), frozenset(expected))
+
+    def test_sources_inside_path_block(self):
+        # `source` без блока глобален и внутри `path … do`; явный источник гема важнее местного блока.
+        cases = {
+            'path "x" do\n  source "https://evil"\n  gem "l"\nend\n': {"index https://evil"},
+            'path "x" do\n  gem "l", git: "https://evil/l"\nend\n': {"l @ git+https://evil/l"},
+            'path "x" do\n  gem "l", source: "https://evil"\nend\n': {"l @ https://evil"},
+            'path "x" do\n  gem "a"; gem "l", github: "evil/l"\nend\n': {"l @ github:evil/l"},
+        }
+        for text, expected in cases.items():
+            with self.subTest(text):
+                self.assertEqual(manifests.names("gemfile", text), frozenset(expected))
+
+    def test_linear_on_long_line(self):
+        # Строка до размера манифеста: значение в кавычках, пробелы между частями оператора, хвост `do`.
+        cases = {
+            "quotes": lambda n: 'path "' + 'a"' * n,
+            "spaces after do": lambda n: 'path "x" do' + " " * n + "x",
+            "spaces after block word": lambda n: "path" + " " * n + "x",
+            "spaces after gem": lambda n: "gem" + " " * n + "x",
+            "spaces after source": lambda n: "source" + " " * n + "x",
+            "spaces after source value": lambda n: 'source "x"' + " " * n + "x",
+            "spaces after any do": lambda n: "x do" + " " * n + "x",
+            "source statements": lambda n: "source 'x'; " * n + "gem 'a'",
+            "spaces after source statement": lambda n: "gem 'a'; source 'x'" + " " * n + "x",
+        }
+        for name, make in cases.items():
+            with self.subTest(name):
+                small, large = make(2000), make(8000)
+                assert_linear(self, lambda: manifests.names("gemfile", small),
+                              lambda: manifests.names("gemfile", large))
 
     def test_never_unparseable(self):
         self.assertEqual(manifests.names("gemfile", "gem (\n"), frozenset())
@@ -1037,3 +1110,286 @@ class OldPatchGitTest(unittest.TestCase):
 
     def test_patch_written_in_session_blocked(self):
         self.assertEqual(self.added(int(os.stat(self.patch).st_ctime) - 1), {"package.json": ["left-pad"]})
+
+
+class SourceTest(unittest.TestCase):
+    """Источник пакета не из реестра по умолчанию — имя с источником (`имя @ источник`) или `index <url>`:
+    смена источника существующего имени — новое имя, другая ссылка (коммит, тег) того же источника — нет."""
+
+    def assert_added(self, path, old, cases):
+        for new, expected in cases.items():
+            with self.subTest(new):
+                self.assertEqual(_added(path, old, new), expected)
+
+    def test_npm_specs(self):
+        old = '{"dependencies": {"left-pad": "^1", "a": "github:o/a#v1"}}'
+        dep = '{"dependencies": {"left-pad": "%s", "a": "github:o/a#v1"}}'
+        self.assert_added("package.json", old, {
+            dep % "github:evil/evil": ["left-pad @ github:evil/evil"],
+            dep % "evil/left-pad#v2": ["left-pad @ evil/left-pad"],
+            dep % "git+https://x/evil.git#main": ["left-pad @ git+https://x/evil.git"],
+            dep % "https://x/evil.tgz": ["left-pad @ https://x/"],
+            dep % "jsr:@evil/pad": ["left-pad @ jsr:@evil/pad"],
+            dep % "git@github.com:evil/pad.git": ["left-pad @ git@github.com:evil/pad.git"],
+            # Реестр по умолчанию: версия, тег, каталог pnpm.
+            dep % "^2": [],
+            dep % "latest": [],
+            dep % "catalog:": [],
+            '{"dependencies": {"left-pad": "^1", "a": "github:o/a#v2"}}': [],
+        })
+
+    def test_npm_overrides(self):
+        old = '{"dependencies": {"left-pad": "^1"}}'
+        base = '{"dependencies": {"left-pad": "^1"}, %s}'
+        self.assert_added("package.json", old, {
+            base % '"overrides": {"left-pad": "npm:evil-pad@1"}': ["evil-pad"],
+            base % '"overrides": {"react": {"left-pad": "github:evil/pad"}}': ["left-pad @ github:evil/pad"],
+            base % '"overrides": {"left-pad@1": {".": "npm:evil-pad@1"}}': ["evil-pad"],
+            base % '"resolutions": {"**/left-pad": "npm:evil-pad@1"}': ["evil-pad"],
+            base % '"resolutions": {"a/@s/left-pad": "https://x/e.tgz"}': ["@s/left-pad @ https://x/"],
+            base % '"pnpm": {"overrides": {"a>left-pad@<2": "npm:evil-pad"}}': ["evil-pad"],
+            # Версия, ссылка на версию зависимости и местный пакет — не новый источник.
+            base % '"overrides": {"left-pad": "1.3.0", "x": "$left-pad", "y": "file:../y"}': [],
+        })
+
+    def test_go_replace_module(self):
+        old = "module m\n\ngo 1.22\n\nrequire golang.org/x/text v0.14.0\n"
+        self.assert_added("go.mod", old, {
+            old + "\nreplace golang.org/x/text => github.com/evil/text v0.1.0\n": ["github.com/evil/text"],
+            old + "\nreplace (\n\tgolang.org/x/text v0.14.0 => github.com/evil/text v0.1.0\n)\n":
+                ["github.com/evil/text"],
+            # Замена версией того же модуля и каталогом — не новый источник.
+            old + "\nreplace golang.org/x/text => golang.org/x/text v0.15.0\n": [],
+            old + "\nreplace golang.org/x/text => ../text\n": [],
+        })
+
+    def test_cargo_sources(self):
+        old = '[package]\nname = "app"\n\n[dependencies]\nserde = "1"\nx = { git = "https://x/x", rev = "a" }\n'
+        self.assert_added("Cargo.toml", old, {
+            old + '\n[patch.crates-io]\nserde = { git = "https://github.com/evil/serde" }\n':
+                ["serde @ git+https://github.com/evil/serde"],
+            old + '\n[patch."https://github.com/rust-lang/crates.io-index"]\nserde = { git = "https://e/s", '
+                  'branch = "b" }\n': ["serde @ git+https://e/s"],
+            old + '\n[patch.crates-io]\nserde = { path = "../serde" }\n': [],
+            old.replace('serde = "1"', 'serde = { version = "1", registry = "evil" }'): ["serde @ registry:evil"],
+            old + '\n[replace]\n"serde:1.0.0" = { git = "https://e/serde" }\n': ["serde @ git+https://e/serde"],
+            old.replace('rev = "a"', 'rev = "b"'): [],
+        })
+
+    def test_requirements_sources(self):
+        old = "requests\n"
+        self.assert_added("requirements.txt", old, {
+            "--extra-index-url https://evil.example/simple\nrequests\n": ["index https://evil.example/simple"],
+            "-i https://evil/simple/\nrequests\n": ["index https://evil/simple"],
+            "--index-url=https://evil/simple\nrequests\n": ["index https://evil/simple"],
+            "-f https://evil/links\nrequests\n": ["index https://evil/links"],
+            "requests @ git+https://github.com/evil/requests@v2\n": ["requests @ git+https://github.com/evil/requests"],
+            # Каталог колёс и индекс PyPI по умолчанию — не новый источник.
+            "--find-links ./wheels\nrequests\n": [],
+            "--index-url https://pypi.org/simple\nrequests\n": [],
+        })
+
+    def test_pyproject_sources(self):
+        old = '[project]\nname = "app"\ndependencies = ["requests"]\n'
+        self.assert_added("pyproject.toml", old, {
+            old.replace('"requests"', '"requests @ https://evil/r.whl"'): ["requests @ https://evil/"],
+            old + '\n[tool.uv.sources]\nrequests = { git = "https://evil/r", tag = "v1" }\n':
+                ["requests @ git+https://evil/r"],
+            old + '\n[tool.uv.sources]\nrequests = { index = "evil" }\n': ["requests @ index:evil"],
+            old + '\n[[tool.uv.index]]\nname = "evil"\nurl = "https://evil/simple"\n': ["index https://evil/simple"],
+            old + '\n[tool.uv]\nextra-index-url = ["https://evil/simple"]\n': ["index https://evil/simple"],
+            old + '\n[[tool.poetry.source]]\nname = "evil"\nurl = "https://evil/simple"\n':
+                ["index https://evil/simple"],
+            old + '\n[[tool.pdm.source]]\nname = "evil"\nurl = "https://evil/simple"\n':
+                ["index https://evil/simple"],
+            '[tool.poetry.dependencies]\nrequests = { git = "https://evil/r" }\n': ["requests @ git+https://evil/r"],
+        })
+
+    def test_gemfile_sources(self):
+        old = GemfileTest.OLD
+        self.assert_added("Gemfile", old, {
+            old.replace('"~> 7.1"', '"~> 7.1", git: "https://github.com/evil/rails"'):
+                ["rails @ git+https://github.com/evil/rails"],
+            old.replace('"~> 7.1"', '"~> 7.1", :git => "https://github.com/evil/rails"'):
+                ["rails @ git+https://github.com/evil/rails"],
+            old.replace('"~> 7.1"', '"~> 7.1", github: "evil/rails"'): ["rails @ github:evil/rails"],
+            old.replace('"~> 7.1"', '"~> 7.1", source: "https://evil"'): ["rails @ https://evil"],
+            old.replace('gem "rails", "~> 7.1"\n', 'git "https://github.com/evil/rails" do\n  gem "rails"\nend\n'):
+                ["rails @ git+https://github.com/evil/rails"],
+            old.replace('gem "rails", "~> 7.1"\n', 'source "https://evil" do\n  gem "rails"\nend\n'):
+                ["rails @ https://evil"],
+            old + 'source "https://evil"\n': ["index https://evil"],
+        })
+
+    def test_archive_url_source_is_directory(self):
+        # Источник архива — каталог URL: другая версия файла в том же каталоге — не новое имя, другой хост или
+        # каталог — новое.
+        req = "pkg @ https://h/d/pkg-1.0-py3-none-any.whl\n"
+        self.assert_added("requirements.txt", req, {
+            "pkg @ https://h/d/pkg-2.0-py3-none-any.whl\n": [],
+            "https://h/d/pkg-2.0-py3-none-any.whl\n": [],
+            "pkg @ https://h/d/pkg-2.0.tar.gz?token=1#sha256=00\n": [],
+            "pkg @ https://evil/d/pkg-1.0-py3-none-any.whl\n": ["pkg @ https://evil/d/"],
+            "pkg @ https://h/e/pkg-1.0-py3-none-any.whl\n": ["pkg @ https://h/e/"],
+        })
+        npm = '{"dependencies": {"x": "%s"}}'
+        self.assert_added("package.json", npm % "https://h/x-1.0.tgz", {
+            npm % "https://h/x-2.0.tgz": [],
+            npm % "https://evil/x-1.0.tgz": ["x @ https://evil/"],
+        })
+        uv = '[project]\nname = "app"\ndependencies = ["x"]\n\n[tool.uv.sources]\nx = { url = "%s" }\n'
+        self.assert_added("pyproject.toml", uv % "https://h/x-1.0.zip", {
+            uv % "https://h/x-2.0.zip": [],
+            uv % "https://evil/x-1.0.zip": ["x @ https://evil/"],
+        })
+
+    def test_composer_repositories(self):
+        old = '{"require": {"monolog/monolog": "^3"}}'
+        self.assert_added("composer.json", old, {
+            '{"require": {"monolog/monolog": "^3"}, "repositories": [{"type": "vcs", '
+            '"url": "https://github.com/evil/monolog"}]}': ["index https://github.com/evil/monolog"],
+            '{"require": {"monolog/monolog": "^3"}, "repositories": {"e": {"type": "composer", '
+            '"url": "https://evil"}}}': ["index https://evil"],
+            '{"require": {"monolog/monolog": "^3"}, "repositories": [{"type": "path", "url": "../x"}, '
+            '{"packagist.org": false}]}': [],
+        })
+
+
+class StatementsTest(unittest.TestCase):
+    def test_gemfile_statements_on_one_line(self):
+        self.assertEqual(manifests.names("gemfile", 'gem "rails"; gem "evil"\n'), frozenset({"rails", "evil"}))
+        self.assertEqual(manifests.names("gemfile", "group :test do; gem 'evil'; end\n"), frozenset({"evil"}))
+        self.assertEqual(manifests.names("gemfile", 'gem "a;b"\n'), frozenset())
+
+    def test_gemfile_global_source_per_statement(self):
+        for text in ["source 'https://evil'; gem 'a'\n", "gem 'a'; source 'https://evil'\n",
+                     "gem 'a'; source('https://evil') # x\n"]:
+            with self.subTest(text):
+                self.assertEqual(manifests.names("gemfile", text), frozenset({"a", "index https://evil"}))
+
+    def test_hatch_envs(self):
+        text = ('[tool.hatch.envs.default]\ndependencies = ["pytest"]\n\n'
+                '[tool.hatch.envs.lint]\nextra-dependencies = ["Ruff>=0.5"]\n')
+        self.assertEqual(manifests.names("pyproject", text), frozenset({"pytest", "ruff"}))
+
+
+def _write(root, rel, text):
+    path = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+class OwnNameTrustTest(unittest.TestCase):
+    """Имя пакета манифеста — пакет проекта, только если манифест в HEAD или член workspace корня (`workspaces`
+    package.json, `[tool.uv.workspace]` pyproject.toml); имя свежего манифеста вне workspace — внешнее."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+        _write(self.root, "package.json", '{"name": "app", "dependencies": {"left-pad": "^1"}}')
+        _write(self.root, "tools/fake/package.json", '{"name": "evil-pkg"}')
+
+    def names(self, kind="package.json"):
+        return manifest_watch.project_names(self.root, kind, time.monotonic() + 30)
+
+    def test_fresh_manifest_name_not_project_package(self):
+        self.assertNotIn("evil-pkg", self.names())
+        self.assertIn("left-pad", self.names())
+
+    def test_workspace_member_name_is_project_package(self):
+        for workspaces in ('["tools/*"]', '{"packages": ["tools/**"]}', '["./tools/fake/"]'):
+            with self.subTest(workspaces):
+                _write(self.root, "package.json", '{"name": "app", "workspaces": %s}' % workspaces)
+                self.assertIn("evil-pkg", self.names())
+        for workspaces in ('["tools/*", "!tools/fake"]', '["other/*"]', '["tools"]'):
+            with self.subTest(workspaces):
+                _write(self.root, "package.json", '{"name": "app", "workspaces": %s}' % workspaces)
+                self.assertNotIn("evil-pkg", self.names())
+
+    def test_uv_workspace_member(self):
+        _write(self.root, "pyproject.toml", '[project]\nname = "app"\n\n[tool.uv.workspace]\nmembers = ["libs/*"]\n'
+                                            'exclude = ["libs/skip"]\n')
+        _write(self.root, "libs/a/pyproject.toml", '[project]\nname = "Lib_A"\n')
+        _write(self.root, "libs/skip/pyproject.toml", '[project]\nname = "skipped"\n')
+        _write(self.root, "other/pyproject.toml", '[project]\nname = "other"\n')
+        names = self.names("pyproject")
+        self.assertIn("lib-a", names)
+        self.assertNotIn("skipped", names)
+        self.assertNotIn("other", names)
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_committed_manifest_name_is_project_package(self):
+        _git("init", "-q", cwd=self.root)
+        self.assertNotIn("evil-pkg", self.names())
+        _git("add", ".", cwd=self.root)
+        _git("commit", "-qm", "i", cwd=self.root)
+        self.assertIn("evil-pkg", self.names())
+
+    def test_compare_fresh_manifest_name_is_new(self):
+        os.remove(os.path.join(self.root, "tools/fake/package.json"))
+        entry = manifest_watch.take(self.root, time.monotonic() + 30)
+        _write(self.root, "tools/fake/package.json", '{"name": "evil-pkg"}')
+        _write(self.root, "package.json", '{"name": "app", "dependencies": {"left-pad": "^1", "evil-pkg": "^1"}}')
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30)[0], {"package.json": ["evil-pkg"]})
+        # Свежий манифест в снимке перед следующей командой — тоже не пакет проекта.
+        _write(self.root, "package.json", '{"name": "app", "dependencies": {"left-pad": "^1"}}')
+        entry = manifest_watch.take(self.root, time.monotonic() + 30)
+        _write(self.root, "package.json", '{"name": "app", "dependencies": {"left-pad": "^1", "evil-pkg": "^1"}}')
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30)[0], {"package.json": ["evil-pkg"]})
+
+    def test_compare_workspace_member_not_new(self):
+        _write(self.root, "package.json", '{"name": "app", "workspaces": ["tools/*"], "dependencies": {}}')
+        entry = manifest_watch.take(self.root, time.monotonic() + 30)
+        _write(self.root, "package.json", '{"name": "app", "workspaces": ["tools/*"], '
+                                          '"dependencies": {"evil-pkg": "*"}}')
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30)[0], {})
+
+
+@unittest.skipUnless(hasattr(os, "mkfifo"), "нет FIFO")
+class FifoManifestTest(unittest.TestCase):
+    """FIFO под именем манифеста и ссылка на него не вешают хук: не обычный файл не читается."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+        _write(self.root, "requirements.txt", "requests\n")
+        self.fifo = os.path.join(self.root, "requirements-dev.txt")
+        os.mkfifo(self.fifo)
+        os.makedirs(os.path.join(self.root, "sub"))
+        os.symlink(self.fifo, os.path.join(self.root, "sub", "requirements-dev.txt"))
+        self.addCleanup(self.release)
+
+    def release(self):
+        # Писатель отпускает читателя, если разбор всё же открыл FIFO в блокирующем режиме.
+        try:
+            os.close(os.open(self.fifo, os.O_WRONLY | os.O_NONBLOCK))
+        except OSError:
+            pass
+
+    def call(self, fn, *args):
+        result = {}
+
+        def run():
+            try:
+                result["value"] = fn(*args)
+            except Exception as e:
+                result["error"] = e
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(5)
+        self.assertFalse(thread.is_alive(), "разбор FIFO завис")
+        return result
+
+    def test_project_names(self):
+        result = self.call(manifest_watch.project_names, self.root, "requirements", time.monotonic() + 30)
+        self.assertEqual(result.get("value"), frozenset({"requests"}), result)
+
+    def test_edit_texts(self):
+        for path in (self.fifo, os.path.join(self.root, "sub", "requirements-dev.txt")):
+            with self.subTest(path):
+                result = self.call(manifest_watch.edit_texts, "Write", {"content": "flask\n"}, path)
+                self.assertIsInstance(result.get("error"), manifest_watch.Unavailable, result)
+

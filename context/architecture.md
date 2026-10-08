@@ -13,18 +13,18 @@ planka — плагин Claude Code уровня пользователя: ше�
 
 | Файл | Роль |
 | --- | --- |
-| `hooks/hooks.json` | регистрация хуков: `SessionStart` и `PostModelSwitch` → `model_watch.py`; `UserPromptSubmit` → `remind.py`; `PreToolUse` на `^(AskUserQuestion\|ExitPlanMode\|Bash\|Write\|Edit\|MultiEdit)$` → `judge_tool.py`; `PreToolUse` на файловые инструменты записи и MCP-инструменты с `memor` или `remember` в имени в любом регистре (регулярное выражение — в `hooks/hooks.json`) → `guard_memory.py`; `Stop` → `judge_stop.py`; `PostToolUse` и `PostToolUseFailure` на `Bash` → `debug_watch.py` и `judge_tool.py` |
-| `planka/remind.py` | `philosophy.md` целиком как `additionalContext`; снимок дерева (`take_snapshot`); строка `NO_DOCS_LINE` об отсутствии `CLAUDE.md` |
+| `hooks/hooks.json` | регистрация хуков: `SessionStart` и `PostModelSwitch` → `model_watch.py`; `UserPromptSubmit` → `remind.py 1` и `remind.py 2` (по хуку на часть ядра); `PreToolUse` на `^(AskUserQuestion\|ExitPlanMode\|Bash\|Write\|Edit\|MultiEdit)$` → `judge_tool.py`; `PreToolUse` на файловые инструменты записи и MCP-инструменты с `memor` или `remember` в имени в любом регистре (регулярное выражение — в `hooks/hooks.json`) → `guard_memory.py`; `Stop` → `judge_stop.py`; `PostToolUse` и `PostToolUseFailure` на `Bash` → `debug_watch.py` и `judge_tool.py` |
+| `planka/remind.py` | часть ядра с номером из аргумента (`part_number`) как `additionalContext`: деление по разделам (`split_core`, `core_parts`, `PARTS`, предел `CONTEXT_LIMIT`); в части 1 — снимок дерева (`take_snapshot`) и строка `NO_DOCS_LINE` об отсутствии `CLAUDE.md` (`remind_project`) |
 | `planka/judge_tool.py` | судья вопроса (`judge_question`), плана (`judge_plan`), отказ на добавление пакета и на команду установки под сомнением (`judge_bash`, причины `DEP_REASON`, `DEP_DOUBT_REASON`) и снимок манифестов перед командой (`snapshot_manifests`); отказ правке манифеста (`judge_manifest_edit`, `MANIFEST_REASON`); после команды `Bash` — блок на новые имена в манифестах (`check_command_manifests`, `COMMAND_REASON`) |
-| `planka/guard_memory.py` | судья записи в постоянную память: цель — `is_memory_path`, `is_memory_mcp`; содержимое — `render_content` |
-| `planka/judge_stop.py` | фильтры «варианты» (`looks_like_options`), «готово» (`claims_done`) по последнему сообщению, «документация» (`docs_check`) по изменениям со снимка; один вызов судьи на шаги реплики (`turn_messages`, до `prompts.MAX_TURN_CHARS`); отметка снимка проверенным после Stop без блока (`release_snapshot`) |
-| `planka/debug_watch.py` | счётчик неудач подряд одной команды `Bash` (`update`); с `REPEAT_THRESHOLD`-й неудачи — модуль `debugging.md` контекстом |
+| `planka/guard_memory.py` | судья записи в постоянную память: цель — `is_memory_path` (в том числе `CLAUDE.local.md` — `_local_memory`, импорты `@путь` — `_imported_files`), `is_memory_mcp`; содержимое — `render_content` |
+| `planka/judge_stop.py` | фильтры «варианты» (`looks_like_options`), «готово» (`claims_done`) по последнему сообщению, «документация» (`docs_check`) по изменениям со снимка; один вызов судьи на шаги реплики (`turn_messages`, `prompts.Step`, до `prompts.MAX_TURN_CHARS`); отметка снимка проверенным после Stop без блока (`release_snapshot`, в `finally` `main`) |
+| `planka/debug_watch.py` | счётчик неудач подряд одной команды `Bash` (`update`; хранятся последние `MAX_COUNTS` счётчиков и `MAX_SHOWN` отметок показа); с `REPEAT_THRESHOLD`-й неудачи — модуль `debugging.md` контекстом |
 | `planka/model_watch.py` | модель сессии из `model` входа `SessionStart` и `to_model` входа `PostModelSwitch` в состояние (`store`); агенту ничего не выводит |
 | `planka/common.py` | барьер, чтение входа, тексты правил и рубрика, транскрипт (`read_transcript`), модель и запуск судьи (`judge_model`, `stored_session_model`, `usable_model`, `run_judge`), лимит отказов, журнал, корень проекта (`project_root`) и окружение git о нём (`git_env`), классы путей, формат ответа (`run_hook`) |
-| `planka/prompts.py` | системный промпт, схема ответа `JUDGE_SCHEMA`, вопросы судье по видам проверки, сборка содержимого |
+| `planka/prompts.py` | системный промпт, схема ответа `JUDGE_SCHEMA`, вопросы судье по видам проверки, сборка содержимого; шаг реплики `Step` и его текст для судьи (`render_step`, `turn_content`) |
 | `planka/planparse.py` | разбор плана на волны и задачи, владение файлами (`shared_files`) |
-| `planka/manifests.py` | разбор манифестов: вид по имени (`kind`), имена внешних зависимостей (`names`), они же с транзитивными (`known_names`), имя пакета манифеста (`own_name`) |
-| `planka/manifest_watch.py` | текст манифеста после правки файловым инструментом (`edit_texts`, `check_edit`), новые имена (`fresh_names`, `edit_names`), имена версии HEAD и сторон конфликта (`head_names`), других манифестов проекта и манифестов и файлов `setup.py`, `setup.cfg`, `Pipfile` его версии HEAD (`project_names`, `_tree_names`, `source_kind`), снимок манифестов проекта и сравнение после команды (`take`, `compare`, `store`, `pop`), имена ref до начала сессии, откуда команда git возвращает файлы, и патчей `git apply`, не менявшихся с начала сессии (`command_refs`, `command_patches`, `restored_names`; начало сессии — `mark_start`, `session_start`), файлы вывода генераторов requirements (`generated_requirements`) |
+| `planka/manifests.py` | разбор манифестов: вид по имени (`kind`), имена внешних зависимостей с источником не по умолчанию (`names`), они же с транзитивными `go.mod` (`known_names`), имя пакета манифеста (`own_name`), шаблоны членов workspace корня (`workspace_members`) |
+| `planka/manifest_watch.py` | манифест, который правит файловый инструмент, в том числе через ссылку (`edit_target`), текст манифеста после правки (`edit_texts`, `check_edit`), новые имена (`fresh_names`, `edit_names`), имена версии HEAD и сторон конфликта (`head_names`), других манифестов проекта и манифестов и файлов `setup.py`, `setup.cfg`, `Pipfile` его версии HEAD (`project_names`, `_tree_names`, `source_kind`), снимок манифестов проекта и сравнение после команды (`take`, `compare`, `store`, `pop`), имена ref до начала сессии, откуда команда git возвращает файлы, и патчей `git apply`, не менявшихся с начала сессии (`command_refs`, `command_patches`, `restored_names`; начало сессии — `mark_start`, `session_start`), члены workspace корня (`_workspace`, `_member`) |
 | `planka/depcheck.py` | разбор команды Bash: добавляет ли она пакет (`dependency_add`), команда установки под сомнением (`dependency_doubt`), маркер `DEP_OK_MARKER`, heredoc (`heredocs`), автомат кавычек `_scan` |
 | `planka/snapshot.py` | снимок дерева (`capture`, `store`, `load`) и изменения с него (`changed_since`) в режимах git и walk; порог `MAX_FILES` грязных путей в git; перепривязка непроверенного снимка (`carry_over`, `mark_checked`), неудачи снимка (`mark_failed`, `failure`) |
 | `planka/comments.py` | строки комментариев изменённых файлов для судьи документации (`extract`) |
@@ -76,7 +76,9 @@ planka — плагин Claude Code уровня пользователя: ше�
 
 Все хуки запускаются через `common.run_hook`: stdout — один JSON (ответ из `common.emit` плюс
 `systemMessage` из `common.warn`) или пусто; stderr не пишется; исключение превращается в
-предупреждение «внутренняя ошибка». Ввод и вывод — байтами через `sys.stdin.buffer` и
+предупреждение «внутренняя ошибка»; без `fcntl` (не POSIX, «Платформы») `run_hook` не вызывает хук и отвечает
+только предупреждением. `remind.py` получает номер части ядра аргументом командной строки (`run_hook(lambda:
+main(sys.argv[1:]))`). Ввод и вывод — байтами через `sys.stdin.buffer` и
 `sys.stdout.buffer` в UTF-8, независимо от локали, в том числе при кодировке файловой системы ascii
 (локаль C без UTF-8 mode); JSON — через `common.dumps`. Путь из входа или транскрипта приводится к
 кодировке файловой системы `common.input_path`: Claude Code пишет пути байтами UTF-8, и в локали не
@@ -88,7 +90,13 @@ UTF-8 строка с кириллицей иначе не кодируется 
 начинается с `planka: `. Отказ `PreToolUse` — `common.deny_output`, отказ `Stop` —
 `common.block_output` (им же `judge_tool.check_command_manifests` отвечает на `PostToolUse` и
 `PostToolUseFailure`: команда уже выполнена, `decision: block` отдаёт причину агенту), контекст
-`UserPromptSubmit` — `common.context_output`; `debug_watch` отвечает
+`UserPromptSubmit` — `common.context_output`, у каждой части ядра свой: Claude Code меряет предел
+`remind.CONTEXT_LIMIT` (10 000 символов, code.claude.com/docs/en/hooks.md) у строки каждого хука отдельно, длиннее —
+сохраняет в файл и отдаёт агенту путь и первые 2 000 символов. `remind.split_core` делит ядро по разделам `## ` на
+`PARTS` кусков с наименьшим наибольшим; часть k > 1 начинается заголовком `remind.CONTINUATION`: хуки события идут
+параллельно, порядок частей не гарантирован. Часть длиннее предела выдаётся с предупреждением; что части влезают при
+пути `{RULES}` в 200 символов, склейка частей — ядро и в `hooks/hooks.json` есть хук на каждый номер, сверяет
+`CorePartsTest` в `tests/test_contract.py`; `debug_watch` отвечает
 `hookSpecificOutput` с `additionalContext` своего события; `model_watch` — только `systemMessage` предупреждения:
 plain-text stdout `SessionStart` и `PostModelSwitch` Claude Code добавляет в контекст агента. Ответ запоминается до
 записи журнала: сбой записи не отменяет отказ.
@@ -103,7 +111,9 @@ plain-text stdout `SessionStart` и `PostModelSwitch` Claude Code добавля
 
 Результат — `common.Verdict`. Любая ошибка судьи — `Verdict` с `error`: короткое описание без текста модели, оно идёт в
 журнал; фрагмент ответа (до `MAX_DETAIL` = 200 символов) — в `detail`, только для пользователя. Предупреждение о
-пропуске собирает `common.skip_message`. `reason` обрезается до `MAX_REASON`. Аргументы после `claude` и stdin судьи —
+пропуске собирает `common.skip_message`. Ответ не по схеме — `ok` не `bool`, `reason` не строка, `violated` не
+список строк — ошибка «ответ судьи не по схеме», не вердикт: приведение типов сделало бы из `"false"` вердикт
+`ok`. `reason` обрезается до `MAX_REASON`. Аргументы после `claude` и stdin судьи —
 байты `common._utf8` (claude читает их в UTF-8 при любой локали; суррогат U+DC80..U+DCFF — исходный байт пути, прочие
 одиночные суррогаты заменяются «?» поштучно, остальной текст как есть), ответ декодируется из UTF-8 с заменой; ответ
 судьи делится на строки только по `\n`: U+2028, U+2029 и U+0085 JSON оставляет символами внутри строки; `ValueError` при
@@ -129,16 +139,23 @@ plain-text stdout `SessionStart` и `PostModelSwitch` Claude Code добавля
 `AskUserQuestion` после неё; `message_before_author` — последнее сообщение ассистента до неё; `earlier_turns` —
 прежние непустые реплики автора основной ветки от старых к новым, каждая собрана как `author_turn` и
 дополнена ответами на `AskUserQuestion` своей реплики (обрезка — в `prompts`); `turn_steps` — шаги той же
-реплики по порядку: тексты ответов и вызовы инструментов основной ветки (`common._tool_step`: «⟦вызов <имя>⟧» и
-команда `Bash`, путь файлового инструмента или вход JSON одной строкой — переводы строки «⏎», до `STEP_ARG`
-символов) с выводом из `tool_result`
-(«⟦вывод⟧» или «⟦ошибка⟧», длиннее `STEP_HEAD` + `STEP_TAIL` — начало и конец; `common._step_output`) или
-«⟦отклонено⟧» для отклонённого вызова. При переполнении `prompts.MAX_TURN_CHARS` `prompts.turn_content` сначала
-снимает вывод ранних вызовов — от первой метки `prompts.STEP_OUTPUTS` («⟦вывод опущен⟧», `prompts._drop_old_outputs`;
-вызов без вывода и «⟦отклонено⟧» не трогаются), затем опускает ранние шаги: тексты
-сообщений и ближние к последнему выводы — опоры рекомендации — вытесняются последними. Записи `isSidechain`
+реплики по порядку, `prompts.Step`: текст ответа (`text`) или вызов инструмента основной ветки (`common._tool_step`:
+имя `call` и аргумент `arg` — команда `Bash`, путь файлового инструмента или вход JSON одной строкой, переводы строки
+«⏎», до `STEP_ARG` символов) с меткой результата `mark` и выводом `output` из `tool_result` (`STEP_OUTPUT` или
+`STEP_ERROR`, длиннее `STEP_HEAD` + `STEP_TAIL` — начало и конец, `common._step_output`; `STEP_REJECTED` для
+отклонённого вызова). Текстом шаг становится только в `prompts.render_step`: метки «⟦вызов …⟧», «⟦вывод⟧» и
+разделитель `TURN_SEPARATOR` ставятся по полям, а в данных `prompts._escape_data` ставит обратную косую перед ⟦ и ⟧ и
+перед строкой из трёх и более «-» (обратные косые перед ними удваиваются — правило обратимо, его объясняет судье
+`TURN_LABEL`): шаг, подделанный текстом агента, командой или выводом, судья видит как данные. Отвергнуто: шаги
+строками с метками внутри — граница шага и метка вывода искались по тексту, который пишет агент. При переполнении
+`prompts.MAX_TURN_CHARS` `prompts.turn_content` сначала снимает вывод ранних вызовов с меткой из
+`prompts.STEP_OUTPUTS` (метка `STEP_DROPPED`, «⟦вывод опущен⟧», `prompts._drop_old_outputs`; вызов без вывода и
+«⟦отклонено⟧» не трогаются), затем опускает ранние шаги: тексты сообщений и ближние к последнему выводы — опоры
+рекомендации — вытесняются последними. Последний шаг длиннее предела режется по данным до экранирования
+(`prompts._clip_last`): у сообщения остаётся конец текста, у вызова — строка вызова и конец вывода. Записи `isSidechain`
 пропускаются. Шаги берёт только судья `Stop` (`judge_stop.turn_messages`): по ним он видит проверку, о которой
-агент пишет словами; дубль последнего сообщения сверяется с последним текстовым шагом — после него в транскрипте
+агент пишет словами; дубль последнего сообщения сверяется с последним текстовым шагом (`call is None`) — после него в
+транскрипте
 бывает вызов инструмента.
 
 Реплика автора (`common._is_author_turn`) — запись `user` основной ветки без `isMeta`, которую написал человек: с полем
@@ -180,12 +197,14 @@ author_answers, earlier_turns)`: прежние реплики автора от
 Вопросы по видам: `prompts.question_prompt`, `prompts.plan_prompt`, `prompts.memory_prompt`,
 `prompts.stop_prompt` (вопросы совпавших фильтров в порядке options, done, docs; сообщения реплики
 склеивает `prompts.turn_content` с пояснением `prompts.TURN_LABEL`, не больше `prompts.MAX_TURN_CHARS`
-символов: ранние сообщения сверх предела опущены с пометкой их числа), содержимое фильтра
+символов: ранние шаги сверх предела опущены с пометкой их числа), содержимое фильтра
 «документация» — `prompts.render_docs_content`.
 
 Судья — группа процессов (`start_new_session`) со сторожем `common._WATCHDOG` (`python3 -I -c`) во
 главе (`common._start_judge`): сторож запускает `claude` потомком и раз в `WATCHDOG_POLL` (0,5 с)
-сверяет своего родителя с PID хука; хук умер — `SIGKILL` всей группе, `claude` и его потомкам. Таймаут
+сверяет своего родителя с PID хука; хук умер — `SIGKILL` всей группе, `claude` и его потомкам. `claude`
+завершился — тоже `SIGKILL` группе: его потомок, отпустивший каналы судьи, не переживает хук; код возврата `claude`
+сторож не передаёт — ответ уже в каналах. Таймаут
 `JUDGE_TIMEOUT` (60 с) убивает группу из хука (`common._kill_group`, ожидание до `common.KILL_WAIT`,
 5 с); сторож, убитый отдельно от группы, оставляет её этому таймауту. Сторож — на всех платформах:
 `PR_SET_PDEATHSIG` Linux действует только на сам `claude`, не на его потомков. Цена — лишний запуск
@@ -194,14 +213,18 @@ author_answers, earlier_turns)`: прежние реплики автора от
 
 ## Сроки
 
-Таймауты хуков в `hooks/hooks.json`: `UserPromptSubmit` 10 с, `PreToolUse` 90 с у обоих хуков, `Stop` 120 с,
+Таймауты хуков в `hooks/hooks.json`: `UserPromptSubmit` 10 с у части 1 и 5 с у части 2 (без снимка — только чтение
+ядра), `PreToolUse` 90 с у обоих хуков, `Stop` 120 с,
 `PostToolUse` и `PostToolUseFailure` — 10 с у `debug_watch` и 30 с у `judge_tool`, `SessionStart` и `PostModelSwitch` —
 10 с у `model_watch` (без судьи, git и процессов — только запись файла под `state_lock`). У `Stop` до судьи ещё
 `git rev-parse` и, если вершина — домашний каталог или его предок и `CLAUDE_PROJECT_DIR` ниже неё, `git ls-files`
 корня проекта (`common.project_root`, вместе до `common.GIT_ROOT_TIMEOUT`, 5 с), сверка со снимком со сроком
 `judge_stop.SNAPSHOT_BUDGET` (20 с) и извлечение комментариев со сроком `judge_stop.COMMENTS_BUDGET` (20 с) — вместе с
-судьёй (до 65 с) не больше 110 с. У `UserPromptSubmit` снимок ограничен сроком `remind.SNAPSHOT_BUDGET` (7 с от старта
-хука); не уложился — `TimeoutError`, снимок пропускается с предупреждением, неудача запоминается для корня
+судьёй (до 65 с) не больше 110 с. У части 1 `UserPromptSubmit` снимок вместе с упаковкой блоков walk
+(`snapshot._pack_dirs`: срок проверяется на
+каждом каталоге и через каждые `snapshot.PACK_CHUNK` байт блока) ограничен сроком `remind.SNAPSHOT_BUDGET` (7 с от
+старта хука); запись готового файла и `prune_state` — в оставшемся запасе; не уложился — `TimeoutError`, снимок
+пропускается с предупреждением, неудача запоминается для корня
 (`snapshot.mark_failed`; так же при `TooManyFiles`), и до конца сессии `remind` этот корень не снимает;
 напоминание выдаётся. Один вызов git в
 `snapshot` и `comments` — не дольше `GIT_TIMEOUT` (10 с) и остатка срока. У хуков `PreToolUse` с судьёй срок —
@@ -258,7 +281,11 @@ cat-file --batch` изменённых манифестов, и дерево HEA
 `context/testing.md`). Формы, которые разбор понимает, —
 `README.md`, «Известные ограничения». Строку файлов `planparse._split` делит на пути и остаток после серии путей в
 кавычках (связки серии — `planparse._CONN`); повторная строка файлов задачи с остатком-предложением
-(`planparse._continues_description`) — описание, её пути владением не считаются.
+(`planparse._continues_description`) — описание, её пути владением не считаются. Пункт списка файлов, который не
+владение (`- **Не трогать:**`), `parse_plan` запоминает отступом `skip_indent`: пункты глубже него принадлежат ему и
+пропускаются, даже если они целиком пути; пункт на его уровне или мельче, заголовок, конец списка и новая строка
+файлов снимают отметку. Пункты, вложенные под саму строку `Файлы:`, — владение. Корпус —
+`tests/fixtures/plan-readonly-nested.md`.
 
 ## Запись в память
 
@@ -308,12 +335,40 @@ NUL и значение, не кодируемое в файловую сист�
 памяти не дальше чем через одно слово или сразу после него (слова по порядку — `guard_memory._words`). Корпус настоящих
 и ложных имён — `MemoryMcpNameTest.CORPUS` в `tests/test_guard_memory.py`. Дешёвая ошибка — ложное срабатывание: лишний
 вызов судьи (не больше `common.MAX_DENIES` отказов на реплику) дешевле записи в память без согласия автора; поэтому
-`set_memory_limit` и `clear_memory_cache` судятся как запись. Matcher хука в `hooks/hooks.json` пропускает `mcp__` с
+`set_memory_limit` и `clear_memory_cache` судятся как запись. `guard_memory._words` делит и конец аббревиатуры
+перед словом (`saveLTMemory`), и границу буквы и цифры (`storeMemory2`). Matcher хука в `hooks/hooks.json` пропускает
+`mcp__` с
 `memor` или `remember` в любом регистре — надмножество `MEMORY_WORDS`. Содержимое судьи — `guard_memory.render_content`
 из полей `Transcript` и текста записи (`guard_memory.write_text`): прежние реплики автора, реплика текущего хода и его
 ответы — тем же текстом `prompts.author_context`, что блок `<author>` других судей (пределы —
 `prompts.MAX_AUTHOR_FIELD`), сообщения агента и текст записи — до `guard_memory.MAX_FIELD` символов
 (`guard_memory._clip`).
+
+Личные инструкции и импорты. Память — ещё `CLAUDE.local.md` (`guard_memory.LOCAL_MEMORY`) в каталоге проекта, над ним
+и в его подкаталогах (`guard_memory._local_memory`: Claude Code читает их из каталога запуска, каталогов над ним и
+подкаталогов) и файлы, которые подключают импортом `@путь` файлы `_import_roots` — `CLAUDE.md` и `rules/**.md`
+каталога настроек (ссылки на каталоги проходятся, цикл — нет) и `CLAUDE.local.md` проекта и каталогов над ним
+(`guard_memory._imported_files`: обход по уровням, не дальше `IMPORT_DEPTH` переходов, каждый файл — в формах
+`_forms`, файл не обязан существовать: его создание тоже запись в память). Импорты файла — `guard_memory._imports`:
+`IMPORT` — `@` не после буквы и цифры (почта — не импорт), путь до пробела, `\ ` — пробел, `#…` отрезан, путь
+берётся и с хвостом разметки `IMPORT_TAIL`, и без него; `_accepted_import` — формы, которые принимает Claude Code;
+относительный — от каталога файла, `~/` — от дома; `_strip_code` вырезает ограждённые блоки, код в строке и
+HTML-комментарии. Файл читает `_read_memory_file`: только обычный файл (FIFO не вешает хук), не больше
+`MAX_IMPORT_FILE` (4 МиБ — больше Claude Code не читает). Импорты `CLAUDE.local.md` подкаталогов не разбираются:
+Claude Code читает их по требованию, а обход проекта на каждый вызов хука дорог. Пределы на вызов —
+`MAX_IMPORT_FILES` файлов и `MAX_IMPORT_BYTES` байт: сверх них остаток не разбирается, с предупреждением. Проектный
+`CLAUDE.md` в корни не входит: это документация, его импорты — не память. `CLAUDE.local.md` или импортированный файл,
+оказавшийся файлом репозитория проекта (`_repository_file`), — не память, как проектный `CLAUDE.md`; git
+спрашивается не больше одного раза на вызов (`repository_file` в `is_memory_path`): срок `CHECK_IGNORE_TIMEOUT`
+входит в сумму `TimeoutsTest` один раз. Корпус форм импорта — `ImportParseTest.CORPUS` в `tests/test_guard_memory.py`
+(примеры документации Claude Code о памяти).
+
+Регистр и `..`. На файловой системе без учёта регистра (`guard_memory._case_insensitive`: путь или его предок
+находится по имени с обращённым регистром, и `os.path.samefile` — тот же файл; проверяется каждый уровень) путь и
+места памяти сравниваются после `str.casefold`. Отдельного вызова о регистре в стандартной библиотеке нет; цена —
+соседняя ссылка с тем же именем в другом регистре даёт лишний вызов судьи. `target_path` схлопывает `..`
+лексически (`os.path.normpath`) до разрешения ссылок: Claude Code сам нормализует путь инструмента так же перед
+хуком и пишет в нормализованный (проверено на бинарнике 2.1.294; закреплено тестом).
 
 ## Повторная неудача команды
 
@@ -323,7 +378,10 @@ NUL и значение, не кодируемое в файловую сист�
 `{agent_id: prompt_id}`, реплика, в которой модуль уже показан этому агенту (у основного ключ `""`).
 Субагенты и основной агент считают и получают модуль порознь: неудача субагента не делает «второй раз»
 у другого. `debug_watch.update` пишет файл заново только из `counts` и `shown`: поля прежних форматов
-(`shown_prompt`) не читаются и при записи не переносятся.
+(`shown_prompt`) не читаются и при записи не переносятся. Файл ограничен: последние `MAX_COUNTS` (500) ключей
+`counts` и `MAX_SHOWN` (100) записей `shown` (`debug_watch._recent`); свежесть — порядок вставки словаря, тронутая
+запись переставляется в конец. Без предела каждая новая команда сессии росла бы файл, который хук читает и пишет
+целиком под `state_lock`.
 
 Неудача — событие `PostToolUseFailure` без `is_interrupt`, кроме кода 1 команды-ответа; `PostToolUse`
 той же команды и код 1 команды-ответа удаляют её ключ.
@@ -340,7 +398,9 @@ NUL и значение, не кодируемое в файловую сист�
 подстановки `x=$(…)` (`SUBSTITUTION_ASSIGNMENT`) — по команде подстановки. Затем — после присваиваний и
 обёрток `WRAPPERS`, из
 `CODE1_ANSWERS`, git-подкоманда из `GIT_CODE1_ANSWERS` с нужным флагом, `command -v`/`-V` или `!`;
-неразборная строка — не ответ. Ложное срабатывание здесь дороже пропуска: модуль только
+неразборная строка — не ответ. Слова команды берёт `debug_watch._head_words` по первым `_HEAD_LIMIT` (4096)
+символам: слово, разрезанное пределом, отбрасывается, кавычка, не закрытая в пределах обрезанной строки, — не ошибка;
+флаг ответа дальше предела не виден — неудача. Ложное срабатывание здесь дороже пропуска: модуль только
 подмешивается, агент и без него видит ошибку, а модуль «упала второй раз подряд» на ответе
 «не найдено» засоряет контекст и учит агента пропускать модуль. Сомнение решается в пользу ответа
 только для команд из списка, остальное — неудача. Сам Claude Code код 1 у `grep`, `rg`,
@@ -382,10 +442,32 @@ heredoc, открытого в незакрытой кавычке (в том ч
 `)` из тела. Дешёвая ошибка разбора кавычек — пропуск: ложный отказ останавливает обычную работу агента; на
 незакрытой конструкции (bash сам падает с синтаксической ошибкой) детектор может молчать.
 
+Сегменты — `depcheck._parse` (`_segments` — его первая часть): кроме сегментов, он отдаёт связи «источник →
+приёмник» для конвейера `a | b` и процесс-подстановки `b <(a)` и тела heredoc с терминатором без кавычек.
+Подстановка `$(…)`, `` `…` `` и `<(…)`, `>(…)` вне кавычек — свой сегмент, сегмент вокруг продолжается с заглушкой
+`$`. `depcheck._stdin_scripts` по связям берёт вывод `echo`/`printf` с аргументами-литералами (`_echo_text`), который
+идёт в оболочку без скрипта (`_heredoc_runs`) или `source` без маркера у приёмника, и подстановки в телах heredoc
+(bash раскрывает их, `_quoted_substitutions` с `heredoc`); `_find` и `_find_doubt` проверяют этот текст на уровень
+глубже. Строки, которые исполняет сама команда сегмента, собирает `_scripts`: `sh -c`/`eval` (`_inline_script`),
+here-string оболочки (`_herestrings`) и запуск из аргументов (`_launched`: ssh, `trap`, `find -exec`, `cmd /c`,
+`pwsh -Command`, `nix develop|shell -c`, `nix-shell --run`, `mise exec --`). Ведущие слова снимает
+`_command_info`: присваивания `_ENV_ASSIGN` (и `+=`; маркер — слово без кавычек и `\`), `_KEYWORDS`, обёртки
+`_WRAPPERS` (`su`, `runuser` — `_C_WRAPPERS`, `_c_wrapper` разбирает флаги как getopt с перестановкой: строка
+`-c`/`--command`/`--session-command`, у `runuser` без неё — слова после `-u пользователь`, без `-c` и `-u` —
+`<программа -s или sh> [слова за
+пользователем]`, без слов — оболочка, читающая stdin (`_stdin_scripts`); с сегмента снимается не больше
+`_MAX_WRAPPERS` (16) обёрток, за пределом — сомнение `_WHY_WRAPPERS`; `flock файл -c`; `watch` без
+`-x` — строка `sh -c` из склеенных слов, `_WATCH_EXEC`), слова команды — до
+`_WORDS_LIMIT` символов от её первого слова. Имя команды — `_basename`: без каталога и суффикса Windows, в нижнем
+регистре (`NPM.CMD` — `npm`: macOS и Windows регистр не различают). Флаг, склеенный со значением (`-uroot`),
+следующего слова не берёт (`_takes_value`). Каждая из этих форм названа в коде поимённо: неназванная запись той же
+установки проходит — `context/deferred/depcheck-enumerated-forms.md`. Корпус настоящих команд —
+`tests/fixtures/bash-commands.jsonl` (`CorpusTest` в `tests/test_depcheck.py`).
+
 Не добавление: пробный прогон (`depcheck._dry_run`: у npm — `_npm_dry_run`, у apt и apt-get — `_apt_parse`, у
 aptitude — `_aptitude_simulates`, у brew — ещё `-n` и склейка с ним (`_brew_dry_run`; короткие флаги `brew install`
-значения не берут, Library/Homebrew/cmd/install.rb, флаги со значением — `_BREW_VALUE_FLAGS`), у прочих — слово
-`_DRY_RUN` среди слов команды; у запускателей — `npx`,
+значения не берут, Library/Homebrew/cmd/install.rb, флаги со значением — `_BREW_VALUE_FLAGS`), у pip и
+`_DRY_RUN_MANAGERS` — слово `_DRY_RUN` среди слов команды, у прочих — не пробный прогон, ниже; у запускателей — `npx`,
 `corepack`, `python -m`, `… run` — проверяется вложенная команда), пакеты своего workspace (`_LOCAL_PROTOCOLS`:
 `workspace:`, `link:`, `portal:`, `file:`; `pnpm --workspace`) и `--path` у cargo и bundle. `corepack` и
 `npx`/`bunx`/`pnpx` (`_NPX`) разбираются как запуск следующей команды (версия `@…` у имени снимается). `bash +c '…'`
@@ -409,22 +491,30 @@ apt-private/private-cmndline.cc) в словах остаются: их проп
 читается по основанию 10: у значений 0 и 1 результат тот же, прочие не булевы. У прочих
 менеджеров флаг без значения: `false` следом — позиционное слово (`pip install --dry-run false x` — пробный прогон),
 `--dry-run=false` и `--no-dry-run` — ошибка разбора (optparse у pip, clap у cargo и uv, cleo у poetry, symfony
-console у composer; у `pnpm add` и `pnpm install <пакет>` 12.10 `--dry-run` нет — ошибка в любой форме). Дешёвая
-ошибка — пропуск: команда с `--dry-run` у неизвестного разбора считается пробной, кроме `--dry-run` сразу за флагом
-со значением этого менеджера — это сомнение (ниже). Отвергнуто: один разбор
+console у composer; у `pnpm add` и `pnpm install <пакет>` 12.10 `--dry-run` нет — ошибка в любой форме). Команда с
+`--dry-run` считается пробной только у менеджеров `_DRY_RUN_MANAGERS`, где флаг — пробный прогон или ошибка
+разбора, и у pip; у прочих (yarn 1 незнакомый флаг пропускает и ставит пакет, проверено на 1.22; mix, choco, nuget,
+winget, cpan, cpanm, port, scoop) — установка: пропуск открыл бы обход дописанным `--dry-run`. `--dry-run` сразу за
+флагом со значением этого менеджера — сомнение (ниже). Отвергнуто: один разбор
 `--dry-run false` для всех менеджеров — у pip, cargo, bun это пробный прогон с пакетом `false`, вышел бы ложный
 отказ.
 
 Сомнение — `depcheck.dependency_doubt`, второй проход тем же обходом (`_find_doubt`, `_segment_doubt`), когда
 `dependency_add` добавления не нашёл: сегмент, где менеджер и команда установки распознаны, а пакет или подкоманда
-под сомнением, — отказ `judge_tool.DEP_DOUBT_REASON` с доводом (`_WHY_*`) и обходом маркером, в журнал `deny-dep`.
+под сомнением, или за `_MAX_WRAPPERS` снятыми обёртками стоит ещё обёртка (`wrapped`, любая команда, `_WHY_WRAPPERS`;
+маркер — в начале сегмента), — отказ `judge_tool.DEP_DOUBT_REASON` с доводом (`_WHY_*`) и обходом маркером, в журнал
+`deny-dep`.
 По правилу о краях эвристик (`CLAUDE.md`, «Правила проекта») это то же добавление пакета другой записью: пропуск
 открыл бы обход проверки, ложный отказ снимает маркер. `_doubt` проверяет слова команды (`_command_info`: ещё снята
-ли обёртка `xargs` и есть ли слово-не-флаг, начатое за `_WORDS_LIMIT`) по очереди: заглушка пакета `_STDIN_PACKAGE`
-в конце (xargs, хвост сегмента), `_is_add` в режимах `_MASKED` (`--dry-run` сразу за флагом со значением этого
+ли обёртка `xargs`, есть ли слово-не-флаг, начатое за `_WORDS_LIMIT`, и стоит ли обёртка за пределом) по очереди:
+обёртка за пределом (`_WHY_WRAPPERS`), заглушка пакета `_STDIN_PACKAGE`
+в конце (xargs, хвост за `_WORDS_LIMIT`), `eval` или оболочка, чья строка `-c` или скрипт за пределом (`_cut_script`),
+`_is_add` в режимах `_MASKED` (`--dry-run` сразу за флагом со значением этого
 менеджера, `_DRY_VALUE_FLAGS`, — значение флага), `_LOOSE` (`_loosened`: первые `_LOOSE_FLAGS` пар «флаг без `=`,
 слово-не-флаг» перед подкомандой склеиваются в `--flag=value`, по варианту на k; не у `_NO_SUBCOMMAND`) и `_DEEP` (за
-`_MAX_DEPTH` у запускателей — `_flat_add`); режим переходит во вложенные `npx`, `python -m`, `… run`. На глубине
+`_MAX_DEPTH` у запускателей — `_flat_add`), затем имя команды — подстановка или переменная, за ним глагол
+`_INSTALL_VERBS` и слово-не-флаг по наборам `_EXPANDED_VALUE_FLAGS` (`_expanded_install`, `$M install x`): менеджер
+известен только при исполнении; режим переходит во вложенные `npx`, `python -m`, `… run`. На глубине
 `_MAX_DEPTH` строка `sh -c`/`eval` и подстановки проверяются `_soup_add`: кавычки и `\` сняты, команды по `;&|()`,
 обратной кавычке и переводу строки, в каждой `_flat_add` берёт первое слово после присваиваний, флагов, обёрток,
 `eval`, оболочек, запускателей и `<менеджер> run`. Отвергнуто: пропуск с предупреждением — обход проверки; спуск
@@ -443,15 +533,37 @@ console у composer; у `pnpm add` и `pnpm install <пакет>` 12.10 `--dry-r
 отсюда Python 3.11+; requirements, `go.mod`, `Gemfile` разбираются построчно и `None` не дают). Нормализация: PyPI — PEP
 503 (`manifests._pep503`), Composer — нижний регистр без платформенных пакетов (`_COMPOSER_PLATFORM`), crates.io —
 `_crate`; npm, Go, RubyGems — как записаны. Транзитивные в `names` не входят: строки `// indirect` в `go.mod`
-(`_GO_INDIRECT`) и весь сгенерированный файл требований (`_generated`: заголовок `_GENERATED_HEADER` в начальном блоке
-комментариев или аннотация `_VIA` где угодно). `build-system.requires` в `pyproject` без стандартных бэкендов
+(`_GO_INDIRECT`). Файл требований с заголовком генератора или аннотацией `# via` разбирается, как любой: заголовок
+впишет и агент вместе с пакетом. `build-system.requires` в `pyproject` без стандартных бэкендов
 `_BUILD_BACKENDS` (руководство PyPA «Choosing a build backend»); прочее в `requires` — зависимость.
-`manifests.known_names(kind, text)` — старая сторона сравнения: `names` вместе с транзитивными (`_KNOWN`); ставшая
-прямой транзитивная зависимость и пакет, уже перечисленный в сгенерированном файле, не новые.
+`manifests.known_names(kind, text)` — старая сторона сравнения: `names` вместе с транзитивными `go.mod` (`_KNOWN`);
+ставшая прямой транзитивная зависимость не новая. Пакет не из реестра по умолчанию `names` пишет именем с источником
+`имя @ источник` (`manifests._sourced`; git, URL, другой реестр: спецификатор npm не из реестра `_NPM_SOURCE`, PEP 508
+`name @ url`, таблицы uv и poetry `_table_source`, Cargo `_cargo_source`, опции и блоки `git`, `github`, `source`
+Gemfile `_gem_source`), источник для всех пакетов — `index <url>` (`manifests._index`: индексы uv, poetry, pdm и
+опции requirements `_pypi_index` кроме PyPI, `repositories` composer кроме `path`, `source` Gemfile кроме RubyGems).
+У VCS ссылка `@…` и фрагмент `#…` снимаются, у архива (`_ARCHIVE`: `.whl`, `.zip`, `.tar`, `.tgz`, `.tbz2`, `.txz`,
+`.tar.gz|bz2|xz`) источник — каталог URL без имени файла, запроса и фрагмента (`_url_source`; у npm — для
+спецификатора `http(s)://`): смена источника — новое имя, другой коммит, тег, ветка или файл архива в том же каталоге —
+нет. Ещё имена дают overrides npm (`_npm_overrides`: `overrides`, `resolutions`,
+`pnpm.overrides`, только ключ, который ставит другой пакет или источник — версия лишь закрепляет пакет), `patch.*` и
+`replace` Cargo, модуль-замена из другого пути в `replace` `go.mod` (`_go_replace`), `tool.hatch.envs.*`. Операторы
+строки Gemfile делит `_ruby_statements` (`;` и `#` вне кавычек). Источник вне манифеста (`.npmrc`, `pip.conf`,
+`.cargo/config.toml`, `go.work`, `GOPROXY`, `UV_INDEX_URL`) не виден.
 `manifests.own_name(kind, text)` — имя пакета самого манифеста (`_OWN`: `name`, `project.name`, `tool.poetry.name`,
-`package.name`, `module`; у requirements и Gemfile `None`): оно не внешнее. Местные источники `names` отбрасывает:
+`package.name`, `module`; у requirements и Gemfile `None`): оно не внешнее, только если манифест в версии HEAD или
+ref до начала сессии (`_tree_names` добавляет имена пакетов манифестов дерева) или член workspace корня
+(`manifest_watch._member` по `manifests.workspace_members`: `workspaces` корневого `package.json`,
+`[tool.uv.workspace]` `members` и `exclude` корневого `pyproject.toml`, последний совпавший шаблон решает) — такого
+члена менеджер ставит из каталога по имени. Имя свежего манифеста вне workspace пишет кто угодно, и обход в два шага
+(новый `package.json` с `"name": "x"`, затем зависимость `x`) прошёл бы. Цена — ложный отказ на соседа вне workspace
+корня: член `pnpm-workspace.yaml` (файл не читается), Cargo-член без `path`, модуль `go.work`, сосед вне git. Местные
+источники `names` отбрасывает:
 `[tool.uv.sources]` с `workspace` или `path` (список — если местный хоть один), `gem` с `path:`/`:path =>` и гемы блока
-`path … do … end` (`_GEM_PATH`, `_GEM_PATH_BLOCK`; вложенность в блоке — по `do` в конце строки, ключевому слову блока в
+`path … do … end` на любой глубине (`_GEM_PATH`, `_GEM_BLOCK`, `_GEM_LOCAL`; источник гема — ближайший блок `path`,
+`git`, `github`, `source` в стеке блоков, прочий блок наследует внешний; `source "url"` без блока (в каждом операторе
+`_ruby_statements`) и гем с опцией источника внутри `path` — с источником; вложенность в блоке — по `do` в конце строки,
+ключевому слову блока в
 начале строки (`_RUBY_KEYWORD_OPEN`: `if`, `unless`, `case`, `begin`, `while`, `until`, `for`, `def`, `class`,
 `module`), кроме блока в одну строку с `end` в конце (`_RUBY_LINE_END`), и `end` в начале строки; лишнее открытие
 дешевле недосчёта: первое — пропуск гемов после блока, второе — ложный отказ на местный гем), `replace x => ./…` в
@@ -461,9 +573,13 @@ console у composer; у `pnpm add` и `pnpm install <пакет>` 12.10 `--dry-r
 Проверка — `judge_tool` и `manifest_watch`, без модели и без лимита отказов:
 
 - Правка файловым инструментом — `judge_tool.judge_manifest_edit` на `EDIT_TOOLS` (`Write`, `Edit`,
-  `MultiEdit`). Путь — `guard_memory.target_path`; вид — `manifest_watch.watched_kind`: путь с каталогом из
-  `FOREIGN_DIRS` не манифест, каталоги ищутся в пути от проекта (`CLAUDE_PROJECT_DIR`, без неё `cwd`
-  входа) — проект сам может лежать под `fixtures/` (`ManifestProjectUnderFixturesTest`).
+  `MultiEdit`). Путь — `guard_memory.target_path`; путь и вид — `manifest_watch.edit_target`: `watched_kind` пути
+  с разрешёнными ссылками от `realpath` корня проекта (`common.project_root`, зовётся, только если имя файла по одному
+  из путей — манифест) и пути как написан от корня; манифест хоть по одному из них — манифест, и проверяется путь, по
+  которому он манифест (ссылка `deps.json` → `package.json`, каталог-ссылка `build` → `.`). Путь с каталогом из
+  `FOREIGN_DIRS` не манифест, каталоги ищутся в пути от корня — проект сам может лежать под `fixtures/`
+  (`ManifestProjectUnderFixturesTest`); проект неизвестен (нет `CLAUDE_PROJECT_DIR` и абсолютного `cwd`) — путь как
+  есть. Файл читает `manifest_watch._read` с `O_NONBLOCK`: FIFO не вешает хук, не обычный файл — `Unavailable`.
   `manifest_watch.edit_texts` повторяет инструмент: `Write` — `content`, `Edit` и `MultiEdit` — замены
   `old_string` по очереди с `replace_all`, текст файла для них с CRLF, приведёнными к LF (как Claude Code);
   не найден или неоднозначен — `None`, хук молчит: инструмент откажет сам. Единый путь сравнения —
@@ -522,22 +638,24 @@ console у composer; у `pnpm add` и `pnpm install <пакет>` 12.10 `--dry-r
   сегмента; комментарий и аргумент не маркер, внутри `bash -c "…"` маркер не виден) не снимается. `manifest_watch.take`
   берёт список `list_manifests` — `git ls-files -z -c -o --exclude-standard`, вне git обход `_walk` (в обоих режимах без
   `FOREIGN_DIRS`, куда входит `snapshot.IGNORED_DIRS`), не больше `MAX_WALK_FILES` файлов, — не больше `MAX_MANIFESTS`
-  манифестов и на каждый пишет `[size, mtime_ns, имена с транзитивными или None, имя пакета манифеста или None]`:
+  манифестов и на каждый пишет `[size, mtime_ns, ctime_ns, имена с транзитивными или None, имя пакета манифеста или
+  None]` (ctime ставит ядро при любой записи, `touch -r` возвращает размер и mtime, но не ctime):
   содержимое не хранится. Если команда возвращает файлы из ref (`manifest_watch.command_refs`), в снимок идёт поле
   `known` — `{реестр: имена}` манифестов и файлов `_LEGACY` ref, созданных до начала сессии (`restored_names`,
   ниже), и слова патчей `git apply`, не менявшихся с начала сессии (`command_patches`, ниже). Файлы `_LEGACY` рабочего
   дерева в снимок не входят: их имена после команды берутся только из версии HEAD (`project_of` в `compare`). Снимок с
-  полями `cwd` (каталог команды до неё) и `known` `store` кладёт в `state/<session>.manifests.json` под `tool_use_id` и
+  полем `known` `store` кладёт в `state/<session>.manifests.json` под `tool_use_id` и
   там же удаляет записи старше `ENTRY_TTL`. Сбой снимка — `common.warn_once` с ключом `manifest-snapshot` и `skipped` в
   журнал на каждую команду.
-- После команды — `judge_tool.check_command_manifests` на `POST_EVENTS`: `manifest_watch.pop` забирает снимок; пути
-  вывода генераторов requirements (`generated_requirements`) `resolve` разрешает от `cwd` снимка и от `cwd` после
-  команды (`cd` внутри неё); `compare` — смена режима git/walk — `Unavailable`; манифест с тем же размером и mtime
+- После команды — `judge_tool.check_command_manifests` на `POST_EVENTS`: `manifest_watch.pop` забирает снимок;
+  `compare` — смена режима git/walk — `Unavailable`; манифест с тем же размером, mtime и ctime
   пропускается, новый сравнивается с пустым, не разобранный до или после — в список предупреждения и `skipped`. Имя,
-  объявленное в любом манифесте того же реестра в снимке, в `known` снимка (ref до начала сессии) или пакет самого
-  проекта в снимке и в манифестах после команды, не новое: `mv`, `cp`, `git mv`, член workspace, возврат работы автора.
+  объявленное в любом манифесте того же реестра в снимке, в `known` снимка (ref до начала сессии, с именами пакетов
+  их манифестов) или пакет члена workspace корня (`_member`) в снимке и в манифестах после команды, не новое: `mv`,
+  `cp`, `git mv`, член workspace, возврат работы автора.
   Остальное решает `fresh_names` с версиями `_REPO_REFS` и сторонами `_INDEX_STAGES`; в git остаток сверяется ещё с
-  именами манифестов и `_LEGACY` версии HEAD (`project_of` в `compare`: дерево читается один раз и лениво, только если
+  именами манифестов и `_LEGACY` версии HEAD и именами пакетов её манифестов (`project_of` в `compare`: дерево читается
+  один раз и лениво, только если
   что-то осталось). Новые имена — `block_output(COMMAND_REASON)`: правка уже в файле, хук не знает, чья она (`git apply`
   патча из stdin или изменённого в сессии, ref моложе начала сессии), поэтому текст велит спросить автора, не откатывать
   вслепую и откатывать только свою правку; в журнал `block-dep` с числами `manifests` и `added`. Сбой
@@ -570,7 +688,8 @@ heredoc, конвейер и `git -C` не разбираются. `_old_patch_n
 читает обычный файл не больше `MAX_MANIFEST_BYTES` и сверяет ctime после чтения: меньше `start` — патч не менялся с
 начала сессии. ctime ставит ядро при любой записи и смене атрибутов, `touch` назад его не ставит (POSIX,
 «Платформы»). Относительный путь — от `cwd` аргумента `restored_names`, без него — от корня; `snapshot_manifests`
-передаёт каталог команды до неё (`cwd` снимка), `cd` внутри команды не учитывается. `_patch_names` берёт блоки, чей
+передаёт каталог команды до неё (`cwd` входа `PreToolUse`), `cd` внутри команды не учитывается. `_patch_names` берёт
+блоки, чей
 файл по заголовку `---`/`+++` — манифест или `_LEGACY` (`source_kind`), считает строки блока по числам `@@` (строка
 `--- x` внутри блока — содержимое) и из строк `+` и `-` берёт слова `_TOKEN`, нормализованные по реестру
 (`_NORMALIZE`): надмножество имён, лишнее слово — пропуск, дешёвая ошибка.
@@ -587,32 +706,31 @@ heredoc, конвейер и `git -C` не разбираются. `_old_patch_n
 маркером `PLANKA_DEP_OK=1` или записью стадий индекса (выше). Патч из stdin, heredoc или конвейера не несёт ни ref,
 ни файла — блок.
 
-Генератор requirements (`manifest_watch._is_generator`) узнаётся по словам сегмента `depcheck._command` приватными
-помощниками `depcheck`: `_subcommand`, `_after_flags`, `_python_module`, `_PIP`, `_GLOBAL_FLAGS` и наборы флагов;
-файлы вывода — цели перенаправлений stdout (`depcheck._split`, `depcheck._REDIRECT`) и значения `_OUTPUT_FLAGS`.
-Правка этих помощников `depcheck` — правка `_is_generator`, её держит `GeneratedRequirementsTest` в
-`tests/test_judge_tool.py`. `depcheck._basename` приводит имя с суффиксом Windows к нижнему регистру
-(`PIP.EXE` — `pip`). Файл, который пишет генератор (`pip freeze`, `uv export`, `poetry export` и т.п.),
-перечисляет транзитивные пакеты — их выбрал не агент, поэтому файл в сравнении после команды не проверяется. Дешёвая
-ошибка здесь — пропуск: генератор, направленный в рукописный файл, снимает с него проверку. `tee` сразу за генератором
-(`pip freeze | tee requirements.txt`) узнаётся (`_tee_outputs`); конвейер с фильтром (`pip freeze | sort >
-requirements.txt`) нет — перенаправление в другом сегменте, файл проверяется.
+Генератор requirements. Файл, который пишет генератор (`pip freeze > requirements.txt`, `uv export -o …`), и файл с
+заголовком генератора или аннотацией `# via` проверяются после команды по содержимому, как прочие манифесты: хук не
+знает, выполнился ли генератор и писал ли он последним (`echo x >> requirements.txt; false && pip freeze >
+requirements.txt`), а заголовок впишет и агент. Новые имена — блок, обход — маркер `PLANKA_DEP_OK=1` перед командой
+генератора по согласию автора. Отвергнуто: узнавать генератор по словам команды и снимать проверку с файлов его вывода
+— запись в тот же файл другим сегментом той же команды проходила бы без проверки.
 
 ## Состояние и журнал
 
 Каталог данных — `$CLAUDE_PLUGIN_DATA`, без него `.data/` в корне плагина (`common.data_dir`).
 
 - `state/<session>.json` — счётчики отказов; `state/<session>.warned.json` — выданные
-  однократные предупреждения (`common.warn_once`); `state/<session>.snap.json` — снимок дерева
+  однократные предупреждения (`common.warn_once`; сбой чтения или записи файла — `OSError` глотается, предупреждение
+выдаётся как обычное и может повториться); `state/<session>.snap.json` — снимок дерева
   текущей реплики (`snapshot.store`, поле `format` = `snapshot.FORMAT`, 2; блоки режима walk — строкой
   `snapshot._pack_dirs`; поле `checked` — отметил ли `Stop` снимок проверенным, `snapshot.mark_checked`; снимок
   без поля считается проверенным); `state/<session>.start.json` — начало сессии `{"start": секунды}`
   (`manifest_watch.mark_start`: содержимое пишется один раз, mtime обновляется на каждом `PreToolUse`);
-  `state/<session>.debug.json` — неудачи команд (`counts`) и отметки показа модуля по агентам (`shown`);
-  `state/<session>.manifests.json` — снимки манифестов перед командами `Bash`, `{tool_use_id: {root, mode, ts, cwd,
-  files: {путь: [size, mtime_ns, имена или None, имя пакета или None]}, known?: {реестр: [имена]}}}`
-  (`manifest_watch.store`, `manifest_watch.pop`; запись не той формы `pop` отбрасывает; `known` — имена манифестов и
-  файлов `_LEGACY` ref до начала сессии); `state/<session>.snapfail.json` — неудачи снимка дерева `{корень: причина}`
+  `state/<session>.debug.json` — неудачи команд (`counts`, последние `debug_watch.MAX_COUNTS`) и отметки показа
+  модуля по агентам (`shown`, последние `MAX_SHOWN`);
+  `state/<session>.manifests.json` — снимки манифестов перед командами `Bash`, `{tool_use_id: {root, mode, ts,
+  files: {путь: [size, mtime_ns, ctime_ns, имена или None, имя пакета или None]}, known?: {реестр: [имена]}}}`
+  (`manifest_watch.store`, `manifest_watch.pop`; запись не той формы `pop` отбрасывает — снимок прошлой версии
+  плагина, команда идёт без сравнения; `known` — имена манифестов и файлов `_LEGACY` ref до начала сессии и имена
+  пакетов их манифестов); `state/<session>.snapfail.json` — неудачи снимка дерева `{корень: причина}`
   (`snapshot.mark_failed`, `snapshot.failure`); `state/<session>.model.json` — модель сессии `{"model": имя}`
   (`model_watch.store`, `common.session_model_path`; запись под `state_lock`, чтение `common.stored_session_model` — без
   него, файл заменяется целиком). Имя — `common.safe_name`. Запись атомарная (`common.atomic_write_json`: временный
@@ -650,7 +768,9 @@ requirements.txt`) нет — перенаправление в другом с�
   любом порядке readdir. Объекта на файл нет — память около размера блоков. Предела числа файлов нет:
   обход ограничен только сроком, срок проверяется на каждом каталоге и раз в `STAT_CHECK_EVERY` файлов.
   В файл снимка блоки идут одной строкой `snapshot._pack_dirs` — base64 от zlib (уровень 1, сжатие по
-  каталогу) записей «каталог, NUL, `_LEN` длины блока, блок»; `load` разворачивает её `_unpack_dirs`.
+  каталогу) записей «каталог, NUL, `_LEN` длины блока, блок»; `load` разворачивает её `_unpack_dirs`. Упаковка
+  растёт с деревом и входит в срок снимка: `store(…, deadline)` проверяет его на каждом каталоге и через каждые
+  `PACK_CHUNK` байт блока, вышел — `TimeoutError`, файл не пишется.
 
 `snapshot.changed_since(root, snap, deadline)` даёт `[(путь, обычный ли файл сейчас)]`. В git
 кандидаты — грязные пути на старте и сейчас и, для репозитория, чей HEAD сменился, `git diff
@@ -691,8 +811,10 @@ git — в одном сроке `GIT_ROOT_TIMEOUT`. Отвергнуто: пр�
 `remind.take_snapshot` не переснимает снимок того же корня и формата `FORMAT` с `checked: false`: `snapshot.carry_over`
 перепривязывает его `prompt_id` к новой реплике, база и HEAD остаются со старта первой реплики без `Stop` (на прерванную
 реплику `Stop` не приходит). Корень, снимок которого в сессии не удался (`snapshot.failure`), не снимается.
-`judge_stop.main` после `Stop` без блока зовёт `release_snapshot` → `snapshot.mark_checked`; блок (`judge` вернул
-`True`) и исключение в `judge` снимок не отмечают. Ошибка судьи, лимит отказов, нет рубрики, неопределимые изменения —
+`judge_stop.main` после `Stop` без блока зовёт в `finally` `release_snapshot` → `snapshot.mark_checked`; блок снимок
+не отмечает — признак блока `judge` кладёт в список `blocked` сразу после `common.emit`, до записи журнала, так что и
+исключение после блока его не теряет; исключение без блока (в том числе после вердикта ok или пропуска) снимок отмечает.
+Ошибка судьи, лимит отказов, нет рубрики, неопределимые изменения —
 отмечают: иначе при постоянной ошибке судьи база растёт без конца, а «не определить» предупреждало бы на каждом `Stop`.
 Блок не отмечает: `Stop` после блока приходит снова, когда агент закончит, а если автор прервёт реплику после блока,
 правки проверит следующая реплика. Формат меняется аддитивно, поэтому `FORMAT` не поднят: снимок без поля `checked`
@@ -729,7 +851,9 @@ HEAD подмодуля), вложенные репозитории — ключ
 Срок разбора `_comments` проверяет раз на `_DEADLINE_EVERY` шагов, шаг — строка или позиция внутри строки: и одна
 длинная строка (минифицированный бандл) не уходит за срок. BOM UTF-8 в начале файла снимается; файл с BOM UTF-16 или
 UTF-32 декодируется по нему (`comments._read`), номера строк пересчитываются по байтам 0x0A, как их считает git (в
-UTF-16 этот байт входит и в другие знаки). Heredoc Ruby и Perl (`rb`, `pl`, `pm`, `Rakefile`, `Gemfile`;
+UTF-16 этот байт входит и в другие знаки): строка текста k занимает git-строки `[номера[k - 1], номера[k])`, и
+`extract` берёт её комментарий, если добавлена любая из них. Heredoc Ruby и Perl (`rb`, `pl`, `pm`, `Rakefile`,
+`Gemfile`;
 `comments._RUBY_HEREDOC`: `<<ID`, `<<-ID`, `<<~ID`, идентификатор и в кавычках — там любые знаки, кроме этой кавычки,
 `<<'----END----'`) — данные. Сдвиг или добавление от heredoc отличает `comments._heredoc_ok`: `<<` сразу после слова или
 закрывающей скобки — сдвиг (`1<<BITS`, `a[0]<<X`, `print $fh<<EOF`), кроме слова из `comments._tight_heredoc`: в Ruby —
@@ -786,7 +910,18 @@ ts, tsx, mts, cts): `/` в начале выражения — литерал `_
 запретив открывать их (`banned`), как heredoc без терминатора. Шаблонная строка JS, строки Ruby `"…"`, `` `…` `` и
 slashy-строка Groovy — элемент `tpl` того же стека: кавычка закрывает строку, `${` и `#{` открывают `code`
 подстановки; комментарий в подстановке — настоящий, кавычки в ней строку не закрывают. `<<` в коде JSX — сдвиг, не
-тег. Остаток — `context/deferred/comment-syntaxes.md`.
+тег.
+
+Однофайловые компоненты Vue и Svelte — поле `sfc` (`"vue"`, `"svelte"`), как их компиляторы: `comments._sfc` вырезает
+блоки `<script>` и `<style>` (`_SFC_BLOCK`, атрибуты — до `>` вне кавычек `_SFC_ATTRS`, конец — `_SFC_END`, сырой текст
+HTML) и разбирает их содержимое синтаксисом по атрибуту `lang` (`_SFC_LANGS`: без `lang` — `mjs` и `css`;
+неизвестный `lang`, `coffee`, `pug`, — без комментариев), номера строк — по всему файлу. Остаток — разметка
+(`_reparse` с вершиной стека `ctx` `["text", None]`, `comments._markup` с `sfc`): текст — данные, `<!-- -->` —
+комментарий, вложенность элементов не ведётся (пустые элементы HTML без закрытия), в теге `//` и `/*` — текст; код —
+`{{…}}` Vue и `{…}` Svelte (у Svelte и в теге, `_SFC_TAG`; `{/if}`, `{:else}` — не код) разбирается как JavaScript.
+Отвергнуто: разбирать весь файл одним синтаксисом с `//`, `/* */` и `<!-- -->` — URL в тексте шаблона давал ложный
+«комментарий». Код в атрибутах-директивах Vue (`@click="…"`, `:x="…"`) и атрибутах Svelte в кавычках — строка
+атрибута, данные (`context/deferred/comment-syntaxes.md`).
 
 `regex="ruby"` и `regex="perl"`: `/` и `%` (Ruby) — литерал по `comments._literal_opens`: в начале выражения (не
 после `}` — это элемент хеша), после слова из `comments._TERM_WORDS` (Ruby — `comments._RUBY_BEG`: `if`, `unless`,
@@ -802,7 +937,8 @@ Ruby `/=` после слова — всегда присваивание с д�
 после `.`) — деление; `:/` и `:%` Ruby — символы. Буквы за закрывающим разделителем литерала — флаги
 (`comments._FLAGS`), не оператор-кавычка: `/a/s, @x` — не `s,…,`. Регулярка-аргумент, не закрытая в строке, кончается с
 ней; в начале выражения — многострочная. Операторы-кавычки Perl (`comments._PERL_QUOTE`: `m`, `s`, `qr`, `tr`, `y`, `q`,
-`qq`, `qw`, `qx` не после знака слова, сигила, `->`, `::`; разделитель — вплотную любой знак не слова, кроме закрывающих
+`qq`, `qw`, `qx` не после знака слова, сигила, `->`, `::`; `s` за `-` и перед знаком не слова — файловый тест
+`-s($f)`, как читает toke.c, а `--s` — декремент и `s`; разделитель — вплотную любой знак не слова, кроме закрывающих
 скобок, `;` и `=>`, через пробелы — `/` и открывающая скобка) и литералы `%` Ruby разбирает `comments._quote_parts`:
 скобки вкладываются, escape — обратная косая; у `s`, `tr`, `y` две части, вторая — тем же разделителем или своими
 скобками через пробелы или на следующих строках (`comments._second_part`); многострочный литерал — состояние разбора с
@@ -863,7 +999,12 @@ JavaScript — только при `uses: actions/github-script` того же �
 строки — данные (`$%` Erlang, `\;` Clojure, `?;` Emacs Lisp, `#\;` Common Lisp, `?#` Ruby и Elixir — за
 ним не буква); `rem` — слово `REM` после указанных знаков открывает комментарий (vb, vbs, bat, cmd,
 `comments._rem`); `line_block` — блок из целых строк с первой колонки, идёт в вывод целиком (`=begin`…`=end`
-Ruby, POD Perl от `=слово` до `=cut`); `exdoc` — `@doc`, `@moduledoc`, `@typedoc` Elixir со строкой —
+Ruby, POD Perl от `=слово` до `=cut`); не внутри строки с подстановками (`=begin` в `"…"` Ruby — текст, в коде
+подстановки `#{…}` — комментарий, как у ruby 3.4); POD — только где лексер Perl ждёт новый оператор (toke.c,
+`PL_expect == XSTATE`): флаг `stmt` `_parse` ставит по концу прошлой строки кода (`comments._statement_end`: `;`, `{`,
+`}` или метка `_PERL_LABEL`), посреди оператора `\n=shift` — присваивание; `}` анонимного хеша без разбора языка от
+блока не отличить — после него POD (дешёвая ошибка: лишние строки у судьи); `exdoc` — `@doc`, `@moduledoc`, `@typedoc`
+Elixir со строкой —
 документация, в вывод; `heredoc="php"` — тело `<<<ID` до терминатора с отступом, за которым код той же
 строки разбирается дальше. Правила маркера `comments._marker_ok`: `start` — только пробелы перед ним (`::`
 bat), `word` — только в начале слова (sh, yaml, `Dockerfile`: и в строке `RUN` для shell, внутри слова — значение,
@@ -885,8 +1026,11 @@ bat), `word` — только в начале слова (sh, yaml, `Dockerfile`
 
 ## Платформы
 
-Только POSIX: `common` импортирует `fcntl`, `run_judge` использует `os.killpg` и
-`start_new_session`. Смерть судьи вместе с хуком — сторож `common._WATCHDOG` на всех платформах, без
+Только POSIX: блокировкам состояния нужен `fcntl`, `run_judge` использует `os.killpg` и
+`start_new_session`. Без `fcntl` (Windows без WSL) `common` импортируется, а `run_hook` не вызывает хук и отвечает
+предупреждением «хуки работают только на POSIX» (`NoPosixTest` в `tests/test_common.py`): упавший импорт дал бы
+Claude Code трассировку в stderr вместо ответа. Смерть судьи вместе с хуком — сторож `common._WATCHDOG` на всех
+платформах, без
 `prctl`; сторож проверен тестами `WatchdogTest` и `JudgeDiesWithHookTest` только на Linux, на других
 платформах не запускался. Python 3.11+ (`tomllib` в `manifests`). Зависимостей вне стандартной
 библиотеки Python нет.
