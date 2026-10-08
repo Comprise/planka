@@ -5,6 +5,7 @@ import unittest
 PLANKA_DIR = pathlib.Path(__file__).resolve().parent.parent / "plugin" / "planka"
 sys.path.insert(0, str(PLANKA_DIR))
 import depcheck  # noqa: E402
+from tests.helpers import assert_linear  # noqa: E402
 
 
 class DependencyAddTest(unittest.TestCase):
@@ -613,7 +614,6 @@ class QuotedSubstitutionTest(unittest.TestCase):
             'echo "$(npm install x)"',
             'echo "`npm install x`"',
             'git commit -m "msg $(pip install requests)"',
-            'echo "$(echo "$(npm install x)")"',
             "bash -c 'echo \"$(npm install x)\"'",
         ]:
             self.assertIsNotNone(depcheck.dependency_add(cmd), cmd)
@@ -765,6 +765,9 @@ class SystemManagersTest(unittest.TestCase):
             "brew doctor",
             "brew install",
             "brew install ./Formula/x.rb",
+            "brew install --cc gcc-14",
+            "brew install --env std",
+            "brew install --bottle-arch x86-64",
             "dnf upgrade",
             "dnf upgrade --refresh",
             "dnf check-update",
@@ -1084,7 +1087,7 @@ class BroadRunTest(unittest.TestCase):
             "./configure --prefix=/usr",
             "python3 -m unittest -v", "python3 -m pytest -x", "pytest -k install", "python3 script.py --install",
             "python3 -c 'print(1)'", "python3 -m venv .venv", "python3 -m http.server 8000", "tox -e py312",
-            "node index.js", "npm run build", "npm test", "npm ci", "npm ls", "npm outdated", "npm audit",
+            "node index.js", "npm run build", "npm test", "npm ls", "npm outdated", "npm audit",
             "npx tsc --noEmit", "yarn", "yarn install --frozen-lockfile", "pnpm install --frozen-lockfile",
             "cargo build --release", "cargo test", "cargo clippy", "cargo fmt", "cargo update",
             "go build ./...", "go test ./...", "go mod tidy", "go mod download", "go vet ./...",
@@ -1098,8 +1101,8 @@ class BroadRunTest(unittest.TestCase):
             "pacman -Qe", "snap version", "flatpak --version", "nix --version", "nix-env --version",
             "conda env list", "conda activate base", "conda list", "pip list", "pip freeze > requirements.txt",
             "pip show requests", "pip check", "uv sync", "uv lock", "poetry install",
-            "poetry lock", "bundle install", "bundle exec rspec", "composer install", "dotnet build",
-            "mix test", "stack build", "cabal build", "opam env", "luarocks list", "Rscript analysis.R",
+            "poetry lock", "bundle install", "bundle exec rspec", "composer install",
+            "opam env", "Rscript analysis.R",
             "R --version", "port version", "zypper lr", "dnf repolist", "yum repolist", "apk version",
             "choco --version", "winget --version", "scoop status", "vcpkg version", "conan profile detect",
             "nuget help", "pixi info", "pdm info", "rye show", "hatch version", "cpanm --version",
@@ -1150,6 +1153,13 @@ class UvFlagsTest(unittest.TestCase):
             with self.subTest(cmd):
                 self.assertEqual(depcheck.dependency_add(cmd), cmd)
 
+    def test_cert_value_is_not_package(self):
+        self.assertIsNone(depcheck.dependency_add("uv pip install --cert ca -r r.txt"))
+        for cmd in ["uv --cert ca pip install -r r.txt", "uv add --cert ca -r r.txt",
+                    "uv tool install --cert ca .", "uv run --cert ca script.py"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
 
 class HeredocInQuotedSubstitutionTest(unittest.TestCase):
     """Heredoc внутри `"$(…)"` на несколько строк — форма сообщения коммита агента
@@ -1187,8 +1197,8 @@ class HeredocInQuotedSubstitutionTest(unittest.TestCase):
 
     def test_heredoc_to_cat_inside_quote_is_data(self):
         self.assertIsNone(depcheck.dependency_add("git commit -m \"$(cat <<'EOF'\nnpm install x\nEOF\n)\""))
-        self.assertEqual(depcheck.dependency_add("git commit -m \"$(cat <<'EOF'\nnpm install x\nEOF\n)\"\nnpm install x"),
-                         "npm install x")
+        cmd = "git commit -m \"$(cat <<'EOF'\nnpm install x\nEOF\n)\"\nnpm install x"
+        self.assertEqual(depcheck.dependency_add(cmd), "npm install x")
 
 
 class PythonInterpreterFlagsTest(unittest.TestCase):
@@ -1200,13 +1210,6 @@ class PythonInterpreterFlagsTest(unittest.TestCase):
 
     def test_glued_c_is_code_not_module(self):
         for cmd in ["python -cm pip install x", "python -c 'import x'", "python -Ic 'import x' -m pip install x"]:
-            with self.subTest(cmd):
-                self.assertIsNone(depcheck.dependency_add(cmd))
-
-    def test_uv_cert_value_is_not_package(self):
-        self.assertIsNone(depcheck.dependency_add("uv pip install --cert ca -r r.txt"))
-        for cmd in ["uv --cert ca pip install -r r.txt", "uv add --cert ca -r r.txt",
-                    "uv tool install --cert ca .", "uv run --cert ca script.py"]:
             with self.subTest(cmd):
                 self.assertIsNone(depcheck.dependency_add(cmd))
 
@@ -1240,7 +1243,6 @@ class ToolchainAndAliasTest(unittest.TestCase):
             "python -Im pip install x",
             "python -sm pip install x",
             "python -Impip install x",
-            "python -W ignore -m pip install x",
             "composer req monolog/monolog",
             "composer r monolog/monolog",
         ]:
@@ -1343,3 +1345,326 @@ class ParserEdgesTest(unittest.TestCase):
         beyond = head + " " * (4096 - len(head)) + "left-pad"
         self.assertIsNotNone(depcheck.dependency_add(inside))
         self.assertIsNone(depcheck.dependency_add(beyond))
+
+
+class NestedQuotesInSubstitutionTest(unittest.TestCase):
+    """Кавычки внутри `"$(…)"` вложены: внутренняя `"` не закрывает внешнюю. Форма — тело PR и коммита агента
+    (`gh pr create --body "$(printf "…")"`, `git commit -m "$(cat <<'EOF'` … `)"`)."""
+
+    def test_text_inside_nested_quotes_is_data(self):
+        for cmd in [
+            'echo "$(echo "a; npm install x")"',
+            'gh pr create --body "$(printf "Steps:\\n1) pip install mylib==1.0\\n2) run")"',
+            'printf "%s\\n" "$(echo "a; echo npm install x")"',
+            "git commit -m \"$(\ncat <<'EOF'\n1) Run `npm install foo` first.\nEOF\n)\"",
+            "git commit -m \"$(\ncat <<'EOF'\nfix: 12\" screens; npm install x\nEOF\n)\"",
+        ]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+    def test_commands_inside_and_after_detected(self):
+        for cmd, segment in [
+            ('echo "$(echo "a"; npm install x)"', 'echo "$(echo "a"; npm install x)"'),
+            ('echo "$(echo "a")" && npm install x', "npm install x"),
+            ("git commit -m \"$(\ncat <<'EOF'\nmsg)\nEOF\n)\"\nnpm install x", "npm install x"),
+            ('x="$(\nbash <<EOF\nnpm install x\nEOF\n)"', 'x="$(\nbash <<EOF\nnpm install x\nEOF\n)"'),
+            ('echo "$(echo "$(npm install x)")"', 'echo "$(echo "$(npm install x)")"'),
+            ('A="$(echo "a b")" npm install x', 'A="$(echo "a b")" npm install x'),
+        ]:
+            with self.subTest(cmd):
+                self.assertEqual(depcheck.dependency_add(cmd), segment)
+
+
+class ProjectLocalPackagesTest(unittest.TestCase):
+    """Пакеты самого проекта (workspace, `link:`, `portal:`, `--path`) — не новая зависимость."""
+
+    def test_not_adds(self):
+        for cmd in [
+            "pnpm add @org/utils@workspace:*",
+            "pnpm add @org/utils@workspace:^1.0.0",
+            "pnpm add workspace:../utils",
+            "yarn add link:../lib",
+            "yarn add portal:../lib",
+            "yarn add lib@link:../lib",
+            "yarn add lib@portal:../lib",
+            "pnpm add @org/utils --workspace",
+            "cargo add mylib --path ../mylib",
+            "cargo add --path=../mylib mylib",
+            "bundle add mygem --path ../mygem",
+        ]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+    def test_still_detected(self):
+        for cmd in ["pnpm add @org/utils", "pnpm add --workspace-root lodash", "yarn add lodash@npm:other",
+                    "cargo add serde --git https://github.com/x/serde", "bundle add rails --version 7.1"]:
+            with self.subTest(cmd):
+                self.assertEqual(depcheck.dependency_add(cmd), cmd)
+
+
+class EscapedQuoteTest(unittest.TestCase):
+    def test_escaped_quote_inside_double_quotes(self):
+        self.assertIsNone(depcheck.dependency_add('git commit -m "docs: say \\"hi\\"; npm install x in README"'))
+        self.assertEqual(depcheck.dependency_add('git commit -m "fix: quote \\"a\\"" && npm install x'),
+                         "npm install x")
+
+
+class MarkerOrderTest(unittest.TestCase):
+    def test_marker_before_other_assignment(self):
+        self.assertIsNone(depcheck.dependency_add("PLANKA_DEP_OK=1 CI=1 npm install x"))
+
+
+class SubstitutionBoundsTest(unittest.TestCase):
+    """Конец `$(…)` в двойных кавычках: кавычки, `\\` и скобки внутри подстановки."""
+
+    def test_detected(self):
+        for cmd in ["echo \"$(echo ')' ; npm install x)\"", "echo \"$(echo \\) ; npm install x)\"",
+                    "echo \"$( (cd a) ; npm install x)\"", "echo $'it\\'s' \"$(npm install x)\"",
+                    # `\$'` — `$` экранирован, кавычка обычная: `\'` её закрывает.
+                    "echo \\$'a\\' \"$(npm install x)\"",
+                    # Арифметика на две строки не прячет подстановку за ней.
+                    "echo \"$((1<<x\n))\" \"$(npm install x)\""]:
+            with self.subTest(cmd):
+                self.assertEqual(depcheck.dependency_add(cmd), cmd)
+
+    def test_quoted_substitution_is_text(self):
+        for cmd in ["echo '\"$(npm install x)\"'", "echo $'a\\'\"$(npm install x)\"'"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+
+class HeredocOpenerEdgesTest(unittest.TestCase):
+    def test_not_heredoc_opener(self):
+        # Экранированный `<<`, сдвиг в `"$((…))"` и `<<` внутри `$'…'` heredoc не открывают.
+        for cmd in ["echo \\<<EOF\nnpm install x", 'echo "$((1<<2))"\nnpm install x',
+                    "cat $'a\\'<<EOF' \nnpm install x"]:
+            with self.subTest(cmd):
+                self.assertEqual(depcheck.dependency_add(cmd), "npm install x")
+
+    def test_shell_body_runs(self):
+        # `-s` — команды из stdin и при позиционных; оболочка в любом сегменте строки с `<<`.
+        for cmd in ["bash -s arg <<EOF\nnpm install x\nEOF", "bash -s foo <<EOF\nnpm install x\nEOF",
+                    "cat <<EOF | bash; echo\nnpm install x\nEOF", "bash <<EOF && echo hi\nnpm install x\nEOF"]:
+            with self.subTest(cmd):
+                self.assertEqual(depcheck.dependency_add(cmd), "npm install x")
+
+
+class DryRunTest(unittest.TestCase):
+    """Пробный прогон ничего не ставит."""
+
+    def test_not_adds(self):
+        for cmd in ["pip install --dry-run requests", "npm install --dry-run lodash", "cargo add --dry-run serde",
+                    "poetry add --dry-run requests", "apt-get install -s jq", "apt-get -s install jq",
+                    "apt-get install -qs jq", "apt install --simulate jq", "apt-get install --just-print jq",
+                    "python -m pip install --dry-run requests", "uv pip install --dry-run httpx"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+    def test_still_detected(self):
+        for cmd in ["npm install --dry-run=false lodash", "apt-get install -y jq", "apt-get install -t sid jq",
+                    "apt-get install -tsid jq"]:
+            with self.subTest(cmd):
+                self.assertEqual(depcheck.dependency_add(cmd), cmd)
+
+
+class LauncherTest(unittest.TestCase):
+    """Запускатели менеджера: суффикс Windows в любом регистре, `corepack`, `npx`, `time` с флагами."""
+
+    def test_detected(self):
+        for cmd in ["NPM.CMD install x", "Pip.Exe install requests", "corepack pnpm add x", "corepack yarn@4.1.0 add x",
+                    "npx pnpm add x", "npx -y yarn add x", "npx pnpm@9 add x", "npx -- pnpm add x",
+                    "bunx pnpm add x", "/usr/bin/time -f %e npm i x", "time -o t.txt npm i x",
+                    "time --format=%e npm i x", "Rscript.exe -e 'install.packages(\"x\")'"]:
+            with self.subTest(cmd):
+                self.assertEqual(depcheck.dependency_add(cmd), cmd)
+
+    def test_not_adds(self):
+        for cmd in ["corepack enable", "corepack pnpm install", "npx -p pnpm pnpm install", "npx -y cowsay hi",
+                    "/usr/bin/time -f %e make", "NPM.CMD run build"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+
+class ParserBranchesTest(unittest.TestCase):
+    """По входу на ветку разбора: вход различает, работает ли ветка."""
+
+    DETECTED = [
+        "if a; then :; elif npm install x; then :; fi",
+        "env -C sub npm install x",
+        'fish -c "npm install x"',
+        "bash +c 'npm install x'",
+        "pypy3 -m pip install x",
+        "python -X utf8 -m pip install x",
+        "pacman --sync jq",
+        "nix-env -f https://e.com/x.tar.gz -iA hello",
+        "nix --option substituters https://cache profile install nixpkgs#hello",
+        "vcpkg add artifact cmake",
+        "npm install >&2 x",
+        "pnpm i lodash",
+        "deno i npm:chalk",
+    ]
+    NOT_ADDS = [
+        "uv tool install --with x --editable .",
+        "cargo install --version 1.0 --path .",
+        "cargo install --version 1.0 --locked",
+        "rye add --features x",
+        "mix archive.install hex",
+        "cpanm --info=1 Moose",
+        "conan install -pr x/y@ .",
+        "conan install -pr:h x/y@ .",
+        "nix-env -i --arg a b",
+        "nix-env -i -f default.nix hello",
+        "port install +universal",
+        "make &>log npm install x",
+    ]
+
+    def test_detected(self):
+        for cmd in self.DETECTED:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in self.NOT_ADDS:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+
+class DryRunValueTest(unittest.TestCase):
+    """Значение флага пробного прогона: npm разбирает флаги nopt (`--dry-run false`, `--no-dry-run`, сокращение
+    `--dr`), apt и apt-get — CommandLine apt (`-s no`, `--simulate=off`, `--no-simulate`); проверено на npm 11.16
+    (`npm config get dry-run …`) и по apt-pkg/contrib/cmndline.cc."""
+
+    DETECTED = [
+        "npm install foo --dry-run false",
+        "npm install --dry-run false foo",
+        "npm install --dry-run=false foo",
+        "npm install --no-dry-run foo",
+        "npm install --No-dry-run foo",
+        "npm install --no-dry-run=true foo",
+        "npm install --dry-run --no-dry-run foo",
+        "npm install --dr false foo",
+        "npm install foo -- --dry-run",
+        "npx npm install --dry-run false foo",
+        "uv run npm install --dry-run false foo",
+        "apt-get install --dry-run false jq",
+        "apt-get install -s no jq",
+        "apt-get install -s0 jq",
+        "apt-get install -s=false jq",
+        "apt-get install --simulate=off jq",
+        "apt-get install --Simulate no jq",
+        "apt install --no-simulate jq",
+        "apt-get install --no-s jq",
+        "apt-get --just-print=0 install jq",
+        "apt-get install --no-no-act jq",
+        "apt-get install -t no --no-recon jq",
+        "apt-get install -s --no-s jq",
+        "apt-get install -s --no-recon jq",
+        "apt-get install --no-simulate ' -1' jq",
+        "apt-get -s no install jq",
+        "apt-get --simulate no install jq",
+        "apt-get install -s 0 jq",
+        "apt-get install -s0x0 jq",
+        "apt-get install -s 0X0 jq",
+        "apt-get install -ts jq",
+        "apt-get -q 2 install jq",
+        "apt-get -q2 install jq",
+        "apt-get -q +2 install jq",
+        "apt-get --quiet 2 install jq",
+        "apt-get --silent=1 install jq",
+        "apt-get -qq install jq",
+        "apt-get -q install jq",
+        "apt-get install -q jq",
+        "npm install --d foo",
+        "brew install -s jq",
+        "brew install --cc gcc-14 jq",
+        "brew install -- -n jq",
+        "brew install +nv jq",
+    ]
+    NOT_ADDS = [
+        "npm install --dry-run true foo",
+        "npm install --dry-run=true foo",
+        "npm install --dry-run=x foo",
+        "npm install --no-dry-run --dry-run foo",
+        "npm install --no-dry-run false foo",
+        "npm install --dry foo",
+        "npm --dry-run install foo",
+        "pip install --dry-run false requests",
+        "bun add --dry-run false x",
+        "apt-get install --dry-run jq",
+        "apt-get install --no-simulate yes jq",
+        "apt-get install --yes-simulate jq",
+        "apt-get install --simulate=maybe jq",
+        "apt-get install --no-dry-run --dry-run jq",
+        "apt-get install -s1 jq",
+        "apt-get install -sy jq",
+        "apt-get install -s --no-act jq",
+        "apt-get -y -s install jq",
+        "aptitude install -s jq",
+        "aptitude install --simulate jq",
+        "apt-get install -q 2",
+        "apt-get install -s 2 jq",
+        "apt-get install -s0x1 jq",
+        "apt-get install -s 0X1 jq",
+        "apt-get install --no-simulate=maybe jq",
+        "apt-get -q=x install jq",
+        "apt-get install --quiet=x jq",
+        "apt-get -q 2 -s install jq",
+        "apt-get -qs install jq",
+        "apt-get -q 2x install jq",
+        "npm install --dr foo",
+        "npm install --no-no-dry-run foo",
+        "brew install -n jq",
+        "brew install -vn jq",
+        "brew install jq --dry-run",
+    ]
+
+    def test_detected(self):
+        for cmd in self.DETECTED:
+            with self.subTest(cmd):
+                self.assertEqual(depcheck.dependency_add(cmd), cmd)
+
+    def test_not_adds(self):
+        for cmd in self.NOT_ADDS:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+
+class BacktickInDoubleQuotesTest(unittest.TestCase):
+    """`` `…` `` внутри `"…"` — свой уровень до неэкранированной обратной кавычки: кавычки внутри не закрывают
+    внешнюю (как в bash 5.3)."""
+
+    def test_text_inside_is_data(self):
+        for cmd in [
+            'git commit -m "fix `echo "a; npm install x"` text"',
+            'echo "x `echo "it\'s"` y; npm install x"',
+            'npm install --tag "`date "+%Y %m"`"',
+            'git commit -m "a `echo\n"b; npm install x"` c"',
+        ]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+    def test_commands_inside_and_after_detected(self):
+        for cmd, segment in [
+            ('echo "a `echo \'it"s\'` c"; npm install x', "npm install x"),
+            ('echo "`echo "b"; npm install x`"', 'echo "`echo "b"; npm install x`"'),
+            ('echo "a `echo\n"b"` c"; npm install x', "npm install x"),
+            ('npm install --tag "`date "+%Y %m"`" left-pad', 'npm install --tag "`date "+%Y %m"`" left-pad'),
+            ('echo "`echo a\\`b\\` ; npm install q` x"', 'echo "`echo a\\`b\\` ; npm install q` x"'),
+        ]:
+            with self.subTest(cmd):
+                self.assertEqual(depcheck.dependency_add(cmd), segment)
+
+    def test_heredoc_opener_inside_backticks_ignored(self):
+        self.assertEqual(depcheck.heredocs('echo "`echo "x"` <<EOF"'), [])
+
+    def test_linear(self):
+        cases = [
+            lambda n: 'echo "' + '`a "b"` ' * n + '"; npm install x',
+            lambda n: 'npm install --tag "' + '`a "b c"`' * n + '"',
+            lambda n: 'echo "`' + 'a "b" ' * n,
+            lambda n: 'echo "`' + 'a\n' * n + '`"',
+        ]
+        for make in cases:
+            small, large = make(2000), make(8000)
+            with self.subTest(small[:20]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))

@@ -6,6 +6,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import time
 from unittest import mock
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -21,6 +22,10 @@ PHILOSOPHY = """# Философия работы
 
 1. Правило решений один.
 2. Правило решений два.
+
+### Подраздел
+
+3. Правило подраздела решений.
 
 ## Поведение
 
@@ -174,3 +179,19 @@ def assert_not_logged(test, env, *texts):
 def author_block(rec):
     """Блок <author> промпта судьи из записи заглушки PLANKA_STUB_RECORD."""
     return rec.read_text(encoding="utf-8").split("\n<author>\n", 1)[1].split("\n</author>\n", 1)[0]
+
+
+def cpu_seconds(run):
+    """Наименьшее процессорное время трёх запусков run: нагрузка машины его почти не растягивает."""
+    best = float("inf")
+    for _ in range(3):
+        start = time.process_time()
+        run()
+        best = min(best, time.process_time() - start)
+    return best
+
+
+def assert_linear(test, small, large, ratio=8, msg=None):
+    """Запуск large (вход вчетверо больше, чем у small) не дольше ratio запусков small и 5 мс: линейный — около
+    4 раз, квадратичный — около 16."""
+    test.assertLess(cpu_seconds(large), ratio * cpu_seconds(small) + 0.005, msg)

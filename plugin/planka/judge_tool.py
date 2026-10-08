@@ -1,6 +1,7 @@
 """PreToolUse: судья вопросов автору (AskUserQuestion), планов (ExitPlanMode), детерминированная проверка
 команд Bash и правок манифестов (Write, Edit, MultiEdit). PostToolUse и PostToolUseFailure на Bash: новые
 имена зависимостей в манифестах после команды."""
+import functools
 import os
 import time
 
@@ -63,9 +64,9 @@ def _judge_and_emit(hook, data, transcript, user_prompt, content):
 
 
 def _author(transcript):
-    """Блок <author> судьи: реплика автора и его ответы — граница задачи. В журнал не идёт: content журнала —
-    только проверяемое содержимое."""
-    return prompts.author_context(transcript.author_turn, transcript.author_answers)
+    """Блок <author> судьи: прежние реплики автора, текущая и его ответы — граница задачи. В журнал не идёт:
+    content журнала — только проверяемое содержимое."""
+    return prompts.author_context(transcript.author_turn, transcript.author_answers, transcript.earlier_turns)
 
 
 def judge_question(data):
@@ -162,14 +163,16 @@ def _manifest_skip(session, msg, **fields):
     common.log_event(MANIFEST_HOOK, session, verdict="skipped", error=msg, **fields)
 
 
-def _project_names(cwd, project, kind):
-    """Имена манифестов вида kind и пакетов самого проекта (manifest_watch.project_names) под корнем проекта
-    в пределах SNAPSHOT_BUDGET; проект неизвестен (нет CLAUDE_PROJECT_DIR и абсолютного cwd) — пусто."""
-    if not (isinstance(project, str) and os.path.isabs(project)):
+def _project_names(root, kind):
+    """Имена манифестов реестра вида kind и пакетов самого проекта под корнем проекта root() и в его версии HEAD,
+    файлов manifest_watch._LEGACY в версии HEAD (manifest_watch.project_names) в пределах SNAPSHOT_BUDGET; root()
+    None — пусто."""
+    root = root()
+    if root is None:
         return frozenset()
     deadline = time.monotonic() + manifest_watch.SNAPSHOT_BUDGET
     try:
-        return manifest_watch.project_names(common.project_root(cwd), kind, deadline)
+        return manifest_watch.project_names(root, kind, deadline)
     except manifest_watch.Unavailable as e:
         raise manifest_watch.Unavailable(f"не сравнён с другими манифестами проекта ({e})") from None
 
@@ -191,8 +194,11 @@ def judge_manifest_edit(data):
     if kind is None:
         return
     session = _session(data)
+    # Корень проекта: проект неизвестен (нет CLAUDE_PROJECT_DIR и абсолютного cwd) — None.
+    known_project = isinstance(project, str) and os.path.isabs(project)
+    root = functools.cache(lambda: common.project_root(cwd) if known_project else None)
     try:
-        names = manifest_watch.check_edit(tool, tool_input, path, kind, lambda: _project_names(cwd, project, kind))
+        names = manifest_watch.check_edit(tool, tool_input, path, kind, lambda: _project_names(root, kind), root)
     except manifest_watch.Unavailable as e:
         _manifest_skip(session, f"манифест {path} {e}: новые зависимости не проверены", tool=tool)
         return
@@ -221,8 +227,9 @@ def _command_and_id(data):
 
 def snapshot_manifests(data):
     """Снимок имён манифестов проекта перед командой Bash с именами ref до начала сессии, откуда команда
-    возвращает файлы (manifest_watch.restored_names); команда с маркером согласия не снимается. Сбой —
-    предупреждение раз на сессию и пропуск в журнале на каждую команду, команда идёт без проверки манифестов."""
+    возвращает файлы (manifest_watch.restored_names); команда с маркером согласия не снимается. Сбой снимка или
+    чтения имён ref — предупреждение раз на сессию и пропуск в журнале на каждую команду, снимок не сохраняется,
+    команда идёт без проверки манифестов."""
     command, tool_use_id = _command_and_id(data)
     cwd = data.get("cwd")
     if command is None or manifest_watch.has_marker(command) or not isinstance(cwd, str) or not cwd:
@@ -266,7 +273,13 @@ def check_command_manifests(data):
     try:
         entry = manifest_watch.pop(session, tool_use_id)
     except OSError as e:
-        common.warn(f"снимок манифестов не прочитан, новые зависимости после команды не проверены: {e!r}")
+        msg = f"снимок манифестов не прочитан, новые зависимости после команды не проверены: {e!r}"
+        common.warn(msg)
+        try:
+            common.log_event(MANIFEST_HOOK, session, verdict="skipped", error=msg)
+        except OSError:
+            # Каталог данных недоступен: предупреждение уже выдано.
+            pass
         return
     if entry is None or manifest_watch.has_marker(command):
         return

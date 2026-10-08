@@ -30,8 +30,9 @@ class MemoryHookTest(unittest.TestCase):
     def tearDown(self):
         self.env.close()
 
-    def run_tool(self, tool, tool_input, *, transcript=None, prompt_id=None, cwd=None, **extra):
-        # Свой prompt_id на вызов: отказы в цикле не упираются в лимит.
+    def run_tool(self, tool, tool_input, *, transcript=None, prompt_id=None, cwd=None, proc_cwd=None, **extra):
+        # Свой prompt_id на вызов: отказы в цикле не упираются в лимит. proc_cwd — текущий каталог процесса
+        # хука; без него процесс наследует каталог процесса тестов.
         self.calls = getattr(self, "calls", 0) + 1
         env = {"HOME": str(self.home), "CLAUDE_CONFIG_DIR": "", "PLANKA_STUB_RECORD": str(self.rec)}
         env.update(extra)
@@ -41,7 +42,12 @@ class MemoryHookTest(unittest.TestCase):
             fields["transcript_path"] = transcript
         if cwd is not None:
             fields["cwd"] = cwd
-        return self.env.run("guard_memory.py", self.env.hook_input("PreToolUse", **fields), **env)
+        hook_input = self.env.hook_input("PreToolUse", **fields)
+        if proc_cwd is None:
+            return self.env.run("guard_memory.py", hook_input, **env)
+        return subprocess.run([sys.executable, str(PLANKA_DIR / "guard_memory.py")], input=json.dumps(hook_input),
+                              capture_output=True, text=True, encoding="utf-8", env=self.env.environ(**env),
+                              cwd=proc_cwd, timeout=30)
 
     def write_mem(self, path=None, content="Тесты: make test.", *, cwd=None, **extra):
         return self.run_tool("Write", {"file_path": str(path or self.memdir / "MEMORY.md"), "content": content},
@@ -165,13 +171,17 @@ class MemoryHookTest(unittest.TestCase):
     def test_edit_tools(self):
         target = str(self.memdir / "topic.md")
         cases = [("Edit", {"file_path": target, "old_string": "a", "new_string": "новый факт"}),
-                 ("MultiEdit", {"file_path": target, "edits": [{"old_string": "a", "new_string": "новый факт"}]}),
+                 ("MultiEdit", {"file_path": target, "edits": [{"old_string": "b", "new_string": "первый"},
+                                                          {"old_string": "a", "new_string": "новый факт"}]}),
                  ("NotebookEdit", {"notebook_path": str(self.memdir / "n.ipynb"), "new_source": "новый факт"})]
         for tool, ti in cases:
             self.rec.unlink(missing_ok=True)
             r = self.run_tool(tool, ti, PLANKA_STUB="deny")
             self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny", tool)
             self.assertIn("новый факт", self.judged(), tool)
+            if tool == "MultiEdit":
+                # Судья видит новые строки всех правок по порядку.
+                self.assertIn("первый\n---\nновый факт", self.judged())
 
     def test_tilde_and_relative_paths(self):
         r = self.write_mem("~/.claude/projects/p/memory/MEMORY.md", PLANKA_STUB="deny")
@@ -262,8 +272,10 @@ class MemoryHookTest(unittest.TestCase):
         self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny")
         r = self.write_mem(custom / "MEMORY.md", PLANKA_STUB="deny")
         self.assertEqual(r.stdout, "")
+        # Относительное значение не разрешается и от текущего каталога процесса хука.
         r = self.write_mem(self.env.project / "cowork" / "MEMORY.md", PLANKA_STUB="deny",
-                           CLAUDE_COWORK_MEMORY_PATH_OVERRIDE="cowork", cwd=str(self.env.project))
+                           CLAUDE_COWORK_MEMORY_PATH_OVERRIDE="cowork", cwd=str(self.env.project),
+                           proc_cwd=str(self.env.project))
         self.assertEqual(r.stdout, "")
 
     def test_auto_memory_directory_project_settings(self):
@@ -407,6 +419,43 @@ class MemoryHookTest(unittest.TestCase):
         self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertIsNotNone(self.judged())
 
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_auto_memory_directory_project_under_dotfiles_home(self):
+        # Домашний каталог — репозиторий dotfiles, проект ~/Projects/app без своего git — каталог запуска.
+        # Репозиторий дома — не репозиторий проекта (common.project_root): файл проекта в каталоге памяти,
+        # равном проекту или содержащем его, — память, хотя git дома его не исключает. Каталога проекта нет —
+        # так же.
+        commit(self.home, ".bashrc")
+        app = self.home / "Projects" / "app"
+        settings = app / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        for value in (str(app), "~"):
+            settings.write_text(json.dumps({"autoMemoryDirectory": value}), encoding="utf-8")
+            self.rec.unlink(missing_ok=True)
+            r = self.write_mem(app / "notes.md", PLANKA_STUB="deny", CLAUDE_PROJECT_DIR=str(app), cwd=str(app))
+            self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny", value)
+            self.assertIsNotNone(self.judged(), value)
+        gone = self.home / "Projects" / "gone"
+        (self.config / "settings.json").write_text(
+            json.dumps({"autoMemoryDirectory": str(self.home / "Projects")}), encoding="utf-8")
+        self.rec.unlink(missing_ok=True)
+        r = self.write_mem(gone / "notes.md", PLANKA_STUB="deny", CLAUDE_PROJECT_DIR=str(gone), cwd=str(app))
+        self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_auto_memory_directory_monorepo_subproject(self):
+        # Каталог запуска — новый или удалённый подкаталог монорепозитория, autoMemoryDirectory — монорепозиторий:
+        # файл подкаталога, не исключённый git, — файл репозитория, не память.
+        mono = self.env.project
+        commit(mono, "package.json", "packages/old/package.json")
+        (self.config / "settings.json").write_text(json.dumps({"autoMemoryDirectory": str(mono)}),
+                                                   encoding="utf-8")
+        (mono / "packages" / "new").mkdir()
+        for sub in (mono / "packages" / "new", mono / "packages" / "gone"):
+            r = self.write_mem(sub / "notes.md", PLANKA_STUB="deny", CLAUDE_PROJECT_DIR=str(sub), cwd=str(mono))
+            self.assertEqual(r.stdout, "", sub)
+        self.assertIsNone(self.judged())
+
     def test_non_utf8_locale_cyrillic_paths(self):
         # Локаль C с PYTHONUTF8=0: кодировка файловой системы ascii, пути входа — байты UTF-8 (как в
         # make test-hostile). Кириллица в cwd и в пути цели не роняет хук.
@@ -425,6 +474,37 @@ class MemoryHookTest(unittest.TestCase):
         self.assertEqual(messages(r), [])
         self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertIn(str(memory), self.judged())
+        # Кириллица в autoMemoryDirectory (settings.json — текст UTF-8) и в путях окружения: запись в каталог
+        # памяти — отказ без сообщений, запись в файл проекта — пустой ответ.
+        notes = self.env.root.parent / "заметки"
+        (self.config / "settings.json").write_text(json.dumps({"autoMemoryDirectory": str(notes)},
+                                                              ensure_ascii=False), encoding="utf-8")
+        places = ((notes / "MEMORY.md", {}),
+                  (self.env.root.parent / "кворк" / "MEMORY.md",
+                   {"CLAUDE_COWORK_MEMORY_PATH_OVERRIDE": str(self.env.root.parent / "кворк")}),
+                  (self.env.root.parent / "удалённо" / "agent-memory" / "r" / "M.md",
+                   {"CLAUDE_CODE_REMOTE_MEMORY_DIR": str(self.env.root.parent / "удалённо")}),
+                  (self.env.root.parent / "настройки" / "CLAUDE.md",
+                   {"CLAUDE_CONFIG_DIR": str(self.env.root.parent / "настройки")}))
+        for path, extra in places:
+            self.rec.unlink(missing_ok=True)
+            r = self.write_mem(path, PLANKA_STUB="deny", LC_ALL="C", **extra)
+            self.assertEqual(messages(r), [], path)
+            self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny", path)
+            self.assertIn(str(path), self.judged())
+        r = self.write_mem(self.env.project / "src" / "a.py", PLANKA_STUB="deny", LC_ALL="C")
+        self.assertEqual((r.stdout, r.stderr), ("", ""))
+
+    def test_unusable_auto_memory_directory_skipped(self):
+        # Значение autoMemoryDirectory, которое не путь файловой системы (NUL, одиночный суррогат), и файл
+        # настроек не с объектом JSON пропускаются: остальные места памяти судятся, хук не падает.
+        for settings in ({"autoMemoryDirectory": "/tmp/a\0b"}, {"autoMemoryDirectory": "/tmp/\ud800x"}, []):
+            (self.config / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+            r = self.write_mem(PLANKA_STUB="deny")
+            self.assertEqual(messages(r), [], settings)
+            self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny", settings)
+            r = self.write_mem(self.env.project / "src" / "a.py", PLANKA_STUB="deny")
+            self.assertEqual(r.stdout, "", settings)
 
     def test_nul_in_path_is_not_memory(self):
         # Путь с NUL файловый инструмент не откроет: записи нет, судить нечего.
@@ -496,6 +576,21 @@ class MemoryHookTest(unittest.TestCase):
         self.assertIn("ХВОСТ", text)
         self.assertNotIn("НАЧАЛО", text)
 
+    def test_message_before_author_clipped_keep_tail(self):
+        # Длинное сообщение агента перед репликой автора: судье — его конец, ближайший к реплике.
+        t = self.env.data / "t.jsonl"
+        long = "НАЧАЛО" + "я" * guard_memory.MAX_FIELD + "ХВОСТ"
+        entries = [{"type": "user", "message": {"role": "user", "content": "запомни команду тестов"}},
+                   {"type": "assistant", "message": {"model": "m", "content": [{"type": "text", "text": long}]}},
+                   {"type": "user", "message": {"role": "user", "content": "да"}},
+                   {"type": "assistant", "message": {"model": "m", "content": [{"type": "text", "text": "Пишу."}]}}]
+        t.write_text("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in entries), encoding="utf-8")
+        self.write_mem(PLANKA_STUB="ok", transcript=str(t))
+        text = self.judged()
+        self.assertIn("ХВОСТ", text)
+        self.assertNotIn("НАЧАЛО", text)
+        self.assertIn("Пишу.", text)
+
     def test_mcp_memory_tools(self):
         for tool in ("mcp__memory__create_entities", "mcp__serena__write_memory",
                      "mcp__plugin_x_openmemory__addMemories"):
@@ -566,7 +661,8 @@ class MemoryHookTest(unittest.TestCase):
         self.assertIn("Сохранить в память: тесты через make test?", text)
         self.assertIn("Записываю факт.", text)
         self.assertIn("ответ: подтверждаю", text)
-        for absent in ("старая реплика", "служебная вставка", "реплика субагента", "вывод другого инструмента"):
+        self.assertIn("Прежние реплики автора, от старых к новым:\nстарая реплика\n", text)
+        for absent in ("служебная вставка", "реплика субагента", "вывод другого инструмента"):
             self.assertNotIn(absent, text)
 
     def test_long_write_is_clipped(self):
@@ -604,14 +700,36 @@ class ManagedSettingsTest(unittest.TestCase):
 
 
 class RepositoryFileTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("git"), "нет git")
     def test_check_ignore_gets_named_timeout(self):
         # Срок вызова — CHECK_IGNORE_TIMEOUT: его сумму с судьёй проверяет TimeoutsTest в test_contract.
-        done = subprocess.CompletedProcess([], 1)
-        with mock.patch.object(guard_memory.subprocess, "run", return_value=done) as run:
-            self.assertTrue(guard_memory._repository_file("/nonexistent/x.md", "/nonexistent"))
+        # Каталога проекта нет — git спрашивается из ближайшего существующего предка под корнем репозитория.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(os.path.realpath(tmp)) / "repo"
+            commit(repo, "a.txt")
+            with mock.patch.object(guard_memory.subprocess, "run", wraps=subprocess.run) as run:
+                self.assertTrue(guard_memory._repository_file(str(repo / "gone" / "x.md"), str(repo / "gone")))
         self.assertEqual(run.call_args.kwargs["timeout"], guard_memory.CHECK_IGNORE_TIMEOUT)
-        # Git спрашивается из каталога проекта, а нет его — из ближайшего существующего предка.
-        self.assertEqual(run.call_args.args[0][:3], ["git", "-C", "/"])
+        self.assertEqual(run.call_args.args[0][:4], ["git", "-C", str(repo), "check-ignore"])
+        self.assertEqual(run.call_args.kwargs["env"]["GIT_CEILING_DIRECTORIES"].split(os.pathsep)[0],
+                         str(repo.parent))
+
+    def test_missing_root_is_not_repository_file(self):
+        with mock.patch.object(guard_memory.subprocess, "run", wraps=subprocess.run) as run:
+            self.assertFalse(guard_memory._repository_file("/nonexistent/x.md", "/nonexistent"))
+        self.assertNotIn("check-ignore", [a for c in run.call_args_list for a in c.args[0]])
+
+
+def commit(repo, *files):
+    """git init repo (если нет) и коммит файлов files с содержимым «x»."""
+    if not (repo / ".git").exists():
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    for rel in files:
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text("x\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-f", "--", *files], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c"],
+                   check=True)
 
 
 @unittest.skipUnless(shutil.which("git"), "нет git")

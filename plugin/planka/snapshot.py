@@ -1,4 +1,5 @@
-"""Снимок дерева проекта: какие файлы и с каким размером и mtime были на реплике."""
+"""Снимок дерева проекта: какие файлы и с каким размером и mtime были на реплике; отметка проверки снимка
+на Stop и неудачи снимка в сессии."""
 import base64
 import json
 import os
@@ -62,11 +63,13 @@ def _remaining(deadline):
 
 
 def _git(root, deadline, *args):
-    """stdout `git -C root <args>` байтами; None вне git или при сбое; TimeoutError по сроку deadline."""
+    """stdout `git -C root <args>` байтами; None вне git или при сбое; TimeoutError по сроку deadline.
+    Репозиторий ищется в root и ниже (common.git_env): root — корень проекта или репозиторий под ним."""
     # TimeoutError — подкласс OSError; срок проверяется вне try.
     timeout = _remaining(deadline)
     try:
-        proc = subprocess.run(["git", "-C", str(root), *args], capture_output=True, timeout=timeout)
+        proc = subprocess.run(["git", "-C", str(root), *args], capture_output=True, timeout=timeout,
+                              env=common.git_env(root))
     except subprocess.TimeoutExpired:
         raise TimeoutError("git не уложился в срок снимка") from None
     except (OSError, subprocess.SubprocessError):
@@ -78,6 +81,16 @@ def _git_ls(root, deadline, *args):
     """Записи `git ls-files -z <args>` в root; None вне git или при сбое."""
     out = _git(root, deadline, "ls-files", "-z", *args)
     return None if out is None else [os.fsdecode(e) for e in out.split(b"\0") if e]
+
+
+def _ext_ignored(name, exts):
+    """Совпадает ли имя файла с записью «*.ext» из exts: часть имени после любой его точки — в exts."""
+    i = name.find(".")
+    while i != -1:
+        if name[i + 1:] in exts:
+            return True
+        i = name.find(".", i + 1)
+    return False
 
 
 def _walk(root, deadline):
@@ -111,7 +124,7 @@ def _walk(root, deadline):
                 if e.is_dir(follow_symlinks=False):
                     if e.name not in IGNORED_DIRS:
                         stack.append((pre + e.name, e.path, rules))
-                elif e.is_file(follow_symlinks=False) and not any(e.name.endswith("." + x) for x in exts):
+                elif e.is_file(follow_symlinks=False) and not _ext_ignored(e.name, exts):
                     files.append(e)
             except OSError:
                 continue
@@ -386,11 +399,10 @@ def _unpack_dirs(text):
     return dirs
 
 
-
 def store(state_dir, session_id, prompt_id, root, snap):
-    """Снимок capture в state_dir/<session>.snap.json вместе с репликой, корнем и версией формата FORMAT;
-    блоки режима walk — строкой _pack_dirs."""
-    data = {**snap, "format": FORMAT, "prompt_id": prompt_id, "root": str(root)}
+    """Снимок capture в state_dir/<session>.snap.json вместе с репликой, корнем, версией формата FORMAT и
+    "checked": False; блоки режима walk — строкой _pack_dirs."""
+    data = {**snap, "format": FORMAT, "prompt_id": prompt_id, "root": str(root), "checked": False}
     if snap.get("mode") == "walk":
         data["dirs"] = _pack_dirs(snap["dirs"])
     common.atomic_write_json(_snap_path(state_dir, session_id), data)
@@ -419,3 +431,52 @@ def load(state_dir, session_id):
     except (ValueError, zlib.error, struct.error):
         return None
     return data
+
+
+def carry_over(state_dir, session_id, prompt_id, root):
+    """Перепривязывает к реплике prompt_id снимок сессии, который Stop не отметил проверенным (mark_checked),
+    если он снят для корня root; True — снимок перепривязан и остаётся базой сверки.
+
+    Снимок без поля "checked" считается проверенным. Блоки walk не разворачиваются.
+    """
+    path = _snap_path(state_dir, session_id)
+    with common.state_lock(state_dir):
+        data = common.read_json(path, dict)
+        if data.get("format") != FORMAT or data.get("checked", True) is not False \
+                or data.get("root") != str(root):
+            return False
+        data["prompt_id"] = prompt_id
+        common.atomic_write_json(path, data)
+    return True
+
+
+def mark_checked(state_dir, session_id, prompt_id):
+    """Отмечает снимок сессии реплики prompt_id проверенным: следующая реплика снимет новый.
+    Нет снимка или он другой реплики — ничего."""
+    path = _snap_path(state_dir, session_id)
+    with common.state_lock(state_dir):
+        data = common.read_json(path, dict)
+        if data.get("checked", True) is not False or data.get("prompt_id") != prompt_id:
+            return
+        data["checked"] = True
+        common.atomic_write_json(path, data)
+
+
+def _failed_path(state_dir, session_id):
+    return state_dir / f"{common.safe_name(session_id)}.snapfail.json"
+
+
+def failure(state_dir, session_id, root):
+    """Причина неудачи снимка корня root в этой сессии (mark_failed); None — снимок корня не падал."""
+    with common.state_lock(state_dir):
+        reason = common.read_json(_failed_path(state_dir, session_id), dict).get(str(root))
+    return reason if isinstance(reason, str) else None
+
+
+def mark_failed(state_dir, session_id, root, reason):
+    """Запоминает неудачу снимка корня root в сессии: {корень: причина} в state_dir/<session>.snapfail.json."""
+    path = _failed_path(state_dir, session_id)
+    with common.state_lock(state_dir):
+        failed = common.read_json(path, dict)
+        failed[str(root)] = reason
+        common.atomic_write_json(path, failed)

@@ -1,0 +1,27 @@
+# источник: esp-idf release/v6.0 (71722673), .idf_ci.toml, строки 21–46
+[gitlab]
+
+[gitlab.build_pipeline]
+workflow_name = "build_child_pipeline"
+runs_per_job = 30
+
+job_tags = ['build', 'shiny']
+job_template_name = '.dynamic_build_template'
+job_template_jinja = ''  # write in tools/ci/dynamic_pipelines/templates/.dynamic_jobs.yml
+pre_yaml_jinja = """
+include:
+  - .gitlab/ci/common.yml
+  - tools/ci/dynamic_pipelines/templates/.dynamic_jobs.yml
+  - tools/ci/dynamic_pipelines/templates/test_child_pipeline.yml
+"""
+yaml_jinja = """
+{{ settings.gitlab.build_pipeline.pre_yaml_jinja }}
+
+workflow:
+  name: {{ settings.gitlab.build_pipeline.workflow_name }}
+  rules:
+    - when: always
+
+{{ jobs }}
+"""  # simplified since we included the tools/ci/dynamic_pipelines/templates/test_child_pipeline.yml
+

@@ -1,12 +1,13 @@
 # Данные из недокументированного транскрипта
 
-**Что не так.** `common.read_transcript` берёт из транскрипта (`transcript_path`) модель сессии
-(`message.model` последнего ответа основной ветки), все сообщения агента за реплику (судья `Stop`)
-и реплику автора (судья записи в память), а формат транскрипта Claude Code не документирует.
-Отсев записей `isSidechain`, `isMeta`, `tool_result`, служебных записей по `origin.kind`
-(`task-notification`, `peer`), вложений `queued_command` с репликой человека посреди хода и моделей
-вида `<synthetic>` опирается на тот же формат; записи `<synthetic>` в транскриптах автора не
-встречались, отсев — допущение. Корпус форм — `tests/fixtures/transcript-shapes.jsonl`.
+**Что не так.** `common.read_transcript` берёт из транскрипта (`transcript_path`) модель сессии (`message.model`
+последнего ответа основной ветки), все сообщения агента за реплику (судья `Stop`) и реплики автора — текущую и прежние
+(блок `<author>` судей и судья записи в память), а формат транскрипта Claude Code не документирует. Отсев записей
+`isSidechain`, `isMeta`, `tool_result`, служебных записей по `origin.kind` (`task-notification`, `peer`), вложений
+`queued_command` с репликой человека посреди хода, ответов автора при отклонении инструмента (`toolDenialKind`,
+`permissionDecision.source`, `userFeedback`) и моделей вида `<synthetic>` опирается на тот же формат; записи
+`<synthetic>` в транскриптах автора не встречались, отсев — допущение. Корпус форм —
+`tests/fixtures/transcript-shapes.jsonl`.
 
 **Чем доказано.** Документация хуков (code.claude.com/docs/en/hooks.md): поле `model` во входе есть
 только у `SessionStart` и `/model` посреди сессии не отражает; сообщений реплики во входе `Stop` нет —

@@ -1,0 +1,22 @@
+# источник: mldsa-native в esp-idf release/v6.0 (71722673), .github/workflows/hol_light.yml, строки 55–75 (script: | под with:)
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-shell
+        with:
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          nix-shell: 'hol_light'
+          script: |
+            # Load base infrastructure and specs to validate HOL-Light environment
+            # When we have smaller/faster proofs, we can run them here instead:
+            # make -C proofs/hol_light/x86_64 mldsa/mldsa_ntt.o
+            # echo 'needs "proofs/mldsa_ntt.ml";;' | hol.sh
+            echo 'needs "x86/proofs/base.ml";; needs "proofs/mldsa_specs.ml";; #quit;;' | hol.sh
+  hol_light_proofs:
+    needs: [ hol_light_bytecode ]
+    strategy:
+      fail-fast: false
+      matrix:
+        proof:
+          # Dependencies on {name}.{S,ml} are implicit
+          - name: mldsa_ntt

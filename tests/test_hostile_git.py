@@ -2,9 +2,12 @@
 
 tests/__init__.py изолирует процесс тестов от git-настроек машины. Здесь враждебный конфиг передаётся
 явно — GIT_CONFIG_GLOBAL на временный файл — только вызовам плагина: snapshot.capture,
-snapshot.changed_since, comments.extract, common.project_root, guard_memory.is_memory_path (git check-ignore),
-manifest_watch.list_manifests (git ls-files), manifest_watch.head_names (git cat-file --batch),
-manifest_watch.restored_names (git cat-file --batch, git ls-tree)
+snapshot.changed_since, comments.extract, common.project_root (git rev-parse, git ls-files под домашним
+каталогом-репозиторием), guard_memory.is_memory_path (git check-ignore),
+manifest_watch.list_manifests (git ls-files), manifest_watch.head_names (git cat-file --batch версий ref и сторон
+конфликта индекса, для имени с возвратом каретки — git cat-file blob),
+manifest_watch.restored_names, manifest_watch.project_names и manifest_watch.compare (git ls-files, git ls-tree,
+git cat-file --batch)
 и хукам remind.py и judge_stop.py подпроцессом. Git-команды подготовки репозитория идут под изолированным
 конфигом процесса.
 
@@ -251,12 +254,54 @@ class HostileMemoryTest(HostileCase):
         self.assertEqual(self.memory_scenario(self.config(HOSTILE)), EXPECTED_MEMORY)
 
 
+# Ожидаемый результат HostileRootTest.root_scenario: каталог запуска → корень относительно дома.
+EXPECTED_ROOTS = {"Projects/app": "Projects/app", ".config/ü vim": "."}
+
+
+class HostileRootTest(HostileCase):
+    """common.project_root с CLAUDE_PROJECT_DIR под домашним каталогом-репозиторием (git ls-files -z --cached) под
+    враждебным конфигом: проект без отслеживаемых файлов — сам каталог, каталог с отслеживаемыми — вершина."""
+
+    def root_scenario(self, cfg):
+        home = self.repo()
+        write(home, ".config/ü vim/init.lua", "x\n")
+        git("add", ".", cwd=home)
+        git("commit", "-qm", "c", cwd=home)
+        write(home, "Projects/app/a.py", "x = 1\n")
+        found = {}
+        for rel in ("Projects/app", ".config/ü vim"):
+            with hostile(cfg), mock.patch.dict(os.environ, {"HOME": str(home), "CLAUDE_PROJECT_DIR": str(home / rel)}):
+                found[rel] = os.path.relpath(common.project_root(str(home / rel)).resolve(), home.resolve())
+        return found
+
+    def test_baseline(self):
+        self.assertEqual(self.root_scenario(os.devnull), EXPECTED_ROOTS)
+
+    def test_each_setting_keeps_result(self):
+        for key, value in HOSTILE.items():
+            with self.subTest(setting=key):
+                self.assertEqual(self.root_scenario(self.config({key: value})), EXPECTED_ROOTS)
+
+    def test_all_settings_together_keep_result(self):
+        self.assertEqual(self.root_scenario(self.config(HOSTILE)), EXPECTED_ROOTS)
+
+
 # Ожидаемый результат HostileManifestTest.manifest_scenario под изолированным конфигом: режим, манифесты
-# проекта и имена версий из HEAD.
-# Версия package.json из HEAD объединена с версией из MERGE_HEAD (lodash) незавершённого слияния.
-EXPECTED_MANIFESTS = ("git", ["new/requirements.txt", "package.json", "sp ace/Cargo.toml", "ü/requirements.txt"],
-                      {"package.json": ["lodash", "react"], "ü/requirements.txt": ["rich"], "new/requirements.txt": None},
-                      {"npm": ["lodash", "react"], "pypi": ["click", "flask", "rich"], "crates.io": ["serde"]})
+# проекта, имена версий из HEAD и сторон конфликта, имена ref команды, имена проекта реестра PyPI и новые имена
+# после правки.
+# Версия package.json из HEAD объединена с версией из MERGE_HEAD (lodash) незавершённого слияния; у
+# cf/requirements.txt — версия HEAD (attrs) и стороны конфликта индекса :1:, :2:, :3: (base, ours, theirs).
+# Имена ref команды — из манифестов и setup.py их деревьев. Имена проекта: манифесты рабочего дерева и манифесты и
+# setup.py версии HEAD (legacydep).
+EXPECTED_MANIFESTS = ("git", ["cf/requirements.txt", "new/requirements.txt", "nl/requirements\r.txt",
+                              "package.json", "sp ace/Cargo.toml", "ü/requirements.txt"],
+                      {"package.json": ["lodash", "react"], "ü/requirements.txt": ["rich"],
+                       "new/requirements.txt": None, "nl/requirements\r.txt": ["httpx"],
+                       "cf/requirements.txt": ["attrs", "base", "ours", "theirs"]},
+                      {"npm": ["lodash", "react"], "pypi": ["attrs", "click", "flask", "legacydep", "rich"],
+                       "crates.io": ["serde"]},
+                      ["attrs", "flask", "httpx", "legacydep", "rich"],
+                      ({"new/requirements.txt": ["evilpkg"]}, []))
 
 
 class HostileManifestTest(HostileCase):
@@ -267,10 +312,17 @@ class HostileManifestTest(HostileCase):
         root = self.repo()
         write(root, ".gitignore", "ign/\n")
         # Драйвер junk из HOSTILE для манифеста: версия из HEAD читается без textconv.
-        write(root, ".gitattributes", "package.json diff=junk\n")
+        write(root, ".gitattributes", "package.json diff=junk\nsetup.py diff=junk\ncf/requirements.txt diff=junk\n")
+        # Файл _LEGACY версии HEAD: его имена читает git ls-tree и git cat-file --batch дерева HEAD.
+        write(root, "setup.py", "setup(install_requires=['legacydep'])\n")
+        write(root, "cf/requirements.txt", "attrs\n")
         write(root, "package.json", '{"dependencies": {"react": "^18"}}\n')
         write(root, "ü/requirements.txt", "rich\n")
         write(root, "sp ace/Cargo.toml", "[dependencies]\nserde = \"1\"\n")
+        # Имя с возвратом каретки (имя с переводом строки не манифест): версия HEAD — отдельным `git cat-file blob`,
+        # под драйвером junk тоже без textconv.
+        write(root, "nl/.gitattributes", "* diff=junk\n")
+        write(root, "nl/requirements\r.txt", "httpx\n")
         git("add", ".", cwd=root)
         git("commit", "-qm", "m", cwd=root)
         git("checkout", "-qb", "feat", cwd=root)
@@ -288,16 +340,32 @@ class HostileManifestTest(HostileCase):
         write(root, "new/requirements.txt", "flask\n")
         write(root, "ign/requirements.txt", "flask\n")
         write(root, "tests/fixtures/x/package.json", "{}\n")
+        # Конфликт cf/requirements.txt: стороны :1:, :2:, :3: в индексе в форме `git ls-files -s`.
+        stages = []
+        for stage, name in ((1, "base"), (2, "ours"), (3, "theirs")):
+            blob = subprocess.run([*GIT, "hash-object", "-w", "--stdin"], cwd=root, input=f"{name}\n", check=True,
+                                  capture_output=True, text=True).stdout.strip()
+            stages.append(f"100644 {blob} {stage}\tcf/requirements.txt\n")
+        git("rm", "-q", "--cached", "cf/requirements.txt", cwd=root)
+        subprocess.run([*GIT, "update-index", "--index-info"], cwd=root, input="".join(stages), check=True,
+                       capture_output=True, text=True)
         with hostile(cfg):
             mode, found = manifest_watch.list_manifests(root, time.monotonic() + 30)
             heads = {}
-            for rel in ("package.json", "ü/requirements.txt", "new/requirements.txt"):
+            for rel in ("package.json", "ü/requirements.txt", "new/requirements.txt", "nl/requirements\r.txt",
+                        "cf/requirements.txt"):
                 names = manifest_watch.head_names(str(root / rel), manifest_watch.watched_kind(rel), 10)
                 heads[rel] = None if names is None else sorted(names)
             # Начало сессии позже коммитов: ref — работа до сессии.
             restored = manifest_watch.restored_names(root, "git checkout feat -- package.json; git stash pop",
                                                      int(time.time()) + 100, time.monotonic() + 30)
-        return mode, sorted(found), heads, restored
+            project = sorted(manifest_watch.project_names(root, "requirements", time.monotonic() + 30))
+            entry = manifest_watch.take(root, time.monotonic() + 30)
+        # Перенос из setup.py версии HEAD и новое имя: сравнение читает дерево HEAD.
+        write(root, "new/requirements.txt", "flask\nlegacydep\nevilpkg\n")
+        with hostile(cfg):
+            compared = manifest_watch.compare(entry, time.monotonic() + 30)
+        return mode, sorted(found), heads, restored, project, compared
 
     def test_baseline(self):
         self.assertEqual(self.manifest_scenario(os.devnull), EXPECTED_MANIFESTS)
@@ -368,9 +436,11 @@ class HostileHookTest(unittest.TestCase):
         env.transcript.write_text("".join(json.dumps(e) + "\n" for e in (
             {"type": "user", "message": {"role": "user", "content": "реплика автора"}},
             {"type": "assistant", "message": {"model": "claude-test-model", "content": [
-                {"type": "text", "text": "Поправил."}]}})), encoding="utf-8")
+                {"type": "text", "text": "Комментарии в a.py."}]}})), encoding="utf-8")
         rec = env.data / "rec.txt"
-        r = env.run("judge_stop.py", env.hook_input("Stop", last_assistant_message="Поправил.", stop_hook_active=False),
+        # Сообщение без заявки «готово»: судью зовёт фильтр документации.
+        r = env.run("judge_stop.py", env.hook_input("Stop", last_assistant_message="Комментарии в a.py.",
+                                                    stop_hook_active=False),
                     PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec), **extra)
         self.assertEqual(r.stdout, "", r.stderr)
         return rec.read_text(encoding="utf-8").split("\n<content>\n", 1)[1].split("\n</content>\n", 1)[0]

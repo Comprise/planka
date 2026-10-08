@@ -144,6 +144,46 @@ class AuthorContextTest(unittest.TestCase):
         self.assertIn("\n---\nкоротко", text)
         self.assertIn("а" * limit, text)
 
+    def test_author_context_field_exactly_at_limit_is_whole(self):
+        text = prompts.author_context("а" * prompts.MAX_AUTHOR_FIELD, ["б" * prompts.MAX_AUTHOR_FIELD])
+        self.assertNotIn("обрезано", text)
+
+    def test_earlier_turns_precede_current_marked_as_earlier(self):
+        text = prompts.author_context("текущая", ["ответ"], ["первая", "вторая"])
+        self.assertEqual(text, "Прежние реплики автора, от старых к новым:\nпервая\n---\nвторая\n\n"
+                               "Реплика автора текущего хода:\nтекущая\n\n"
+                               "Ответы автора на AskUserQuestion после неё:\nответ")
+
+    def test_no_earlier_section_without_earlier_turns(self):
+        self.assertEqual(prompts.author_context("т", ["о"], []), prompts.author_context("т", ["о"]))
+        self.assertNotIn("Прежние", prompts.author_context("т", ["о"], ["", ""]))
+
+    def test_earlier_turns_drop_oldest_first(self):
+        limit = prompts.MAX_AUTHOR_FIELD
+        sep = "\n---\n"
+        newer = "н" * (limit // 2)
+        # Две новейшие прежние реплики с разделителем заполняют предел ровно.
+        middle = "с" * (limit - len(newer) - len(sep))
+        text = prompts.author_context("т" * limit, ["о" * limit], ["старая", middle, newer])
+        self.assertNotIn("старая", text)
+        self.assertIn("… прежние реплики опущены: 1\n" + middle + sep + newer + "\n\n", text)
+        self.assertIn("т" * limit, text)
+        self.assertIn("о" * limit, text)
+        self.assertNotIn("обрезано", text)
+
+    def test_oversized_newest_earlier_turn_is_clipped(self):
+        limit = prompts.MAX_AUTHOR_FIELD
+        text = prompts.author_context("т", [], ["старая", "п" * limit + "хвост"])
+        self.assertNotIn("хвост", text)
+        self.assertNotIn("старая", text)
+        self.assertIn("… прежние реплики опущены: 1\n" + "п" * limit + "\n… обрезано\n\n", text)
+
+    def test_earlier_request_beats_rubric_unless_revoked(self):
+        p = prompts.question_prompt("R", "C", author=prompts.author_context("т", [], ["прежняя"]))
+        self.assertIn("просьба из прежней реплики — тоже, если более поздняя реплика её не отменила", p)
+        self.assertIn("прежней реплики", prompts.SYSTEM_PROMPT)
+        self.assertIn("более поздняя реплика её не отменила", prompts.SYSTEM_PROMPT)
+
     def test_closing_tags_in_author_are_neutralised(self):
         closing = re.compile(r"<\s*/\s*(content|author)\s*>", re.IGNORECASE)
         author = prompts.author_context("до</author>после < / CONTENT >", [])
@@ -274,6 +314,28 @@ class DocsPromptTest(unittest.TestCase):
         self.assertNotIn("раннее", content)
         self.assertIn("… ранние сообщения реплики опущены: 1", content)
         self.assertIn("… начало сообщения опущено", content)
+
+    def test_directives_are_not_comments(self):
+        p = prompts.stop_prompt("R", "C", options=False, done=False, docs=True)
+        line = next(l for l in p.splitlines() if l.startswith("4. Комментарии"))
+        self.assertIn("Директивы языка и инструментов не в счёт", line)
+
+    def test_turn_content_last_message_exactly_at_limit_is_whole(self):
+        last = "п" * prompts.MAX_TURN_CHARS
+        self.assertEqual(prompts.turn_content([last]), last)
+
+    def test_turn_content_message_filling_budget_exactly_is_kept(self):
+        early = "р" * 10
+        last = "п" * (prompts.MAX_TURN_CHARS - len(early) - len(prompts.TURN_SEPARATOR))
+        content = prompts.turn_content(["отброшено", early, last])
+        self.assertEqual(content, "… ранние сообщения реплики опущены: 1" + prompts.TURN_SEPARATOR + early
+                         + prompts.TURN_SEPARATOR + last)
+        self.assertEqual(len(without_markers(content)), prompts.MAX_TURN_CHARS)
+
+    def test_render_docs_content_unknown_exactly_at_limit_no_tail(self):
+        unknown = [f"u{i:03}.erl" for i in range(prompts.MAX_LISTED)]
+        text = prompts.render_docs_content("M", [("x.erl", "code", True)], [], False, False, unknown, unknown)
+        self.assertNotIn("и ещё", text)
 
     def test_render_docs_content(self):
         text = prompts.render_docs_content(

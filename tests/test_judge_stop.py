@@ -9,8 +9,8 @@ import time
 import unittest
 from unittest import mock
 
-from tests.helpers import (RULES, Env, PLANKA_DIR, assert_not_logged, author_block, fill_budget, messages, output,
-                           run_in_process)
+from tests.helpers import (Env, PLANKA_DIR, assert_linear, assert_not_logged, author_block, fill_budget, messages,
+                           output, run_in_process)
 
 sys.path.insert(0, str(PLANKA_DIR))
 import common  # noqa: E402
@@ -26,6 +26,9 @@ OPTIONS_MSG = """Есть два подхода:
 Какой берём?"""
 
 PLAIN_MSG = "Смотрю, что сломалось."
+
+# Сообщение после правки без слов фильтров «варианты» и «готово».
+EDIT_MSG = "Правка в a.py."
 
 TURN_MISSING = "planka: сообщения реплики не найдены в транскрипте, судья видит последнее сообщение"
 
@@ -61,6 +64,21 @@ class FilterTest(unittest.TestCase):
             self.assertTrue(judge_stop.looks_like_options(f"{word}\n- a\n- b"), word)
         for word in ("это подходит", "подходящий", "optional", "Option<T>", "Option::None", "adoption"):
             self.assertFalse(judge_stop.looks_like_options(f"{word}\n- a\n- b"), word)
+
+    def test_proposal_and_choice_words(self):
+        for text in ("Можно двумя способами:\n1. Заплатка.\n2. Перестройка.",
+                     "Выбор за тобой:\n- A — быстро\n- B — надёжно",
+                     "Предлагаю так:\n1. x\n2. y\nСоветую второй.",
+                     "Советую:\n- a\n- b", "Предлагаю:\n- a\n- b"):
+            self.assertTrue(judge_stop.looks_like_options(text), text)
+        for word in ("способный", "способен", "выборка", "выборочно"):
+            self.assertFalse(judge_stop.looks_like_options(f"{word}\n- a\n- b"), word)
+
+    def test_list_items_linear_in_blank_lines(self):
+        # Строки из пробелов: отступ пункта не переходит через перевод строки.
+        small, large = (" \n" * n + "Варианты:\n- a\n- b" for n in (2000, 8000))
+        self.assertTrue(judge_stop.looks_like_options(large))
+        assert_linear(self, lambda: judge_stop.looks_like_options(small), lambda: judge_stop.looks_like_options(large))
 
 
 class StopHookTest(unittest.TestCase):
@@ -99,6 +117,8 @@ class StopHookTest(unittest.TestCase):
         self.assertIn("нет варианта с причиной", out["reason"])
         self.assertIn("Решения 4", out["reason"])
         self.assertTrue(out["reason"].startswith("planka: "))
+        last = self.env.log_lines()[-1]
+        self.assertEqual((last["verdict"], last["reason"]), ("deny", "нет варианта с причиной"))
 
     def test_judge_gets_message_and_rubric(self):
         rec = self.env.data / "rec.txt"
@@ -111,6 +131,21 @@ class StopHookTest(unittest.TestCase):
         for needle in ("# Доказательство", "команда-доказательство", "# Документация", "локальный CLAUDE.md"):
             self.assertNotIn(needle, text)
         self.assertIn("Сообщение без выбора между вариантами", text)
+
+    def test_judge_gets_earlier_author_turns(self):
+        earlier = "Варианты дай без рефакторинга, только заплатки."
+        write_turn(self.env, OPTIONS_MSG)
+        entries = [{"type": "user", "message": {"role": "user", "content": earlier}},
+                   {"type": "assistant", "message": {"model": "claude-test-model", "content": [
+                       {"type": "text", "text": "Понял."}]}}]
+        self.env.transcript.write_text("".join(json.dumps(e) + "\n" for e in entries)
+                                       + self.env.transcript.read_text(encoding="utf-8"), encoding="utf-8")
+        rec = self.env.data / "rec.txt"
+        r = self.env.run("judge_stop.py", self.env.hook_input("Stop", last_assistant_message=OPTIONS_MSG),
+                         PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertTrue(author_block(rec).startswith("Прежние реплики автора, от старых к новым:\n" + earlier + "\n"))
+        assert_not_logged(self, self.env, earlier)
 
     def test_judge_gets_author_turn_not_logged(self):
         author = "Сделай быструю заплатку, без перестройки."
@@ -340,6 +375,30 @@ class DoneFilterTest(unittest.TestCase):
         self.assertFalse(judge_stop.claims_done(""))
         self.assertFalse(judge_stop.claims_done(None))
 
+    def test_past_tense_claims(self):
+        for text in ("Исправил баг в parse().", "Починил тест, теперь всё работает.",
+                     "Сделал правку и прогнал make test: OK.", "Починила сборку", "Исправила.", "Исправили опечатку",
+                     "Поправил импорт", "Реализовал разбор", "Добавил тест", "Доделал миграцию",
+                     "Закончил с parse", "Завершил перенос", "Теперь всё работает", "Сборка снова работает",
+                     "Тесты уже работают"):
+            self.assertTrue(judge_stop.claims_done(text), text)
+
+    def test_past_tense_not_matched_in_questions_and_plans(self):
+        for text in ("Как работает parse?", "Добавить тест?", "Сделать правку сейчас?", "Исправить или откатить?",
+                     "Реализация займёт час", "Не работает импорт", "Закончить план?"):
+            self.assertFalse(judge_stop.claims_done(text), text)
+
+    def test_each_word_alone(self):
+        # По строке на слово: другие слова списка в строке не совпадают.
+        for text in ("All done", "Тесты проходят", "Тесты зелёные", "Migration completed", "Тест проходит",
+                     "Сделано", "Починено", "Тест прошёл", "Тесты прошли", "Build passing", "It passes",
+                     "Build succeeds", "Migration complete", "Готовы", "Bug fixed"):
+            self.assertTrue(judge_stop.claims_done(text), text)
+
+    def test_words_need_leading_boundary(self):
+        for text in ("prefixed", "undone", "несделано", "неисправлено", "bypassed", "incomplete"):
+            self.assertFalse(judge_stop.claims_done(text), text)
+
 
 class DoneHookTest(unittest.TestCase):
     def setUp(self):
@@ -421,7 +480,7 @@ class DocsFilterTest(unittest.TestCase):
         self.snap()
         (self.project / "a.py").write_text("x = 1\n", encoding="utf-8")
         rec = self.env.data / "rec.txt"
-        r = self.stop("Поправил.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        r = self.stop(EDIT_MSG, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         self.assertEqual(r.stdout, "", r.stderr)
         self.assertIn("- a.py — код", judged(rec))
         self.assertNotIn("В корне проекта нет CLAUDE.md.", judged(rec))
@@ -430,7 +489,7 @@ class DocsFilterTest(unittest.TestCase):
         self.snap()
         (self.project / "a.py").write_text("x = 1\n", encoding="utf-8")
         rec = self.env.data / "rec.txt"
-        self.stop("Поправил.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.stop(EDIT_MSG, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         text = rec.read_text(encoding="utf-8")
         self.assertIn("ждёт ответа автора", text)
         for needle in ("самый правильный", "команда-доказательство", "# Доказательство", "## Решения"):
@@ -457,7 +516,7 @@ class DocsFilterTest(unittest.TestCase):
         self.snap()
         (self.project / "pkg" / "a.go").write_text("// hello\nx := 1\n", encoding="utf-8")
         rec = self.env.data / "rec.txt"
-        r = self.stop("Поправил.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        r = self.stop(EDIT_MSG, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         self.assertEqual(r.stdout, "", r.stderr)
         text = rec.read_text(encoding="utf-8")
         self.assertIn("# Документация", text)
@@ -466,8 +525,9 @@ class DocsFilterTest(unittest.TestCase):
         self.assertIn("pkg/a.go: // hello", text)
         self.assertIn("В корне проекта нет CLAUDE.md.", text)
         self.assertIn("локальный CLAUDE.md", text)
+        # Судья видит сообщения, список файлов и комментарии, не код: модулей паттернов и рефакторинга в рубрике нет.
         for needle in ["# Паттерны", "# Рефакторинг"]:
-            self.assertIn(needle, text)
+            self.assertNotIn(needle, text)
         last = self.env.log_lines()[-1]
         self.assertEqual(last["filters"], ["docs"])
         judged = text.split("\n<content>\n", 1)[1].split("\n</content>\n", 1)[0]
@@ -480,7 +540,7 @@ class DocsFilterTest(unittest.TestCase):
         self.snap()
         (self.project / "a.py").write_text("x = 1\n", encoding="utf-8")
         rec = self.env.data / "rec.txt"
-        self.stop("Поправил.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.stop(EDIT_MSG, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         text = rec.read_text(encoding="utf-8")
         self.assertIn("В изменённых файлах кода комментарии не добавлены.", text)
         self.assertIn("При отказе назови файл, который нужно сверить, или строку комментария, "
@@ -490,7 +550,7 @@ class DocsFilterTest(unittest.TestCase):
         self.snap()
         (self.project / "pkg" / "data.erl").write_text("% x\n", encoding="utf-8")
         rec = self.env.data / "rec.txt"
-        self.stop("Поправил.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.stop(EDIT_MSG, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         text = rec.read_text(encoding="utf-8")
         self.assertIn("- pkg/data.erl: % x", text)
         self.assertNotIn("комментарии не добавлены", text)
@@ -498,9 +558,9 @@ class DocsFilterTest(unittest.TestCase):
     def test_absent_prompt_id_matches_empty_snapshot(self):
         self.snap(prompt_id="")
         (self.project / "a.py").write_text("x = 1\n", encoding="utf-8")
-        data = self.env.hook_input("Stop", last_assistant_message="Поправил.", stop_hook_active=False, cwd=str(self.project))
+        data = self.env.hook_input("Stop", last_assistant_message=EDIT_MSG, stop_hook_active=False, cwd=str(self.project))
         del data["prompt_id"]
-        write_turn(self.env, "Поправил.")
+        write_turn(self.env, EDIT_MSG)
         rec = self.env.data / "rec.txt"
         r = self.env.run("judge_stop.py", data, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         self.assertEqual(r.stdout, "", r.stderr)
@@ -513,9 +573,9 @@ class DocsFilterTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         (self.project / "a.py").write_text("x = 1\n", encoding="utf-8")
         rec = self.env.data / "rec.txt"
-        write_turn(self.env, "Поправил.")
+        write_turn(self.env, EDIT_MSG)
         r = self.env.run("judge_stop.py", self.env.hook_input(
-            "Stop", last_assistant_message="Поправил.", stop_hook_active=False, cwd=str(self.project / "pkg")),
+            "Stop", last_assistant_message=EDIT_MSG, stop_hook_active=False, cwd=str(self.project / "pkg")),
             CLAUDE_PROJECT_DIR=project_dir, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         self.assertEqual(r.stdout, "", r.stderr)
         self.assertIn("- a.py — код", rec.read_text(encoding="utf-8"))
@@ -525,7 +585,7 @@ class DocsFilterTest(unittest.TestCase):
         self.snap()
         (self.project / "CLAUDE.md").write_text("# x\n", encoding="utf-8")
         (self.project / "notes.md").write_text("n\n", encoding="utf-8")
-        r = self.stop("Поправил.")
+        r = self.stop(EDIT_MSG)
         self.assertEqual(r.stdout, "")
         self.assertEqual(self.env.log_lines(), [])
 
@@ -538,7 +598,7 @@ class DocsFilterTest(unittest.TestCase):
                     path = self.project / rel
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text(f"{files}\n", encoding="utf-8")
-                r = self.stop("Поправил.")
+                r = self.stop(EDIT_MSG)
                 self.assertEqual(r.stdout, "")
                 self.assertEqual(self.env.log_lines(), [])
 
@@ -564,7 +624,7 @@ class DocsFilterTest(unittest.TestCase):
         (self.project / "c.json").write_text("{}\n", encoding="utf-8")
         (self.project / "d.md").write_text("d\n", encoding="utf-8")
         rec = self.env.data / "rec.txt"
-        r = self.stop("Поправил.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        r = self.stop(EDIT_MSG, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         self.assertEqual(r.stdout, "", r.stderr)
         text = rec.read_text(encoding="utf-8")
         listed = text.split("Изменённые файлы за ход:\n", 1)[1].split("\n\n", 1)[0].split("\n")
@@ -581,7 +641,7 @@ class DocsFilterTest(unittest.TestCase):
         for i in range(prompts.MAX_LISTED + 3):
             (self.project / f"f{i:03}.py").write_text("x = 1\n", encoding="utf-8")
         rec = self.env.data / "rec.txt"
-        self.stop("Поправил.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.stop(EDIT_MSG, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         text = rec.read_text(encoding="utf-8")
         self.assertIn("\n- … и ещё 3\n", text)
         files = self.env.log_lines()[-1]["files"]
@@ -595,24 +655,23 @@ class DocsFilterTest(unittest.TestCase):
         for needle in ["# Паттерны", "# Рефакторинг"]:
             self.assertNotIn(needle, rec.read_text(encoding="utf-8"))
 
-    def test_docs_skips_without_new_modules(self):
+    def test_docs_judged_without_pattern_and_refactoring_modules(self):
         for name in ("refactoring", "design-patterns"):
-            with self.subTest(name=name):
-                self.snap()
-                (self.project / "a.py").write_text(f"# {name}\n", encoding="utf-8")
-                path = self.env.root / "rules" / f"{name}.md"
-                path.unlink()
-                r = self.stop("Поправил.")
-                self.assertIsNone(output(r))
-                self.assertEqual(messages(r), [f"planka: нет модуля правил {path}"])
-                path.write_text(RULES[name], encoding="utf-8")
+            (self.env.root / "rules" / f"{name}.md").unlink()
+        self.snap()
+        (self.project / "a.py").write_text("# x\n", encoding="utf-8")
+        rec = self.env.data / "rec.txt"
+        r = self.stop(EDIT_MSG, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertEqual(messages(r), [])
+        self.assertIn("a.py: # x", judged(rec))
 
     def test_budget_exhausted_skips_docs_judge(self):
         rec = self.env.data / "rec.txt"
         for i in range(3):
             self.snap()
             (self.project / "a.py").write_text(f"x = {i}\n", encoding="utf-8")
-            r = self.stop("Поправил.", active=i > 0, PLANKA_STUB="deny", PLANKA_STUB_RECORD=str(rec) if i == 2 else "")
+            r = self.stop(EDIT_MSG, active=i > 0, PLANKA_STUB="deny", PLANKA_STUB_RECORD=str(rec) if i == 2 else "")
             if i < 2:
                 self.assertEqual(output(r)["decision"], "block")
         self.assertIsNone(output(r))
@@ -716,7 +775,7 @@ class DocsFilterTest(unittest.TestCase):
         (self.project / "a.py").write_text("# старый комментарий\nx = 1\n# комментарий хода\n", encoding="utf-8")
         subprocess.run([*git, "commit", "-qam", "turn"], check=True)
         rec = self.env.data / "rec.txt"
-        self.stop("Поправил.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.stop(EDIT_MSG, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         text = rec.read_text(encoding="utf-8")
         self.assertIn("a.py: # комментарий хода", text)
         self.assertNotIn("старый комментарий", text)
@@ -740,15 +799,85 @@ class DocsFilterTest(unittest.TestCase):
                                                    encoding="utf-8")
         subprocess.run([*git, "-C", str(self.project / "sub"), "commit", "-qam", "turn"], check=True)
         rec = self.env.data / "rec.txt"
-        r = self.stop("Поправил.", PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        r = self.stop(EDIT_MSG, PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         self.assertEqual(r.stdout, "", r.stderr)
         text = rec.read_text(encoding="utf-8")
         self.assertIn("sub/s.py: # новый в подмодуле", text)
         self.assertNotIn("старый комментарий подмодуля", text)
 
+    def remind(self, prompt_id):
+        r = self.env.run("remind.py", self.env.hook_input("UserPromptSubmit", prompt="x", prompt_id=prompt_id))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(messages(r), [])
+
+    def stop_turn(self, prompt_id, msg=EDIT_MSG, active=False, **extra):
+        """Stop реплики prompt_id; (ответ, записан ли вызов судьи в rec.txt)."""
+        rec = self.env.data / "rec.txt"
+        rec.unlink(missing_ok=True)
+        write_turn(self.env, msg)
+        r = self.env.run("judge_stop.py", self.env.hook_input(
+            "Stop", last_assistant_message=msg, stop_hook_active=active, prompt_id=prompt_id),
+            PLANKA_STUB_RECORD=str(rec), **extra)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r, rec
+
+    def test_interrupted_turn_edits_checked_on_next_stop(self):
+        # Прерванная реплика p-1 без Stop: её правка видна на Stop реплики p-2, в которой правок нет.
+        self.remind("p-1")
+        (self.project / "a.py").write_text("# x\n", encoding="utf-8")
+        self.remind("p-2")
+        r, rec = self.stop_turn("p-2", PLANKA_STUB="ok")
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertIn("- a.py — код", rec.read_text(encoding="utf-8"))
+        self.assertEqual(self.env.log_lines()[-1]["filters"], ["docs"])
+
+    def test_checked_turn_not_rechecked(self):
+        self.remind("p-1")
+        (self.project / "a.py").write_text("# x\n", encoding="utf-8")
+        self.stop_turn("p-1", PLANKA_STUB="ok")
+        self.assertEqual(self.env.log_lines()[-1]["filters"], ["docs"])
+        self.remind("p-2")
+        r, rec = self.stop_turn("p-2", PLANKA_STUB="ok")
+        self.assertEqual(r.stdout, "")
+        self.assertFalse(rec.exists())
+        self.assertEqual(len(self.env.log_lines()), 1)
+
+    def test_judge_error_marks_turn_checked(self):
+        self.remind("p-1")
+        (self.project / "a.py").write_text("# x\n", encoding="utf-8")
+        r, _ = self.stop_turn("p-1", PLANKA_STUB="notlogged")
+        self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")
+        self.remind("p-2")
+        r, rec = self.stop_turn("p-2", PLANKA_STUB="ok")
+        self.assertFalse(rec.exists())
+
+    def test_blocked_then_interrupted_turn_rechecked(self):
+        # Stop после блока приходит с stop_hook_active и видит те же правки; реплику прервали после блока —
+        # правки видны на Stop следующей реплики.
+        self.remind("p-1")
+        (self.project / "a.py").write_text("# x\n", encoding="utf-8")
+        r, _ = self.stop_turn("p-1", PLANKA_STUB="deny")
+        self.assertEqual(output(r)["decision"], "block")
+        r, _ = self.stop_turn("p-1", active=True, PLANKA_STUB="deny")
+        self.assertEqual(output(r)["decision"], "block")
+        self.assertEqual(self.env.log_lines()[-1]["files"], ["a.py"])
+        self.remind("p-2")
+        r, rec = self.stop_turn("p-2", PLANKA_STUB="ok")
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertIn("- a.py — код", rec.read_text(encoding="utf-8"))
+
+    def test_block_on_other_filter_keeps_snapshot(self):
+        self.remind("p-1")
+        r, _ = self.stop_turn("p-1", msg=OPTIONS_MSG, PLANKA_STUB="deny")
+        self.assertEqual(output(r)["decision"], "block")
+        (self.project / "a.py").write_text("# x\n", encoding="utf-8")
+        self.remind("p-2")
+        r, rec = self.stop_turn("p-2", PLANKA_STUB="ok")
+        self.assertIn("- a.py — код", rec.read_text(encoding="utf-8"))
+
     def test_no_snapshot_no_trigger(self):
         (self.project / "a.py").write_text("x\n", encoding="utf-8")
-        r = self.stop("Поправил.")
+        r = self.stop(EDIT_MSG)
         self.assertEqual(r.stdout, "")
         self.assertEqual(messages(r), [])
         self.assertEqual(r.stderr, "")
@@ -757,14 +886,14 @@ class DocsFilterTest(unittest.TestCase):
     def test_stale_snapshot_no_trigger(self):
         self.snap(prompt_id="p-0")
         (self.project / "a.py").write_text("x\n", encoding="utf-8")
-        r = self.stop("Поправил.")
+        r = self.stop(EDIT_MSG)
         self.assertEqual(r.stdout, "")
         self.assertEqual(self.env.log_lines(), [])
 
     def test_denied_blocks_with_reason(self):
         self.snap()
         (self.project / "a.py").write_text("# было так, стало эдак\n", encoding="utf-8")
-        r = self.stop("Поправил.", PLANKA_STUB="deny", PLANKA_STUB_REASON="сверь pkg/CLAUDE.md")
+        r = self.stop(EDIT_MSG, PLANKA_STUB="deny", PLANKA_STUB_REASON="сверь pkg/CLAUDE.md")
         out = output(r)
         self.assertEqual(out["decision"], "block")
         self.assertTrue(out["reason"].startswith("planka: "))
@@ -786,7 +915,7 @@ class DocsFilterTest(unittest.TestCase):
         self.snap()
         (self.project / "a.py").write_text("x\n", encoding="utf-8")
         (self.env.root / "rules" / "comments.md").unlink()
-        r = self.stop("Поправил.")
+        r = self.stop(EDIT_MSG)
         self.assertIsNone(output(r))
         self.assertEqual(messages(r), [f"planka: нет модуля правил {self.env.root / 'rules' / 'comments.md'}"])
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "skipped")

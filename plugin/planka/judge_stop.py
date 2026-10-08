@@ -1,6 +1,7 @@
 """Stop: последнее сообщение со списком вариантов судится по «Решениям», заявка о готовности — по модулю
-проверки, правка кода со снимка текущей реплики — по модулям документации, комментариев, паттернов и
-рефакторинга; при совпадении нескольких фильтров — один вызов, судья видит все сообщения реплики и реплику автора."""
+проверки, правка кода со снимка текущей реплики — по модулям документации и комментариев; при совпадении
+нескольких фильтров — один вызов, судья видит все сообщения реплики и реплику автора. Stop без блока отмечает
+снимок реплики проверенным."""
 import re
 import time
 
@@ -9,9 +10,10 @@ import common
 import prompts
 import snapshot
 
-_LIST_ITEM = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+\S", re.MULTILINE)
-# Целые слова: «подходит», optional, adoption и тип Option<T> не совпадают.
+_LIST_ITEM = re.compile(r"^[ \t]*(?:[-*•]|\d+[.)])\s+\S", re.MULTILINE)
+# Целые слова: «подходит», «способный», «выборка», optional, adoption и тип Option<T> не совпадают.
 _KEYWORDS = re.compile(r"\b(?:рекоменд\w*|вариант\w*|подход(?:а|е|у|ы|ом|ов|ам|ами|ах)?|"
+                       r"способ(?:а|е|у|ы|ом|ов|ам|ами|ах)?|выбор(?:а|е|у|ом)?|предлага\w*|совету\w*|"
                        r"recommend(?:s|ed|ation|ations)?|options?(?!<|::)|approach(?:es)?)\b",
                        re.IGNORECASE)
 
@@ -20,9 +22,12 @@ def looks_like_options(text):
     return len(_LIST_ITEM.findall(text or "")) >= 2 and bool(_KEYWORDS.search(text or ""))
 
 
-# «готов» — только перед знаком препинания или концом строки: «Фикс готов.», но не «готов обсудить».
+# «готов» — только перед знаком препинания или концом строки: «Фикс готов.», но не «готов обсудить»;
+# «работает» — только после «всё», «все», «теперь», «снова», «уже»: не «как работает parse».
 _DONE = re.compile(r"\b(?:готов[оаы]|готов(?=[ \t]*(?:[.!?,;:)\n]|\Z))|сделан[оаы]?|исправлен[оаы]?|"
                    r"починен[оаы]?|выполнен[оаы]?|заверш[её]н[оаы]?|проход[яи]т|прош[её]л|прошли|зел[её]н\w*|"
+                   r"(?:ис|по)правил[аи]?|починил[аи]?|сделал[аи]?|доделал[аи]?|реализовал[аи]?|добавил[аи]?|"
+                   r"закончил[аи]?|завершил[аи]?|(?:вс[её]|теперь|снова|уже)[ \t]+работа[ею]т|"
                    r"done|fixed|passing|passes|passed|succeeded|succeeds|completed?)\b",
                    re.IGNORECASE)
 
@@ -40,7 +45,8 @@ COMMENTS_BUDGET = 20
 
 def changed_this_turn(data):
     """Корень проекта, HEAD корня и подмодулей на старте реплики и (путь, класс по common.path_kind, есть ли
-    файл сейчас) со снимка текущей реплики.
+    файл сейчас) со снимка текущей реплики. Снимок, перепривязанный snapshot.carry_over, снят на старте
+    первой реплики без Stop: её правки входят в изменения.
 
     None — нет cwd или снимка, снимок другой реплики или другого корня, изменения со снимка не определить
     (snapshot.changed_since) или сверка не уложилась в SNAPSHOT_BUDGET; в двух последних случаях —
@@ -98,12 +104,29 @@ def turn_messages(data, transcript, message):
     return found
 
 
+def release_snapshot(data):
+    """Отмечает снимок реплики проверенным (snapshot.mark_checked); сбой — предупреждение, снимок остаётся базой
+    следующей реплики."""
+    try:
+        state_dir = common.data_dir() / "state"
+        if state_dir.is_dir():
+            snapshot.mark_checked(state_dir, data.get("session_id", ""), data.get("prompt_id", ""))
+    except Exception as e:
+        common.warn(f"снимок реплики не отмечен проверенным: {e!r}")
+
+
 def main():
     if common.barrier_active():
         return
     data = common.read_input()
     if not data:
         return
+    if not judge(data):
+        release_snapshot(data)
+
+
+def judge(data):
+    """Фильтры и судья Stop; True — Stop заблокирован."""
     message = data.get("last_assistant_message") or ""
     # Фильтры «варианты» и «готово» — по последнему сообщению; судья видит всю реплику.
     options = looks_like_options(message)
@@ -111,7 +134,7 @@ def main():
     docs_info = docs_check(data)
     docs = docs_info is not None
     if not (options or done or docs):
-        return
+        return False
     filters = [name for flag, name in ((options, "options"), (done, "done"), (docs, "docs")) if flag]
     meta = {"filters": filters}
     if docs:
@@ -121,17 +144,17 @@ def main():
     if not common.deny_budget_left(session, prompt_id, "stop"):
         common.warn("лимит отказов, пропущено без проверки")
         common.log_event("stop", session, verdict="budget", **meta)
-        return
+        return False
     modules = []
     if done:
         modules.append("verification")
     if docs:
-        modules += ["docs", "comments", "design-patterns", "refactoring"]
+        modules += ["docs", "comments"]
     rubric = common.rubric(("Решения",) if options else (), tuple(modules))
     if rubric is None:
         # Предупреждение уже выдал common.rubric.
         common.log_event("stop", session, verdict="skipped", error="нет раздела рубрики", **meta)
-        return
+        return False
     transcript = common.read_transcript(data.get("transcript_path"))
     content = prompts.turn_content(turn_messages(data, transcript, message))
     if docs:
@@ -141,27 +164,29 @@ def main():
                                prompts.stop_prompt(rubric, content, options=options, done=done, docs=docs,
                                                    label=prompts.TURN_LABEL,
                                                    author=prompts.author_context(transcript.author_turn,
-                                                                                 transcript.author_answers)),
+                                                                                 transcript.author_answers,
+                                                                                 transcript.earlier_turns)),
                                common.judge_model(data, transcript))
     duration_ms = int((time.monotonic() - started) * 1000)
     if verdict.error:
         common.warn(common.skip_message(verdict))
         common.log_event("stop", session, verdict="skipped", error=verdict.error,
                          duration_ms=duration_ms, content=content, **meta)
-        return
+        return False
     if verdict.ok:
         common.log_event("stop", session, verdict="ok", duration_ms=duration_ms, content=content, **meta)
-        return
+        return False
     log = dict(reason=verdict.reason, violated=verdict.violated, duration_ms=duration_ms, content=content, **meta)
     # Счётчик на пределе к моменту отказа — пропуск с предупреждением вместо отказа.
     if common.deny_budget_exhausted(session, prompt_id, "stop"):
         common.warn("лимит отказов, пропущено без проверки")
         common.log_event("stop", session, verdict="budget", **log)
-        return
+        return False
     violated = f" (нарушено: {', '.join(verdict.violated)})" if verdict.violated else ""
     # Ответ запоминается до записи журнала: сбой записи не отменяет отказ.
     common.emit(common.block_output(f"planka: {verdict.reason}{violated}"))
     common.log_event("stop", session, verdict="deny", **log)
+    return True
 
 
 if __name__ == "__main__":

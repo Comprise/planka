@@ -1,11 +1,12 @@
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import time
 import unittest
 
-from tests.helpers import PLANKA_DIR, RULES, Env, messages, output
+from tests.helpers import PLANKA_DIR, RULES, Env, assert_linear, messages, output
 
 sys.path.insert(0, str(PLANKA_DIR))
 import debug_watch  # noqa: E402
@@ -149,6 +150,25 @@ class DebugWatchTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout, "")
 
+    def test_command_of_other_tool_ignored(self):
+        # Вход не Bash с полем command: не неудача и не успех команды — счётчик Bash не меняется.
+        self.failure()
+        for event in ("PostToolUse", "PostToolUseFailure", "PostToolUseFailure"):
+            r = self.env.run("debug_watch.py", self.env.hook_input(
+                event, tool_name="Task", tool_input={"command": "make test"}, tool_use_id="t",
+                error="Exit code 1\nboom", is_interrupt=False))
+            self.assertEqual(r.stdout, "", event)
+        self.assertIn("упала второй раз подряд", self.context(self.failure()))
+
+    def test_other_event_ignored(self):
+        # Событие вне PostToolUse и PostToolUseFailure (PreToolUse на Bash) — не исход команды: счётчик не
+        # сбрасывается.
+        self.failure()
+        r = self.env.run("debug_watch.py", self.env.hook_input(
+            "PreToolUse", tool_name="Bash", tool_input={"command": "make test"}, tool_use_id="t"))
+        self.assertEqual(r.stdout, "")
+        self.assertIn("упала второй раз подряд", self.context(self.failure()))
+
     def test_missing_command_silent(self):
         r = self.env.run("debug_watch.py", self.env.hook_input(
             "PostToolUseFailure", tool_name="Bash", tool_input={}, is_interrupt=False))
@@ -248,6 +268,65 @@ class DebugWatchTest(unittest.TestCase):
         self.assertTrue(self.state_file().exists())
 
 
+class StateLockRaceTest(unittest.TestCase):
+    """Параллельные неудачи разных команд одной сессии: каждая доходит до counts файла состояния."""
+
+    PARALLEL = 6
+    # Хук подпроцессом: процессы ждут друг друга перед первым common.data_dir (в update — до блокировки
+    # состояния), чтение файла состояния задерживается на SLOW секунд. Без блокировки все читают пустой
+    # файл, и каждая запись затирает предыдущие.
+    SLOW = 0.3
+    WRAPPER = """
+import os, sys, time
+sys.path.insert(0, sys.argv[1])
+import common, debug_watch
+arrive, parallel, slow = sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
+data_dir, read_json = common.data_dir, common.read_json
+def rendezvous():
+    if not getattr(rendezvous, "done", False):
+        rendezvous.done = True
+        open(os.path.join(arrive, str(os.getpid())), "w").close()
+        deadline = time.monotonic() + 20
+        while len(os.listdir(arrive)) < parallel and time.monotonic() < deadline:
+            time.sleep(0.01)
+    return data_dir()
+def delayed(*args):
+    value = read_json(*args)
+    time.sleep(slow)
+    return value
+common.data_dir, common.read_json = rendezvous, delayed
+common.run_hook(debug_watch.main)
+"""
+
+    def setUp(self):
+        self.env = Env(rules=dict(RULES, debugging=DEBUGGING))
+        self.addCleanup(self.env.close)
+
+    def test_parallel_failures_all_counted(self):
+        arrive = self.env.data / "arrive"
+        arrive.mkdir()
+        procs = []
+        for i in range(self.PARALLEL):
+            hook_input = self.env.hook_input("PostToolUseFailure", tool_name="Bash",
+                                             tool_input={"command": f"make t{i}"}, tool_use_id=f"t{i}",
+                                             error="Exit code 1\nboom", is_interrupt=False)
+            proc = subprocess.Popen(
+                [sys.executable, "-c", self.WRAPPER, str(PLANKA_DIR), str(arrive), str(self.PARALLEL),
+                 str(self.SLOW)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=self.env.environ())
+            proc.stdin.write(json.dumps(hook_input).encode("utf-8"))
+            proc.stdin.close()
+            procs.append(proc)
+        for proc in procs:
+            self.assertEqual(proc.wait(timeout=60), 0)
+            self.assertEqual((proc.stdout.read(), proc.stderr.read()), (b"", b""))
+            proc.stdout.close()
+            proc.stderr.close()
+        state = json.loads((self.env.data / "state" / "sess-1.debug.json").read_text(encoding="utf-8"))
+        expected = {debug_watch.command_key(f"make t{i}")[0]: 1 for i in range(self.PARALLEL)}
+        self.assertEqual(state["counts"], expected)
+
+
 class ExitCodeTest(unittest.TestCase):
     def test_corpus(self):
         expected = {"spawn /bin/bash ENOENT": None}
@@ -296,9 +375,8 @@ class SegmentsTest(unittest.TestCase):
                          [("", "echo $((1<<2))"), ("\n", "grep x f")])
 
     def test_unclosed_test_brackets_linear(self):
-        start = time.monotonic()
-        debug_watch._segments("[[ " * 100000)
-        self.assertLess(time.monotonic() - start, 1)
+        small, large = ("[[ " * n for n in (25000, 100000))
+        assert_linear(self, lambda: debug_watch._segments(small), lambda: debug_watch._segments(large))
 
 
 class Code1IsAnswerTest(unittest.TestCase):

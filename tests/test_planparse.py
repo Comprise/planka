@@ -1,12 +1,12 @@
 import pathlib
 import sys
-import time
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 PLANKA_DIR = REPO / "plugin" / "planka"
 sys.path.insert(0, str(PLANKA_DIR))
 import planparse  # noqa: E402
+from tests.helpers import assert_linear  # noqa: E402
 
 PLAN_RU = """# План
 
@@ -372,8 +372,13 @@ class ReadNoteConflictTest(unittest.TestCase):
         self.assertEqual(planparse.parse_plan(plan)[0].files, ["a.py"])
 
     def test_files_line_state_is_per_task(self):
-        plan = ("### Задача 1: A\nФайлы: `a.py`\n### Задача 2: B\nФайл: `b.py` правится\n")
+        plan = ("### Задача 1: A\nФайлы: `a.py`\n### Задача 2: B\nФайл: `b.py` правится при старте.\n")
         self.assertEqual(_structure(plan), [(None, "1", ["a.py"]), (None, "2", ["b.py"])])
+
+    def test_first_files_line_with_sentence_in_each_task_gives_conflict(self):
+        plan = ("## Wave 1\n### Task 1\n**Files:** `a.py`\n### Task 2\n**Files:** `shared.py` is created here.\n"
+                "### Task 3\n**Files:** `shared.py` gets a new function.\n")
+        self.assertEqual(planparse.shared_files(planparse.parse_plan(plan)), [("shared.py", 1, ["2", "3"])])
 
 
 class RobustnessTest(unittest.TestCase):
@@ -384,18 +389,25 @@ class RobustnessTest(unittest.TestCase):
         self.assertEqual(planparse.shared_files(planparse.parse_plan(plan)), [("b/two.py", 1, ["1", "2"])])
 
     def test_adversarial_input_is_linear(self):
-        inputs = ["- " + "a/" * 8000 + " x",
-                  "- " + "a." * 20000 + " (",
-                  "- " + "a.py" + " " * 30000 + "x",
-                  "- `a.py`" + " " * 30000 + "x",
-                  "- x.py" + " " * 30000 + "(a",
-                  "- " + "(" * 20000]
-        for item in inputs:
-            for plan in (f"### Task 1: A\n**Files:**\n{item}\n", f"### Task 1: A\nFiles: {item[2:]}\n",
-                         "# a" + " " * 30000 + "b\n"):
-                started = time.monotonic()
-                planparse.parse_plan(plan)
-                self.assertLess(time.monotonic() - started, 1, item[:30])
+        # Пункт списка файлов при множителе k: большой вход (k=4) вчетверо длиннее малого (k=1).
+        items = [lambda k: "- " + "a/" * 2000 * k + " x",
+                 lambda k: "- " + "a." * 5000 * k + " (",
+                 lambda k: "- " + "a.py" + " " * 7500 * k + "x",
+                 lambda k: "- `a.py`" + " " * 7500 * k + "x",
+                 lambda k: "- x.py" + " " * 7500 * k + "(a",
+                 lambda k: "- " + "(" * 5000 * k,
+                 lambda k: "- `c.py` (read" + " " * 7500 * k + "x)",
+                 lambda k: "- `a.py` — read" + " " * 7500 * k + "x",
+                 lambda k: "- Create" + " " * 7500 * k + "x"]
+        plans = [lambda k, item=item: f"### Task 1: A\n**Files:**\n{item(k)}\n" for item in items]
+        plans += [lambda k, item=item: f"### Task 1: A\nFiles: {item(k)[2:]}\n" for item in items]
+        plans += [lambda k: "# a" + " " * 7500 * k + "b\n",
+                  lambda k: "### Task 1: A\nFiles: `a.py` " + "<!---->" * 37500 * k + "\n",
+                  lambda k: "### Task 1: A\nFiles" + " " * 7500 * k + "x\n"]
+        for plan in plans:
+            small, large = plan(1), plan(4)
+            assert_linear(self, lambda: planparse.parse_plan(small), lambda: planparse.parse_plan(large),
+                          msg=large[:40])
 
 
 class ParserBranchesTest(unittest.TestCase):
@@ -478,6 +490,55 @@ class ParserBranchesTest(unittest.TestCase):
         plan = "### Задача 1: A\nФайлы: `a.py`\n\nЗадача 2: B\nФайлы: `b.py`\n"
         self.assertEqual(_structure(plan), [(None, "1", ["a.py", "b.py"])])
 
+    def test_prefix_with_note(self):
+        self.assertEqual(_files("- Create (temp only, not committed): `$ROOT/t.sh` (v3, below), fixture repos"),
+                         ["$ROOT/t.sh"])
+        self.assertEqual(_files("- `a.py`\n\n- Modify (only if a GREEN gate fails): `s.md`"), ["a.py", "s.md"])
+        self.assertEqual(_files("- **Modify (optional):** `s.md`"), ["s.md"])
+
+    def test_bold_wave_kept_under_task_subheading(self):
+        plan = "**Волна 1**\n\n### Задача 1: A\nФайлы: `a.py`\n\n#### Шаги\n\n1. x\n\n### Задача 2: B\nФайлы: `a.py`\n"
+        self.assertEqual(planparse.shared_files(planparse.parse_plan(plan)), [("a.py", 1, ["1", "2"])])
+
+    def test_bold_wave_closed_by_heading_not_deeper_than_first_task(self):
+        tail = "### Задача 3: C\nФайлы: `a.py`\n"
+        plan = "**Волна 1**\n### Задача 1: A\nФайлы: `a.py`\n#### Шаги\n### Задача 2: B\nФайлы: `a.py`\n"
+        for closing in ("### Итог\n", "## Итог\n"):
+            self.assertEqual(_structure(plan + closing + tail),
+                             [(1, "1", ["a.py"]), (1, "2", ["a.py"]), (None, "3", ["a.py"])], closing)
+        self.assertEqual(_structure("**Волна 1**\n#### Цель\n" + tail), [(None, "3", ["a.py"])])
+        self.assertEqual(_structure("**Волна 1**\n**Задача 1:** A\nФайлы: `a.py`\n#### Шаги\n" + tail),
+                         [(1, "1", ["a.py"]), (None, "3", ["a.py"])])
+
+    def test_setext_level(self):
+        body = "### Задача 1: A\nФайлы: `a.py`\n## Итог\n### Задача 2: B\nФайлы: `a.py`\n"
+        self.assertEqual(_structure("Волна 1\n=======\n" + body), [(1, "1", ["a.py"]), (1, "2", ["a.py"])])
+        self.assertEqual(_structure("Волна 1\n-------\n" + body), [(1, "1", ["a.py"]), (None, "2", ["a.py"])])
+
+    def test_underscore_bold_headings(self):
+        plan = "__Волна 1__\n__Задача 1:__ A\nФайлы: `a.py`\n## __Wave 2__\n### __Task 2: B__\nФайлы: `a.py`\n"
+        tasks = planparse.parse_plan(plan)
+        self.assertEqual([(t.wave, t.number, t.title) for t in tasks], [(1, "1", "A"), (2, "2", "B")])
+
+    def test_seven_hashes_are_not_heading(self):
+        plan = "## Волна 1\n### Задача 1: A\nФайлы: `a.py`\n####### Задача 2: B\nФайл: `b.py`\n"
+        self.assertEqual(_structure(plan), [(1, "1", ["a.py", "b.py"])])
+
+    def test_read_note_with_dash_explanation(self):
+        self.assertEqual(_files("- `a.py`\n- `c.py` (read-only — for the interface)"), ["a.py"])
+        self.assertEqual(_files("- `a.py`\n- `c.py` (read-only - for the interface)"), ["a.py"])
+
+    def test_unquoted_paths_drop_final_dot(self):
+        self.assertEqual(_files("", head="Files: a.py, b.py."), ["a.py", "b.py"])
+
+    def test_unquoted_note_before_final_dot(self):
+        self.assertEqual(_files("", head="Files: a.py, b.py (new)."), ["a.py", "b.py"])
+        self.assertEqual(_files("", head="Files: a.py, b.py (read-only)."), ["a.py"])
+        self.assertEqual(_files("- a.py, b.py (read-only);"), ["a.py"])
+
+    def test_directory_item_without_dot_is_path(self):
+        self.assertEqual(_files("- `a.py`\n\n- docs/"), ["a.py", "docs/"])
+
     def test_note_applies_only_to_adjacent_path(self):
         self.assertEqual(_files("", head="Files: `a.py` (новый) (только чтение)"), ["a.py"])
         self.assertEqual(_files("- `a.py`, `make test` (read-only)"), ["a.py"])
@@ -507,8 +568,10 @@ CORPUS = {
          (1, "2", ["src/api/limiter/store.py", "tests/limiter/test_store.py"]),
          (2, "3", ["src/api/limiter/middleware.py", "src/api/app.py", "tests/limiter/test_middleware.py"]),
          (2, "4", ["docs/settings.md", "README.md"]),
-         (2, "5", ["docs/headers.md", "README.md"])],
-        [("README.md", 2, ["4", "5"])]),
+         (2, "5", ["docs/headers.md", "README.md"]),
+         (3, "6", ["$EVAL_ROOT/load-fixture.sh", "docs/load-eval.md", "src/api/limiter/bucket.py"]),
+         (3, "7", ["src/api/limiter/bucket.py", "tests/limiter/test_bucket.py"])],
+        [("README.md", 2, ["4", "5"]), ("src/api/limiter/bucket.py", 3, ["6", "7"])]),
     "plan-canonical.md": (
         [(1, "1", ["planka/cache.py", "tests/test_cache.py"]),
          (1, "2", ["planka/cache_store.py", "tests/test_cache_store.py"]),
