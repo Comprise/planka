@@ -1330,6 +1330,14 @@ class OutputsTest(unittest.TestCase):
                     want = "planka: Мой дорогой друг, " + body
                     self.assertEqual(self.reasons("planka: " + body), (want, want))
 
+    def test_multiword_section_keeps_case(self):
+        # Раздел из нескольких слов: первое слово причины сверяется с первым словом имени.
+        with tempfile.TemporaryDirectory() as root:
+            pathlib.Path(root, "philosophy.md").write_text("# Ядро\n\n## Общие правила\n\nТекст.\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": root}):
+                want = "planka: Мой дорогой друг, Общие правила 2 нарушены."
+                self.assertEqual(self.reasons("planka: Общие правила 2 нарушены."), (want, want))
+
     def test_names_and_code_keep_case(self):
         # Аббревиатура, имя из заглавных, имя латиницей и код в обратных кавычках — не обычное слово.
         for body in ("API не вызывается.", "README не сверен.", "PreToolUse отклонён.", "Python не нужен.",
