@@ -24,6 +24,11 @@ KILL_WAIT = 5
 GIT_ROOT_TIMEOUT = 5
 MAX_REASON = 2000
 MAX_DETAIL = 200
+# Шаг реплики (Transcript.turn_steps): аргумент вызова — до STEP_ARG символов; вывод инструмента — начало и конец
+# в символах, середина опускается.
+STEP_ARG = 300
+STEP_HEAD = 1500
+STEP_TAIL = 2500
 STATE_TTL = 7 * 86400
 LOG_MAX_BYTES = 1_048_576
 SESSION_MODEL = "session"
@@ -256,7 +261,8 @@ class Transcript:
     отправленных посреди хода после неё, и ответов автора при отклонении инструмента; author_answers —
     тексты ответов на вызовы AskUserQuestion после неё; message_before_author — последнее непустое сообщение
     ассистента до неё; earlier_turns — непустые прежние реплики основной ветки от старых к новым, каждая
-    собрана как author_turn, ответы на AskUserQuestion дописаны к ней через перевод строки.
+    собрана как author_turn, ответы на AskUserQuestion дописаны к ней через перевод строки; turn_steps — шаги
+    той же реплики по порядку: тексты ответов и вызовы инструментов основной ветки с их выводом (_tool_step).
     """
     model: str | None = None
     plan_file: pathlib.Path | None = None
@@ -265,6 +271,7 @@ class Transcript:
     author_answers: list = dataclasses.field(default_factory=list)
     message_before_author: str = ""
     earlier_turns: list = dataclasses.field(default_factory=list)
+    turn_steps: list = dataclasses.field(default_factory=list)
 
 
 def _text_blocks(content):
@@ -282,6 +289,27 @@ def _result_text(content):
     if isinstance(content, str):
         return content
     return "\n".join(_text_blocks(content))
+
+
+def _tool_step(block):
+    """Шаг вызова инструмента: «⟦вызов <имя>⟧ <аргумент>» одной строкой — команда Bash (переводы строки — «⏎»),
+    путь файлового инструмента, иначе вход JSON; длиннее STEP_ARG символов — начало с числом опущенных."""
+    data = block.get("input") if isinstance(block.get("input"), dict) else {}
+    arg = data.get("command") or data.get("file_path") or data.get("notebook_path")
+    if not isinstance(arg, str):
+        arg = dumps(data)
+    # Метки вывода начинаются с перевода строки: в строке вызова их нет.
+    arg = arg.replace("\n", " ⏎ ")
+    if len(arg) > STEP_ARG:
+        arg = f"{arg[:STEP_ARG]} … опущено символов: {len(arg) - STEP_ARG}"
+    return f"⟦вызов {block.get('name')}⟧ {arg}"
+
+
+def _step_output(text):
+    """Вывод инструмента для шага: длиннее STEP_HEAD + STEP_TAIL — начало и конец с пометкой опущенного."""
+    if len(text) <= STEP_HEAD + STEP_TAIL:
+        return text
+    return f"{text[:STEP_HEAD]}\n… опущено символов: {len(text) - STEP_HEAD - STEP_TAIL}\n{text[-STEP_TAIL:]}"
 
 
 def _origin_kind(obj):
@@ -361,6 +389,8 @@ def read_transcript(path):
     path = input_path(path)
     plan = None
     asked = set()
+    # id вызова инструмента реплики → индекс его шага в turn_steps.
+    calls = {}
     try:
         origin_format = _transcript_has_origin(path)
         with open(path, encoding="utf-8", errors="replace") as f:
@@ -390,15 +420,24 @@ def read_transcript(path):
                     if earlier:
                         out.earlier_turns.append(earlier)
                     out.author_turn = "\n".join(_text_blocks(content))
-                    out.author_answers, out.turn_messages = [], []
+                    out.author_answers, out.turn_messages, out.turn_steps = [], [], []
                     asked.clear()
+                    calls.clear()
                 elif entry.get("type") == "user" and entry.get("toolDenialKind"):
                     # Ответ при отклонении — указание автора посреди хода; его tool_result — не ответ AskUserQuestion.
                     out.author_turn = _join(out.author_turn, _rejection_feedback(entry))
+                    for b in content if isinstance(content, list) else []:
+                        if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") in calls:
+                            out.turn_steps[calls.pop(b["tool_use_id"])] += "\n⟦отклонено⟧"
                 elif entry.get("type") == "user" and isinstance(content, list):
                     out.author_answers += [_result_text(b.get("content")) for b in content
                                            if isinstance(b, dict) and b.get("type") == "tool_result"
                                            and b.get("tool_use_id") in asked]
+                    for b in content:
+                        if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") in calls:
+                            mark = "⟦ошибка⟧" if b.get("is_error") else "⟦вывод⟧"
+                            i = calls.pop(b["tool_use_id"])
+                            out.turn_steps[i] += f"\n{mark} {_step_output(_result_text(b.get('content')))}"
                 elif entry.get("type") == "assistant":
                     if isinstance(content, list):
                         asked.update(b.get("id") for b in content if isinstance(b, dict)
@@ -410,6 +449,19 @@ def read_transcript(path):
                     text = "".join(_text_blocks(content))
                     if text.strip():
                         out.turn_messages.append(text)
+                    pending = []
+                    for b in content if isinstance(content, list) else [content]:
+                        if isinstance(b, dict) and b.get("type") == "tool_use":
+                            if "".join(pending).strip():
+                                out.turn_steps.append("".join(pending))
+                            pending = []
+                            if isinstance(b.get("id"), str):
+                                calls[b["id"]] = len(out.turn_steps)
+                            out.turn_steps.append(_tool_step(b))
+                        else:
+                            pending += _text_blocks(b if isinstance(b, str) else [b])
+                    if "".join(pending).strip():
+                        out.turn_steps.append("".join(pending))
     except (OSError, ValueError):
         return Transcript()
     out.plan_file = pathlib.Path(input_path(plan)) if plan else None

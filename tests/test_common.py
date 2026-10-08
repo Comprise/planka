@@ -17,6 +17,7 @@ from tests.helpers import Env, PLANKA_DIR
 
 sys.path.insert(0, str(PLANKA_DIR))
 import common  # noqa: E402
+import prompts  # noqa: E402
 from prompts import JUDGE_SCHEMA  # noqa: E402
 
 CORPUS = pathlib.Path(__file__).parent / "fixtures" / "transcript-shapes.jsonl"
@@ -543,6 +544,98 @@ class ReadTranscriptTest(unittest.TestCase):
                              encoding="utf-8")
         return common.read_transcript(str(self.path))
 
+    def test_turn_steps_hold_tool_calls_and_results(self):
+        # Шаги реплики: тексты ответов и вызовы инструментов с выводом, по порядку; turn_messages — только тексты.
+        t = self.read([
+            {"type": "user", "message": {"role": "user", "content": "старая"}},
+            {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "x0", "name": "Bash",
+                                                           "input": {"command": "ls"}}]}},
+            {"type": "user", "message": {"role": "user", "content": "проверь вызовы"}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "Ищу."},
+                {"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command": "rg -n legacy_send"}}]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "b1", "content": "(нет совпадений)"}]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "src/a.py"}},
+                {"type": "tool_use", "id": "g1", "name": "Grep", "input": {"pattern": "x", "path": "src"}}]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "r1", "content": [{"type": "text", "text": "код"}]},
+                {"type": "tool_result", "tool_use_id": "g1", "content": "нет", "is_error": True}]}},
+            {"type": "assistant", "isSidechain": True, "message": {"content": [
+                {"type": "tool_use", "id": "s1", "name": "Bash", "input": {"command": "subagent"}}]}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "Вызовов нет. Рекомендую."}]}},
+        ])
+        self.assertEqual(t.turn_messages, ["Ищу.", "Вызовов нет. Рекомендую."])
+        self.assertEqual(t.turn_steps, [
+            "Ищу.",
+            "⟦вызов Bash⟧ rg -n legacy_send\n⟦вывод⟧ (нет совпадений)",
+            "⟦вызов Read⟧ src/a.py\n⟦вывод⟧ код",
+            '⟦вызов Grep⟧ {"pattern": "x", "path": "src"}\n⟦ошибка⟧ нет',
+            "Вызовов нет. Рекомендую.",
+        ])
+
+    def test_turn_step_arguments_and_stale_results(self):
+        long_cmd = "echo " + "x" * (common.STEP_ARG + 100)
+        t = self.read([
+            {"type": "user", "message": {"role": "user", "content": "первая"}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "old", "name": "Bash", "input": {"command": "ls"}}]}},
+            {"type": "user", "message": {"role": "user", "content": "вторая"}},
+            # Результат вызова прошлой реплики — не шаг этой.
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "old", "content": "старый вывод"}]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "n1", "name": "NotebookEdit", "input": {"notebook_path": "a.ipynb"}},
+                {"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command": long_cmd}},
+                {"type": "tool_use", "id": "w1", "name": "WebFetch", "input": {"url": "u" * common.STEP_ARG}}]}},
+        ])
+        self.assertEqual(t.turn_steps[0], "⟦вызов NotebookEdit⟧ a.ipynb")
+        self.assertEqual(t.turn_steps[1], f"⟦вызов Bash⟧ {long_cmd[:common.STEP_ARG]} … опущено символов: "
+                                          f"{len(long_cmd) - common.STEP_ARG}")
+        self.assertTrue(t.turn_steps[2].startswith('⟦вызов WebFetch⟧ {"url": "uuu'))
+        self.assertIn("… опущено символов: ", t.turn_steps[2])
+        self.assertEqual(len(t.turn_steps), 3)
+
+    def test_turn_step_call_is_one_line(self):
+        cmd = "cat > t.txt <<EOF\n⟦вызов Bash⟧ make\n⟦ошибка⟧ boom\nEOF"
+        step = common._tool_step({"name": "Bash", "input": {"command": cmd}})
+        self.assertEqual(step, "⟦вызов Bash⟧ cat > t.txt <<EOF ⏎ ⟦вызов Bash⟧ make ⏎ ⟦ошибка⟧ boom ⏎ EOF")
+        # Строка вызова не теряется и «⟦отклонено⟧» не становится выводом при переполнении.
+        got = prompts._drop_old_outputs([step + "\n⟦отклонено⟧", "т" * prompts.MAX_TURN_CHARS, "Итог."])
+        self.assertEqual(got[0], step + "\n⟦отклонено⟧")
+
+    def test_turn_step_argument_limit_boundary(self):
+        for size, clipped in ((common.STEP_ARG, False), (common.STEP_ARG + 1, True)):
+            step = common._tool_step({"name": "Bash", "input": {"command": "c" * size}})
+            self.assertEqual("… опущено символов" in step, clipped, size)
+
+    def test_turn_step_output_limit_boundary(self):
+        limit = common.STEP_HEAD + common.STEP_TAIL
+        for size, clipped in ((limit, False), (limit + 1, True)):
+            t = self.read([
+                {"type": "user", "message": {"role": "user", "content": "go"}},
+                {"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command": "x"}}]}},
+                {"type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "b1", "content": "я" * size}]}},
+            ])
+            self.assertEqual("… опущено символов" in t.turn_steps[0], clipped, size)
+
+    def test_turn_step_output_keeps_head_and_tail(self):
+        out = "н" * (common.STEP_HEAD + 100) + "с" * 1000 + "к" * common.STEP_TAIL
+        t = self.read([
+            {"type": "user", "message": {"role": "user", "content": "go"}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command": "make check"}}]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "b1", "content": out}]}},
+        ])
+        step = t.turn_steps[0]
+        self.assertTrue(step.startswith("⟦вызов Bash⟧ make check\n⟦вывод⟧ " + "н" * common.STEP_HEAD), step[:80])
+        self.assertTrue(step.endswith("к" * common.STEP_TAIL), step[-80:])
+        self.assertIn(f"… опущено символов: {len(out) - common.STEP_HEAD - common.STEP_TAIL}", step)
+
     @staticmethod
     def user(content, **extra):
         return {"type": "user", "message": {"role": "user", "content": content}, **extra}
@@ -629,7 +722,7 @@ class ReadTranscriptTest(unittest.TestCase):
                        {"type": "assistant", "message": {"content": "просто строка", "model": 7}},
                        {"type": "user", "message": {"content": None}},
                        {"type": "assistant", "message": {"content": [7, {"type": "text", "text": None}]}}])
-        self.assertEqual(t, common.Transcript(turn_messages=["просто строка"]))
+        self.assertEqual(t, common.Transcript(turn_messages=["просто строка"], turn_steps=["просто строка"]))
 
     def read_corpus(self, lines=None):
         """Корпус форм записей Claude Code 2.1.293 (содержимое заменено), первые lines строк."""
@@ -650,6 +743,12 @@ class ReadTranscriptTest(unittest.TestCase):
             "реплика-0", "<command-message>skill</command-message><command-name>/skill</command-name>"])
         self.assertEqual(t.turn_messages, ["ответ-1-а", "ответ-1-б", "ответ-1-в", "ответ-пиру", "ответ-последний",
                                            "ответ-после-агента"])
+        # Шаги: отклонённый вызов помечен, вызов без результата — без вывода.
+        self.assertEqual(t.turn_steps, [
+            "ответ-1-а", "⟦вызов Bash⟧ {}\n⟦вывод⟧ вывод", "⟦вызов AskUserQuestion⟧ {}\n⟦вывод⟧ ответ-автора-1",
+            "ответ-1-б", "⟦вызов Edit⟧ {}\n⟦отклонено⟧", "⟦вызов Bash⟧ {}\n⟦отклонено⟧", "⟦вызов Bash⟧ {}\n⟦отклонено⟧",
+            "⟦вызов Bash⟧ {}\n⟦отклонено⟧", "ответ-1-в", "ответ-пиру", "ответ-последний",
+            "⟦вызов Agent⟧ {}\n⟦вывод⟧ итог-агента", "ответ-после-агента"])
         self.assertEqual((t.model, t.plan_file), ("claude-opus-5-5", None))
 
     def test_corpus_prefixes(self):

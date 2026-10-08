@@ -45,7 +45,8 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
     `permission-rule` (hook, config/safetyCheck), `automode-blocked`, в начале — две локальные команды до первой
     записи с `origin` (с выводом `<local-command-stdout>` и без него, с записью `system`/`local_command`, как в
     сессии, начатой с `/plugin`); `test_common` (`ReadTranscriptTest`) прогоняет корпус и его префиксы: префикс без
-    `origin` — старый формат, локальные команды в нём — реплики;
+    `origin` — старый формат, локальные команды в нём — реплики; шаги реплики корпуса (`Transcript.turn_steps`:
+    вызовы, их вывод, отклонённые вызовы) сверяет `test_corpus_service_entries_are_not_author_turn`;
   - `bash-failure-errors.jsonl` — поле `error` упавшего Bash во входе `PostToolUseFailure`;
     `test_debug_watch` прогоняет хук на каждом образце;
   - `manifests/<образец>/<манифест>` — настоящие `package.json`, `composer.json`, `pyproject.toml`, `requirements*.txt`,

@@ -91,15 +91,17 @@ def docs_check(data):
 
 
 def turn_messages(data, transcript, message):
-    """Сообщения агента за реплику по порядку, последним — message (last_assistant_message входа: транскрипт к
-    Stop может его ещё не содержать). Реплики в транскрипте нет — только message, с предупреждением раз на
-    сессию."""
-    found = list(transcript.turn_messages)
+    """Шаги агента за реплику по порядку — сообщения и вызовы инструментов с выводом (Transcript.turn_steps),
+    последним — message (last_assistant_message входа: транскрипт к Stop может его ещё не содержать). Реплики в
+    транскрипте нет — только message, с предупреждением раз на сессию."""
+    found = list(transcript.turn_steps)
     if not found and message:
         session = data.get("session_id", "")
         common.warn_once(session if isinstance(session, str) else "", "turn-messages",
                          "сообщения реплики не найдены в транскрипте, судья видит последнее сообщение")
-    if message and (not found or found[-1].strip() != message.strip()):
+    # Последний текстовый шаг: после него в транскрипте может стоять вызов инструмента.
+    last_text = next((s for s in reversed(found) if not s.startswith("⟦вызов ")), None)
+    if message and (last_text is None or last_text.strip() != message.strip()):
         found.append(message)
     return found
 

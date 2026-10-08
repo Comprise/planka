@@ -11,7 +11,7 @@ import prompts  # noqa: E402
 
 def without_markers(content):
     """Содержимое turn_content без строк-пометок: числа опущенных сообщений и обрезки последнего."""
-    head = "… ранние сообщения реплики опущены: "
+    head = "… ранние шаги реплики опущены: "
     if content.startswith(head):
         content = content.split(prompts.TURN_SEPARATOR, 1)[1]
     return content.replace("… начало сообщения опущено\n", "", 1)
@@ -78,6 +78,60 @@ class PromptsTest(unittest.TestCase):
         # Слова-маркеры живут только в рубрике.
         for marker in ["«пока»", "«временно»", "«потом»", "«вне рамок»"]:
             self.assertNotIn(marker, p)
+
+    def test_options_filter_asks_recommendation_premises(self):
+        # Опоры рекомендации спрашивает только судья Stop: он видит шаги реплики с вызовами инструментов; судья
+        # AskUserQuestion видит только вопрос.
+        question = "назван источник («Решения» 4"
+        self.assertIn(question, prompts.stop_prompt("R", "C", options=True, done=False))
+        self.assertNotIn(question, prompts.question_prompt("R", "C"))
+        self.assertIn("⟦вызов", prompts.TURN_LABEL)
+
+    def test_old_tool_outputs_dropped_before_messages(self):
+        # При переполнении сначала снимается вывод ранних вызовов, тексты сообщений остаются.
+        big = "⟦вызов Bash⟧ make\n⟦вывод⟧ " + "в" * prompts.MAX_TURN_CHARS
+        content = prompts.turn_content(["Проверил.", big, "Рекомендую."])
+        self.assertEqual(content, prompts.TURN_SEPARATOR.join(["Проверил.", "⟦вызов Bash⟧ make\n⟦вывод опущен⟧",
+                                                                "Рекомендую."]))
+        # Вмещается — вывод не трогается.
+        small = "⟦вызов Bash⟧ make\n⟦вывод⟧ OK"
+        self.assertIn(small, prompts.turn_content(["Проверил.", small, "Рекомендую."]))
+
+    def test_old_outputs_dropped_oldest_first_until_fits(self):
+        sep = len(prompts.TURN_SEPARATOR)
+        filler = "з" * 1000
+        early = "⟦вызов Bash⟧ rg a\n⟦вывод⟧ " + "р" * filler.__len__()
+        near = "⟦вызов Bash⟧ rg b\n⟦вывод⟧ " + "б" * filler.__len__()
+        last = "⟦вызов Bash⟧ make\n⟦вывод⟧ OK"
+        # Переполнение меньше вывода раннего вызова: снимается только он, ближний цел, последний шаг не трогается.
+        body = "т" * (prompts.MAX_TURN_CHARS - len(early) - len(near) - len(last) - 3 * sep + 10)
+        steps = [early, body, near, last]
+        got = prompts._drop_old_outputs(steps)
+        self.assertEqual(got, ["⟦вызов Bash⟧ rg a\n⟦вывод опущен⟧", body, near, last])
+        self.assertLessEqual(sum(map(len, got)) + sep * (len(got) - 1), prompts.MAX_TURN_CHARS)
+        # Ровно на пределе (с разделителями) — ничего не снимается.
+        exact = [early, "т" * (prompts.MAX_TURN_CHARS - len(early) - len(last) - 2 * sep), last]
+        self.assertEqual(prompts._drop_old_outputs(exact), exact)
+        # Последний шаг-вызов с выводом не трогается даже при переполнении.
+        huge_last = "⟦вызов Bash⟧ x\n⟦вывод⟧ " + "п" * prompts.MAX_TURN_CHARS
+        self.assertEqual(prompts._drop_old_outputs(["текст", huge_last]), ["текст", huge_last])
+
+    def test_dropping_cuts_at_first_output_mark_and_skips_text(self):
+        big = "в" * prompts.MAX_TURN_CHARS
+        call = "⟦вызов Bash⟧ cat log\n⟦вывод⟧ a\n⟦ошибка⟧ b" + big
+        text = "Пример:\n⟦вывод⟧ " + big
+        self.assertEqual(prompts._drop_old_outputs([call, "Итог."])[0], "⟦вызов Bash⟧ cat log\n⟦вывод опущен⟧")
+        self.assertEqual(prompts._drop_old_outputs([text, "Итог."])[0], text)
+
+    def test_dropping_keeps_whole_call_and_marks(self):
+        big = "в" * prompts.MAX_TURN_CHARS
+        heredoc = "⟦вызов Bash⟧ cat > x.sh <<EOF\nrg -n foo src\nEOF\n⟦вывод⟧ " + big
+        failed = "⟦вызов Bash⟧ make\n⟦ошибка⟧ " + big
+        rejected = "⟦вызов Edit⟧ a.py\n⟦отклонено⟧"
+        no_output = "⟦вызов Bash⟧ python3 - <<EOF\nprint(1)\nEOF"
+        got = prompts._drop_old_outputs([heredoc, failed, rejected, no_output, "Итог."])
+        self.assertEqual(got, ["⟦вызов Bash⟧ cat > x.sh <<EOF\nrg -n foo src\nEOF\n⟦вывод опущен⟧",
+                               "⟦вызов Bash⟧ make\n⟦вывод опущен⟧", rejected, no_output, "Итог."])
 
     def test_plan_prompt_asks_plan_questions(self):
         p = prompts.plan_prompt("R", "C")
@@ -293,7 +347,7 @@ class DocsPromptTest(unittest.TestCase):
         self.assertTrue(content.endswith(prompts.TURN_SEPARATOR + "последнее"))
         kept = content.count("ранее-")
         self.assertEqual(kept, 3)
-        self.assertTrue(content.startswith(f"… ранние сообщения реплики опущены: {6 - kept}" + prompts.TURN_SEPARATOR))
+        self.assertTrue(content.startswith(f"… ранние шаги реплики опущены: {6 - kept}" + prompts.TURN_SEPARATOR))
 
     def test_turn_content_counts_separators(self):
         # Короткие сообщения: разделители между ними в сумме — тысячи символов.
@@ -312,7 +366,7 @@ class DocsPromptTest(unittest.TestCase):
         self.assertEqual(len(without_markers(content)), prompts.MAX_TURN_CHARS)
         self.assertTrue(content.endswith("конец"))
         self.assertNotIn("раннее", content)
-        self.assertIn("… ранние сообщения реплики опущены: 1", content)
+        self.assertIn("… ранние шаги реплики опущены: 1", content)
         self.assertIn("… начало сообщения опущено", content)
 
     def test_directives_are_not_comments(self):
@@ -328,7 +382,7 @@ class DocsPromptTest(unittest.TestCase):
         early = "р" * 10
         last = "п" * (prompts.MAX_TURN_CHARS - len(early) - len(prompts.TURN_SEPARATOR))
         content = prompts.turn_content(["отброшено", early, last])
-        self.assertEqual(content, "… ранние сообщения реплики опущены: 1" + prompts.TURN_SEPARATOR + early
+        self.assertEqual(content, "… ранние шаги реплики опущены: 1" + prompts.TURN_SEPARATOR + early
                          + prompts.TURN_SEPARATOR + last)
         self.assertEqual(len(without_markers(content)), prompts.MAX_TURN_CHARS)
 

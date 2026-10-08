@@ -17,7 +17,7 @@ planka — плагин Claude Code уровня пользователя: пя�
 | `planka/remind.py` | `philosophy.md` целиком как `additionalContext`; снимок дерева (`take_snapshot`); строка `NO_DOCS_LINE` об отсутствии `CLAUDE.md` |
 | `planka/judge_tool.py` | судья вопроса (`judge_question`), плана (`judge_plan`), отказ на добавление пакета (`judge_bash`, причина `DEP_REASON`) и снимок манифестов перед командой (`snapshot_manifests`); отказ правке манифеста (`judge_manifest_edit`, `MANIFEST_REASON`); после команды `Bash` — блок на новые имена в манифестах (`check_command_manifests`, `COMMAND_REASON`) |
 | `planka/guard_memory.py` | судья записи в постоянную память: цель — `is_memory_path`, `is_memory_mcp`; содержимое — `render_content` |
-| `planka/judge_stop.py` | фильтры «варианты» (`looks_like_options`), «готово» (`claims_done`) по последнему сообщению, «документация» (`docs_check`) по изменениям со снимка; один вызов судьи на сообщения реплики (`turn_messages`, до `prompts.MAX_TURN_CHARS`); отметка снимка проверенным после Stop без блока (`release_snapshot`) |
+| `planka/judge_stop.py` | фильтры «варианты» (`looks_like_options`), «готово» (`claims_done`) по последнему сообщению, «документация» (`docs_check`) по изменениям со снимка; один вызов судьи на шаги реплики (`turn_messages`, до `prompts.MAX_TURN_CHARS`); отметка снимка проверенным после Stop без блока (`release_snapshot`) |
 | `planka/debug_watch.py` | счётчик неудач подряд одной команды `Bash` (`update`); с `REPEAT_THRESHOLD`-й неудачи — модуль `debugging.md` контекстом |
 | `planka/common.py` | барьер, чтение входа, тексты правил и рубрика, транскрипт (`read_transcript`), модель и запуск судьи (`judge_model`, `run_judge`), лимит отказов, журнал, корень проекта (`project_root`) и окружение git о нём (`git_env`), классы путей, формат ответа (`run_hook`) |
 | `planka/prompts.py` | системный промпт, схема ответа `JUDGE_SCHEMA`, вопросы судье по видам проверки, сборка содержимого |
@@ -40,7 +40,11 @@ planka — плагин Claude Code уровня пользователя: пя�
 - Разделы ядра берутся по заголовку `## <имя>` (`common.philosophy_sections`, `common.rubric`): `Решения` —
   рубрика вопроса, плана и фильтра «варианты»; `Планы` — рубрика плана; `Границы` — рубрика записи в память,
   её же называют `judge_tool.DEP_REASON`, `MANIFEST_REASON` и `COMMAND_REASON`. Пункт 7 «Решений» называют
-  вопросы `prompts._QUESTION_CHECKS`.
+  вопросы `prompts._CHOICE_CHECKS`. Опоры рекомендации из пункта 4 «Решений» (у опоры назван источник) проверяет
+  только фильтр «варианты» (`prompts._MESSAGE_CHECKS`, вопрос 6): судья `Stop` видит шаги реплики с вызовами
+  инструментов. Судьи вопроса и плана шагов не видят: `judge_tool` вырезает этот пункт из их рубрики
+  (`prompts.without_premises` по строке `prompts.PREMISES_ITEM`). Отвергнуто: исключение словами в вопросах — судья
+  плана всё равно требовал источник опоры; проверка опор у судьи вопроса — выбор по предпочтению получал отказ.
 - Модули берутся по имени файла (`common.rule_texts`, `common.rubric`): `planning`, `subagents`,
   `refactoring`, `design-patterns`, `heuristics` — план (`judge_tool.judge_plan`); `verification` — фильтр «готово»;
   `docs`, `comments` — фильтр «документация» (`judge_stop.judge`; судья видит сообщения, список файлов и
@@ -115,8 +119,17 @@ UTF-8 строка с кириллицей иначе не кодируется 
 сообщений человека посреди хода и ответов автора при отклонении инструмента; `author_answers` — ответы на
 `AskUserQuestion` после неё; `message_before_author` — последнее сообщение ассистента до неё; `earlier_turns` —
 прежние непустые реплики автора основной ветки от старых к новым, каждая собрана как `author_turn` и
-дополнена ответами на `AskUserQuestion` своей реплики (обрезка — в `prompts`). Записи `isSidechain`
-пропускаются.
+дополнена ответами на `AskUserQuestion` своей реплики (обрезка — в `prompts`); `turn_steps` — шаги той же
+реплики по порядку: тексты ответов и вызовы инструментов основной ветки (`common._tool_step`: «⟦вызов <имя>⟧» и
+команда `Bash`, путь файлового инструмента или вход JSON одной строкой — переводы строки «⏎», до `STEP_ARG`
+символов) с выводом из `tool_result`
+(«⟦вывод⟧» или «⟦ошибка⟧», длиннее `STEP_HEAD` + `STEP_TAIL` — начало и конец; `common._step_output`) или
+«⟦отклонено⟧» для отклонённого вызова. При переполнении `prompts.MAX_TURN_CHARS` `prompts.turn_content` сначала
+снимает вывод ранних вызовов («⟦вывод опущен⟧», `prompts._drop_old_outputs`), затем опускает ранние шаги: тексты
+сообщений и ближние к последнему выводы — опоры рекомендации — вытесняются последними. Записи `isSidechain`
+пропускаются. Шаги берёт только судья `Stop` (`judge_stop.turn_messages`): по ним он видит проверку, о которой
+агент пишет словами; дубль последнего сообщения сверяется с последним текстовым шагом — после него в транскрипте
+бывает вызов инструмента.
 
 Реплика автора (`common._is_author_turn`) — запись `user` основной ветки без `isMeta`, которую написал человек: с полем
 `origin` — только `origin.kind == "human"` (`task-notification` — уведомление о фоновой задаче, `peer` — сообщение

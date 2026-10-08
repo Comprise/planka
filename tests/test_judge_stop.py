@@ -41,8 +41,9 @@ def write_turn(env, *texts, author="реплика автора"):
         if i:
             entries.append({"type": "user", "message": {"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": f"t{i}", "content": "вывод"}]}})
+        tool = [{"type": "tool_use", "id": f"t{i + 1}", "name": "Bash", "input": {}}] if i + 1 < len(texts) else []
         entries.append({"type": "assistant", "message": {"model": "claude-test-model", "content": [
-            {"type": "text", "text": text}, {"type": "tool_use", "id": f"t{i + 1}", "name": "Bash", "input": {}}]}})
+            {"type": "text", "text": text}] + tool}})
     env.transcript.write_text("".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8")
 
 
@@ -132,6 +133,29 @@ class StopHookTest(unittest.TestCase):
             self.assertNotIn(needle, text)
         self.assertIn("Сообщение без выбора между вариантами", text)
 
+    def test_last_message_after_trailing_tool_call_not_repeated(self):
+        # Последний ответ уже в транскрипте, после него — вызов инструмента: сообщение не дублируется.
+        t = common.Transcript(turn_steps=["Ответ.", "⟦вызов Bash⟧ ls"])
+        self.assertEqual(judge_stop.turn_messages({}, t, "Ответ."), ["Ответ.", "⟦вызов Bash⟧ ls"])
+
+    def test_judge_sees_tool_calls_of_turn(self):
+        # Судья видит вызовы инструментов реплики и их вывод: проверку, о которой агент пишет словами.
+        entries = [{"type": "user", "message": {"role": "user", "content": "какой вариант?"}},
+                   {"type": "assistant", "message": {"model": "claude-test-model", "content": [
+                       {"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command": "rg -n legacy_send"}}]}},
+                   {"type": "user", "message": {"role": "user", "content": [
+                       {"type": "tool_result", "tool_use_id": "b1", "content": "(нет совпадений)"}]}},
+                   {"type": "assistant", "message": {"model": "claude-test-model", "content": [
+                       {"type": "text", "text": OPTIONS_MSG}]}}]
+        self.env.transcript.write_text("".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8")
+        rec = self.env.data / "rec.txt"
+        r = self.env.run("judge_stop.py", self.env.hook_input("Stop", last_assistant_message=OPTIONS_MSG),
+                         PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertEqual(judged(rec), "⟦вызов Bash⟧ rg -n legacy_send\n⟦вывод⟧ (нет совпадений)"
+                                      + prompts.TURN_SEPARATOR + OPTIONS_MSG)
+        assert_not_logged(self, self.env, "legacy_send")
+
     def test_judge_gets_earlier_author_turns(self):
         earlier = "Варианты дай без рефакторинга, только заплатки."
         write_turn(self.env, OPTIONS_MSG)
@@ -191,7 +215,8 @@ class StopHookTest(unittest.TestCase):
         r = self.env.run("judge_stop.py", self.env.hook_input("Stop", last_assistant_message=OPTIONS_MSG),
                          PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         self.assertEqual(r.stdout, "", r.stderr)
-        self.assertEqual(judged(rec), "Первый ответ." + prompts.TURN_SEPARATOR + OPTIONS_MSG)
+        self.assertEqual(judged(rec), prompts.TURN_SEPARATOR.join(["Первый ответ.", "⟦вызов Bash⟧ {}\n⟦вывод⟧ вывод",
+                                                                   OPTIONS_MSG]))
         self.assertIn(prompts.TURN_LABEL, rec.read_text(encoding="utf-8"))
         self.assertEqual(self.env.log_lines()[-1]["content_len"], len(judged(rec)))
 
@@ -203,7 +228,7 @@ class StopHookTest(unittest.TestCase):
                          PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         self.assertEqual(r.stdout, "", r.stderr)
         content = judged(rec)
-        self.assertTrue(content.startswith("… ранние сообщения реплики опущены: "))
+        self.assertTrue(content.startswith("… ранние шаги реплики опущены: "))
         self.assertLessEqual(len(content.split(prompts.TURN_SEPARATOR, 1)[1]), prompts.MAX_TURN_CHARS)
         self.assertTrue(content.endswith(prompts.TURN_SEPARATOR + OPTIONS_MSG))
 
@@ -215,7 +240,7 @@ class StopHookTest(unittest.TestCase):
                          PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
         self.assertEqual(r.stdout, "", r.stderr)
         content = judged(rec)
-        self.assertTrue(content.startswith("… ранние сообщения реплики опущены: "))
+        self.assertTrue(content.startswith("… ранние шаги реплики опущены: "))
         kept = content.split(prompts.TURN_SEPARATOR, 1)[1]
         self.assertLessEqual(len(kept), prompts.MAX_TURN_CHARS)
         self.assertGreater(kept.count(prompts.TURN_SEPARATOR) * len(prompts.TURN_SEPARATOR), 100)

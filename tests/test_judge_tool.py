@@ -8,12 +8,13 @@ import time
 import unittest
 from unittest import mock
 
-from tests.helpers import (RULES, Env, PLANKA_DIR, assert_not_logged, author_block, fill_budget, messages, output,
-                           run_in_process)
+from tests.helpers import (PHILOSOPHY, RULES, Env, PLANKA_DIR, assert_not_logged, author_block, fill_budget, messages,
+                           output, run_in_process)
 
 sys.path.insert(0, str(PLANKA_DIR))
 import common  # noqa: E402
 import judge_tool  # noqa: E402
+import prompts  # noqa: E402
 import manifest_watch  # noqa: E402
 
 QUESTION_INPUT = {"questions": [{
@@ -52,6 +53,9 @@ def author_entries(model="claude-test-model"):
     ]
 
 
+# Ядро теста с пунктом об опорах рекомендации в «Решениях»: его вырезает prompts.without_premises.
+PHILOSOPHY_WITH_PREMISES = PHILOSOPHY.replace("2. Правило решений два.\n", "2. Правило решений два.\n"
+                                              + prompts.PREMISES_ITEM + " — факта о коде — назван\n     источник.\n")
 PLAN_CLEAN = PLAN_CONFLICT.replace("- Создать: `x.py`\n### Задача 2", "- Создать: `y.py`\n### Задача 2")
 
 
@@ -81,6 +85,15 @@ class QuestionTest(unittest.TestCase):
         self.assertIn("рекомендован по трудозатратам", out["permissionDecisionReason"])
         self.assertIn("Решения 4", out["permissionDecisionReason"])
         self.assertTrue(out["permissionDecisionReason"].startswith("planka: "))
+
+    def test_question_rubric_without_premises_item(self):
+        self.env.close()
+        self.env = Env(philosophy=PHILOSOPHY_WITH_PREMISES)
+        rec = self.env.data / "rec.txt"
+        self.ask(PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        text = rec.read_text(encoding="utf-8")
+        self.assertIn("Правило решений два", text)
+        self.assertNotIn("у опоры рекомендации", text)
 
     def test_judge_gets_rendered_options_and_rubric(self):
         rec = self.env.data / "rec.txt"
@@ -280,6 +293,17 @@ class PlanTest(unittest.TestCase):
         self.assertIn("## Планы", text)
         self.assertIn("Задача 2: B", text)
         self.assertIn("схождени", text)
+
+    def test_plan_rubric_without_premises_item(self):
+        # Судья плана шагов реплики не видит: пункт об опорах рекомендации из рубрики вырезан.
+        self.env.close()
+        self.env = Env(philosophy=PHILOSOPHY_WITH_PREMISES)
+        rec = self.env.data / "rec.txt"
+        r = self.exit_plan(self.with_plan(PLAN_CLEAN), PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        text = rec.read_text(encoding="utf-8")
+        self.assertIn("Правило решений два", text)
+        self.assertNotIn("у опоры рекомендации", text)
 
     def test_plan_deny(self):
         r = self.exit_plan(self.with_plan(PLAN_CLEAN), PLANKA_STUB="deny", PLANKA_STUB_REASON="нет схождения после волны 1")

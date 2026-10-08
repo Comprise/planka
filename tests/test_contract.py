@@ -286,6 +286,19 @@ class RulesMatchJudgeTest(unittest.TestCase):
         self.assertIn("Директивы языка и инструментов", rule)
         self.assertIn("не комментарии: правила модуля к ним не применяются", rule)
 
+    def test_recommendation_premises_checked(self):
+        # Правило — plugin/philosophy.md, «Решения» 4; судья Stop его проверяет (видит шаги реплики), судьям вопроса
+        # и плана пункт вырезается из рубрики (prompts.without_premises).
+        decisions = common.philosophy_sections("Решения")
+        self.assertIn("у опоры рекомендации — факта о коде, данных, поведении — назван источник",
+                      " ".join(decisions.split()))
+        self.assertIn("назван источник («Решения» 4", prompts._MESSAGE_CHECKS)
+        stripped = prompts.without_premises(decisions)
+        self.assertNotIn("опоры рекомендации", stripped)
+        self.assertEqual(stripped.count("\n") + 4, decisions.count("\n"))
+        self.assertIn("после него остаётся недоделанным;", stripped)
+        self.assertIn("5. Правильное не значит большее.", stripped)
+
     def test_numbers_from_command_output(self):
         self.assertIn("Числа и подсчёты — из вывода команды", prompts._DONE_CHECKS)
         gate = next(item for item in self.flat(self.rules["verification"]).split("- ") if item.startswith("Шлюз"))

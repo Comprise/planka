@@ -75,6 +75,7 @@ def judge_question(data):
     if not content:
         return
     rubric = common.philosophy_sections("Решения")
+    rubric = prompts.without_premises(rubric) if rubric is not None else None
     if rubric is None:
         # Предупреждение уже выдал philosophy_sections.
         common.log_event("question", session, verdict="skipped", error="нет раздела рубрики")
@@ -111,6 +112,7 @@ def judge_plan(data):
         _deny("plan", data, reason, "deny-files", plan, reason=reason)
         return
     rubric = common.rubric(("Решения", "Планы"), ("planning", "subagents", "refactoring", "design-patterns", "heuristics"))
+    rubric = prompts.without_premises(rubric) if rubric is not None else None
     if rubric is None:
         # Предупреждение уже выдал common.rubric.
         common.log_event("plan", session, verdict="skipped", error="нет раздела рубрики")
