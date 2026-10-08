@@ -10,7 +10,7 @@ _KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{"}
 # Обёртки, запускающие следующую команду: флаги со значением и число позиционных слов обёртки
 # (длительность у timeout) перед командой.
 _WRAPPERS = {
-    "time": (frozenset(), 0),
+    "time": (frozenset({"-f", "--format", "-o", "--output"}), 0),
     "nohup": (frozenset(), 0),
     "exec": (frozenset({"-a"}), 0),
     "command": (frozenset(), 0),
@@ -142,6 +142,17 @@ _RUNNERS = {"uv": _UV_RUN_VALUE_FLAGS, "poetry": _NO_VALUE_FLAGS, "pipenv": _NO_
             "micromamba": _CONDA_RUN_VALUE_FLAGS, "pdm": _NO_VALUE_FLAGS, "rye": _NO_VALUE_FLAGS,
             "hatch": _NO_VALUE_FLAGS, "pixi": {"--manifest-path", "-e", "--environment"}}
 _CONDAS = {"conda", "mamba", "micromamba"}
+# Запускатели пакета npm (`npx pnpm add x`): флаги со значением перед пакетом.
+_NPX_VALUE_FLAGS = {"-p", "--package", "-c", "--call", "--cache", "--userconfig"}
+_NPX = {"npx", "bunx", "pnpx"}
+# Версия в спецификации пакета: `pnpm@9`, `@scope/x@1`.
+_VERSION = re.compile(r"(?<=.)@[^/]*$")
+# Пробный прогон без установки; у apt — и его синонимы.
+_DRY_RUN = "--dry-run"
+_APT_SIMULATE = {"-s", "--simulate", "--just-print", "--dry-run", "--recon", "--no-act"}
+# Длинные имена пробного прогона apt и apt-get без `--`, в нижнем регистре.
+_APT_SIMULATE_LONG = {f[2:] for f in _APT_SIMULATE if f.startswith("--")}
+_APTS = {"apt", "apt-get", "aptitude"}
 # Псевдонимы `npm install`.
 _NPM_INSTALL = {"install", "i", "add", "in", "ins", "inst", "insta", "instal", "isnt", "isnta", "isntal",
                 "isntall", "it", "install-test"}
@@ -149,8 +160,11 @@ _NPM_INSTALL = {"install", "i", "add", "in", "ins", "inst", "insta", "instal", "
 # Локальные архивы пакетов.
 _ARCHIVES = (".whl", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".tar.zst", ".zip", ".gem", ".conda", ".deb",
              ".rpm", ".apk", ".snap", ".flatpak", ".nupkg", ".rock", ".rockspec", ".ez")
-# Именованное требование на локальный путь: `name@file:///x`, `name @ file:x`.
-_NAMED_FILE = re.compile(r"@\s*file:")
+# Протоколы локального пакета: путь (`file:`) и пакет своего workspace (`workspace:`, `link:`, `portal:` у
+# pnpm и yarn).
+_LOCAL_PROTOCOLS = ("file:", "workspace:", "link:", "portal:")
+# Именованное требование на локальный пакет: `name@file:///x`, `name @ file:x`, `@org/x@workspace:*`.
+_NAMED_LOCAL = re.compile(r"@\s*(?:file|workspace|link|portal):")
 # Сколько первых символов сегмента _command разбирает на слова: пакет, названный дальше, не виден.
 _WORDS_LIMIT = 4096
 
@@ -166,14 +180,18 @@ def _takes_value(flag, value_flags):
 
 
 def _basename(word):
-    return _WIN_EXT.sub("", re.split(r"[/\\]", word)[-1])
+    """Имя команды без каталога; с суффиксом Windows (`NPM.CMD`) — без суффикса и в нижнем регистре."""
+    name = re.split(r"[/\\]", word)[-1]
+    bare = _WIN_EXT.sub("", name)
+    return bare.lower() if bare != name else bare
 
 
 def _split(text):
     """Слова по правилам POSIX shell: кавычки и `\\` сняты. Каждое слово — пара (слово, начало слова
     до первой кавычки или `\\`): оператор перенаправления узнаётся только в этом начале.
 
-    Незакрытая кавычка продолжается до конца текста.
+    Подстановки `$(…)` и `` `…` `` внутри двойных кавычек входят в слово текстом, с их кавычками. Незакрытая
+    кавычка продолжается до конца текста.
     """
     out = []
     buf, lead, started = [], None, False
@@ -207,6 +225,17 @@ def _split(text):
         elif c == '"':
             i += 1
             while i < n and text[i] != '"':
+                if text.startswith("$(", i):
+                    arith = text.startswith("$((", i)
+                    end = min(_close_paren(text, i + (3 if arith else 2), arith), n - 1)
+                    buf.append(text[i:end + 1])
+                    i = end + 1
+                    continue
+                if text[i] == "`":
+                    end = _close_backtick(text, i + 1)
+                    buf.append(text[i:end + 1])
+                    i = end + 1
+                    continue
                 if text[i] == "\\" and i + 1 < n and text[i + 1] in '$`"\\':
                     i += 1
                 buf.append(text[i])
@@ -279,8 +308,9 @@ def _command(segment):
 
 
 def _is_local(word, pip):
-    """Слово — локальный путь или архив, а не пакет; URL со схемой, кроме `file:`, — пакет."""
-    if word.startswith("file:") or _NAMED_FILE.search(word):
+    """Слово — локальный путь, архив или пакет своего workspace, а не пакет; URL со схемой, кроме `file:`, —
+    пакет."""
+    if word.startswith(_LOCAL_PROTOCOLS) or _NAMED_LOCAL.search(word):
         return True
     if "://" in word:
         return False
@@ -405,15 +435,55 @@ def _git_source(args):
     return value is not None and not _is_local(value, False)
 
 
+def _npm_dry_run(args):
+    """Пробный прогон npm по разбору флагов nopt: действует последний из `--dry-run` и `--no-dry-run` (`no-` в
+    любом регистре, каждый повтор обращает; имя сокращается до `--dr`). Слово `true` или `false` следом или
+    после `=` — значение флага; иное значение после `=` — отдельное слово, флаг — истина. `--` завершает флаги."""
+    dry = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--":
+            break
+        if not a.startswith("--"):
+            continue
+        name, eq, value = a[2:].partition("=")
+        negate = False
+        while name[:3].lower() == "no-":
+            negate, name = not negate, name[3:]
+        if len(name) < 2 or not _DRY_RUN[2:].startswith(name):
+            continue
+        if not eq:
+            value = args[i] if i < len(args) else ""
+            i += value in ("true", "false")
+        dry = (value != "false") != negate
+    return dry
+
+
+def _dry_run(w):
+    """Слова команды w (с именем) — пробный прогон: у npm — по _npm_dry_run, у apt, apt-get и aptitude его
+    разбирает _apt; у прочих — слово `--dry-run` среди слов (у brew ещё `-n` — _brew_dry_run в _brew)."""
+    if w[0] == "npm":
+        return _npm_dry_run(w[1:])
+    return w[0] not in _APTS and _DRY_RUN in w
+
+
 def _is_add(words, depth=0):
     """Команда добавляет пакет: в проект или глобально (`npm i -g`, `cargo install`, `pipx install`).
 
-    Разовый запуск без установки (`npx`, `bunx`, `uvx`, `pipx run`, `go run`) — не добавление.
+    Разовый запуск без установки (`npx`, `bunx`, `uvx`, `pipx run`, `go run`) — не добавление, кроме запуска
+    менеджера (`npx pnpm add x`, `corepack pnpm add x`); пробный прогон (_dry_run, у apt — _apt_parse, у brew —
+    _brew_dry_run) — тоже не добавление.
     """
     if not words or depth > _MAX_DEPTH:
         return False
     w = [_basename(words[0]), *words[1:]]
     name = w[0]
+    if name == "corepack" or name in _NPX:
+        # `corepack <менеджер>[@версия] …`, `npx [флаги] <пакет>[@версия] …`: исполняется программа пакета.
+        rest = w[1:] if name == "corepack" else _after_flags(w[1:], _NPX_VALUE_FLAGS)
+        return bool(rest) and _is_add([_VERSION.sub("", rest[0]), *rest[1:]], depth + 1)
     if _PYTHON.match(name):
         module = _python_module(w)
         return module is not None and _is_add(module, depth + 1)
@@ -421,7 +491,8 @@ def _is_add(words, depth=0):
         sub, args = _sub_args(w)
         if name in _RUNNERS and sub == "run":
             return _is_add(_after_flags(args, _RUNNERS[name]), depth + 1)
-        return _OTHER_MANAGERS[name](w)
+        return not _dry_run(w) and _OTHER_MANAGERS[name](w)
+    dry = _dry_run(w)
     # `cargo +nightly install …`: выбор toolchain rustup перед подкомандой.
     if name == "cargo" and w[1:2] and w[1].startswith("+"):
         w = [w[0], *w[2:]]
@@ -439,6 +510,8 @@ def _is_add(words, depth=0):
         return False
     if name in _RUNNERS and sub == "run":
         return _is_add(_after_flags(args, _RUNNERS[name]), depth + 1)
+    if dry:
+        return False
     if name == "go":
         if sub == "get":
             return _has(args, _GO_VALUE_FLAGS)
@@ -449,7 +522,8 @@ def _is_add(words, depth=0):
     if name == "npm":
         return sub in _NPM_INSTALL and _has(args, _NPM_VALUE_FLAGS)
     if name == "pnpm":
-        return sub in ("add", "install", "i") and _has(args, _PNPM_VALUE_FLAGS)
+        # `--workspace` берёт пакеты только из workspace проекта.
+        return sub in ("add", "install", "i") and "--workspace" not in args and _has(args, _PNPM_VALUE_FLAGS)
     if name == "yarn":
         return sub == "add" and _has(args, _YARN_VALUE_FLAGS)
     if name == "bun":
@@ -481,6 +555,9 @@ def _is_add(words, depth=0):
         return sub == "install" and _pip_add(args, _PIPENV_VALUE_FLAGS)
     if name in _CONDAS:
         return sub == "install" and _has(args, _CONDA_VALUE_FLAGS)
+    if name in ("cargo", "bundle") and _flag_value(args, "--path") is not None:
+        # `--path` — локальный пакет под названным именем.
+        return False
     if name == "cargo":
         if sub == "install":
             return _has(args, _CARGO_INSTALL_VALUE_FLAGS) or _git_source(args)
@@ -519,8 +596,13 @@ def _is_add(words, depth=0):
 # обновление, поиск, список и удаление — не добавление.
 
 _APT_VALUE_FLAGS = {"-o", "--option", "-c", "--config-file", "-t", "--target-release", "--default-release",
-                    "-a", "--host-architecture", "-P", "--build-profiles", "--solver"}
-_APTITUDE_VALUE_FLAGS = _APT_VALUE_FLAGS | {"-F", "--display-format", "-w", "--width", "-S", "--sort"}
+                    "-a", "--host-architecture", "-P", "--build-profiles", "--solver", "--planner", "--comment",
+                    "-S", "--snapshot", "--with-source", "--cli-version"}
+_APTITUDE_VALUE_FLAGS = _APT_VALUE_FLAGS | {"-F", "--display-format", "-w", "--width", "--sort"}
+# Флаги уровня apt (IntLevel): `-q`, `--quiet`, `--silent`.
+_APT_LEVEL_LONG = {"quiet", "silent"}
+# Флаги `brew install` со значением; короткие флаги `brew install` значения не берут.
+_BREW_VALUE_FLAGS = {"--cc", "--env", "--bottle-arch"}
 _DNF_VALUE_FLAGS = {"-c", "--config", "--repo", "--repoid", "--enablerepo", "--disablerepo", "--setopt",
                     "--installroot", "--releasever", "-d", "--debuglevel", "-e", "--errorlevel", "-x", "--exclude",
                     "--forcearch", "--downloaddir", "--destdir", "--comment", "--color", "--repofrompath",
@@ -626,10 +708,153 @@ def _sub_args(w, value_flags: Set[str] = _NO_VALUE_FLAGS):
     return (w[1] if len(w) > 1 else None), w[2:]
 
 
+def _aptitude_simulates(args, flags):
+    """Среди флагов aptitude — пробный прогон: `-s` (и в склейке `-qs`), `--simulate` и синонимы. Остаток склейки
+    после флага со значением (`-tsid`) — значение."""
+    for a in args:
+        if a in _APT_SIMULATE:
+            return True
+        if a.startswith("-") and not a.startswith("--"):
+            for letter in a[1:]:
+                if letter == "s":
+                    return True
+                if "-" + letter in flags:
+                    break
+    return False
+
+
+# Пробелы isspace локали C, которые strtol пропускает перед числом.
+_C_SPACE = r"[ \t\n\v\f\r]*"
+# Целое C (strtol с основанием 0): десятичное, восьмеричное с ведущим `0`, шестнадцатеричное с `0x`.
+_C_INT = re.compile(_C_SPACE + r"([+-]?)(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)")
+# Целое C по основанию 10 (strtol с основанием 10).
+_C_DEC = re.compile(_C_SPACE + r"[+-]?[0-9]+")
+_APT_FALSE = {"no", "false", "without", "off", "disable"}
+_APT_TRUE = {"yes", "true", "with", "on", "enable"}
+
+
+def _apt_bool(text):
+    """Булево значение apt (StringToBool): True, False или None — не булево. Пустая строка — False."""
+    m = _C_INT.fullmatch(text)
+    if m or not text:
+        digits = m[2] if m else "0"
+        # Восьмеричное `0…` читается по основанию 10: значения 0 и 1 у них совпадают, прочие — не булевы.
+        value = int(digits, 16 if digits[1:2] in ("x", "X") else 10)
+        value = -value if m and m[1] == "-" else value
+        if value in (0, 1):
+            return bool(value)
+    low = text.lower()
+    return False if low in _APT_FALSE else True if low in _APT_TRUE else None
+
+
+def _apt_sense(argument, certain, prefix):
+    """Значение булева флага apt (HandleOpt): (значение, съедено ли argument). argument — остаток слова или
+    следующее слово без `-`, certain — он после `=`, prefix — слово перед первым `-` имени (`no` в
+    `--no-simulate`) или None. Значение None — ошибка разбора: apt не выполняется."""
+    if argument is not None:
+        value = _apt_bool(argument)
+        if value is not None:
+            return value, True
+        if certain:
+            return None, False
+    if prefix is not None:
+        return _apt_bool(prefix), False
+    return True, False
+
+
+def _apt_level(argument, certain):
+    """Съедает ли флаг уровня apt (IntLevel) argument: целое strtol по основанию 10 до конца строки — да; иначе
+    уровень растёт без значения. argument — как у _apt_sense. None — ошибка разбора: после `=` не целое."""
+    if argument is not None and _C_DEC.fullmatch(argument):
+        return True
+    return None if certain else False
+
+
+def _apt_parse(args, flags):
+    """Разбор флагов apt и apt-get по CommandLine apt: (пробный прогон, args без слов-значений булевых флагов и
+    флагов уровня). Пробный прогон — последнее значение `-s`, `--simulate` и синонимов (имя без учёта регистра).
+    Значение — после `=`, остаток склейки (`-s0`, `-q2`), следующее слово без `-` (`--simulate no`, `-q 2`) или
+    слово перед `-` имени (`--no-simulate`); не булево после `=` или перед `-`, не целое после `=` у `-q` —
+    ошибка, установки нет (True). Значения флагов из flags остаются в args. `--` завершает флаги."""
+    simulate = False
+    eaten_words = set()
+    i = 0
+    while i < len(args):
+        a = args[i]
+        following = args[i + 1] if i + 1 < len(args) and not args[i + 1].startswith("-") else None
+        i += 1
+        if a == "--":
+            break
+        if a.startswith("--"):
+            name, eq, value = a[2:].partition("=")
+            low = name.lower()
+            argument = value if eq else following
+            prefix = None
+            if low in _APT_LEVEL_LONG:
+                eaten = _apt_level(argument, bool(eq))
+                if eaten is None:
+                    return True, args
+            else:
+                if low not in _APT_SIMULATE_LONG:
+                    prefix, dash, rest = low.partition("-")
+                    if not dash or rest not in _APT_SIMULATE_LONG and rest != "s":
+                        i += not eq and a in flags and following is not None
+                        continue
+                simulate, eaten = _apt_sense(argument, bool(eq), prefix)
+                if simulate is None:
+                    return True, args
+            if eaten and not eq:
+                eaten_words.add(i)
+                i += 1
+        elif a.startswith("-") and len(a) > 1:
+            for j, letter in enumerate(a[1:], 1):
+                rest = a[j + 1:]
+                certain = rest.startswith("=")
+                argument = rest[1:] if certain else rest or following
+                if letter in ("s", "q"):
+                    if letter == "s":
+                        simulate, eaten = _apt_sense(argument, certain, None)
+                        error = simulate is None
+                    else:
+                        eaten = _apt_level(argument, certain)
+                        error = eaten is None
+                    if error:
+                        return True, args
+                    if eaten:
+                        if not rest:
+                            eaten_words.add(i)
+                            i += 1
+                        break
+                elif "-" + letter in flags:
+                    i += not rest and following is not None
+                    break
+                elif certain or rest and _apt_bool(rest) is not None:
+                    break
+    return simulate, [a for k, a in enumerate(args) if k not in eaten_words]
+
+
 def _apt(w):
-    flags = _APTITUDE_VALUE_FLAGS if w[0] == "aptitude" else _APT_VALUE_FLAGS
+    if w[0] == "aptitude":
+        flags = _APTITUDE_VALUE_FLAGS
+        simulates = _aptitude_simulates(w[1:], flags)
+    else:
+        flags = _APT_VALUE_FLAGS
+        simulates, args = _apt_parse(w[1:], flags)
+        w = [w[0], *args]
+    if simulates:
+        return False
     sub, args = _sub_args(w, flags)
     return sub == "install" and _has(args, flags)
+
+
+def _brew_dry_run(args):
+    """Пробный прогон `brew install`: `-n` (и в склейке `-vn`) до `--`; `--dry-run` проверяет _dry_run."""
+    for a in args:
+        if a == "--":
+            return False
+        if _GLUED.fullmatch(a) and a[0] == "-" and "n" in a or a == "-n":
+            return True
+    return False
 
 
 def _brew(w):
@@ -637,7 +862,7 @@ def _brew(w):
     # `brew cask install` — старая форма `brew install --cask`.
     if sub == "cask" and args[:1] == ["install"]:
         sub, args = "install", args[1:]
-    return sub == "install" and _has(args)
+    return sub == "install" and not _brew_dry_run(args) and _has(args, _BREW_VALUE_FLAGS)
 
 
 def _dnf(w):
@@ -881,7 +1106,7 @@ _OTHER_MANAGERS = {
     "choco": _choco, "nuget": _nuget, "winget": _winget, "scoop": _scoop, "port": _port, "snap": _snap,
     "flatpak": _flatpak, "nix-env": _nix_env, "nix": _nix, "pdm": _pdm, "rye": _rye, "pixi": _pixi, "mix": _mix,
     "cabal": _cabal, "stack": _stack, "opam": _opam, "luarocks": _luarocks, "cpan": _cpan, "cpanm": _cpanm,
-    "vcpkg": _vcpkg, "conan": _conan, "R": _r, "Rscript": _r,
+    "vcpkg": _vcpkg, "conan": _conan, "R": _r, "Rscript": _r, "r": _r, "rscript": _r,
 }
 
 
@@ -903,39 +1128,43 @@ def _inline_script(words):
         elif a.startswith("--"):
             continue
         elif a.startswith(("-", "+")) and len(a) > 1:
-            has_c = has_c or a[0] == "-" and "c" in a[1:]
+            has_c = has_c or "c" in a[1:]
             skip = _takes_value(a, _SHELL_VALUE_FLAGS)
         else:
             return a if has_c else None
     return None
 
 
-def _close_paren(text, i):
-    """Позиция `)`, закрывающей подстановку, тело которой начинается с i; кавычки внутри учтены."""
-    depth, n = 1, len(text)
+def _close_paren(text, i, arith=False):
+    """Позиция последней `)` подстановки `$(…)` (при arith — арифметики `$((…))`), тело которой начинается
+    с i; len(text), если она не закрыта. Кавычки, вложенные подстановки и тела heredoc внутри учтены."""
+    stack = ["A" if arith else "("]
+    pending = []
+    n = len(text)
     while i < n:
-        c = text[i]
-        if c == "\\":
-            i += 2
-            continue
-        if c == "'":
-            end = text.find("'", i + 1)
-            i = n if end < 0 else end + 1
-            continue
-        if c == '"':
-            i += 1
-            while i < n and text[i] != '"':
-                i += 2 if text[i] == "\\" else 1
-            i += 1
-            continue
-        if c == "(":
-            depth += 1
-        elif c == ")":
-            depth -= 1
-            if depth == 0:
-                return i
-        i += 1
+        eol = text.find("\n", i)
+        eol = n if eol < 0 else eol
+        if pending:
+            term, strip_tabs = pending[0]
+            line = text[i:eol]
+            if (line.lstrip("\t") if strip_tabs else line) == term:
+                pending.pop(0)
+        else:
+            found, stop = _scan(text, stack, i, eol)
+            if stop is not None:
+                return stop - 1
+            pending.extend(found)
+        i = eol + 1
     return n
+
+
+def _close_backtick(text, i):
+    """Позиция обратной кавычки, закрывающей подстановку `` `…` ``, тело которой начинается с i: первая
+    неэкранированная; len(text), если её нет."""
+    n = len(text)
+    while i < n and text[i] != "`":
+        i += 2 if text[i] == "\\" else 1
+    return min(i, n)
 
 
 def _quoted_substitutions(text):
@@ -948,28 +1177,26 @@ def _quoted_substitutions(text):
         c = text[i]
         if c == "\\":
             i += 2
+        elif not in_dq and text.startswith("$'", i):
+            i += 2
+            while i < n and text[i] != "'":
+                i += 2 if text[i] == "\\" else 1
+            i += 1
         elif not in_dq and c == "'":
-            if text[i - 1:i] == "$":
-                i += 1
-                while i < n and text[i] != "'":
-                    i += 2 if text[i] == "\\" else 1
-                i += 1
-            else:
-                end = text.find("'", i + 1)
-                i = n if end < 0 else end + 1
+            end = text.find("'", i + 1)
+            i = n if end < 0 else end + 1
         elif c == '"':
             in_dq = not in_dq
             i += 1
+        elif in_dq and text.startswith("$((", i):
+            # `$((…))` — арифметика, не команда.
+            i = _close_paren(text, i + 3, arith=True) + 1
         elif in_dq and text.startswith("$(", i):
             end = _close_paren(text, i + 2)
-            # `$((…))` — арифметика, не команда.
-            if not text.startswith("$((", i):
-                found.append(text[i + 2:end])
+            found.append(text[i + 2:end])
             i = end + 1
         elif in_dq and c == "`":
-            j = i + 1
-            while j < n and text[j] != "`":
-                j += 2 if text[j] == "\\" else 1
+            j = _close_backtick(text, i + 1)
             found.append(text[i + 1:j])
             i = j + 1
         else:
@@ -1017,7 +1244,7 @@ def _heredoc_runs(words):
     return not positional
 
 
-_WORD_END = " \t;&|<>()"
+_WORD_END = " \t\n;&|<>()"
 
 
 def _heredoc_word(line, i):
@@ -1039,18 +1266,22 @@ def _heredoc_word(line, i):
     return "".join(word), i
 
 
-def heredocs(line):
-    """Heredoc, открытые строкой, по порядку: (терминатор, снимать ли ведущие табы).
+def _scan(text, stack, i=0, end=None):
+    """Проход text[i:end] (одна строка) со стеком открытых кавычек и скобок stack; стек меняется на месте.
 
-    `<<` в кавычках (в том числе `$'…'` с `\\'`), here-string `<<<`, сдвиг в арифметике `((…))` и
-    комментарий не считаются; подстановка `$(…)` внутри двойных кавычек — снова команда.
+    Символы стека: "'", '"', "$'", "(" — подстановка или подоболочка, "`" — подстановка `` `…` `` в двойных
+    кавычках (до неэкранированной обратной кавычки, кавычки внутри не считаются), "A" — арифметика, "a" — скобка
+    в ней.
+    Возвращает heredoc, открытые вне кавычек и арифметики, — (терминатор, снимать ли ведущие табы), — и
+    позицию за символом, после которого непустой на входе стек опустел; None — не опустел до конца строки
+    или комментария. С пустым стеком на входе проход идёт до конца строки.
     """
     found = []
-    stack = []  # "'", '"', "$'", "(" — подстановка или подоболочка, "A" — арифметика, "a" — скобка в ней
-    i = 0
-    while i < len(line):
+    nested = bool(stack)
+    end = len(text) if end is None else end
+    while i < end:
         top = stack[-1] if stack else None
-        c = line[i]
+        c = text[i]
         if top == "'":
             if c == "'":
                 stack.pop()
@@ -1061,26 +1292,33 @@ def heredocs(line):
             i += 2 if c == "\\" else 1
         elif c == "\\":
             i += 2
+        elif top == "`":
+            if c == "`":
+                stack.pop()
+            i += 1
         elif top == '"':
             if c == '"':
                 stack.pop()
                 i += 1
-            elif line.startswith("$((", i):
+            elif c == "`":
+                stack.append("`")
+                i += 1
+            elif text.startswith("$((", i):
                 stack.append("A")
                 i += 3
-            elif line.startswith("$(", i):
+            elif text.startswith("$(", i):
                 stack.append("(")
                 i += 2
             else:
                 i += 1
-        elif line.startswith("$'", i):
+        elif text.startswith("$'", i):
             stack.append("$'")
             i += 2
         elif c in "'\"":
             stack.append(c)
             i += 1
         elif top in ("A", "a"):
-            if top == "A" and line.startswith("))", i):
+            if top == "A" and text.startswith("))", i):
                 stack.pop()
                 i += 2
             else:
@@ -1089,57 +1327,61 @@ def heredocs(line):
                 elif c == ")" and top == "a":
                     stack.pop()
                 i += 1
-        elif line.startswith("$((", i) or line.startswith("((", i):
+        elif text.startswith("$((", i) or text.startswith("((", i):
             stack.append("A")
             i += 3 if c == "$" else 2
-        elif line.startswith("$(", i) or c == "(":
+        elif text.startswith("$(", i) or c == "(":
             stack.append("(")
             i += 2 if c == "$" else 1
         elif c == ")":
             if top == "(":
                 stack.pop()
             i += 1
-        elif c == "#" and (i == 0 or line[i - 1].isspace()):
+        elif c == "#" and (i == 0 or text[i - 1].isspace()):
             break
-        elif line.startswith("<<<", i):
+        elif text.startswith("<<<", i):
             i += 3
-        elif line.startswith("<<", i):
+        elif text.startswith("<<", i):
             i += 2
-            strip_tabs = line.startswith("-", i)
+            strip_tabs = text.startswith("-", i)
             i += strip_tabs
-            while i < len(line) and line[i] in " \t":
+            while i < end and text[i] in " \t":
                 i += 1
-            word, i = _heredoc_word(line, i)
+            word, i = _heredoc_word(text, i)
             if word:
                 found.append((word, strip_tabs))
         else:
             i += 1
-    return found
+        if nested and not stack:
+            return found, i
+    return found, None
 
 
-def _quoted_heredoc_runs(text):
-    """Heredoc внутри `$(…)` в тексте от открывающей кавычки: его команда — оболочка, исполняющая тело
-    (_heredoc_runs), а не `cat`, для которого тело — данные."""
-    cut = text.find("<<")
-    start = text.rfind("$(", 0, cut)
-    if cut < 0 or start < 0:
-        return False
-    return any(_heredoc_runs(_command(s)[0]) for s in _segments(text[start + 2:cut]))
+def heredocs(line):
+    """Heredoc, открытые строкой, по порядку: (терминатор, снимать ли ведущие табы).
+
+    `<<` в кавычках (в том числе `$'…'` с `\\'`), here-string `<<<`, сдвиг в арифметике `((…))` и
+    комментарий не считаются; подстановка `$(…)` внутри двойных кавычек — снова команда.
+    """
+    return _scan(line, [])[0]
 
 
 def _segments(command):
     """Сегменты команды: границы — `&&`, `||`, `;`, `|`, `&`, `(`, `)`, обратная кавычка и перевод
     строки вне кавычек.
 
-    Кавычка, открытая на одной строке, продолжается на следующих; `\\` в конце строки продолжает
-    сегмент. Тело heredoc — данные: строки после конца логической строки с `<<` до терминатора не
-    входят ни в один сегмент; у heredoc внутри `"$(…)"`, открытой до конца строки, тело начинается со
-    следующей строки, внутри кавычки; тело heredoc оболочки без скрипта (`bash <<EOF`, `ssh host <<EOF`),
-    в том числе внутри `"$(…)"`, — команды (_heredoc_runs). Комментарий — `#` в начале строки или после пробела вне кавычек — до
-    конца строки.
+    Кавычка, открытая на одной строке, продолжается на следующих; внутри `"$(…)"` кавычки вложены, внутри
+    `` "`…`" `` не считаются до закрывающей обратной кавычки (_scan).
+    `\\` в конце строки продолжает сегмент. Тело heredoc — данные: строки после конца логической строки с
+    `<<` до терминатора не входят ни в один сегмент; тело heredoc оболочки без скрипта (`bash <<EOF`,
+    `ssh host <<EOF`) — команды (_heredoc_runs). Heredoc внутри кавычки, открытой до конца строки, тело
+    начинает со следующей строки: тело и терминатор входят в сегмент текстом без разбора, их разбирает
+    _quoted_substitutions. Комментарий — `#` в начале строки или после пробела вне кавычек — до конца
+    строки.
     """
     segments, current = [], []
-    quote = None
+    # Открытые кавычки и подстановки в них (символы стека _scan).
+    stack = []
     pending = []
     # Heredoc логической строки: тело начинается после её конца.
     opened = []
@@ -1151,72 +1393,60 @@ def _segments(command):
 
     for line in command.split("\n"):
         if pending:
+            if stack:
+                current.append(line + "\n")
             term, strip_tabs = pending[0]
             if (line.lstrip("\t") if strip_tabs else line) == term:
                 pending.pop(0)
             continue
         # Позиция, с которой строка идёт вне кавычки, перенесённой с прошлых строк.
-        outside = 0 if quote is None else None
-        # Позиция последней кавычки, открытой на этой строке.
+        outside = 0 if not stack else None
+        # Позиция последней кавычки, открытой на этой строке вне кавычек.
         quote_start = None
+        # Heredoc, открытые внутри кавычек этой строки.
+        inner = []
         continued = False
         i, n = 0, len(line)
         while i < n:
+            if stack:
+                found, stop = _scan(line, stack, i)
+                end = n if stop is None else stop
+                current.append(line[i:end])
+                inner.extend(found)
+                i = end
+                if not stack and outside is None:
+                    outside = i
+                continue
             c = line[i]
-            if quote == "'":
-                current.append(c)
-                if c == "'":
-                    quote = None
-            elif quote == "$'":
-                if c == "\\" and i + 1 < n:
-                    current.append(line[i:i + 2])
-                    i += 2
-                    continue
-                current.append(c)
-                if c == "'":
-                    quote = None
-            elif quote == '"':
-                if c == "\\" and i + 1 < n:
-                    current.append(line[i:i + 2])
-                    i += 2
-                    continue
-                current.append(c)
-                if c == '"':
-                    quote = None
-            elif c == "\\":
+            if c == "\\":
                 if i + 1 == n:
                     continued = True
                     break
                 current.append(line[i:i + 2])
                 i += 2
                 continue
-            elif c == "'" and line[i - 1:i] == "$":
-                quote = "$'"
+            if line.startswith("$'", i) or c in "'\"":
+                opener = "$'" if c == "$" else c
+                stack.append(opener)
                 quote_start = i
-                current.append(c)
-            elif c in "'\"":
-                quote = c
-                quote_start = i
-                current.append(c)
-            elif c == "#" and (i == 0 or line[i - 1].isspace()):
+                current.append(opener)
+                i += len(opener)
+                continue
+            if c == "#" and (i == 0 or line[i - 1].isspace()):
                 break
-            elif line.startswith(("&&", "||"), i):
+            if line.startswith(("&&", "||"), i):
                 flush()
                 i += 2
                 continue
-            elif c in ";|()`" or (c == "&" and line[i - 1:i] not in ("<", ">") and line[i + 1:i + 2] != ">"):
+            if c in ";|()`" or (c == "&" and line[i - 1:i] not in ("<", ">") and line[i + 1:i + 2] != ">"):
                 flush()
             else:
                 current.append(c)
-            if outside is None and quote is None:
-                outside = i + 1
             i += 1
-        if quote is not None:
-            # Heredoc в `"$(…)"`, открытой до конца строки, — тело идёт со следующей строки внутри кавычки
-            # и кончается до её закрытия; тело — данные.
+        if stack:
             if outside is not None and quote_start is not None:
                 opened.extend(heredocs(line[outside:quote_start]))
-                pending = [] if _quoted_heredoc_runs(line[quote_start:]) else heredocs(line[quote_start:])
+            pending = inner
             current.append("\n")
             continue
         if outside is not None:

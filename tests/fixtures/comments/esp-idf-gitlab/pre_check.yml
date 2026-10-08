@@ -1,0 +1,56 @@
+# источник: esp-idf release/v6.0 (71722673), .gitlab/ci/pre_check.yml, строки 1–55
+check_version:
+  # Don't run this for feature/bugfix branches, so that it is possible to modify
+  # esp_idf_version.h in a branch before tagging the next version.
+  extends:
+    - .pre_check_template
+    - .rules:protected:check
+  tags: [ brew, github_sync ]
+  variables:
+    # need a full clone to get the latest tag
+    # the --shallow-since=$(git log -1 --format=%as $LATEST_GIT_TAG) option is not accurate
+    GIT_STRATEGY: fetch
+    SUBMODULES_TO_FETCH: "none"
+    GIT_DEPTH: 0
+  script:
+    - export IDF_PATH=$PWD
+    - tools/ci/check_idf_version.sh
+
+check_api_usage:
+  extends: .pre_check_template
+  script:
+    - python -m pip install ast-grep-cli # use ast-grep to describe customized lint rules
+    - ast-grep scan
+    - tools/ci/check_api_violation.sh
+    - tools/ci/check_examples_extra_component_dirs.sh
+
+check_blobs:
+  extends:
+    - .pre_check_template
+    - .rules:build:check
+  variables:
+    SUBMODULES_TO_FETCH: "components/esp_wifi/lib;components/esp_phy/lib;components/esp_coex/lib"
+  script:
+    # Check if Wi-Fi library header files match between IDF and the version used when compiling the libraries
+    - IDF_TARGET=esp32 $IDF_PATH/components/esp_wifi/test_md5/test_md5.sh
+    - IDF_TARGET=esp32s2 $IDF_PATH/components/esp_wifi/test_md5/test_md5.sh
+    - IDF_TARGET=esp32s3 $IDF_PATH/components/esp_wifi/test_md5/test_md5.sh
+    - IDF_TARGET=esp32c2 $IDF_PATH/components/esp_wifi/test_md5/test_md5.sh
+    - IDF_TARGET=esp32c3 $IDF_PATH/components/esp_wifi/test_md5/test_md5.sh
+    - IDF_TARGET=esp32c6 $IDF_PATH/components/esp_wifi/test_md5/test_md5.sh
+    - IDF_TARGET=esp32c5 $IDF_PATH/components/esp_wifi/test_md5/test_md5.sh
+    - IDF_TARGET=esp32c61 $IDF_PATH/components/esp_wifi/test_md5/test_md5.sh
+    - IDF_TARGET=esp32_host $IDF_PATH/components/esp_wifi/test_md5/test_md5.sh
+    # Check if Coexistence library header files match between IDF and the version used when compiling the libraries
+    - IDF_TARGET=esp32 $IDF_PATH/components/esp_coex/test_md5/test_md5.sh
+    - IDF_TARGET=esp32s2 $IDF_PATH/components/esp_coex/test_md5/test_md5.sh
+    - IDF_TARGET=esp32s3 $IDF_PATH/components/esp_coex/test_md5/test_md5.sh
+    - IDF_TARGET=esp32c2 $IDF_PATH/components/esp_coex/test_md5/test_md5.sh
+    - IDF_TARGET=esp32c3 $IDF_PATH/components/esp_coex/test_md5/test_md5.sh
+    - IDF_TARGET=esp32c6 $IDF_PATH/components/esp_coex/test_md5/test_md5.sh
+    - IDF_TARGET=esp32h2 $IDF_PATH/components/esp_coex/test_md5/test_md5.sh
+    - IDF_TARGET=esp32c5 $IDF_PATH/components/esp_coex/test_md5/test_md5.sh
+    - IDF_TARGET=esp32c61 $IDF_PATH/components/esp_coex/test_md5/test_md5.sh
+    # Check if Wi-Fi, PHY, BT blobs contain references to specific symbols
+    - bash $IDF_PATH/tools/ci/check_blobs.sh
+

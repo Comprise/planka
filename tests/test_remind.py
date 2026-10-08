@@ -160,6 +160,47 @@ class RemindTest(unittest.TestCase):
         self.assertIn("# Философия работы", out["additionalContext"])
         self.assertFalse((self.env.data / "state" / "sess-1.snap.json").exists())
 
+    def test_failed_snapshot_not_repeated_for_same_root(self):
+        capture = mock.Mock(side_effect=snapshot.TooManyFiles("изменённых и неотслеживаемых файлов больше 2"))
+        patch = mock.patch.object(snapshot, "capture", capture)
+        first, _ = self.run_in_process(patch)
+        second, out = self.run_in_process(patch)
+        self.assertEqual(first, ["planka: изменённых и неотслеживаемых файлов больше 2, "
+                                 "сверка документации не проверяется"])
+        self.assertEqual(second, [])
+        self.assertIn("# Философия работы", out["additionalContext"])
+        self.assertEqual(capture.call_count, 1)
+        failed = json.loads((self.env.data / "state" / "sess-1.snapfail.json").read_text(encoding="utf-8"))
+        self.assertEqual(failed, {str(self.env.project): "изменённых и неотслеживаемых файлов больше 2"})
+
+    def test_failed_snapshot_retried_for_other_root(self):
+        other = self.env.data / "other"
+        other.mkdir()
+        capture = mock.Mock(side_effect=TimeoutError("снимок не уложился в срок"))
+        with mock.patch.object(snapshot, "capture", capture):
+            self.run_in_process()
+            msgs, _ = self.run_in_process(CLAUDE_PROJECT_DIR=str(other))
+        self.assertEqual(msgs, ["planka: снимок не уложился в срок, сверка документации не проверяется"])
+        self.assertEqual([c.args[0] for c in capture.call_args_list], [self.env.project, other])
+
+    def test_unchecked_snapshot_kept_as_base(self):
+        (self.env.project / "a.py").write_text("x\n", encoding="utf-8")
+        self.prompt()
+        (self.env.project / "b.py").write_text("x\n", encoding="utf-8")
+        r = self.env.run("remind.py", self.env.hook_input("UserPromptSubmit", prompt="x", prompt_id="p-2"))
+        self.assertEqual(messages(r), [])
+        snap = snapshot.load(self.env.data / "state", "sess-1")
+        self.assertEqual((snap["prompt_id"], self.walk_paths(snap)), ("p-2", ["a.py"]))
+
+    def test_checked_snapshot_replaced(self):
+        (self.env.project / "a.py").write_text("x\n", encoding="utf-8")
+        self.prompt()
+        snapshot.mark_checked(self.env.data / "state", "sess-1", "p-1")
+        (self.env.project / "b.py").write_text("x\n", encoding="utf-8")
+        self.env.run("remind.py", self.env.hook_input("UserPromptSubmit", prompt="x", prompt_id="p-2"))
+        snap = snapshot.load(self.env.data / "state", "sess-1")
+        self.assertEqual((snap["prompt_id"], snap["checked"], self.walk_paths(snap)), ("p-2", False, ["a.py", "b.py"]))
+
     def test_walk_timeout_warns(self):
         (self.env.project / "a.py").write_text("x", encoding="utf-8")
         timeout = TimeoutError("снимок не уложился в срок")
@@ -199,13 +240,14 @@ class RemindTest(unittest.TestCase):
         real_git = shutil.which("git")
         bin_dir = self.env.data / "bin"
         bin_dir.mkdir()
-        (bin_dir / "git").write_text(f'#!/bin/sh\ncase " $* " in *" status "*) exec sleep 5;; esac\nexec {real_git} "$@"\n',
-                                     encoding="utf-8")
+        # git status, который дожил до конца, оставляет метку: срок 1 с прерывает его на sleep 5.
+        finished = self.env.data / "status-finished"
+        (bin_dir / "git").write_text(f'#!/bin/sh\ncase " $* " in *" status "*) sleep 5; : > "{finished}";; esac\n'
+                                     f'exec {real_git} "$@"\n', encoding="utf-8")
         (bin_dir / "git").chmod(0o755)
         path = f"{bin_dir}:{self.env.environ()['PATH']}"
-        started = time.monotonic()
         msgs, out = self.run_in_process(mock.patch.object(remind, "SNAPSHOT_BUDGET", 1), PATH=path)
-        self.assertLess(time.monotonic() - started, 4)
+        self.assertFalse(finished.exists())
         self.assertIn("# Философия работы", out["additionalContext"])
         self.assertEqual(msgs, ["planka: git не уложился в срок снимка, сверка документации не проверяется"])
 

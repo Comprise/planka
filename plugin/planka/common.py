@@ -84,7 +84,7 @@ DOC_DIRS = ("context/", "docs/")
 CODE_EXTS = {
     "go", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx", "java", "kt", "kts", "swift",
     "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "dart", "rs", "scala", "m", "mm", "cs",
-    "py", "pyi", "sh", "bash", "zsh", "rb", "pl", "toml", "yaml", "yml", "mk", "makefile", "cmake", "cfg",
+    "py", "pyi", "sh", "bash", "zsh", "rb", "pl", "pm", "toml", "yaml", "yml", "mk", "makefile", "cmake", "cfg",
     "ini", "ps1",
     "sql", "lua", "hs",
     "html", "xml", "vue", "svelte", "css", "scss", "sass", "less",
@@ -252,10 +252,11 @@ class Transcript:
 
     model — message.model последнего ответа ассистента основной ветки, кроме служебных моделей вида «<…>»;
     plan_file — последний attachment.planFilePath; turn_messages — непустые тексты ответов ассистента основной
-    ветки после последней реплики автора, по порядку; author_turn — текст этой реплики и сообщений человека,
-    отправленных посреди хода после неё; author_answers —
+    ветки после последней реплики автора, по порядку; author_turn — текст этой реплики, сообщений человека,
+    отправленных посреди хода после неё, и ответов автора при отклонении инструмента; author_answers —
     тексты ответов на вызовы AskUserQuestion после неё; message_before_author — последнее непустое сообщение
-    ассистента до неё.
+    ассистента до неё; earlier_turns — непустые прежние реплики основной ветки от старых к новым, каждая
+    собрана как author_turn, ответы на AskUserQuestion дописаны к ней через перевод строки.
     """
     model: str | None = None
     plan_file: pathlib.Path | None = None
@@ -263,6 +264,7 @@ class Transcript:
     author_turn: str = ""
     author_answers: list = dataclasses.field(default_factory=list)
     message_before_author: str = ""
+    earlier_turns: list = dataclasses.field(default_factory=list)
 
 
 def _text_blocks(content):
@@ -288,18 +290,41 @@ def _origin_kind(obj):
     return origin.get("kind") if isinstance(origin, dict) else None
 
 
-def _is_author_turn(entry, msg, origin_seen):
+def _has_origin(entry):
+    """Есть ли поле origin у записи или её вложения."""
+    att = entry.get("attachment")
+    return "origin" in entry or isinstance(att, dict) and "origin" in att
+
+
+def _transcript_has_origin(path):
+    """Есть ли в файле JSONL path запись с origin (_has_origin); чтение до первой такой записи.
+    OSError и ValueError — наружу."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if '"origin"' not in line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(entry, dict) and _has_origin(entry):
+                return True
+    return False
+
+
+def _is_author_turn(entry, msg, origin_format):
     """Реплика автора: запись user основной ветки, которую написал человек.
 
     Записи isMeta — служебные вставки Claude Code (тело навыка, оговорки команд, сообщения peer), они приходят
     и посреди реплики. С origin — только origin.kind == "human": task-notification и peer — не человек.
-    Без origin в транскрипте, где origin уже встречался, — локальные команды и их вывод; в транскрипте без
-    origin (origin_seen ложно) — запись с текстом без tool_result."""
+    Без origin в транскрипте, где origin есть хоть у одной записи (origin_format), — локальные команды и их
+    вывод, в том числе записанные раньше первой записи с origin; в транскрипте без origin — запись с текстом
+    без tool_result."""
     if entry.get("isMeta"):
         return False
     if "origin" in entry:
         return _origin_kind(entry) == "human"
-    if origin_seen:
+    if origin_format:
         return False
     content = msg.get("content")
     if isinstance(content, str):
@@ -308,6 +333,22 @@ def _is_author_turn(entry, msg, origin_seen):
         return False
     kinds = {b.get("type") for b in content if isinstance(b, dict)}
     return "text" in kinds and "tool_result" not in kinds
+
+
+def _rejection_feedback(entry):
+    """Ответ автора при отклонении инструмента: userFeedback записи с toolDenialKind "user-rejected" и
+    permissionDecision.source "user_reject"; нет — "". Отказы правилом, хуком и классификатором автоматического
+    режима (permission-rule, automode-blocked) — не автор."""
+    decision = entry.get("permissionDecision")
+    if entry.get("toolDenialKind") != "user-rejected" or not isinstance(decision, dict) \
+            or decision.get("source") != "user_reject":
+        return ""
+    feedback = entry.get("userFeedback")
+    return feedback if isinstance(feedback, str) else ""
+
+
+def _join(*texts):
+    return "\n".join(t for t in texts if t)
 
 
 def read_transcript(path):
@@ -320,8 +361,8 @@ def read_transcript(path):
     path = input_path(path)
     plan = None
     asked = set()
-    origin_seen = False
     try:
+        origin_format = _transcript_has_origin(path)
         with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 try:
@@ -337,18 +378,23 @@ def read_transcript(path):
                 # Сообщение человека посреди хода — вложение queued_command, оно дополняет реплику, не начинает новую.
                 if (isinstance(att, dict) and att.get("type") == "queued_command" and not entry.get("isSidechain")
                         and not att.get("isMeta") and _origin_kind(att) == "human"):
-                    out.author_turn = "\n".join(t for t in (out.author_turn, *_text_blocks(att.get("prompt"))) if t)
-                origin_seen = origin_seen or "origin" in entry or isinstance(att, dict) and "origin" in att
+                    out.author_turn = _join(out.author_turn, *_text_blocks(att.get("prompt")))
                 msg = entry.get("message")
                 if entry.get("isSidechain") or not isinstance(msg, dict):
                     continue
                 content = msg.get("content")
-                if entry.get("type") == "user" and _is_author_turn(entry, msg, origin_seen):
+                if entry.get("type") == "user" and _is_author_turn(entry, msg, origin_format):
                     if out.turn_messages:
                         out.message_before_author = out.turn_messages[-1]
+                    earlier = _join(out.author_turn, *out.author_answers)
+                    if earlier:
+                        out.earlier_turns.append(earlier)
                     out.author_turn = "\n".join(_text_blocks(content))
                     out.author_answers, out.turn_messages = [], []
                     asked.clear()
+                elif entry.get("type") == "user" and entry.get("toolDenialKind"):
+                    # Ответ при отклонении — указание автора посреди хода; его tool_result — не ответ AskUserQuestion.
+                    out.author_turn = _join(out.author_turn, _rejection_feedback(entry))
                 elif entry.get("type") == "user" and isinstance(content, list):
                     out.author_answers += [_result_text(b.get("content")) for b in content
                                            if isinstance(b, dict) and b.get("type") == "tool_result"
@@ -406,11 +452,12 @@ def _utf8(text):
     """Текст для claude байтами UTF-8 при любой локали: claude читает argv и stdin в UTF-8.
 
     Суррогат U+DC80..U+DCFF — байт пути, декодированного os.fsdecode, — уходит исходным байтом: в локали
-    не UTF-8 так путь с кириллицей доходит буквами. Прочие одиночные суррогаты — «?»."""
+    не UTF-8 так путь с кириллицей доходит буквами. Прочие одиночные суррогаты — «?», остальной текст как есть."""
     try:
         return text.encode("utf-8", "surrogateescape")
     except UnicodeEncodeError:
-        return text.encode("utf-8", "replace")
+        return "".join("?" if "\ud800" <= c <= "\udfff" and not "\udc80" <= c <= "\udcff" else c
+                       for c in text).encode("utf-8", "surrogateescape")
 
 
 def run_judge(system_prompt, user_prompt, model, *, timeout=JUDGE_TIMEOUT):
@@ -436,7 +483,8 @@ def run_judge(system_prompt, user_prompt, model, *, timeout=JUDGE_TIMEOUT):
         _kill_group(proc)
         return _skipped(f"обмен с claude не удался: {e}")
     stdout, stderr = out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
-    line = next((l for l in stdout.splitlines() if l.startswith("{")), None)
+    # Строки ответа — только по "\n": U+2028, U+2029 и U+0085 JSON оставляет символами внутри строки.
+    line = next((l for l in stdout.split("\n") if l.startswith("{")), None)
     if line is None:
         return _skipped("ответ судьи не JSON", f"{stdout[:200]!r} {stderr[:200]!r}")
     try:
@@ -527,23 +575,81 @@ def deny_budget_exhausted(session_id, prompt_id, hook):
     return before >= MAX_DENIES
 
 
+def _git_out(base, timeout, *args):
+    """stdout `git <args>` в каталоге base байтами; None при коде не 0, сбое или таймауте timeout с."""
+    try:
+        proc = subprocess.run(["git", *args], cwd=base, capture_output=True, timeout=timeout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _same_dir(a, b):
+    """Один ли каталог a и b; ошибка stat — True."""
+    try:
+        return os.path.samefile(a, b)
+    except (OSError, ValueError):
+        return True
+
+
+def _existing_dir(path):
+    """path, если это каталог, иначе ближайший существующий каталог-предок."""
+    while not os.path.isdir(path) and os.path.dirname(path) != path:
+        path = os.path.dirname(path)
+    return path
+
+
+def _home_or_above(top):
+    """top — домашний каталог пользователя (~) или его предок; символические ссылки разрешены. Нет дома или
+    ошибка — False."""
+    home = os.path.expanduser("~")
+    if not os.path.isabs(home):
+        return False
+    try:
+        home, top = os.path.realpath(home), os.path.realpath(top)
+        return os.path.commonpath([home, top]) == top
+    except (OSError, ValueError):
+        return False
+
+
 def project_root(cwd):
     """Корень проекта сессии: вершина git-репозитория для CLAUDE_PROJECT_DIR, без неё — для cwd;
-    вне репозитория — сам каталог.
+    вне репозитория — сам каталог. Каталога нет — git спрашивается из ближайшего существующего предка.
 
+    Вершина — домашний каталог или его предок, CLAUDE_PROJECT_DIR ниже неё и репозиторий не отслеживает под
+    ним ни одного файла (проект без своего git под домашним каталогом-репозиторием dotfiles) — корень сам
+    каталог: репозиторий выше — не репозиторий проекта, git о таком корне спрашивается с окружением git_env.
+    Сбой этой проверки — вершина. Под любой другой вершиной (монорепозиторий) корень — вершина, в том числе
+    для нового или исключённого .gitignore подкаталога.
     CLAUDE_PROJECT_DIR — каталог запуска сессии, после cd агента он не меняется; cwd хука меняется.
     cwd — путь из входа хука, он приводится к кодировке файловой системы (input_path).
+    Оба вызова git вместе — не дольше GIT_ROOT_TIMEOUT.
     """
-    base = os.environ.get("CLAUDE_PROJECT_DIR") or input_path(cwd)
-    try:
-        proc = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=base, capture_output=True,
-                              timeout=GIT_ROOT_TIMEOUT)
-        top = proc.stdout.strip()
-        if proc.returncode == 0 and top:
-            return pathlib.Path(os.fsdecode(top))
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
-    return pathlib.Path(base)
+    launch = os.environ.get("CLAUDE_PROJECT_DIR")
+    base = launch or input_path(cwd)
+    found = _existing_dir(base)
+    deadline = time.monotonic() + GIT_ROOT_TIMEOUT
+    top = _git_out(found, GIT_ROOT_TIMEOUT, "rev-parse", "--show-toplevel")
+    top = top.strip() if top else None
+    if not top:
+        return pathlib.Path(base)
+    top = pathlib.Path(os.fsdecode(top))
+    if launch and _home_or_above(top) and (found != base or not _same_dir(top, base)):
+        left = deadline - time.monotonic()
+        tracked = _git_out(found, left, "--literal-pathspecs", "ls-files", "-z", "--cached", "--",
+                           os.path.relpath(base, found)) if left > 0 else None
+        if tracked == b"":
+            return pathlib.Path(base)
+    return top
+
+
+def git_env(root):
+    """Окружение вызова git о проекте с корнем root (project_root): GIT_CEILING_DIRECTORIES с родителем root
+    (символические ссылки разрешены) первым — git ищет репозиторий в root и ниже, но не выше: корень, который
+    project_root отделил от репозитория выше, остаётся вне git. Вызов идёт из root или каталога под ним."""
+    ceiling = os.path.dirname(os.path.realpath(root))
+    inherited = os.environ.get("GIT_CEILING_DIRECTORIES")
+    return dict(os.environ, GIT_CEILING_DIRECTORIES=f"{ceiling}{os.pathsep}{inherited}" if inherited else ceiling)
 
 
 def is_doc_path(relpath):

@@ -2,22 +2,26 @@
 import dataclasses
 import re
 
-# Заголовок ATX: уровень — число `#`; остаток строки разбирает _atx_text, закрывающие `#` отбрасываются.
-_ATX = re.compile(r"^\s{0,3}(#{1,6})(.*)$")
+# Заголовок ATX: уровень — число `#`, от 1 до 6; остаток строки разбирает _atx_text, закрывающие `#`
+# отбрасываются.
+_ATX = re.compile(r"^\s{0,3}(#{1,6})(?!#)(.*)$")
 # Подчёркивание setext: `===` — уровень 1, `---` — уровень 2.
 _SETEXT = re.compile(r"^\s{0,3}(=+|-+)\s*$")
-# Уровень строки целиком жирным (`**Волна 1**`): глубже любого ATX.
+# Уровень строки целиком жирным (`**Волна 1**`): глубже любого ATX. Жирная волна получает уровень
+# первого заголовка своей задачи; до него её закрывает любой заголовок не волны и не задачи.
 _BOLD_LEVEL = 7
 _WAVE = re.compile(r"^(?:Волна|Wave)\s+(\d+)(?!\d)", re.IGNORECASE)
 # Волна строкой жирным: за номером — разделитель или конец.
 _WAVE_BOLD = re.compile(r"^(?:Волна|Wave)\s+(\d+)\s*(?:[:.—–(-].*)?$", re.IGNORECASE)
 _TASK = re.compile(r"^(?:Задача|Task)\s+(\d+(?:\.\d+)*)(?:\s*\(([^()]*)\))?\s*(?:[:.—–-]\s*(.*))?$",
                    re.IGNORECASE)
-_FILES_HEAD = re.compile(r"^\**\s*(?:Файлы|Файл|Files|File)\s*\**\s*:\s*\**\s*(.*)$", re.IGNORECASE)
+_FILES_HEAD = re.compile(r"^\**\s*(?:Файлы|Файл|Files|File)[\s*]*:[\s*]*(.*)$", re.IGNORECASE)
 _ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.*)$")
 _ITEM_MARK = re.compile(r"^(?:[-*+]|\d+[.)])\s+")
+# Префикс владения: глагол, необязательная пометка в скобках (`Create (temp only):`), двоеточие.
 _PREFIX = re.compile(r"^\**\s*(?:Create|Created|Modify|Modified|Test|Tests|Delete|Deleted|Update|Updated|Edit|"
-                     r"Создать|Изменить|Тест|Тесты|Удалить|Обновить)\s*\**\s*:\s*\**\s*", re.IGNORECASE)
+                     r"Создать|Изменить|Тест|Тесты|Удалить|Обновить)(?:\s*\([^()]*\))?[\s*]*:[\s*]*",
+                     re.IGNORECASE)
 _NO_FILES = {"", "нет", "none", "empty", "—", "-"}
 # Серия путей в обратных кавычках: между путями — пробелы, запятые и пометки в скобках.
 _SEP = re.compile(r"[\s,;]*")
@@ -34,7 +38,7 @@ _READ_NOTE = re.compile(
     r"read[\s-]?only|read(?:ing|\s+access)?|(?:no|without)\s+changes?|unchanged|"
     r"reference(?:\s+only)?|context(?:\s+only)?|imports?\s+only|import|"
     r"(?:do\s+not|don['’]t)\s+(?:modify|edit|touch|change))"
-    r"[\s*_]*(?:$|[,;:.]|\s+[—–-])", re.IGNORECASE)
+    r"(?:[\s*_]*(?:$|[,;:.])|[\s*_]*\s[—–-])", re.IGNORECASE)
 _FENCE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
 # Пункт целиком из путей: `…` или слова с `.` или `/` через пробелы, запятые и пометки в скобках; `…` с
 # пробелом путём не станет в _paths. _is_whole_path разбирает пункт за время, линейное по его длине.
@@ -141,7 +145,7 @@ def _split(fragment):
         if check_read and last is not None and dash and _READ_NOTE.match(text, dash.end()):
             out[last] = ""
         return [p for p in out if p], text[pos:]
-    text, note = _trailing_note(text)
+    text, note = _trailing_note(text.rstrip().rstrip(".;"))
     read_last = check_read and note is not None and _READ_NOTE.match(note)
     text = text.strip().strip("*_").strip().rstrip(".;").strip()
     first = text.split()[0].lower().strip(".,;:*_") if text else ""
@@ -194,14 +198,17 @@ def _structure_lines(text):
                 fence = None
             yield None
             continue
-        while (start := line.find("<!--")) >= 0:
+        kept, pos = [], 0
+        while (start := line.find("<!--", pos)) >= 0:
+            kept.append(line[pos:start])
             end = line.find("-->", start + 4)
             if end < 0:
-                line = line[:start]
                 in_comment = True
+                pos = len(line)
                 break
-            line = line[:start] + line[end + 3:]
-        yield line
+            pos = end + 3
+        kept.append(line[pos:])
+        yield "".join(kept)
 
 
 def _unbold(text):
@@ -235,7 +242,7 @@ def parse_plan(text):
     """Задачи плана с файлами; None, если ни у одной задачи нет файлов.
 
     Любой заголовок закрывает текущую задачу; заголовок не волны и не задачи уровнем не глубже
-    заголовка волны закрывает волну.
+    заголовка волны закрывает волну; уровень жирной волны — см. _BOLD_LEVEL.
     """
     tasks = []
     wave, wave_level = None, None
@@ -257,6 +264,8 @@ def parse_plan(text):
             if m := _WAVE.match(title):
                 wave, wave_level = int(m.group(1)), level
             elif m := _TASK.match(title):
+                if wave_level == _BOLD_LEVEL:
+                    wave_level = level
                 current = PlanTask(wave=wave, number=m.group(1),
                                    title=(m.group(3) or m.group(2) or "").strip(), files=[])
                 tasks.append(current)

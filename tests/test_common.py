@@ -78,6 +78,10 @@ class PhilosophyTest(unittest.TestCase):
         self.assertLess(text.index("## Планы"), text.index("## Решения"))
         self.assertNotIn("## Поведение", text)
         self.assertIn("Правило планов два.", text)
+        # Заголовок «###» — часть раздела, а не начало нового.
+        self.assertIn("### Подраздел", text)
+        self.assertLess(text.index("## Решения"), text.index("### Подраздел"))
+        self.assertIn("Правило подраздела решений.", text)
 
     def test_missing_section_is_none(self):
         common._reset()
@@ -89,6 +93,13 @@ class PhilosophyTest(unittest.TestCase):
         common._reset()
         self.assertIsNone(common.philosophy_text())
         self.assertEqual(common._messages, [f"planka: нет файла правил {self.env.root / 'philosophy.md'}"])
+
+    def test_non_utf8_file_is_none(self):
+        (self.env.root / "philosophy.md").write_bytes(b"## \xff\xfe\n")
+        common._reset()
+        self.assertIsNone(common.philosophy_text())
+        self.assertIsNone(common.philosophy_sections("Решения"))
+        self.assertEqual(common._messages, [f"planka: файл правил {self.env.root / 'philosophy.md'} не в UTF-8"] * 2)
 
 
 class RulesTest(unittest.TestCase):
@@ -326,6 +337,63 @@ class RunJudgeTest(unittest.TestCase):
         reason = 'он сказал "нет" \\ и \n всё'
         v = self.judge(PLANKA_STUB="deny", PLANKA_STUB_REASON=reason)
         self.assertEqual(v.reason, reason)
+
+    def test_reason_with_unicode_line_separators(self):
+        # JSON.stringify claude оставляет U+2028, U+2029 и U+0085 в строке символами: ответ — одна строка.
+        reason = "до\u2028после\u2029и\u0085конец"
+        v = self.judge(PLANKA_STUB="deny", PLANKA_STUB_REASON=reason)
+        self.assertEqual((v.ok, v.reason, v.error), (False, reason, None))
+
+    def test_structured_output_without_ok_is_error(self):
+        v = self.judge(PLANKA_STUB="noOk")
+        self.assertTrue(v.ok)
+        self.assertEqual(v.violated, [])
+        self.assertEqual(v.error, "в ответе судьи нет structured_output")
+
+    def test_default_timeout_is_judge_timeout(self):
+        proc = mock.Mock(pid=1)
+        proc.communicate.return_value = (b'{"structured_output": {"ok": true}}\n', b"")
+        with mock.patch("subprocess.Popen", return_value=proc), \
+             mock.patch.dict(os.environ, self.base, clear=True):
+            v = common.run_judge("S", "U", None)
+        self.assertEqual((v.ok, v.error), (True, None))
+        self.assertEqual(proc.communicate.call_args.kwargs["timeout"], common.JUDGE_TIMEOUT)
+
+    def test_exchange_failure_kills_group(self):
+        proc = mock.Mock(pid=4242)
+        proc.communicate.side_effect = OSError("обрыв")
+        with mock.patch("subprocess.Popen", return_value=proc), mock.patch.object(common.os, "killpg") as killpg, \
+             mock.patch.dict(os.environ, self.base, clear=True):
+            v = common.run_judge("S", "U", None)
+        self.assertTrue(v.ok)
+        self.assertTrue(v.error.startswith("обмен с claude не удался"), v.error)
+        killpg.assert_called_once_with(4242, signal.SIGKILL)
+
+    def test_foreign_surrogate_in_prompt_reaches_judge(self):
+        rec = self.env.data / "rec.txt"
+        with mock.patch.dict(os.environ, {**self.base, "PLANKA_STUB_RECORD": str(rec)}, clear=True):
+            v = common.run_judge("СИС\ud800", "путь\ud800", None, timeout=3)
+        self.assertEqual((v.ok, v.error), (True, None))
+        text = rec.read_text(encoding="utf-8")
+        self.assertEqual(self.argv_of(text)[-1], "СИС?")
+        self.assertIn("STDIN\nпуть?ENV", text)
+
+
+class Utf8Test(unittest.TestCase):
+    def test_path_bytes_kept_and_foreign_surrogates_replaced(self):
+        # \udcff — байт 0xff пути после os.fsdecode; \ud800 и \udc7f — не байты пути.
+        self.assertEqual(common._utf8("путь/\udcffимя"), "путь/".encode("utf-8") + b"\xff" + "имя".encode("utf-8"))
+        self.assertEqual(common._utf8("путь/\udcff\ud800\udc7f"), "путь/".encode("utf-8") + b"\xff??")
+        self.assertEqual(common._utf8("\ud800кириллица"), "?кириллица".encode("utf-8"))
+
+
+class HasOriginTest(unittest.TestCase):
+    def test_origin_of_entry_or_attachment(self):
+        self.assertTrue(common._has_origin({"origin": {"kind": "human"}}))
+        self.assertTrue(common._has_origin({"type": "attachment", "attachment": {"origin": {"kind": "peer"}}}))
+        for entry in ({}, {"attachment": {}}, {"attachment": "origin"}, {"attachment": ["origin"]},
+                      {"message": {"origin": {"kind": "human"}}}):
+            self.assertFalse(common._has_origin(entry), entry)
 
 
 class JudgeModelTest(unittest.TestCase):
@@ -572,24 +640,31 @@ class ReadTranscriptTest(unittest.TestCase):
         # task-notification, peer, локальные команды, вставки isMeta, записи system, вложения хуков и
         # tool_result со списком блоков не сбрасывают реплику; ответ только с thinking — не сообщение; результат
         # инструмента не AskUserQuestion — не ответ автора. Сообщение человека посреди хода (queued_command
-        # с origin human) дописывается к реплике.
+        # с origin human) и ответ автора при отклонении инструмента (user-rejected) дописываются к реплике;
+        # отказы permission-rule и automode-blocked — не автор.
         t = self.read_corpus()
         self.assertEqual((t.author_turn, t.author_answers, t.message_before_author),
-                         ("реплика-1\nреплика-1-посреди", ["ответ-автора-1"], "ответ-навык"))
+                         ("реплика-1\nреплика-1-посреди\nотказ-автора-1", ["ответ-автора-1"], "ответ-навык"))
+        # Локальные команды и их вывод до первой записи с origin — тоже не реплики: origin есть в транскрипте.
+        self.assertEqual(t.earlier_turns, [
+            "реплика-0", "<command-message>skill</command-message><command-name>/skill</command-name>"])
         self.assertEqual(t.turn_messages, ["ответ-1-а", "ответ-1-б", "ответ-1-в", "ответ-пиру", "ответ-последний",
                                            "ответ-после-агента"])
         self.assertEqual((t.model, t.plan_file), ("claude-opus-5-5", None))
 
     def test_corpus_prefixes(self):
-        # До первой записи с origin в транскрипте запись пользователя с текстом без tool_result, в том числе
-        # локальная команда, считается репликой автора.
+        # В транскрипте без origin запись пользователя с текстом без tool_result, в том числе локальная команда,
+        # считается репликой автора; с origin где угодно в файле локальные команды до него — не реплики.
         self.assertTrue(self.read_corpus(2).author_turn.startswith("<command-name>"))
-        t = self.read_corpus(8)
-        self.assertEqual((t.author_turn, t.turn_messages), ("реплика-0", ["ответ-0"]))
-        t = self.read_corpus(10)
-        self.assertEqual((t.author_turn, t.turn_messages, t.message_before_author),
+        self.assertEqual(self.read_corpus(6).earlier_turns, [
+            "<command-name>/x</command-name><command-message>x</command-message><command-args></command-args>",
+            "<local-command-stdout>X</local-command-stdout>"])
+        t = self.read_corpus(11)
+        self.assertEqual((t.author_turn, t.turn_messages, t.earlier_turns), ("реплика-0", ["ответ-0"], []))
+        t = self.read_corpus(13)
+        self.assertEqual((t.author_turn, t.turn_messages, t.message_before_author, t.earlier_turns),
                          ("<command-message>skill</command-message><command-name>/skill</command-name>",
-                          ["ответ-навык"], "ответ-0"))
+                          ["ответ-навык"], "ответ-0", ["реплика-0"]))
 
     def test_queued_human_appends_and_keeps_turn(self):
         def queued(prompt, kind="human", meta=False, **extra):
@@ -611,8 +686,57 @@ class ReadTranscriptTest(unittest.TestCase):
         self.assertEqual((t.author_turn, t.author_answers, t.turn_messages), ("р\nп1", ["да"], ["а1", "а2"]))
         self.assertEqual(self.read([queued("одна")]).author_turn, "одна")
 
+    def test_earlier_turns_hold_previous_author_turns(self):
+        ask = {"type": "tool_use", "id": "q1", "name": "AskUserQuestion", "input": {}}
+        human = {"origin": {"kind": "human"}}
+        t = self.read([
+            self.user("заплатку сейчас, рефакторинг потом", **human),
+            self.reply(self.text("спрашиваю"), ask),
+            self.user([{"type": "tool_result", "tool_use_id": "q1", "content": "да, так"}]),
+            {"type": "attachment", "attachment": {"type": "queued_command", "prompt": "и без тестов", **human}},
+            self.user("субагент", isSidechain=True, **human),
+            self.user([self.text("тело навыка")], isMeta=True),
+            self.user("<task-notification>X</task-notification>", origin={"kind": "task-notification"}),
+            self.reply(self.text("сделал")),
+            self.user("вторая", **human),
+            self.reply(self.text("ок")),
+            self.user("продолжай", **human),
+        ])
+        self.assertEqual(t.earlier_turns, ["заплатку сейчас, рефакторинг потом\nи без тестов\nда, так", "вторая"])
+        self.assertEqual((t.author_turn, t.author_answers), ("продолжай", []))
+
+    def test_earlier_turns_empty_on_first_turn(self):
+        self.assertEqual(self.read([self.user("одна"), self.reply(self.text("а"))]).earlier_turns, [])
+
+    @staticmethod
+    def rejected(tid, feedback, **extra):
+        """Отказ автора от инструмента с ответом, форма Claude Code 2.1.293 (корпус transcript-shapes.jsonl)."""
+        text = "The user doesn't want to proceed with this tool use. ... the user said:\n" + feedback
+        entry = {"type": "user", "toolDenialKind": "user-rejected", "userFeedback": feedback,
+                 "permissionDecision": {"decision": "reject", "source": "user_reject"},
+                 "message": {"role": "user", "content": [{"type": "tool_result", "content": text, "is_error": True,
+                                                          "tool_use_id": tid}]}}
+        return {**entry, **extra}
+
+    def test_rejected_tool_feedback_appends_to_author_turn(self):
+        ask = {"type": "tool_use", "id": "q1", "name": "AskUserQuestion", "input": {}}
+        t = self.read([
+            self.user("р", origin={"kind": "human"}),
+            self.reply({"type": "tool_use", "id": "e1", "name": "Edit", "input": {}}),
+            self.rejected("e1", "правь только README"),
+            self.reply(ask),
+            self.rejected("q1", "спроси иначе"),
+            self.rejected("e2", "субагенту", isSidechain=True),
+            self.rejected("e3", "не тот источник", permissionDecision={"decision": "reject", "source": "hook"}),
+            {**self.rejected("e4", "не отказ"), "toolDenialKind": "permission-rule"},
+            self.rejected("e5", ""),
+            self.reply(self.text("понял")),
+        ])
+        self.assertEqual((t.author_turn, t.author_answers, t.turn_messages),
+                         ("р\nправь только README\nспроси иначе", [], ["понял"]))
+
     def test_missing_or_bad_path_is_empty(self):
-        for path in (None, "", 7, "/nonexistent/t.jsonl", self.dir.name, "/a\0b"):
+        for path in (None, "", 7, "/nonexistent/t.jsonl", self.dir.name, "/a\0b", "/x/\ud800.jsonl"):
             self.assertEqual(common.read_transcript(path), common.Transcript(), path)
 
     def test_non_utf8_bytes_do_not_fail(self):
@@ -748,8 +872,9 @@ class WatchdogTest(unittest.TestCase):
         (bin_dir / "claude").chmod(0o755)
         pids_file = self.env.data / "pids.txt"
         env = {**self.base, "PATH": f"{bin_dir}:{self.base['PATH']}", "PLANKA_PIDS": str(pids_file)}
+        # Своя группа хука: сторож при сбое бьёт killpg(0) по группе хука, а не по группе прогона тестов.
         hook = subprocess.Popen([sys.executable, "-c", _HOOK, str(PLANKA_DIR)], stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, start_new_session=True)
         pids = []
         try:
             deadline = time.monotonic() + 10
@@ -979,6 +1104,23 @@ class LogTest(unittest.TestCase):
         self.assertEqual((self.env.data / "judge.log.1").read_text(encoding="utf-8"), old)
         self.assertEqual(len(self.env.log_lines()), 1)
 
+    def test_parallel_writes_around_threshold_lose_nothing(self):
+        # Журнал на байт ниже порога: первая запись переходит порог, вторая переносит файл в judge.log.1.
+        # Замедленный os.replace растягивает окно между проверкой размера и переносом.
+        old = "x" * (common.LOG_MAX_BYTES - 2) + "\n"
+        self.log.write_text(old, encoding="utf-8")
+        real = os.replace
+
+        def slow_replace(*args):
+            time.sleep(0.05)
+            real(*args)
+        with mock.patch("os.replace", side_effect=slow_replace), concurrent.futures.ThreadPoolExecutor(20) as pool:
+            list(pool.map(lambda n: common.log_event("tool", f"s{n}", verdict="ok"), range(20)))
+        rotated = (self.env.data / "judge.log.1").read_text(encoding="utf-8")
+        self.assertTrue(rotated.startswith(old))
+        lines = rotated[len(old):].splitlines() + self.log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(sorted(json.loads(l)["session_id"] for l in lines), sorted(f"s{n}" for n in range(20)))
+
     def test_no_rotation_below_threshold(self):
         old = "x" * (common.LOG_MAX_BYTES - 2) + "\n"
         self.log.write_text(old, encoding="utf-8")
@@ -1063,7 +1205,8 @@ class ProjectRootTest(unittest.TestCase):
         except OSError:
             self.skipTest("файловая система не принимает имя не в UTF-8")
         subprocess.run(["git", "init", "-q", str(root)], check=True)
-        top = common.project_root(str(root))
+        (root / "pkg").mkdir()
+        top = common.project_root(str(root / "pkg"))
         self.assertTrue(top.exists(), top)
         self.assertEqual(top.resolve(), root.resolve())
 
@@ -1079,6 +1222,193 @@ class ProjectRootTest(unittest.TestCase):
 
     def test_null_byte_is_path(self):
         self.assertEqual(common.project_root("/a\0b"), pathlib.Path("/a\0b"))
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_project_dir_with_tracked_files_is_toplevel(self):
+        # Подпроект монорепозитория: под каталогом запуска есть отслеживаемые файлы.
+        git_commit(self.env.project, "pkg/a.py")
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(self.env.project / "pkg")}):
+            self.assertEqual(common.project_root(str(self.env.project / "pkg")).resolve(),
+                             self.env.project.resolve())
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_untracked_subdir_of_monorepo_is_toplevel(self):
+        # Новый подкаталог монорепозитория, подкаталог из .gitignore и удалённый каталог запуска: под ними
+        # ничего не отслеживается, но вершина — не домашний каталог и не его предок: корень — вершина.
+        git_commit(self.env.project, "package.json", "CLAUDE.md", "packages/old/package.json")
+        (self.env.project / ".gitignore").write_text("build/\n", encoding="utf-8")
+        git_commit(self.env.project, ".gitignore")
+        for rel in ("packages/new", "build/out", "packages/gone/src"):
+            sub = self.env.project / rel
+            if rel != "packages/gone/src":
+                sub.mkdir(parents=True)
+            with self.subTest(rel=rel), mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(sub)}):
+                self.assertEqual(common.project_root(str(sub)).resolve(), self.env.project.resolve())
+
+    def test_same_dir_error_is_true(self):
+        self.assertTrue(common._same_dir("/nonexistent/a", "/nonexistent/b"))
+        self.assertTrue(common._same_dir("/a\0b", "/"))
+        self.assertFalse(common._same_dir(str(self.env.project), str(self.env.root)))
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_stat_failure_keeps_toplevel(self):
+        # Сбой сравнения вершины с каталогом запуска под домом-репозиторием — вершина, без вопроса о файлах.
+        git_commit(self.env.project, "a.py")
+        new = self.env.project / "new"
+        new.mkdir()
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(new), "HOME": str(self.env.project)}), \
+                mock.patch.object(common.os.path, "samefile", side_effect=OSError), \
+                mock.patch("subprocess.run", wraps=subprocess.run) as run:
+            self.assertEqual(common.project_root(str(new)).resolve(), self.env.project.resolve())
+        self.assertEqual(len(run.call_args_list), 1)
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_git_calls_share_root_timeout(self):
+        git_commit(self.env.project, "a.py")
+        (self.env.project / "new").mkdir()
+        new = str(self.env.project / "new")
+        # Вершина — домашний каталог. Вторая проверка получает остаток срока; срок вышел — вершина без второго
+        # вызова.
+        for now, timeouts, root in ((3, [common.GIT_ROOT_TIMEOUT, common.GIT_ROOT_TIMEOUT - 3], new),
+                                    (common.GIT_ROOT_TIMEOUT, [common.GIT_ROOT_TIMEOUT], str(self.env.project))):
+            with self.subTest(now=now), \
+                    mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": new, "HOME": str(self.env.project)}), \
+                    mock.patch.object(common.time, "monotonic", side_effect=[100, 100 + now]), \
+                    mock.patch("subprocess.run", wraps=subprocess.run) as run:
+                found = common.project_root(new)
+            self.assertEqual([c.kwargs["timeout"] for c in run.call_args_list], timeouts)
+            self.assertEqual(found.resolve(), pathlib.Path(root).resolve())
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(self.env.project / "new"),
+                                          "HOME": str(self.env.project)}), \
+                mock.patch("subprocess.run", side_effect=[subprocess.run(
+                    ["git", "rev-parse", "--show-toplevel"], cwd=self.env.project, capture_output=True),
+                    subprocess.TimeoutExpired("git", 1)]):
+            # Сбой проверки отслеживаемых файлов — вершина репозитория.
+            self.assertEqual(common.project_root(str(self.env.project / "new")).resolve(),
+                             self.env.project.resolve())
+
+
+def git_commit(repo, *files):
+    """git init repo (если нет) и коммит файлов files с содержимым «x»; конфиг автора — аргументами."""
+    if not (repo / ".git").exists():
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    for rel in files:
+        path = repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-f", "--", *files], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c"],
+                   check=True)
+
+
+@unittest.skipUnless(shutil.which("git"), "нет git")
+class DotfilesHomeTest(unittest.TestCase):
+    """Домашний каталог — репозиторий dotfiles: `git init ~` с status.showUntrackedFiles=no, отслеживаются
+    .bashrc и CLAUDE.md; проект ~/Projects/app без своего git — каталог запуска сессии (CLAUDE_PROJECT_DIR)."""
+
+    def setUp(self):
+        self.env = Env()
+        self.home = pathlib.Path(self.env.environ()["HOME"])
+        git_commit(self.home, ".bashrc", "CLAUDE.md")
+        subprocess.run(["git", "-C", str(self.home), "config", "status.showUntrackedFiles", "no"], check=True)
+        self.project = self.home / "Projects" / "app"
+        (self.project / "src").mkdir(parents=True)
+        (self.project / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+        (self.home / "other.txt").write_text("вне проекта\n", encoding="utf-8")
+        self.patch = mock.patch.dict(os.environ, self.env.environ(CLAUDE_PROJECT_DIR=str(self.project)), clear=True)
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        self.env.close()
+
+    def test_root_is_project_dir(self):
+        self.assertEqual(common.project_root(str(self.project / "src")), self.project)
+
+    def test_relative_home_is_not_home(self):
+        # «.» разрешился бы в текущий каталог процесса.
+        with mock.patch.dict(os.environ, {"HOME": "."}):
+            self.assertFalse(common._home_or_above(os.getcwd()))
+
+    def test_home_given_by_link_and_missing_project_dir(self):
+        # HOME — символьная ссылка на дом-репозиторий; каталог запуска удалён — корень всё равно сам каталог.
+        link = pathlib.Path(self.env.tmp.name) / "homelink"
+        link.symlink_to(self.home)
+        gone = self.home / "Projects" / "gone" / "src"
+        with mock.patch.dict(os.environ, {"HOME": str(link)}):
+            self.assertEqual(common.project_root(str(self.project)), self.project)
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(gone)}):
+            self.assertEqual(common.project_root(str(gone)), gone)
+        # Имя удалённого каталога — путь, а не шаблон: «[ab]» не совпадает с отслеживаемым «a».
+        git_commit(self.home, "a")
+        glob_name = self.home / "[ab]"
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(glob_name)}):
+            self.assertEqual(common.project_root(str(glob_name)), glob_name)
+
+    def test_repository_above_home_is_separated(self):
+        # Репозиторий в предке домашнего каталога: проект без отслеживаемых файлов — сам каталог.
+        shutil.rmtree(self.home / ".git")
+        top = pathlib.Path(self.env.tmp.name)
+        git_commit(top, "home/.bashrc")
+        self.assertEqual(common.project_root(str(self.project)), self.project)
+
+    def test_tracked_dir_under_home_is_toplevel(self):
+        # Каталог dotfiles-репозитория с отслеживаемыми файлами (~/.config/nvim) — часть репозитория дома.
+        git_commit(self.home, ".config/nvim/init.lua")
+        nvim = self.home / ".config" / "nvim"
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(nvim)}):
+            self.assertEqual(common.project_root(str(nvim)).resolve(), self.home.resolve())
+
+    def test_home_under_repository_is_not_ancestor(self):
+        # Репозиторий внутри дома (~/Projects/mono) — не дом и не его предок: новый подкаталог — вершина.
+        mono = self.home / "Projects" / "mono"
+        git_commit(mono, "package.json")
+        (mono / "packages" / "new").mkdir(parents=True)
+        new = mono / "packages" / "new"
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(new)}):
+            self.assertEqual(common.project_root(str(new)).resolve(), mono.resolve())
+
+    def test_cwd_without_project_dir_keeps_toplevel(self):
+        # Без CLAUDE_PROJECT_DIR основа — cwd, он меняется после cd: вершина репозитория остаётся корнем.
+        with mock.patch.dict(os.environ):
+            del os.environ["CLAUDE_PROJECT_DIR"]
+            self.assertEqual(common.project_root(str(self.project)).resolve(), self.home.resolve())
+
+    def test_git_env_stops_discovery_at_root(self):
+        root = common.project_root(str(self.project))
+        out = subprocess.run(["git", "-C", str(root / "src"), "rev-parse", "--show-toplevel"],
+                             capture_output=True, env=common.git_env(root))
+        self.assertNotEqual(out.returncode, 0, out.stdout)
+        # Репозиторий в самом корне и под ним git находит.
+        git_commit(self.project, "src/a.py")
+        out = subprocess.run(["git", "-C", str(root / "src"), "rev-parse", "--show-toplevel"],
+                             capture_output=True, env=common.git_env(root), check=True)
+        self.assertEqual(pathlib.Path(os.fsdecode(out.stdout.strip())).resolve(), self.project.resolve())
+
+    def test_git_env_keeps_existing_ceiling_and_resolves_symlink(self):
+        link = pathlib.Path(self.env.tmp.name) / "link"
+        link.symlink_to(self.project)
+        ceiling = common.git_env(link)["GIT_CEILING_DIRECTORIES"].split(os.pathsep)
+        self.assertEqual(ceiling, [str(self.project.parent.resolve()), os.environ["GIT_CEILING_DIRECTORIES"]])
+
+    def test_snapshot_walks_project_and_sees_change(self):
+        import snapshot
+        root = common.project_root(str(self.project))
+        snap = snapshot.capture(root)
+        self.assertEqual(snap["mode"], "walk")
+        self.assertEqual(list(snap["dirs"]), ["src"])
+        (self.project / "src" / "b.py").write_text("y = 2\n", encoding="utf-8")
+        self.assertEqual(snapshot.changed_since(root, snap), [("src/b.py", True)])
+
+    def test_remind_checks_project_docs_and_snapshots_project(self):
+        r = self.env.run("remind.py", self.env.hook_input("UserPromptSubmit", prompt="x", cwd=str(self.project)),
+                         CLAUDE_PROJECT_DIR=str(self.project))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertIn("Проект без документации", out["hookSpecificOutput"]["additionalContext"])
+        self.assertNotIn("systemMessage", out)
+        snap = json.loads((self.env.data / "state" / "sess-1.snap.json").read_text(encoding="utf-8"))
+        self.assertEqual((snap["mode"], snap["root"]), ("walk", str(self.project)))
 
 
 class KillGroupTest(unittest.TestCase):
@@ -1122,7 +1452,7 @@ class PathKindTest(unittest.TestCase):
             "setup.cfg": "code", "pom.xml": "code", "build.gradle": "code",
             "package-lock.json": "other", "tsconfig.base.json": "other", "docs/package.json": "code",
             "a.cljs": "code", "deps.edn": "code", "a.fsx": "code", "a.fsi": "code", "a.vbs": "code",
-            "a.lisp": "code",
+            "a.lisp": "code", "lib/Foo.pm": "code",
         }
         for path, kind in cases.items():
             self.assertEqual(common.path_kind(path), kind, path)
@@ -1219,3 +1549,21 @@ class WarnOnceTest(unittest.TestCase):
             self.assertEqual(common._messages, ["planka: раз", "planka: два", "planka: три"])
         finally:
             env.close()
+
+
+class EnvIsolationTest(unittest.TestCase):
+    """Env.environ не пропускает к хуку переменные окружения сессии, которые читает код плагина."""
+
+    OUTER = ("PLANKA_JUDGE", "PLANKA_STUB_RECORD", "PLANKA_ANY", "CLAUDE_PLUGIN_OPTION_JUDGE_MODEL",
+             "CLAUDE_PLUGIN_OPTION_COMMENT_LANG", "CLAUDE_PROJECT_DIR", "CLAUDE_CONFIG_DIR",
+             "CLAUDE_CODE_REMOTE_MEMORY_DIR", "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE")
+
+    def test_outer_variables_removed(self):
+        env = Env()
+        try:
+            with mock.patch.dict(os.environ, {name: "/снаружи" for name in self.OUTER}):
+                environ = env.environ()
+        finally:
+            env.close()
+        self.assertEqual([name for name in self.OUTER if name in environ], [])
+        self.assertEqual(environ["PLANKA_STUB"], "ok")

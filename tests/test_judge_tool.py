@@ -91,6 +91,18 @@ class QuestionTest(unittest.TestCase):
         self.assertIn("1. Мьютекс (Recommended) — три строки", text)
         self.assertIn("2. Один писатель — перестроить владение", text)
 
+    def test_judge_gets_earlier_author_turns(self):
+        earlier = "Рефакторинг владения потом, сейчас только заплатка."
+        entries = [{"type": "user", "message": {"role": "user", "content": earlier}},
+                   {"type": "assistant", "message": {"model": "claude-test-model", "content": [
+                       {"type": "text", "text": "Понял."}]}}] + author_entries()
+        self.env.transcript.write_text("".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8")
+        rec = self.env.data / "rec.txt"
+        r = self.ask(PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec))
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertTrue(author_block(rec).startswith("Прежние реплики автора, от старых к новым:\n" + earlier + "\n"))
+        assert_not_logged(self, self.env, earlier)
+
     def test_judge_gets_author_turn_not_logged(self):
         self.env.transcript.write_text("".join(json.dumps(e) + "\n" for e in author_entries()), encoding="utf-8")
         rec = self.env.data / "rec.txt"
@@ -528,6 +540,15 @@ dependencies = ["httpx>=0.27"]
 """
 REQUIREMENTS = "httpx==0.27.0\nrich>=13\n"
 SECRET_NAME = "lodash-secret-name"
+# Файлы зависимостей PyPI без проверки (manifest_watch._LEGACY) из корпуса tests/fixtures/manifests (источник —
+# первая строка файла): имя файла → (текст, два его требования в другой записи — перенос в pyproject.toml).
+FIXTURES = PLANKA_DIR.parent.parent / "tests" / "fixtures" / "manifests"
+LEGACY_SOURCES = {
+    name: ((FIXTURES / rel).read_text(encoding="utf-8"), moved)
+    for name, rel, moved in (("setup.py", "legacy-requests/setup.py", ["IDNA>=2", "certifi"]),
+                             ("setup.cfg", "legacy-pytest/setup.cfg", ["packaging", "Requests"]),
+                             ("Pipfile", "legacy-pipenv/Pipfile", ["Click", "pytz"]))
+}
 
 
 class ManifestEditTest(unittest.TestCase):
@@ -1065,6 +1086,66 @@ class ManifestBashTest(unittest.TestCase):
         self.assertEqual(r.stdout, "")
         self.assertEqual(self.state(), {})
 
+    def test_marker_command_takes_no_snapshot(self):
+        r = self.env.run("judge_tool.py", self.env.hook_input(
+            "PreToolUse", tool_name="Bash", tool_input={"command": "PLANKA_DEP_OK=1 printf 'flask\\n' >> requirements.txt"},
+            tool_use_id="b1"))
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertEqual(self.state(), {})
+
+    def test_block_survives_log_failure(self):
+        pre = self.env.run("judge_tool.py", self.env.hook_input(
+            "PreToolUse", tool_name="Bash", tool_input={"command": "printf 'flask\\n' >> requirements.txt"},
+            tool_use_id="b1"))
+        self.assertEqual(pre.stdout, "", pre.stderr)
+        with open(self.p / "requirements.txt", "a", encoding="utf-8") as f:
+            f.write("flask\n")
+        (self.env.data / "judge.log").mkdir()
+        r = self.env.run("judge_tool.py", self.env.hook_input(
+            "PostToolUse", tool_name="Bash", tool_input={"command": "printf 'flask\\n' >> requirements.txt"},
+            tool_use_id="b1", tool_response={"stdout": "", "stderr": ""}))
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(output(r)["decision"], "block")
+        self.assertIn("flask", output(r)["reason"])
+        self.assertTrue(any("внутренняя ошибка" in m for m in messages(r)), messages(r))
+
+    def test_generator_output_resolved_from_cwd_before_command(self):
+        # Путь вывода генератора — от каталога до команды: cd после генератора меняет cwd входа PostToolUse.
+        r = self.run_command("pip freeze > requirements.txt && cd web", post_cwd=self.p / "web",
+                             effect=f"printf '{self.GENERATED}' > requirements.txt")
+        self.assertEqual(r.stdout, "", r.stderr)
+
+    def test_unparsed_manifest_without_version_unknown(self):
+        # До команды не разобран, версии в репозитории нет: сравнить не с чем — предупреждение, не блок.
+        (self.p / "api").mkdir()
+        (self.p / "api" / "package.json").write_text("{broken", encoding="utf-8")
+        r = self.run_command("printf '{\"dependencies\": {\"axios\": \"1\"}}' > api/package.json")
+        self.assertIsNone(output(r))
+        self.assertEqual(messages(r), ["planka: манифест не разобран до или после команды, новые зависимости не "
+                                       "проверены: api/package.json"])
+        last = self.env.log_lines()[-1]
+        self.assertEqual((last["hook"], last["verdict"]), ("manifest", "skipped"))
+
+    @staticmethod
+    def pyproject_command(deps):
+        """Команда, которая пишет pyproject.toml с зависимостями deps."""
+        return ("printf '[project]\\nname = \"app\"\\ndependencies = [%s]\\n' > pyproject.toml"
+                % ", ".join(f'\\"{d}\\"' for d in deps))
+
+    def test_uncommitted_legacy_source_names_new(self):
+        # setup.py, setup.cfg, Pipfile рабочего дерева (вне git — любые, в git — не в HEAD) не проверяются,
+        # и их имена не известные: перенос из них в pyproject.toml — новые имена.
+        for name, (text, moved) in LEGACY_SOURCES.items():
+            for rel in (name, f"scratch/{name}"):
+                with self.subTest(path=rel):
+                    (self.p / "pyproject.toml").unlink(missing_ok=True)
+                    (self.p / rel).parent.mkdir(exist_ok=True)
+                    (self.p / rel).write_text(text, encoding="utf-8")
+                    r = self.run_command(self.pyproject_command(moved) + f" && rm {rel}")
+                    self.assertFalse((self.p / rel).exists())
+                    self.assert_blocked(r, "pyproject.toml: " + ", ".join(sorted(
+                        m.split(">")[0].lower() for m in moved)))
+
 
 @unittest.skipUnless(shutil.which("git"), "нет git")
 class ManifestBashGitTest(ManifestBashTest):
@@ -1238,6 +1319,336 @@ class ManifestBashGitTest(ManifestBashTest):
         r = self.run_command("mkdir -p vendor && printf 'flask\\n' > vendor/requirements.txt")
         self.assertEqual(r.stdout, "", r.stderr)
 
+    def test_ref_age_is_committer_time_not_author_time(self):
+        # Дата автора коммита в прошлом (`git commit --date`), коммиттер — в сессии: ref молодой.
+        git("checkout", "-qb", "evil", cwd=self.p)
+        with open(self.p / "requirements.txt", "a", encoding="utf-8") as f:
+            f.write("flask\n")
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "evil"], cwd=self.p,
+                       check=True, capture_output=True,
+                       env={**os.environ, "GIT_AUTHOR_DATE": f"@{self.BEFORE} +0000",
+                            "GIT_COMMITTER_DATE": f"@{self.AFTER} +0000"})
+        git("checkout", "-q", "-", cwd=self.p)
+        self.assert_blocked(self.run_command("git checkout evil -- requirements.txt"), "flask")
+
+    def test_committed_legacy_source_moved_to_pyproject_not_new(self):
+        # Перенос из закоммиченного setup.py, setup.cfg, Pipfile в pyproject.toml одной командой: имена из HEAD.
+        for name, (text, moved) in LEGACY_SOURCES.items():
+            with self.subTest(name=name):
+                (self.p / "pyproject.toml").unlink(missing_ok=True)
+                (self.p / name).write_text(text, encoding="utf-8")
+                git("add", name, cwd=self.p)
+                git("commit", "-qm", name, cwd=self.p)
+                r = self.run_command(self.pyproject_command(moved) + f" && git rm -q {name}")
+                self.assertFalse((self.p / name).exists())
+                self.assertEqual(r.stdout, "", r.stderr)
+                r = self.run_command(self.pyproject_command([*moved, "evilpkg"]), tool_use_id="b2")
+                reason = self.assert_blocked(r, "pyproject.toml: evilpkg")
+                self.assertNotIn(moved[1].lower(), reason)
+                git("commit", "-qm", "rm", cwd=self.p)
+
+    def test_removed_manifest_names_in_head_not_new(self):
+        # requirements.txt убран из индекса и дерева, его имена переходят в pyproject.toml следующей командой.
+        r = self.run_command("git rm -q requirements.txt")
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertFalse((self.p / "requirements.txt").exists())
+        r = self.run_command("printf '[project]\\nname = \"app\"\\ndependencies = [\"httpx\", \"Rich>=13\"]\\n' > "
+                             "pyproject.toml", tool_use_id="b2")
+        self.assertEqual(r.stdout, "", r.stderr)
+        r = self.run_command("printf '[project]\\nname = \"app\"\\ndependencies = [\"httpx\", \"evilpkg\"]\\n' > "
+                             "pyproject.toml", tool_use_id="b3")
+        self.assert_blocked(r, "pyproject.toml: evilpkg")
+
+    def test_restored_names_deadline_and_limit_unavailable(self):
+        self.branch_at(self.BEFORE, "old", "flask\n")
+        command = "git checkout old -- requirements.txt"
+        with self.assertRaisesRegex(manifest_watch.Unavailable, "за срок"):
+            manifest_watch.restored_names(self.p, command, self.START, time.monotonic() - 1)
+        # В дереве ref requirements.txt и web/package.json.
+        with mock.patch.object(manifest_watch, "MAX_MANIFESTS", 1), \
+                self.assertRaisesRegex(manifest_watch.Unavailable, "больше 1"):
+            manifest_watch.restored_names(self.p, command, self.START, time.monotonic() + 30)
+
+    def test_restored_names_unreadable_tree_unavailable(self):
+        # Дерево старого ref есть в коммите, но объекта дерева нет (повреждённый репозиторий): ls-tree не читает.
+        self.branch_at(self.BEFORE, "old", "flask\n")
+        tree = run_git(self.p, "rev-parse", "old^{tree}").stdout.strip()
+        (self.p / ".git" / "objects" / tree[:2] / tree[2:]).unlink()
+        with self.assertRaisesRegex(manifest_watch.Unavailable, f"дерево ref {tree} не прочитано"):
+            manifest_watch.restored_names(self.p, "git checkout old -- requirements.txt", self.START,
+                                          time.monotonic() + 30)
+
+    def test_restored_names_timeout_skips_snapshot_with_warning(self):
+        self.branch_at(self.BEFORE, "old", "flask\n")
+        with mock.patch.object(manifest_watch, "_old_trees", side_effect=TimeoutError("не уложился в срок")):
+            out = run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                "PreToolUse", tool_name="Bash", tool_input={"command": "git checkout old -- requirements.txt"},
+                tool_use_id="b1"))
+        self.assertEqual(out, {"systemMessage": "planka: снимок манифестов не снят (имена ref команды не прочитаны "
+                                                "за срок): новые зависимости от команд Bash не проверяются"})
+        self.assertEqual(self.state(), {})
+        last = self.env.log_lines()[-1]
+        self.assertEqual((last["hook"], last["verdict"]), ("manifest", "skipped"))
+
+
+def run_git(cwd, *args, input=None):
+    """git без проверки кода (команда с конфликтом завершается с ошибкой) со строкой stdin input."""
+    return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args], cwd=cwd, capture_output=True,
+                          text=True, input=input)
+
+
+@unittest.skipUnless(shutil.which("git"), "нет git")
+class ManifestConflictTest(unittest.TestCase):
+    """Конфликт операций, которые ref в _REPO_REFS не оставляют (`git stash pop`, `git merge --squash`,
+    `git cherry-pick -n`): имена сторон — в индексе (:1:, :2:, :3:), разрешение конфликта не новое."""
+
+    BASE = '{\n  "name": "app",\n  "dependencies": {\n    "a": "1"\n  }\n}\n'
+    OURS = BASE.replace('"a": "1"', '"a": "2"')
+    THEIRS = BASE.replace('"a": "1"', '"a": "3",\n    "authordep": "1"')
+    RESOLVED = BASE.replace('"a": "1"', '"a": "2",\n    "authordep": "1"')
+    OPS = ("stash pop", "merge --squash feat", "cherry-pick -n feat")
+
+    def conflicted(self, op):
+        """Env с репозиторием, где op оставила конфликт в package.json: наша сторона — OURS, их — THEIRS."""
+        env = Env()
+        self.addCleanup(env.close)
+        p = env.project
+        git("init", "-q", cwd=p)
+        (p / "package.json").write_text(self.BASE, encoding="utf-8")
+        git("add", ".", cwd=p)
+        git("commit", "-qm", "base", cwd=p)
+        if op.startswith("stash"):
+            (p / "package.json").write_text(self.THEIRS, encoding="utf-8")
+            git("stash", "-q", cwd=p)
+        else:
+            git("checkout", "-qb", "feat", cwd=p)
+            (p / "package.json").write_text(self.THEIRS, encoding="utf-8")
+            git("commit", "-qam", "feat", cwd=p)
+            git("checkout", "-q", "-", cwd=p)
+        (p / "package.json").write_text(self.OURS, encoding="utf-8")
+        git("commit", "-qam", "ours", cwd=p)
+        r = run_git(p, *op.split())
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("<<<<<<<", (p / "package.json").read_text(encoding="utf-8"))
+        return env
+
+    def tool(self, env, tool, **tool_input):
+        return env.run("judge_tool.py", env.hook_input(
+            "PreToolUse", tool_name=tool, tool_input={"file_path": str(env.project / "package.json"), **tool_input}))
+
+    def test_write_and_edit_resolution_pass(self):
+        for op in self.OPS:
+            with self.subTest(op=op):
+                env = self.conflicted(op)
+                r = self.tool(env, "Write", content=self.RESOLVED)
+                self.assertEqual(r.stdout, "", r.stderr)
+                current = (env.project / "package.json").read_text(encoding="utf-8")
+                r = self.tool(env, "Edit", old_string=current, new_string=self.RESOLVED)
+                self.assertEqual(r.stdout, "", r.stderr)
+                # Имя ни одной из сторон — новое.
+                r = self.tool(env, "Write", content=self.RESOLVED.replace('"a": "2"', '"a": "2",\n    "evilpkg": "1"'))
+                reason = output(r)["hookSpecificOutput"]["permissionDecisionReason"]
+                self.assertIn("evilpkg", reason)
+                self.assertNotIn("authordep", reason)
+
+    def test_checkout_theirs_passes(self):
+        command = "git checkout --theirs package.json"
+        for op in self.OPS:
+            with self.subTest(op=op):
+                env = self.conflicted(op)
+                pre = env.run("judge_tool.py", env.hook_input(
+                    "PreToolUse", tool_name="Bash", tool_input={"command": command}, tool_use_id="b1"))
+                self.assertEqual(pre.stdout, "", pre.stderr)
+                run_git(env.project, *command.split()[1:])
+                self.assertIn("authordep", (env.project / "package.json").read_text(encoding="utf-8"))
+                r = env.run("judge_tool.py", env.hook_input(
+                    "PostToolUse", tool_name="Bash", tool_input={"command": command}, tool_use_id="b1",
+                    tool_response={"stdout": "", "stderr": ""}))
+                self.assertEqual(r.stdout, "", r.stderr)
+
+    def test_rebase_source_after_resolution(self):
+        # Конфликт git rebase разрешён нашей стороной и `git add` (сторон в индексе нет); имя из
+        # перебазируемого коммита (REBASE_HEAD) возвращается правкой — не новое.
+        env = Env()
+        self.addCleanup(env.close)
+        p = env.project
+        git("init", "-q", cwd=p)
+        (p / "package.json").write_text(self.BASE, encoding="utf-8")
+        git("add", ".", cwd=p)
+        git("commit", "-qm", "base", cwd=p)
+        git("checkout", "-qb", "feat", cwd=p)
+        (p / "package.json").write_text(self.THEIRS, encoding="utf-8")
+        git("commit", "-qam", "feat", cwd=p)
+        git("checkout", "-q", "-", cwd=p)
+        (p / "package.json").write_text(self.OURS, encoding="utf-8")
+        git("commit", "-qam", "ours", cwd=p)
+        main = run_git(p, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        git("checkout", "-q", "feat", cwd=p)
+        self.assertNotEqual(run_git(p, "rebase", main).returncode, 0)
+        (p / "package.json").write_text(self.OURS, encoding="utf-8")
+        git("add", "package.json", cwd=p)
+        self.assertEqual(run_git(p, "ls-files", "-u").stdout, "")
+        self.assertTrue((p / ".git" / "REBASE_HEAD").exists())
+        r = self.tool(env, "Write", content=self.RESOLVED)
+        self.assertEqual(r.stdout, "", r.stderr)
+
+
+    def test_each_index_stage_read(self):
+        # Стадии 1, 2, 3 записаны в индекс в форме `git ls-files -s` конфликтного файла, у каждой своё имя;
+        # head_names видит имя каждой стадии, а имя рабочего дерева — нет.
+        env = Env()
+        self.addCleanup(env.close)
+        p = env.project
+        git("init", "-q", cwd=p)
+        (p / "package.json").write_text(self.BASE, encoding="utf-8")
+        git("add", ".", cwd=p)
+        git("commit", "-qm", "base", cwd=p)
+        lines = []
+        for stage in (1, 2, 3):
+            blob = run_git(p, "hash-object", "-w", "--stdin", input=self.BASE.replace('"a"', f'"stage{stage}"'))
+            lines.append(f"100644 {blob.stdout.strip()} {stage}\tpackage.json\n")
+        run_git(p, "rm", "-q", "--cached", "package.json")
+        r = run_git(p, "update-index", "--index-info", input="".join(lines))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(run_git(p, "ls-files", "-u").stdout.splitlines()), 3)
+        (p / "package.json").write_text(self.BASE.replace('"a"', '"tree"'), encoding="utf-8")
+        names = manifest_watch.head_names(str(p / "package.json"), "package.json", 10)
+        self.assertEqual(names, {"a", "stage1", "stage2", "stage3"})
+
+
+@unittest.skipUnless(shutil.which("git"), "нет git")
+class ManifestTransferEditTest(unittest.TestCase):
+    """Правка файловым инструментом переносит имена из другого файла зависимостей того же реестра: убранного из
+    рабочего дерева манифеста версии HEAD, setup.py, setup.cfg, Pipfile."""
+
+    def setUp(self):
+        self.env = Env()
+        self.p = self.env.project
+        git("init", "-q", cwd=self.p)
+
+    def tearDown(self):
+        self.env.close()
+
+    def write_pyproject(self, deps):
+        content = f'[project]\nname = "app"\ndependencies = [{", ".join(chr(34) + d + chr(34) for d in deps)}]\n'
+        return self.env.run("judge_tool.py", self.env.hook_input(
+            "PreToolUse", tool_name="Write", tool_input={"file_path": str(self.p / "pyproject.toml"),
+                                                         "content": content}))
+
+    def test_removed_manifest_in_head_not_new(self):
+        (self.p / "requirements.txt").write_text("requests\nclick\n", encoding="utf-8")
+        (self.p / "pyproject.toml").write_text('[project]\nname = "app"\ndependencies = []\n', encoding="utf-8")
+        git("add", ".", cwd=self.p)
+        git("commit", "-qm", "i", cwd=self.p)
+        git("rm", "-q", "requirements.txt", cwd=self.p)
+        r = self.env.run("judge_tool.py", self.env.hook_input(
+            "PreToolUse", tool_name="Edit", tool_input={
+                "file_path": str(self.p / "pyproject.toml"), "old_string": "dependencies = []",
+                "new_string": 'dependencies = ["requests>=2", "click"]'}))
+        self.assertEqual(r.stdout, "", r.stderr)
+        r = self.write_pyproject(["requests>=2", "evilpkg"])
+        reason = output(r)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("evilpkg", reason)
+        self.assertNotIn("requests", reason)
+
+    def test_legacy_source_in_head_not_new(self):
+        for name, (text, moved) in LEGACY_SOURCES.items():
+            with self.subTest(name=name):
+                (self.p / name).write_text(text, encoding="utf-8")
+                git("add", name, cwd=self.p)
+                git("commit", "-qm", name, cwd=self.p)
+                git("rm", "-q", name, cwd=self.p)
+                self.assertEqual(self.write_pyproject(moved).stdout, "")
+                r = self.write_pyproject([moved[0], "evilpkg"])
+                reason = output(r)["hookSpecificOutput"]["permissionDecisionReason"]
+                self.assertIn("evilpkg", reason)
+                self.assertNotIn(moved[0], reason)
+                git("reset", "-q", "--hard", cwd=self.p)
+
+    def test_legacy_source_in_tree_only_names_new(self):
+        # Обход в два шага: имя в неотслеживаемом или изменённом setup.py, setup.cfg, Pipfile (их правку никто не
+        # проверяет), затем в pyproject.toml — новое.
+        (self.p / "pyproject.toml").write_text('[project]\nname = "app"\ndependencies = ["requests"]\n',
+                                               encoding="utf-8")
+        git("add", ".", cwd=self.p)
+        git("commit", "-qm", "i", cwd=self.p)
+        evil = {"setup.py": "setup(install_requires=['requests', 'evilpkg'])\n",
+                "setup.cfg": "[options]\ninstall_requires =\n    requests\n    evilpkg\n",
+                "Pipfile": '[packages]\nrequests = "*"\nevilpkg = "*"\n'}
+        edit = {"file_path": str(self.p / "pyproject.toml"), "old_string": '["requests"]',
+                "new_string": '["requests", "evilpkg"]'}
+        for name, (text, moved) in LEGACY_SOURCES.items():
+            for rel in (name, f"scratch/{name}"):
+                with self.subTest(path=rel):
+                    (self.p / rel).parent.mkdir(exist_ok=True)
+                    (self.p / rel).write_text(text, encoding="utf-8")
+                    r = self.write_pyproject(moved)
+                    self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny")
+                    (self.p / rel).write_text(evil[name], encoding="utf-8")
+                    r = self.env.run("judge_tool.py", self.env.hook_input(
+                        "PreToolUse", tool_name="Edit", tool_input=edit))
+                    self.assertIn("evilpkg", output(r)["hookSpecificOutput"]["permissionDecisionReason"])
+        # Закоммиченный и затем изменённый setup.py: имена версии HEAD, не рабочего дерева.
+        (self.p / "setup.py").write_text(LEGACY_SOURCES["setup.py"][0], encoding="utf-8")
+        git("add", "setup.py", cwd=self.p)
+        git("commit", "-qm", "setup", cwd=self.p)
+        (self.p / "setup.py").write_text(evil["setup.py"], encoding="utf-8")
+        r = self.env.run("judge_tool.py", self.env.hook_input("PreToolUse", tool_name="Edit", tool_input=edit))
+        self.assertIn("evilpkg", output(r)["hookSpecificOutput"]["permissionDecisionReason"])
+
+
+    def test_setup_py_syntax_warning_not_on_stderr(self):
+        # Разбор setup.py со строкой `"\d"` даёт SyntaxWarning; хук stderr не пишет.
+        (self.p / "setup.py").write_text('import re\nPATTERN = re.compile("\\d+")\nsetup(install_requires=["click"])\n',
+                                         encoding="utf-8")
+        git("add", "setup.py", cwd=self.p)
+        git("commit", "-qm", "setup", cwd=self.p)
+        r = self.write_pyproject(["click"])
+        self.assertEqual((r.stdout, r.stderr), ("", ""))
+
+
+class ManifestFailureBranchesTest(unittest.TestCase):
+    """Сбои проверки манифестов — предупреждение и `skipped` в журнал, не отказ и не блок."""
+
+    def setUp(self):
+        self.env = Env()
+
+    def tearDown(self):
+        self.env.close()
+
+    def post(self):
+        return run_in_process(self.env, judge_tool.main, self.env.hook_input(
+            "PostToolUse", tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="b1",
+            tool_response={"stdout": "", "stderr": ""}))
+
+    def assert_skipped(self, out, message):
+        self.assertEqual(out, {"systemMessage": message})
+        last = self.env.log_lines()[-1]
+        self.assertEqual((last["hook"], last["verdict"], last["error"]), ("manifest", "skipped",
+                                                                          message.removeprefix("planka: ")))
+
+    def test_pop_failure(self):
+        with mock.patch.object(manifest_watch, "pop", side_effect=OSError("диск")):
+            out = self.post()
+        self.assert_skipped(out, "planka: снимок манифестов не прочитан, новые зависимости после команды не "
+                                 "проверены: OSError('диск')")
+
+    def test_compare_failure(self):
+        run_in_process(self.env, judge_tool.main, self.env.hook_input(
+            "PreToolUse", tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="b1"))
+        with mock.patch.object(manifest_watch, "compare", side_effect=PermissionError("нет доступа")):
+            out = self.post()
+        self.assert_skipped(out, "planka: манифесты после команды не проверены: нет доступа")
+
+    def test_edit_timeout(self):
+        path = self.env.project / "requirements.txt"
+        path.write_text("rich\n", encoding="utf-8")
+        with mock.patch.object(manifest_watch, "check_edit", side_effect=TimeoutError("не уложился в срок")):
+            out = run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                "PreToolUse", tool_name="Write", tool_input={"file_path": str(path), "content": "flask\n"}))
+        self.assert_skipped(out, f"planka: манифест {path}: git или обход проекта не уложились в срок, новые "
+                                 f"зависимости не проверены")
+
 
 class ManifestDeadlineTest(unittest.TestCase):
     """Сроки, которые judge_tool передаёт снимку, сравнению и git cat-file, — константы из TimeoutsTest."""
@@ -1341,6 +1752,77 @@ class ManifestProjectUnderFixturesTest(unittest.TestCase):
             "PreToolUse", tool_name="Write", cwd=str(project),
             tool_input={"file_path": str(project / "requirements.txt"), "content": "flask\n"}))
         self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+
+class ManifestProjectUnderHomeRepoTest(unittest.TestCase):
+    """Проект без своего git под домашним каталогом-репозиторием dotfiles (status.showUntrackedFiles=no,
+    .gitignore `*`): git о проекте не видит репозиторий `~` — манифесты обходом, как вне git, без имён версий `~`."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.home = self.env.project.parent / "home"
+        self.home.mkdir(exist_ok=True)
+        git("init", "-q", cwd=self.home)
+        git("config", "status.showUntrackedFiles", "no", cwd=self.home)
+        (self.home / ".gitignore").write_text("*\n", encoding="utf-8")
+        (self.home / "other").mkdir()
+        (self.home / "other" / "requirements.txt").write_text("flask\n", encoding="utf-8")
+        git("add", "-f", ".gitignore", "other/requirements.txt", cwd=self.home)
+        git("commit", "-qm", "dotfiles", cwd=self.home)
+        self.p = self.home / "proj"
+        self.p.mkdir()
+        (self.p / "requirements.txt").write_text(REQUIREMENTS, encoding="utf-8")
+        self.extra = {"HOME": str(self.home), "CLAUDE_PROJECT_DIR": str(self.p)}
+        with mock.patch.dict(os.environ, self.extra):
+            self.assertEqual(common.project_root(str(self.p)), self.p)
+
+    def hook(self, event, **fields):
+        return self.env.run("judge_tool.py", self.env.hook_input(event, cwd=str(self.p), **fields), **self.extra)
+
+    def test_list_manifests_walks(self):
+        with mock.patch.dict(os.environ, self.extra):
+            self.assertEqual(manifest_watch.list_manifests(self.p, time.monotonic() + 10),
+                             ("walk", ["requirements.txt"]))
+
+    def test_edit_adding_home_name_denied(self):
+        r = self.hook("PreToolUse", tool_name="Write",
+                      tool_input={"file_path": str(self.p / "requirements.txt"), "content": REQUIREMENTS + "flask\n"})
+        self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny", r.stderr)
+
+    def test_command_adding_name_blocked(self):
+        command = "printf 'flask\\n' >> requirements.txt"
+        pre = self.hook("PreToolUse", tool_name="Bash", tool_input={"command": command}, tool_use_id="b1")
+        self.assertEqual(pre.stdout, "", pre.stderr)
+        state = json.loads((self.env.data / "state" / "sess-1.manifests.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["b1"]["mode"], "walk")
+        subprocess.run(command, shell=True, cwd=self.p, check=True)
+        r = self.hook("PostToolUse", tool_name="Bash", tool_input={"command": command}, tool_use_id="b1",
+                      tool_response={"stdout": "", "stderr": ""})
+        out = output(r)
+        self.assertEqual(out["decision"], "block", r.stderr)
+        self.assertIn("requirements.txt: flask", out["reason"])
+
+    def test_home_stash_names_not_known(self):
+        # stash репозитория `~` до начала сессии — не ref проекта: его имена не снимают блок.
+        (self.home / "other" / "requirements.txt").write_text("flask\ndjango\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z"}):
+            git("stash", "-q", cwd=self.home)
+        command = "git stash pop; printf 'django\\n' >> requirements.txt"
+        pre = self.hook("PreToolUse", tool_name="Bash", tool_input={"command": command}, tool_use_id="b1")
+        self.assertEqual(pre.stdout, "", pre.stderr)
+        state = json.loads((self.env.data / "state" / "sess-1.manifests.json").read_text(encoding="utf-8"))
+        self.assertNotIn("known", state["b1"])
+        (self.p / "requirements.txt").write_text(REQUIREMENTS + "django\n", encoding="utf-8")
+        r = self.hook("PostToolUse", tool_name="Bash", tool_input={"command": command}, tool_use_id="b1",
+                      tool_response={"stdout": "", "stderr": ""})
+        self.assertIn("requirements.txt: django", output(r)["reason"], r.stderr)
+
+    def test_file_outside_root_keeps_own_repository(self):
+        # Файл вне корня проекта — версии своего репозитория, здесь `~`.
+        names = manifest_watch.head_names(str(self.home / "other" / "requirements.txt"), "requirements", 10, self.p)
+        self.assertIn("flask", names)
+        self.assertIsNone(manifest_watch.head_names(str(self.p / "requirements.txt"), "requirements", 10, self.p))
 
 
 class HasMarkerTest(unittest.TestCase):
@@ -1481,6 +1963,33 @@ class ManifestWatchStateTest(unittest.TestCase):
         self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30), ({}, []))
         path.write_text("flask\n", encoding="utf-8")
         self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30), ({"requirements.txt": ["flask"]}, []))
+
+    def test_same_size_new_mtime_reread(self):
+        # Правка той же длины (`sed -i s/left-pad/evilpkg1/`) меняет mtime: манифест перечитывается.
+        path = self.env.project / "requirements.txt"
+        path.write_text("left-pad\n", encoding="utf-8")
+        st = path.stat()
+        entry = manifest_watch.take(self.env.project, time.monotonic() + 30)
+        path.write_text("evilpkg1\n", encoding="utf-8")
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+        self.assertEqual(path.stat().st_size, st.st_size)
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30), ({"requirements.txt": ["evilpkg1"]}, []))
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_mode_change_unavailable(self):
+        root = self.env.project
+        (root / "requirements.txt").write_text("rich\n", encoding="utf-8")
+        entry = manifest_watch.take(root, time.monotonic() + 30)
+        self.assertEqual(entry["mode"], "walk")
+        git("init", "-q", cwd=root)
+        with self.assertRaisesRegex(manifest_watch.Unavailable, "^за команду корень проекта стал git-репозиторием$"):
+            manifest_watch.compare(entry, time.monotonic() + 30)
+        entry = manifest_watch.take(root, time.monotonic() + 30)
+        self.assertEqual(entry["mode"], "git")
+        shutil.rmtree(root / ".git")
+        with self.assertRaisesRegex(manifest_watch.Unavailable,
+                                    "^за команду корень проекта перестал быть git-репозиторием$"):
+            manifest_watch.compare(entry, time.monotonic() + 30)
 
     def test_large_manifest_after_command_unknown(self):
         path = self.env.project / "requirements.txt"

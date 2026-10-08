@@ -11,16 +11,23 @@ NO_DOCS_LINE = "Проект без документации: предложи �
 
 
 def take_snapshot(session, prompt_id, root, deadline):
+    """Снимок дерева root для реплики prompt_id. Снимок того же корня, который Stop не отметил проверенным (на
+    прерванную автором реплику Stop не приходит), остаётся базой и перепривязывается к этой реплике. Снимок
+    корня, который в этой сессии уже не удался, не повторяется."""
     if root is None:
+        return
+    state_dir = common.data_dir() / "state"
+    state_dir.mkdir(exist_ok=True)
+    if snapshot.carry_over(state_dir, session, prompt_id, root) \
+            or snapshot.failure(state_dir, session, root) is not None:
         return
     try:
         snap = snapshot.capture(root, deadline)
     # TimeoutError — обход или git не уложились в deadline.
     except (snapshot.TooManyFiles, TimeoutError) as e:
-        common.warn_once(session, "snapshot", f"{e}, сверка документации не проверяется")
+        common.warn(f"{e}, сверка документации не проверяется")
+        snapshot.mark_failed(state_dir, session, root, str(e))
         return
-    state_dir = common.data_dir() / "state"
-    state_dir.mkdir(exist_ok=True)
     snapshot.store(state_dir, session, prompt_id, root, snap)
     common.prune_state(state_dir)
 

@@ -1,3 +1,5 @@
+import codecs
+import errno
 import os
 import pathlib
 import shutil
@@ -12,7 +14,71 @@ PLANKA_DIR = pathlib.Path(__file__).resolve().parent.parent / "plugin" / "planka
 sys.path.insert(0, str(PLANKA_DIR))
 import comments  # noqa: E402
 import common  # noqa: E402
+from tests import helpers  # noqa: E402
 
+
+FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures" / "comments"
+# Номера строк комментариев каждого файла корпуса; путь — относительно FIXTURES, синтаксис — по имени файла.
+CORPUS = {
+    "cpython-makefile/Makefile": [1, 8, 9, 29, 32, 34, 36, 40],
+    "create-vite-react/App.jsx": [1],
+    "esp-idf-ci/idf_ci.toml": [1, 10, 26],
+    "esp-idf-gitlab/pre_check.yml": [1, 3, 4, 10, 11, 22, 34, 44, 54],
+    "ffmpeg-doc/libswscale.html": [1, 4],
+    "flutter-gradle/gradle.dart": [1],
+    "flutter-issue-form/04_performance_others.yml": [1],
+    "flutter-resolve-deps/resolve_dependencies.gradle.kts": [1, *range(4, 17)],
+    "fzf-tmux/fzf-tmux.sh": [1, 7, 8, 9, 12, 22, 37, 42],
+    "go-template-lex/lex.go": [1, 11, 31, 38],
+    "grpc-gateway-ci/ci.yml": [1, 6, 7, 14, 21, 22, 26],
+    "kernel-make/Makefile": [1],
+    "kernel-rustdoc/rustdoc_test_gen.rs": [*range(1, 10)],
+    "kernel-unifdef/unifdef.c": [1, 8, *range(10, 21), 22, 23, 59, 64, 65, 66],
+    "lib-pq/20-config.sql": [1, 12, 13],
+    "mbedtls-readthedocs/readthedocs.yaml": [*range(1, 5), 6, 9, 14, 27, 32, 37],
+    "mldsa-hol-light/hol_light.yml": [1, 2, *range(10, 14), 21],
+    "moby-dockerfile/Dockerfile": [1, 2, 9, 10, 13, 17, 21, 24, *range(31, 35), *range(37, 44), 48, 51, 52, 58,
+        *range(61, 65)],
+    "moby-swagger/swagger.yaml": [1],
+    "npm-install/install.js": [1, 6, 7, 8, 10, 15, 16, 46, 49, 52],
+    "openssh-findssl/findssl.sh": [*range(1, 7), 10, 11, 12, 15, 16, 17, 24, 25, 26, 33],
+    "perl-cpan-distribution/Distribution.pl": [1, 26, 33, 46, 52, 53],
+    "perl-mime-header/Header.pl": [1, 3, 12, 24, 26, 35, 52],
+    "perl-proxysubs/ProxySubs.pl": [1],
+    "python-shlex/shlex.py": [1, 2, *range(4, 10), 20, 59, 61, 63],
+    "react-virtual/index.tsx": [1, *range(9, 14), *range(22, 44), *range(45, 55)],
+    "ruby-rjit/insn_compiler.rb": [1, 4, 7, 21, 48, 52, 53],
+    "rubygems-specification/specification.rb": [1, 4, 6, 8, 12, *range(31, 35)],
+    "ts-dedent/index.ts": [1, 8, 14, 25, 32, 35, 39, 43],
+}
+
+
+class CorpusTest(unittest.TestCase):
+    """Корпус настоящих входов разборщика: выдержки публичных проектов, источник — первой строкой файла."""
+
+    def test_every_fixture_has_expectation(self):
+        files = {p.relative_to(FIXTURES).as_posix() for p in FIXTURES.rglob("*") if p.is_file()}
+        self.assertEqual(files, set(CORPUS))
+
+    def test_corpus(self):
+        for rel, expected in CORPUS.items():
+            with self.subTest(rel):
+                text = (FIXTURES / rel).read_text(encoding="utf-8")
+                found = comments._comments(text, comments._ext(rel))
+                self.assertEqual([n for n, _ in found], expected)
+                lines = text.split("\n")
+                # Строка комментария — хвост своей строки: разбор не сдвигает начало комментария внутрь кода.
+                for n, c in found:
+                    self.assertTrue(lines[n - 1].rstrip().endswith(c), (n, c))
+                self.assertIn("источник:", found[0][1])
+
+    def test_corpus_through_extract(self):
+        # Вне git файл берётся целиком: extract отдаёт те же строки с путём.
+        for rel in CORPUS:
+            with self.subTest(rel):
+                text = (FIXTURES / rel).read_text(encoding="utf-8")
+                expected = [f"{rel}: {c}" for _, c in comments._comments(text, comments._ext(rel))]
+                self.assertEqual(comments.extract(str(FIXTURES), [rel], None), (expected, False, [], []))
 
 class CommentLinesTest(unittest.TestCase):
     def test_c_family(self):
@@ -47,6 +113,27 @@ class CommentLinesTest(unittest.TestCase):
 
     def test_yaml_hash_inside_word_is_value(self):
         self.assertEqual(comments.comment_lines("url: http://a/b#frag\nk: 1 # c\n", "yaml"), ["# c"])
+
+    def test_make_recipe_and_dockerfile_hash_inside_word(self):
+        # Строка рецепта Make уходит в shell; в Dockerfile «#» внутри слова — значение. Формы — Makefile ядра
+        # Linux 7.2 (filechk_version.h), Dockerfile moby 28.5 (ARG DELVE_SUPPORTED).
+        src = ("define filechk_version.h\n\techo '#define KERNEL_VERSION(a,b,c) (((a) << 16) +  \\\n"
+               "\t((c) > 255 ? 255 : (c)))';  \\\n\techo \\#define LINUX_VERSION_MAJOR $(VERSION)\nendef\n"
+               "x := 1 # c1\nall:\n\t@echo hi # c2\n")
+        for name in ("Makefile", "GNUmakefile", "rules.mk"):
+            self.assertEqual(comments.comment_lines(src, comments._ext(name)), ["# c1", "# c2"], name)
+        src = "ARG DELVE_SUPPORTED=${TARGETPLATFORM#linux/amd64}\nRUN make # c1\n# c2\n"
+        self.assertEqual(comments.comment_lines(src, comments._ext("Dockerfile")), ["# c1", "# c2"])
+
+    def test_make_recipe_prefixes_and_hash_outside_recipe(self):
+        # Make снимает со строки рецепта префиксы «@», «-», «+» и отдаёт shell «# текст»; вне рецепта «#» — комментарий
+        # и внутри слова.
+        src = "all:\n\t@# Clean the apidoc\n\t@echo hi\n\t-@# ignore errors note\n\t+ @ #c3\n\t@echo a#b\n"
+        self.assertEqual(comments._comments(src, "makefile"),
+                         [(2, "# Clean the apidoc"), (4, "# ignore errors note"), (5, "#c3")])
+        self.assertEqual(comments._comments("CFLAGS = -O2#opt level\n", "makefile"), [(1, "#opt level")])
+        # Пробел между префиксами: «- @# c».
+        self.assertEqual(comments._comments("all:\n\t- @# c\n", "makefile"), [(2, "# c")])
 
     def test_shell_heredoc_body_is_data(self):
         src = "cat <<EOF > s.md\n# Heading\nEOF\n# real\n"
@@ -226,13 +313,60 @@ class LanguageSyntaxTest(unittest.TestCase):
             # REM внутри строки, в чужом слове и как аргумент — код; метка «:x» — не комментарий.
             self.check(ext, 'echo "a & rem b"\necho rem x\nset remark=1\n:label\necho a::b\n', [])
 
-
     def test_language_variants(self):
         for ext in ("cljs", "edn"):
             self.check(ext, '{:a "x;y"} \\; ; c\n', ["; c"])
         for ext in ("fsx", "fsi"):
             self.check(ext, 'let s = "// not" // c\n(* a (* b *) *)\n', ["// c", "(* a (* b *) *)"])
         self.check("vbs", 'x = "\'REM" \' c\nREM d\n', ["' c", "REM d"])
+        # Модуль Perl — синтаксис Perl: оператор-кавычка прячет «#».
+        self.check("pm", "my @w = qw(a #b); # c\n", ["# c"])
+
+    def test_syntax_table_entries(self):
+        # Каждая запись таблицы: литерал или блок прячет маркер, без записи вывод другой.
+        cases = (("sql", "select '--x' -- c\n", ["-- c"]),
+                 ("proto", "x = '/* no */' /* c */\n", ["/* c */"]), ("sol", "x = '/* no */' /* c */\n", ["/* c */"]),
+                 ("java", "char q = '\"'; s = \"//x\"; // c\n", ["// c"]),
+                 ("zig", "const q = '\"'; const s = \"//x\"; // c\n", ["// c"]),
+                 ("lua", "s = '--x' -- c\n", ["-- c"]), ("xml", "<a/><!-- c -->\n", ["<!-- c -->"]),
+                 ("m", "x = 1; // c\n", ["// c"]), ("mm", "x = 1; // c\n", ["// c"]),
+                 ("svelte", "<p>Don't</p><!-- c -->\n<script>// d\n", ["<!-- c -->", "// d"]),
+                 ("kt", 'val s = """\n// not\n""" // c\n', ["// c"]), ("erl", 'S = """\n% not\n""". % c\n', ["% c"]),
+                 ("cs", 'var s = """\n// not\n"""; // c\n', ["// c"]),
+                 ("dart", "var s = '''\n// not\n'''; // c\n", ["// c"]),
+                 ("groovy", "def s = '''\n// not\n''' // c\n", ["// c"]),
+                 ("swift", 'let s = """\n// not\n""" // c\n', ["// c"]),
+                 # Escape строк: обратной косой нет в литеральных строках toml, ps1, go, go.mod; есть в php.
+                 ("toml", "k = ['C:\\', '# x'] # c\n", ["# c"]), ("ps1", "$p = @('C:\\', '# x') # c\n", ["# c"]),
+                 ("go", "s := []string{`C:\\`, `// x`} // c\n", ["// c"]),
+                 ("go.mod", "replace a => `C:\\` `// x` // c\n", ["// c"]),
+                 ("php", "$s = 'it\\'s # x'; # c\n", ["# c"]),
+                 # Escape в символьном литерале: «'\"'» не открывает строку.
+                 ("c", "char q = '\\\"'; s = \"//x\"; // c\n", ["// c"]),
+                 # «-» в имени heredoc Terraform.
+                 ("tf", "x = <<EOT-1\n# not\nEOT-1\n# c\n", ["# c"]))
+        for ext, src, expected in cases:
+            self.check(ext, src, expected)
+
+    def test_small_branches(self):
+        # «?» после слова — метод-предикат Ruby, а не символьный литерал.
+        self.check("rb", "ok = a.empty?# c\n", ["# c"])
+        # Глубина вложенных блоков переносится через строки.
+        self.check("rs", "/* a /* b\n*/ still\n*/\nlet x = 1; // c\n", ["/* a /* b", "*/ still", "*/", "// c"])
+        # Escape «''\» в строке Nix берёт и следующий знак.
+        self.check("nix", "x = ''a ''\\'' b''; # c\ny = ''z''; # d\n", ["# c", "# d"])
+        # Длинная строка Lua закрывается скобками с тем же числом «=».
+        self.check("lua", "s = [==[\n]] -- not\n]==] -- yes", ["-- yes"])
+        # Голое REM — комментарий.
+        self.check("vb", "REM\nx = 1\n", ["REM"])
+        self.check("bat", "REM\n", ["REM"])
+        # Dollar-slashy Groovy: «$/» — escape, «$/$» не закрывает литерал.
+        self.check("groovy", "def u = $/a $/$ // b/$ // c\n", ["// c"])
+        # ~S в @doc — без escape: «\"» закрывает строку.
+        self.check("ex", '@doc ~S"C:\\"\nx = "# not"\n', ['@doc ~S"C:\\"'])
+        # POD из одной строки «=cut» и «=cutx» — не конец блока.
+        self.check("pl", "=cut\nmy $x; # c\n", ["=cut", "# c"])
+        self.check("pl", "=pod\n=cutx\nmy $x; # not\n=cut\n", ["=pod", "=cutx", "my $x; # not", "=cut"])
 
     def test_common_lisp(self):
         # «#\;» — символьный литерал, «#| |#» вкладываются.
@@ -327,6 +461,8 @@ class ParserEdgeTest(unittest.TestCase):
 
     def test_cpp_prefixed_raw_string(self):
         self.assertEqual(comments.comment_lines('auto s = u8R"(a " // not)"; // yes\n', "cpp"), ["// yes"])
+        # Закрытие — с разделителем: «)"» без него строку не закрывает.
+        self.assertEqual(comments._comments('R"x(\n)" // not\n)x"; // yes', "cpp"), [(3, "// yes")])
 
     def test_rust_byte_raw_string(self):
         self.assertEqual(comments.comment_lines('let s = br"a\\"; // c\nlet t = 1;\n', "rs"), ["// c"])
@@ -463,7 +599,8 @@ class ExpressionLiteralTest(unittest.TestCase):
         for ext in ("js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"):
             self.assertEqual(comments._comments("let r = /\\/\\//;\n", ext), [], ext)
             self.assertEqual(comments._comments("let r = /a\\/*/;\nx = 1;\n// c\n", ext), [(3, "// c")], ext)
-            self.assertEqual(comments._comments("let r = /[/]/; // c\n", ext), [(1, "// c")], ext)
+            # «/» в классе не закрывает регулярку: без классов «"/; y = "» — строка, а «// no» — комментарий.
+            self.assertEqual(comments._comments('re = /[/]"/; y = "// no"\n', ext), [], ext)
             self.assertEqual(comments._comments("return /x/.test(s); // c\n", ext), [(1, "// c")], ext)
             self.assertEqual(comments._comments("s.replace(/\\/+/g, '/'); // c\n", ext), [(1, "// c")], ext)
             self.assertEqual(comments._comments("x = c ? /a/ : /b\\//i // c\n", ext), [(1, "// c")], ext)
@@ -499,7 +636,7 @@ class ExpressionLiteralTest(unittest.TestCase):
             src = ("return (\n  <div className=\"a//b\">\n    see http://x.y\n    {/* jsx */}\n"
                    "    {items.map(i => <li key={i}>// {i}</li>)}\n    <br/>\n    <>frag // t</>\n  </div>\n);\n"
                    "// after\n")
-            self.assertEqual(comments._comments(src, ext), [(4, "{/* jsx */}"[1:]), (10, "// after")], ext)
+            self.assertEqual(comments._comments(src, ext), [(4, "/* jsx */}"), (10, "// after")], ext)
 
     def test_jsx_tag_comment_in_attributes(self):
         src = "x = <div // c\n  id='a'\n>text // t</div>\n"
@@ -514,10 +651,260 @@ class ExpressionLiteralTest(unittest.TestCase):
     def test_plain_ts_has_no_jsx(self):
         self.assertEqual(comments.comment_lines("const f = <T>(x: T) => x // c\n", "ts"), ["// c"])
 
+    def test_multiline_opening_tag(self):
+        src = 'return (\n  <a\n    href="x"\n  >\n    see http://x.y\n  </a>\n);\n// c\n'
+        self.assertEqual(comments._comments(src, "jsx"), [(8, "// c")])
+
+    def test_markup_branches(self):
+        # Счётчик скобок кода в разметке, фрагмент «<>» и вне элемента, и внутри него.
+        self.assertEqual(comments._comments("const a = <div>{fn({a: 1}) // c\n}</div>;", "jsx"), [(1, "// c")])
+        self.assertEqual(comments._comments("const a = <>see http://x.y</>; // yes", "jsx"), [(1, "// yes")])
+        self.assertEqual(comments._comments("const a = <div><>see http://x.y</></div>; // yes", "jsx"),
+                         [(1, "// yes")])
+
+    def test_shift_is_not_tag(self):
+        # «<<» перед именем в конце строки — сдвиг, а не тег JSX.
+        src = "const m = 1 <<SHIFT\n// one\nconst x = a > b\n// two\n</div>\n// three\n"
+        self.assertEqual(comments._comments(src, "js"), [(2, "// one"), (4, "// two"), (6, "// three")])
+
+    def test_block_comment_before_regex_line(self):
+        # Строка кода, кончающаяся блочным комментарием, ждёт выражение: «/» следующей строки — регулярка.
+        self.assertEqual(comments._comments("const r = /* pattern */\n/\\/\\//.test(s);", "js"),
+                         [(1, "/* pattern */")])
+
+    def test_template_substitutions(self):
+        # Шаблон внутри подстановки, комментарий внутри подстановки, текст шаблона после неё.
+        src = ('const html = `\n  <ul>${items.map(i => `<li>${i}</li>`).join("")}</ul>\n`;\n// real comment one\n'
+               "function f() { return 1; } // real two\n")
+        self.assertEqual(comments._comments(src, "js"), [(4, "// real comment one"), (5, "// real two")])
+        src = 'const page = `\n  ${rows.map(r => `<td>${r}</td>`).join("")}\n  Docs: https://example.com/docs\n`;\n'
+        self.assertEqual(comments._comments(src, "js"), [])
+        for ext in ("js", "ts", "jsx", "tsx", "mjs", "cjs", "mts", "cts"):
+            self.assertEqual(comments._comments("const s = `a ${ x // y\n} d`;\n", ext), [(1, "// y")], ext)
+            self.assertEqual(comments._comments("const s = `${p}/*`; // c\n", ext), [(1, "// c")], ext)
+            self.assertEqual(comments._comments("x = `${ {a: 1}.a } // not`; // c\n", ext), [(1, "// c")], ext)
+            self.assertEqual(comments._comments("x = `\\${ // not`; // c\n", ext), [(1, "// c")], ext)
+        self.assertEqual(comments._comments("const a = <p>{`${x}`} // t</p>; // c\n", "jsx"), [(1, "// c")])
+
+    def test_unclosed_template_is_rolled_back(self):
+        # Шаблонная строка без закрытия до конца файла — однострочная: следующие строки — код.
+        self.assertEqual(comments._comments("x = `a\n// c\n", "js"), [(2, "// c")])
+
     def test_unclosed_tag_is_rolled_back(self):
         # Мнимый тег без закрытия до конца файла — не тег: разбор повторяется, и комментарии за ним видны.
         src = "type F = <T>(x: T) => T;\n// c\nconst a = <p>t // t</p>;\n"
         self.assertEqual(comments._comments(src, "tsx"), [(2, "// c")])
+
+
+class RubyPerlElixirLiteralTest(unittest.TestCase):
+    """Регулярные выражения и литералы с разделителями Ruby, Perl, Elixir: «#» в них — не комментарий."""
+
+    def test_perl_regex_and_quote_operators(self):
+        src = "$line =~ s/#.*$//;    # strip comments\nmy @f = split /#/, $s;\n"
+        self.assertEqual(comments._comments(src, "pl"), [(1, "# strip comments")])
+        src = ("my @w = qw(a #b c); # c1\nmy $r = qr{#\\d+}x; # c2\n$s =~ tr/#/ /; # c3\n$s =~ s{#}{ }g; # c4\n"
+               "my $q = q#not#; # c5\nmy $t = qq (#(a)#); # c6\n$s =~ m<#>; # c7\n")
+        self.assertEqual(comments.comment_lines(src, "pl"), [f"# c{i}" for i in range(1, 8)])
+
+    def test_perl_division_and_barewords_are_code(self):
+        src = ("my $x = $a / $b; # c1\nmy %h = (s => 1, y => 2); # c2\nprint $h{s}; # c3\n$x = $n /2; # c4\n"
+               "$x = 10 /2; # c5\n$o->s(1); # c6\nmy $d = $a // 0; # c7\n")
+        self.assertEqual(comments.comment_lines(src, "pl"), [f"# c{i}" for i in range(1, 8)])
+
+    def test_ruby_regex_and_percent_literals(self):
+        self.assertEqual(comments._comments('s = line.sub(/#.*/, "")\nparts = s.split(/#/)', "rb"), [])
+        src = ("w = %w(a #b) # c1\nr = %r{#\\d+#{x}}x # c2\nx = a % b # c3\ny = a / 2 # c4\nn = 10 /2 # c5\n"
+               "puts /#/ # c6\nr = /#{x}/ # c7\n")
+        self.assertEqual(comments.comment_lines(src, "rb"), [f"# c{i}" for i in range(1, 8)])
+
+    def test_elixir_sigils(self):
+        src = '~r/#\\d+/ # c1\nx = ~w(a #b) # c2\ns = ~S"""\n# not\n""" # c3\nl = ~w(\n#a\n) # c4\n'
+        self.assertEqual(comments.comment_lines(src, "ex"), ["# c1", "# c2", "# c3", "# c4"])
+
+    def test_perl_multiline_quote_operators(self):
+        # Многострочные операторы-кавычки; «#» в многострочной регулярке — комментарий режима /x; вторая часть
+        # s{…}{…}e в скобках — код.
+        src = ("my @w = qw(\n  a #b\n); # c1\n$s =~ s{\n  a # c2\n}{b}x; # c3\n$s =~ s{a}{\n  f(1); # c4\n}e; # c5\n"
+               "my $q = q[\n# not\n]; # c6\n$s =~ tr/a\n#/b/; # c7\n$t =~\n  /^(?:  # c8\n    a\n  )$/x; # c9\n")
+        self.assertEqual(comments.comment_lines(src, "pl"), [f"# c{i}" for i in range(1, 10)])
+
+    def test_perl_special_variables_backticks_and_delimiters(self):
+        # «$"» — переменная, а не строка; `…` — строка; «m,…,» и «m$…$» — операторы-кавычки.
+        src = ("local $\" = ')(';\nmy $x = \"a\"; # c1\nmy $o = `echo \"\n# not\n\"`; # c2\n"
+               "if (m,/, ) { f(\"x\"); } # c3\nmy @a = $t =~ m$a\"b$g; # c4\nmy $r = $h{a} / 2; # c5\n")
+        self.assertEqual(comments.comment_lines(src, "pl"), [f"# c{i}" for i in range(1, 6)])
+
+    def test_data_section_and_quoted_heredoc_ids(self):
+        # После __END__ — данные, POD в них — документация; идентификатор heredoc в кавычках — любые знаки.
+        self.assertEqual(comments.comment_lines("print 1; # c1\n__END__\ndon't # not\n=pod\n\nDoc\n\n=cut\n", "pl"),
+                         ["# c1", "=pod", "Doc", "=cut"])
+        self.assertEqual(comments.comment_lines("x = 1 # c1\n__END__\nit's # not\n", "rb"), ["# c1"])
+        self.assertEqual(comments.comment_lines("print <<'----END----';\n'# not\n----END----\n# c\n", "pl"), ["# c"])
+        self.assertEqual(comments.comment_lines('x = <<~"END OF TEXT"\n  "# not\n  END OF TEXT\n# c\n', "rb"), ["# c"])
+
+    def test_ruby_interpolation_and_line_start(self):
+        # Кавычки внутри «#{…}» не закрывают строку; строка Ruby начинает выражение: «/» в её начале — регулярка.
+        src = ('s = "a #{h["k"]} b" # c1\nt = "#{x ? "\\"" : \'"\'}" # c2\ncmd = `echo #{"a"}` # c3\n'
+               "if x\n  /a:/ =~ y # c4\nend\nr = %r{\n  a # c5\n}x # c6\nw = %w(\n  a #b\n) # c7\n")
+        self.assertEqual(comments.comment_lines(src, "rb"), [f"# c{i}" for i in range(1, 8)])
+
+    def test_ruby_slash_after_local_variable_is_division(self):
+        # После локальной переменной Ruby «/» и «%» — деление и остаток; после метода — литерал-аргумент.
+        src = ("a = 4\nx = a /b # c1\ndef f(n, m)\n  n /2 # c2\nend\n[1].each { |k| k /m # c3\n}\n"
+               "v ||= 1\nv /2 # c4\nputs /#/ # c5\n")
+        self.assertEqual(comments._comments(src, "rb"),
+                         [(2, "# c1"), (4, "# c2"), (6, "# c3"), (9, "# c4"), (10, "# c5")])
+        self.assertEqual(comments._comments("x = a /b # c\n", "rb"), [])
+
+    def test_multiline_regex_without_x_flag_has_no_comments(self):
+        # «#» в многострочной регулярке — комментарий только с флагом x после закрытия литерала.
+        cases = (("pl", "$r = qr{\n  a #b\n};\n", []), ("pl", "$r = qr{\n  a #b\n}x;\n", [(2, "#b")]),
+                 ("pl", "$r = qr{\n  a #b\n}i; # c\n", [(3, "# c")]),
+                 ("pl", "$s =~ s/\n a #b\n/c/; # c\n", [(3, "# c")]),
+                 ("pl", "$s =~ s/\n a #b\n/c/x;\n", [(2, "#b")]), ("pl", "$s =~ s{\n a #b\n}{c};\n", []),
+                 ("pl", "$s =~ s{\n a #b\n} {\n c\n}gx;\n", [(2, "#b")]),
+                 ("pl", "$s =~ m{\n a #b\n  c #d\n}; # e\n", [(4, "# e")]),
+                 ("rb", "r = %r{\n  a #b\n}\n", []), ("rb", "r = %r{\n  a #b\n}xi\n", [(2, "#b")]),
+                 ("rb", "r =\n/a #b\n/ # c\n", [(3, "# c")]), ("ex", "r = ~r/\n  a #b\n/\n", []),
+                 ("ex", "r = ~r/\n  a #b\n/x\n", [(2, "#b")]),
+                 # Строка, закрывшая регулярку с флагом x и открывшая новую, к новой не относится.
+                 ("pl", "$r = qr{\n  a #b\n  c #d }x; $s = qr{\n  e\n}; # f\n",
+                  [(2, "#b"), (3, "#d }x; $s = qr{"), (5, "# f")]))
+        for ext, src, expected in cases:
+            self.assertEqual(comments._comments(src, ext), expected, src)
+
+    def test_regex_after_term_words_symbols_and_spaced_heredoc(self):
+        # «/» после split, grep, if и подобных — регулярка и вплотную, и перед пробелом и «=»; «:/» Ruby — символ;
+        # «<< "ID"» Perl — heredoc. Источники форм — Perl core (CPAN/Distribution.pm, B/Deparse.pm,
+        # ExtUtils/Constant/ProxySubs.pm), Ruby 3.4 (ruby_vm/rjit/insn_compiler.rb).
+        cases = (("pl", "my ($p, $a) = split /=/, $plugin, 2; # c1\nmy $x = $a / 2; # c2\n", ["# c1", "# c2"]),
+                 ("pl", "@names = split/\\s+/, $val; # c1\nmy $x = $a / 2; # c2\n", ["# c1", "# c2"]),
+                 ("pl", "print /=#/; # c1\n$n /= 2; # c2\n", ["# c1", "# c2"]),
+                 ("pl", "my @w = split / /, $s; # c1\nmy $x = $a / 2; # c2\n", ["# c1", "# c2"]),
+                 ("pl", "$_ = uc $_ unless /=/; # c1\nmy $x = $a / 2; # c2\n", ["# c1", "# c2"]),
+                 ("pl", "print $xs_fh $e ? <<\"EXPLODE\" : << \"DONT\";\na\nEXPLODE\n#ifndef X\nDONT\n# c1\n",
+                  ["# c1"]),
+                 ("rb", "register(Integer, :/, :jit_div) # c1\nregister(Integer, :%, :jit_mod) # c2\nx = a / 2 # c3\n",
+                  ["# c1", "# c2", "# c3"]),
+                 ("rb", "x << \"a\" # c1\n# c2\n", ["# c1", "# c2"]),
+                 ("rb", "x << \"EOS\" # c1\n# c2\nEOS\n# c3\n", ["# c1", "# c2", "# c3"]))
+        for ext, src, expected in cases:
+            self.assertEqual(comments.comment_lines(src, ext), expected, src)
+
+    def test_ruby_slash_operand_forms(self):
+        # Метод после «.» с именем локальной переменной или слова из _TERM_WORDS — не переменная и не начало
+        # выражения; «::/» — не символ; «/=» после слова — деление с присваиванием и вплотную к знаку;
+        # «a, b = …» вводит обе переменные.
+        cases = (("a = 4\nx = obj.a /#/ # c\n", [(2, "# c")]),
+                 ("x = a.then / 2 # c1\ny = 1 / 2 # c2\n", [(1, "# c1"), (2, "# c2")]),
+                 ("v = t ? a ::/#/ # c\n", [(1, "# c")]),
+                 ("foo /=#/ # c\n", [(1, "#/ # c")]), ("x = obj.foo /=#/ # c\n", [(1, "#/ # c")]),
+                 ("n = 1\nn /= 2 # c\n", [(2, "# c")]),
+                 ("a, b = 4, 2\nx = a /b # c\n", [(2, "# c")]))
+        for src, expected in cases:
+            self.assertEqual(comments._comments(src, "rb"), expected, src)
+
+    def test_flags_after_literal_are_not_quote_operators(self):
+        # Буквы за закрывающим разделителем — флаги: «s,» после «/…/» — не оператор s с разделителем «,».
+        src = ("for my $feep (grep /^\\$pw_/s, @EXPORT_OK) { # c1\nmy @a = m!a!s, 1; # c2\n"
+               "$x = qr{\n  a\n}s, 1; # c3\n$s =~ s{a}{b}s, 1; # c4\n")
+        self.assertEqual(comments.comment_lines(src, "pl"), [f"# c{i}" for i in range(1, 5)])
+        self.assertEqual(comments.comment_lines("r = %r{\n  a\n}s # c1\n", "rb"), ["# c1"])
+
+    def test_perl_substitution_replacement_code_only_with_e_flag(self):
+        # Вторая часть s{…}{…} — код с флагом e, иначе строка; на первой строке и на следующих.
+        cases = (("$s =~ s{a}{ # c\n  f()\n}e;\n", [(1, "# c")]),
+                 ("$s =~ s{a}{ # c\n  f() # d\n}g; # e\n", [(3, "# e")]),
+                 ("$s =~ s{a}{\n  f() # d\n  {x}\n}ge; # e\n", [(2, "# d"), (4, "# e")]),
+                 ("$s =~ s{a}{\n  'x' # d\n};\n", []))
+        for src, expected in cases:
+            self.assertEqual(comments._comments(src, "pl"), expected, src)
+
+    def test_unclosed_literal_ends_with_line(self):
+        # Незакрытая в строке регулярка прячет только остаток своей строки.
+        self.assertEqual(comments._comments("x = split /a # b\n# c\n", "pl"), [(2, "# c")])
+        self.assertEqual(comments._comments("x = %w(a # b\n# c\n", "rb"), [(2, "# c")])
+
+
+class MultilineStringTest(unittest.TestCase):
+    """Многострочные строки Ruby, Perl, Julia, PowerShell, блочные скаляры YAML."""
+
+    def test_strings_span_lines(self):
+        cases = (("rb", 's = "line one\n# inside string\nend"\n# c\n', [(4, "# c")]),
+                 ("rb", "s = 'a\n# not\n' # c\n", [(3, "# c")]),
+                 ("pl", "my $s = 'a\n# not\n'; # c\n", [(3, "# c")]),
+                 ("pl", 'my $s = "a\n# not\n"; # c\n', [(3, "# c")]),
+                 ("jl", 's = "a\n# not\n" # c\n', [(3, "# c")]),
+                 ("ps1", '$s = "a\n# not\n" # c\n', [(3, "# c")]),
+                 ("ps1", "$s = 'a\n# not\n' # c\n", [(3, "# c")]),
+                 # Here-string PowerShell; «`"» — escape кавычки.
+                 ("ps1", '$h = @"\n"# not\n"@ # c\n', [(3, "# c")]),
+                 ("ps1", "$h = @'\n'# not\n'@ # c\n", [(3, "# c")]),
+                 ("ps1", '$e = "a`"b # not" # c\n', [(1, "# c")]))
+        for ext, src, expected in cases:
+            self.assertEqual(comments._comments(src, ext), expected, (ext, src))
+
+    def test_unclosed_multiline_string_is_rolled_back(self):
+        # Строка без закрытия до конца файла — однострочная: следующие строки — код.
+        self.assertEqual(comments._comments('x = "unclosed\n# c\n', "rb"), [(2, "# c")])
+        self.assertEqual(comments._comments('a = "x"\nb = "y\n# c\n', "pl"), [(3, "# c")])
+        self.assertEqual(comments._comments('def f():\n    """Open\nx = 1  # c\n', "py"), [(3, "# c")])
+        self.assertEqual(comments._comments("x = ~w(a\n# c\n", "ex"), [(2, "# c")])
+
+    def test_yaml_block_scalars(self):
+        self.assertEqual(comments._comments("value: |\n  # heading\n  text\nk: v # real", "yaml"), [(4, "# real")])
+        src = ("steps:\n  - text: >-  # c1\n      # not\n    name: x # c2\n  - |\n    # not\n  - y # c3\n"
+               "k: !!str &a |\n  # not\n\n  # not\n# c4\n")
+        self.assertEqual(comments.comment_lines(src, "yaml"), ["# c1", "# c2", "# c3", "# c4"])
+        # «|» и «>» внутри значения — не индикатор.
+        self.assertEqual(comments.comment_lines("a: x | y\n  # c1\nb: x >\n  # c2\n", "yaml"), ["# c1", "# c2"])
+
+    def test_yaml_script_block_scalars_are_shell(self):
+        # Блочный скаляр под ключом скрипта — shell: «#» в начале слова вне кавычек — комментарий.
+        src = ("jobs:\n  b:\n    steps:\n      - run: |\n          # Устанавливаем зависимости\n"
+               "          pip install x  # trailing\n")
+        self.assertEqual(comments._comments(src, "yml"), [(5, "# Устанавливаем зависимости"), (6, "# trailing")])
+        cases = (
+            # GitLab: элемент списка «- |» под script, в том числе список без отступа.
+            ("t:\n  script:\n    - |\n      # c1\n      make\n    - echo # c2\n  after_script:\n  - >-\n    # c3\n",
+             [(4, "# c1"), (6, "# c2"), (9, "# c3")]),
+            # Ansible: модуль с пространством имён.
+            ("- name: x\n  ansible.builtin.shell: |\n    # c1\n    ls\n  args:\n    chdir: /\n", [(3, "# c1")]),
+            # Heredoc и кавычки shell внутри скрипта.
+            ("run: |\n  cat <<EOF\n  # data\n  EOF\n  echo '#x' \"# y\" # c1\n# c2\n", [(5, "# c1"), (6, "# c2")]),
+            # Скаляр после вложенного отображения в том же списке — под своим ключом.
+            ("script:\n  - name: a\n  - |\n    # c1\nvalues:\n  - |\n    # heading\n", [(4, "# c1")]),
+            # Индикатор на строке после ключа.
+            ("run:\n  | # c\n  echo 1 # d\nk: v # e\n", [(2, "# c"), (3, "# d"), (4, "# e")]),
+            ("steps:\n  - run:\n      >-\n      # c1\n  - k: v # c2\n", [(4, "# c1"), (5, "# c2")]),
+        )
+        for src, expected in cases:
+            self.assertEqual(comments._comments(src, "yaml"), expected, src)
+
+    def test_yaml_prose_block_scalars_are_data(self):
+        # Скаляр под прочим ключом — данные: заголовки Markdown формы issue и описаний OpenAPI.
+        src = ("body:\n  - type: markdown\n    attributes:\n      value: |\n        ### Before you start\n"
+               "        # Read docs\n  - type: textarea\n    id: what # c1\ninfo:\n  description: |\n    # Errors\n")
+        self.assertEqual(comments._comments(src, "yaml"), [(8, "# c1")])
+
+    def test_github_script_input_is_javascript(self):
+        # Вход «script» actions/github-script — JavaScript, вход «script» прочих действий — shell. Форма —
+        # flutter, .github/workflows/release-tracker.yml.
+        src = ("steps:\n  - uses: \"actions/github-script@v7\" # c0\n    with:\n      script: |\n"
+               "        const body = `\n        # Release ${tag}\n        `; // c1\n"
+               "  - name: x\n    with:\n      script: |\n        # c2\n    uses: ./setup\n")
+        self.assertEqual(comments._comments(src, "yml"), [(2, "# c0"), (7, "// c1"), (11, "# c2")])
+        self.assertEqual(comments._comments("- uses: actions/github-script\n  with:\n    script: |\n      # a\n",
+                                            "yml"), [])
+        # «script» шага github-script не под «with:» — shell.
+        self.assertEqual(comments._comments("- uses: actions/github-script\n  env:\n    script: |\n      # a\n",
+                                            "yml"), [(4, "# a")])
+
+    def test_yaml_key_stack_keeps_one_key_per_column(self):
+        keys, uses = [], {}
+        for line in ("a:", "  b:", "c:", "d:"):
+            comments._yaml_key(line, keys, uses)
+        self.assertEqual(keys, [(0, "d")])
 
 
 class ExtractTest(unittest.TestCase):
@@ -599,6 +986,34 @@ class ExtractTest(unittest.TestCase):
         self.assertEqual(len(lines), comments.MAX_BYTES // len(f"a.py: {body}"))
         self.assertLessEqual(sum(len(l.encode("utf-8")) for l in lines), comments.MAX_BYTES)
 
+    def test_max_bytes_counts_utf8_bytes(self):
+        body = "# " + "ж" * 500
+        self.write("a.py", f"{body}\n" * 40)
+        lines, truncated, _, _ = comments.extract(self.root, ["a.py"])
+        self.assertTrue(truncated)
+        self.assertEqual(len(lines), comments.MAX_BYTES // len(f"a.py: {body}".encode("utf-8")))
+
+    def test_utf16_and_utf32_by_bom(self):
+        text = "x = 1\n# c\n"
+        for name, bom, codec in (("le.py", codecs.BOM_UTF16_LE, "utf-16-le"),
+                                 ("be.py", codecs.BOM_UTF16_BE, "utf-16-be"),
+                                 ("l4.py", codecs.BOM_UTF32_LE, "utf-32-le")):
+            (self.root / name).write_bytes(bom + text.encode(codec))
+        self.assertEqual(comments.extract(self.root, ["le.py", "be.py", "l4.py"])[0],
+                         ["le.py: # c", "be.py: # c", "l4.py: # c"])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_utf16_added_lines_by_git_line_numbers(self):
+        # «Ċ» (U+010A) несёт байт 0x0A в UTF-16: git видит в строке два перевода, номера строк сдвигаются.
+        self.git("init", "-q")
+        old = "x = 'Ċ'\n# old\n"
+        for name, bom, codec in (("le.py", codecs.BOM_UTF16_LE, "utf-16-le"),
+                                 ("be.py", codecs.BOM_UTF16_BE, "utf-16-be")):
+            (self.root / name).write_bytes(bom + old.encode(codec))
+            self.commit(name)
+            (self.root / name).write_bytes(bom + (old + "# new\n").encode(codec))
+        self.assertEqual(comments.extract(self.root, ["le.py", "be.py"])[0], ["le.py: # new", "be.py: # new"])
+
     def test_no_lines_after_byte_truncation(self):
         self.write("a.py", ("# " + "x" * 1000 + "\n") * 20)
         self.write("b.py", "# s\n")
@@ -608,6 +1023,7 @@ class ExtractTest(unittest.TestCase):
 
     def test_deadline_passed_files_without_check(self):
         common._reset()
+        self.addCleanup(common._reset)
         self.write("a.py", "# a\n")
         self.write("b.bin", "x\n")
         lines, truncated, unknown, late = comments.extract(self.root, ["a.py", "b.bin"], None, None,
@@ -615,16 +1031,15 @@ class ExtractTest(unittest.TestCase):
         self.assertEqual((lines, truncated, unknown, late), ([], False, ["b.bin"], ["a.py"]))
         self.assertEqual(common._messages,
                          ["planka: строки комментариев не извлечены в срок, файлов кода без проверки: 1"])
-        common._reset()
 
     def test_git_timeout_files_without_check(self):
         common._reset()
+        self.addCleanup(common._reset)
         self.write("a.py", "# a\n")
         with mock.patch.object(comments.subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 1)):
             lines, _, unknown, late = comments.extract(self.root, ["a.py"], "HEAD", None, time.monotonic() + 30)
         self.assertEqual((lines, unknown, late), ([], [], ["a.py"]))
         self.assertEqual(len(common._messages), 1)
-        common._reset()
 
     def test_empty_relpaths_no_git_calls(self):
         with mock.patch.object(comments, "_git", wraps=comments._git) as git:
@@ -640,6 +1055,16 @@ class ExtractTest(unittest.TestCase):
         self.write("u.py", "# untracked\n")
         lines, _, _, _ = comments.extract(self.root, ["a.go", "u.py"])
         self.assertEqual(lines, ["a.go: // new", "u.py: # untracked"])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_root_below_repository_is_outside_git(self):
+        # Корень проекта в каталоге чужого репозитория: git не поднимается выше корня, файл — целиком.
+        self.git("init", "-q")
+        self.write("sub/a.py", "# old\n")
+        self.commit("sub/a.py")
+        self.write("sub/a.py", "# old\n# new\n")
+        lines, _, _, _ = comments.extract(self.root / "sub", ["a.py"])
+        self.assertEqual(lines, ["a.py: # old", "a.py: # new"])
 
     @unittest.skipUnless(shutil.which("git"), "нет git")
     def test_base_commit_sees_committed_lines(self):
@@ -750,19 +1175,48 @@ class ExtractTest(unittest.TestCase):
         self.assertEqual(comments.extract(self.root, ["pkg/b.py"], base)[0], ["pkg/b.py: # новое"])
 
     @unittest.skipUnless(shutil.which("git"), "нет git")
-    def test_rename_sources_limit(self):
+    def test_rename_pass_names_no_paths(self):
+        # Пару переименованию ищет git diff всего дерева: удалённые пути не в командной строке, их число не
+        # ограничено.
         self.git("init", "-q")
         body = "# old one\n" + "x = 1\n" * 10 + "# old two\n"
         self.write("a.py", body)
-        self.commit("a.py")
+        for i in range(1001):
+            self.write(f"g/{i}.py", f"v = {i}\n")
+        self.commit("a.py", "g")
+        self.git("rm", "-q", "-r", "g")
         self.git("mv", "a.py", "b.py")
         self.write("b.py", body + "# новое\n")
-        # Предел включительно: один удалённый путь при пределе 1 — пара находится, при пределе 0 — файл целиком.
-        with mock.patch.object(comments, "MAX_RENAME_SOURCES", 1):
+        with mock.patch.object(comments, "_git", wraps=comments._git) as git:
             self.assertEqual(comments.extract(self.root, ["b.py"])[0], ["b.py: # новое"])
-        with mock.patch.object(comments, "MAX_RENAME_SOURCES", 0):
-            self.assertEqual(comments.extract(self.root, ["b.py"])[0],
-                             ["b.py: # old one", "b.py: # old two", "b.py: # новое"])
+        renames = [c.args for c in git.call_args_list if "--diff-filter=R" in c.args]
+        self.assertEqual(len(renames), 1)
+        self.assertEqual(renames[0][-1], "--")
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_paths_beyond_command_line_limit(self):
+        # Пути сверх предела командной строки: execve отвечает E2BIG — git diff идёт частями, а не падает.
+        self.git("init", "-q")
+        names = [f"{'d' * 100}/f{i:04}.py" for i in range(300)]
+        for n in names:
+            self.write(n, "x = 1\n# old\n")
+        self.commit("d" * 100)
+        self.write(names[7], "x = 1\n# old\n# new\n")
+        run, limit = subprocess.run, 32_767
+
+        def limited(args, **kwargs):
+            if sum(len(os.fsencode(str(a))) + 1 for a in args) > limit:
+                raise OSError(errno.E2BIG, "Argument list too long")
+            return run(args, **kwargs)
+
+        with mock.patch.object(comments.subprocess, "run", side_effect=limited):
+            lines, truncated, _, _ = comments.extract(self.root, names)
+        self.assertEqual((lines, truncated), ([f"{names[7]}: # new"], False))
+
+    def test_batches_within_limit(self):
+        with mock.patch.object(comments, "MAX_ARG_BYTES", 10):
+            self.assertEqual(list(comments._batches(["aaaa", "bbbb", "c", "dddddddddddd", "e"])),
+                             [["aaaa", "bbbb"], ["c"], ["dddddddddddd"], ["e"]])
 
     @unittest.skipUnless(shutil.which("git"), "нет git")
     def test_new_tracked_file_without_rename_is_whole(self):
@@ -916,56 +1370,87 @@ class CodeNamesTest(unittest.TestCase):
 
 
 class LinearParseTest(unittest.TestCase):
+    def assert_linear(self, cases):
+        """Разбор каждого входа make(4 * n) не дольше восьми разборов make(n) и 5 мс (helpers.assert_linear)."""
+        for make, ext, n in cases:
+            small, large = make(n), make(4 * n)
+            helpers.assert_linear(self, lambda: comments._comments(small, ext, time.monotonic() + 30),
+                                  lambda: comments._comments(large, ext, time.monotonic() + 30), msg=(ext, make(2)))
+
     def test_unclosed_quotes_and_backslashes(self):
-        started = time.monotonic()
         self.assertEqual(comments.comment_lines('"\\' * 20000 + " // c", "js"), ["// c"])
         self.assertEqual(comments.comment_lines("'\\" * 20000, "js"), [])
         self.assertEqual(comments.comment_lines('"' + "\\a" * 20000 + '" // c', "js"), ["// c"])
-        self.assertLess(time.monotonic() - started, 3)
+        self.assert_linear(((lambda k: '"\\' * k + " // c", "js", 5000), (lambda k: "'\\" * k, "js", 2500),
+                            (lambda k: '"' + "\\a" * k + '" // c', "js", 5000)))
 
     def test_many_triple_quotes_on_one_line(self):
-        started = time.monotonic()
         self.assertEqual(comments.comment_lines('x = """a""" ' * 250000, "py"), [])
-        self.assertLess(time.monotonic() - started, 3)
+        self.assert_linear(((lambda k: 'x = """a""" ' * k, "py", 1500),))
 
     def test_long_prefix_before_many_heredoc_openers(self):
         # Решение «heredoc или сдвиг» смотрит только хвост строки перед «<<», а не весь префикс.
-        cases = (('my $d = "' + "ab" * 50000 + '"; print $fh <<EOF;\nbody\nEOF\n', "pl", []),
-                 ("x" * 200000 + " <<b " * 2000, "rb", []),
-                 ("print {$" + "f" * 200000 + "} <<B " * 2000 + "\n# not\nB\n", "pl", []),
-                 (" " * 200000 + "x <<b " * 20000, "rb", []),
+        cases = ((lambda k: 'my $d = "' + "ab" * k + '"; print $fh <<EOF;\nbody\nEOF\n', "pl", []),
+                 (lambda k: "x" * (100 * k) + " <<b " * k, "rb", []),
+                 (lambda k: "print {$" + "f" * (100 * k) + "} <<B " * k + "\n# not\nB\n", "pl", []),
+                 (lambda k: " " * (10 * k) + "x <<b " * k, "rb", []),
                  # Первые тройные кавычки — docstring: строка идёт в вывод целиком.
-                 (" " * 200000 + '"""""" ' * 20000, "py", [(1, ('"""""" ' * 20000).strip())]))
-        for text, ext, expected in cases:
-            started = time.monotonic()
-            self.assertEqual(comments._comments(text, ext, time.monotonic() + 30), expected, ext)
-            self.assertLess(time.monotonic() - started, 1, ext)
+                 (lambda k: " " * (10 * k) + '"""""" ' * k, "py", [(1, ('"""""" ' * 2000).strip())]))
+        for make, ext, expected in cases:
+            self.assertEqual(comments._comments(make(2000), ext, time.monotonic() + 30), expected, ext)
+        self.assert_linear((make, ext, 100) for make, ext, _ in cases)
 
     def test_new_language_constructs_are_linear(self):
         # Вложенные блоки, символьные литералы, REM, «"» Vim, heredoc PHP, @doc Elixir, блок-дескриптор Perl.
-        cases = (("/* " * 100000 + "*/ " * 100000 + "\n", "rs"), ("(* " + "(*)" * 100000 + "\n", "fs"),
-                 ("/* " + "*/ /*" * 100000 + "\n", "kt"), ("#[" + " #[ ]#" * 50000 + "\n", "nim"),
-                 ("$" * 200000, "erl"), ("\\" * 200000, "clj"), ("?" * 200000, "el"), ("?#" * 100000, "rb"),
-                 ("remx " * 50000, "bat"), (" " * 100000 + "a ::" * 20000, "cmd"), ("x rem" * 50000, "vb"),
-                 (' "a' * 50000, "vim"), ('x"' * 50000 + ' "', "vim"), ("<<<A " * 50000, "php"),
-                 ("@doc " * 50000, "ex"), ("{" * 100000 + "} <<B" * 20000, "pl"),
-                 ("print " + "{$a->{b}}<<B " * 20000, "pl"), ('#' * 100000 + '"', "swift"),
-                 ('r"' * 100000, "nim"),
-                 # Регулярки, slashy-строки, теги JSX: незакрытые литералы, классы, имена тегов, вложенность.
-                 ("(/[" * 100000, "js"), ("=/" * 100000, "ts"), ("(/\\" * 100000, "js"),
-                 (" " * 100000 + "/a/" * 30000, "js"),
-                 ("return" * 50000 + "/", "js"), ("(/" * 100000, "groovy"), ("=$/" * 100000, "gradle"),
-                 ("$/" + "$$/" * 50000, "groovy"), ("(<a>" * 50000, "jsx"), ("=<" * 100000, "tsx"),
-                 ("(<" + "a" * 100000 + " " * 100000 + "=" * 1000, "tsx"), ("<a " * 100000, "jsx"),
-                 ("x = <p>" + "<b>{" * 30000 + "\n" + "}</b>" * 30000 + "</p>\n", "jsx"),
-                 ("(<T,>" * 50000, "tsx"), ("(<a>\n" * 3000 + "// c\n" * 3000, "js"))
-        for text, ext in cases:
-            started = time.monotonic()
-            comments._comments(text, ext, time.monotonic() + 30)
-            self.assertLess(time.monotonic() - started, 1, ext)
+        self.assert_linear((
+            (lambda k: "/* " * k + "*/ " * k + "\n", "rs", 10000), (lambda k: "(* " + "(*)" * k + "\n", "fs", 20000),
+            (lambda k: "/* " + "*/ /*" * k + "\n", "kt", 2000), (lambda k: "#[" + " #[ ]#" * k + "\n", "nim", 10000),
+            (lambda k: "$" * k, "erl", 8000), (lambda k: "\\" * k, "clj", 8000), (lambda k: "?" * k, "el", 6000),
+            (lambda k: "?#" * k, "rb", 3000), (lambda k: "remx " * k, "bat", 2500),
+            (lambda k: " " * (5 * k) + "a ::" * k, "cmd", 1500), (lambda k: "x rem" * k, "vb", 2500),
+            (lambda k: ' "a' * k, "vim", 20000), (lambda k: 'x"' * k + ' "', "vim", 3000),
+            (lambda k: "<<<A " * k, "php", 500), (lambda k: "@doc " * k, "ex", 2500),
+            (lambda k: "{" * (5 * k) + "} <<B" * k, "pl", 200), (lambda k: "print " + "{$a->{b}}<<B " * k, "pl", 400),
+            (lambda k: "#" * k + '"', "swift", 50000), (lambda k: 'r"' * k, "nim", 4000),
+            # Регулярки, slashy-строки, теги JSX: незакрытые литералы, классы, имена тегов, вложенность.
+            (lambda k: "(/[" * k, "js", 50000), (lambda k: "=/" * k, "ts", 5000), (lambda k: "(/\\" * k, "js", 5000),
+            (lambda k: " " * (3 * k) + "/a/" * k, "js", 10000), (lambda k: "return" * k + "/", "js", 50000),
+            (lambda k: "(/" * k, "groovy", 5000), (lambda k: "=$/" * k, "gradle", 50000),
+            (lambda k: "$/" + "$$/" * k, "groovy", 600), (lambda k: "(<a>" * k, "jsx", 1000),
+            (lambda k: "=<" * k, "tsx", 2000), (lambda k: "(<" + "a" * k + " " * k + "=" * (k // 100), "tsx", 50000),
+            (lambda k: "<a " * k, "jsx", 1500),
+            (lambda k: "x = <p>" + "<b>{" * k + "\n" + "}</b>" * k + "</p>\n", "jsx", 600),
+            (lambda k: "(<T,>" * k, "tsx", 2000), (lambda k: "(<a>\n" * k + "// c\n" * k, "js", 500),
+            # Слово перед «/» и «$» просматривается не дальше _KEYWORD_MAX знаков.
+            (lambda k: "$" * k, "groovy", 1200), (lambda k: "a" * (2 * k) + " /" * k, "js", 2000),
+            # Шаблонные строки JS, «<<» перед тегом JSX.
+            (lambda k: "`${" * k, "js", 1500), (lambda k: "x`" + "${`" * k, "ts", 1500),
+            (lambda k: "`" + "${a}" * k + "`", "js", 5000), (lambda k: "x <<" * k, "jsx", 5000),
+            # Литералы Ruby, Perl, Elixir: незакрытые разделители, скобки, «/» после слова.
+            (lambda k: "s{" * k, "pl", 10000), (lambda k: "q(" * k, "pl", 10000),
+            (lambda k: "s " * k + "{", "pl", 10000), (lambda k: "s/a/" * k, "pl", 2000),
+            (lambda k: "a /" * k, "rb", 2500), (lambda k: "x = %w(" * k, "rb", 10000),
+            (lambda k: "~r/" * k, "ex", 5000), (lambda k: ' "a' * k, "rb", 5000),
+            # Специальные переменные, вложенные подстановки Ruby, многострочные операторы-кавычки и heredoc.
+            (lambda k: '$"' * k, "pl", 10000), (lambda k: '"#{' * k, "rb", 5000), (lambda k: "s{a}{" * k, "pl", 5000),
+            (lambda k: "qr{" * k + "\n", "pl", 10000), (lambda k: "%r{\n" + "a # b\n" * k + "}", "rb", 2000),
+            (lambda k: "x = <<'a <<\"b " * k, "pl", 2000),
+            # Блочные скаляры YAML: длинный отступ, теги перед индикатором.
+            (lambda k: "a: |\n" + "  " * k + "\n", "yaml", 50000), (lambda k: "k: !a " * k + "|", "yaml", 10000),
+            # Скрипты в блочных скалярах YAML, стек ключей; локальные переменные Ruby; флаги x и e после литерала.
+            (lambda k: "run: |\n" + "  echo a # c\n" * k, "yaml", 2000),
+            (lambda k: "a:\n  b:\n    c:\n- |\n  # c\n" * k, "yaml", 1000),
+            (lambda k: "script:\n" + "  - a: 1\n  - |\n    # c\n" * k, "yaml", 1000),
+            (lambda k: "".join(" " * d + "- uses: x\n" for d in range(200)) + (" " * 200 + "- k: v\n") * k, "yaml",
+             2000),
+            (lambda k: ("".join(" " * d + f"k{d}:\n" for d in range(100)) + " |\n  # c\n") * k, "yaml", 100),
+            (lambda k: "a = 1; " * k + "a /b # c", "rb", 5000), (lambda k: "do |" * k, "rb", 5000),
+            (lambda k: "def f(" * k, "rb", 5000), (lambda k: "a, " * k + "= 1", "rb", 5000),
+            (lambda k: "qr{\n a #b\n}\n" * k, "pl", 1000), (lambda k: "s{a}{\n" * k + "}e\n" * k, "pl", 500)))
 
     def test_deadline_during_parse_files_without_check(self):
         common._reset()
+        self.addCleanup(common._reset)
         root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, root)
         pathlib.Path(root, "a.py").write_text("# c\n" * 3000, encoding="utf-8")
@@ -981,10 +1466,10 @@ class LinearParseTest(unittest.TestCase):
         self.assertGreater(len(calls), 2)
         self.assertEqual(common._messages,
                          ["planka: строки комментариев не извлечены в срок, файлов кода без проверки: 1"])
-        common._reset()
 
     def test_deadline_inside_one_long_line(self):
         common._reset()
+        self.addCleanup(common._reset)
         root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, root)
         pathlib.Path(root, "a.js").write_text('x = "a"; ' * 200000 + "// c\n", encoding="utf-8")
@@ -1002,4 +1487,3 @@ class LinearParseTest(unittest.TestCase):
         # Разбор остановился на сроке, а не дошёл до конца строки: проверок срока на несколько порядков
         # меньше позиций.
         self.assertLess(len(seen), 200)
-        common._reset()

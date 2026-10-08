@@ -2,16 +2,21 @@
 
 Правка — текст манифеста до и после по входу Write, Edit, MultiEdit. Команда — снимок имён всех
 манифестов проекта перед ней (state/<session>.manifests.json по tool_use_id) и сравнение после.
-Новым не считается имя из текста до правки вместе с транзитивными, из версии манифеста в HEAD и в
-источнике незавершённых merge, cherry-pick, rebase, revert, из другого манифеста того же реестра в
-проекте, имя пакета самого проекта (workspace, монорепозиторий) и, после команды, имя из манифестов ref,
-откуда команда git возвращает файлы (stash, ветка, коммит), если ref создан до начала сессии.
+Новым не считается имя из текста до правки вместе с транзитивными, из версии манифеста в HEAD, в
+источнике незавершённых merge, cherry-pick, rebase, revert и в сторонах конфликта индекса, из другого манифеста
+того же реестра в проекте и в HEAD, из файла _LEGACY в HEAD, имя пакета самого проекта (workspace, монорепозиторий) и,
+после команды, имя из манифестов ref, откуда команда git возвращает файлы (stash, ветка, коммит), если ref
+создан до начала сессии.
 """
+import ast
+import configparser
 import os
 import re
 import stat
 import subprocess
 import time
+import tomllib
+import warnings
 
 import common
 import depcheck
@@ -22,7 +27,7 @@ import snapshot
 # common.GIT_ROOT_TIMEOUT корня проекта (tests/test_contract.py, TimeoutsTest).
 SNAPSHOT_BUDGET = 5
 CHECK_BUDGET = 5
-# Срок `git cat-file` версий из _REPO_REFS при правке файловым инструментом, секунды.
+# Срок `git cat-file` версий из _REPO_REFS и _INDEX_STAGES при правке файловым инструментом, секунды.
 HEAD_TIMEOUT = 5
 # Пределы: больший манифест не разбирается, больше манифестов или файлов обхода вне git — снимка нет.
 MAX_MANIFEST_BYTES = 1_048_576
@@ -53,6 +58,111 @@ def watched_kind(path):
     if FOREIGN_DIRS.intersection(parts[:-1]):
         return None
     return manifests.kind(path)
+
+
+# Файлы зависимостей PyPI, которые не проверяются как манифест: их имена только известные — перенос в
+# pyproject.toml или requirements не новое имя — и берутся только из деревьев git (HEAD, ref до начала сессии):
+# правку рабочего дерева не проверяет никто. setup.py — код: читаются строковые литералы ключей _SETUP_KEYS.
+_LEGACY = frozenset({"setup.py", "setup.cfg", "Pipfile"})
+_SETUP_KEYS = ("install_requires", "setup_requires", "tests_require", "extras_require")
+# Таблицы Pipfile, ключи которых не пакеты; остальные таблицы — категории пакетов (packages, dev-packages, свои).
+_PIPFILE_NOT_PACKAGES = frozenset({"source", "requires", "scripts", "pipenv"})
+
+
+def source_kind(path):
+    """watched_kind или имя файла _LEGACY (вне каталогов FOREIGN_DIRS) — источник известных имён в дереве git;
+    None — ни то, ни другое."""
+    kind = watched_kind(path)
+    if kind is not None:
+        return kind
+    parts = re.split(r"[\\/]", path)
+    return parts[-1] if parts[-1] in _LEGACY and not FOREIGN_DIRS.intersection(parts[:-1]) else None
+
+
+def _registry(kind):
+    return "pypi" if kind in _LEGACY else manifests.registry(kind)
+
+
+def _setup_cfg(text):
+    """Требования `[options]` install_requires, setup_requires, tests_require и `[options.extras_require]`
+    setup.cfg строками; None — не разобран. Значение `file:` — ссылка на файл, не требование."""
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    try:
+        parser.read_string(text)
+    except (configparser.Error, ValueError):
+        return None
+    values = [parser.get("options", key, fallback="") for key in _SETUP_KEYS[:3]]
+    if parser.has_section("options.extras_require"):
+        values += [value for _, value in parser.items("options.extras_require")]
+    return [line for value in values if not value.strip().startswith("file:") for line in value.splitlines()]
+
+
+def _literals(roots, assigned):
+    """Строки литералов roots: строка, элементы списка, кортежа, множества, значения словаря, обе стороны `+`;
+    имя — значение его присваивания на уровне модуля (assigned). Каждый узел и каждое имя обходятся один раз:
+    время линейно по размеру дерева, порядок строк не сохраняется."""
+    out, stack, seen = [], list(roots), set()
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, str):
+                out.append(node.value)
+        elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            stack += node.elts
+        elif isinstance(node, ast.Dict):
+            stack += node.values
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            stack += [node.left, node.right]
+        elif isinstance(node, ast.Name) and node.id in assigned:
+            stack.append(assigned[node.id])
+    return out
+
+
+def _setup_py(text):
+    """Требования setup.py строками: литералы аргументов и ключей словаря _SETUP_KEYS; None — не разобран.
+    Требования, собранные кодом (чтение файла, цикл), не видны."""
+    try:
+        # SyntaxWarning разбора (`"\d"` в строке) печатается в stderr, а хук stderr не пишет.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+    assigned = {node.targets[0].id: node.value for node in tree.body
+                if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)}
+    values = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg in _SETUP_KEYS:
+            values.append(node.value)
+        elif isinstance(node, ast.Dict):
+            values += [v for k, v in zip(node.keys, node.values)
+                       if isinstance(k, ast.Constant) and k.value in _SETUP_KEYS]
+    return _literals(values, assigned)
+
+
+def _pipfile(text):
+    """Имена пакетов Pipfile — ключи таблиц, кроме _PIPFILE_NOT_PACKAGES; None — не разобран."""
+    try:
+        data = tomllib.loads(text)
+    except (ValueError, RecursionError):
+        return None
+    return [name for table, value in data.items() if table not in _PIPFILE_NOT_PACKAGES and isinstance(value, dict)
+            for name in value]
+
+
+_LEGACY_PARSERS = {"setup.py": _setup_py, "setup.cfg": _setup_cfg, "Pipfile": _pipfile}
+
+
+def _known(kind, text):
+    """Имена с транзитивными (manifests.known_names) манифеста или файла _LEGACY вида kind; None — не разобран."""
+    if kind not in _LEGACY:
+        return manifests.known_names(kind, text)
+    lines = _LEGACY_PARSERS[kind](text)
+    # Строки требований разбирает разбор файла требований: имя PEP 508, нормализация PEP 503.
+    return None if lines is None else manifests.known_names("requirements", "\n".join(lines))
 
 
 def _read(path):
@@ -115,10 +225,14 @@ def edit_texts(tool, tool_input, path):
     return current, text
 
 
-def _git(cwd, timeout, *args, input=None):
-    """stdout `git -C cwd <args>` с stdin input байтами; None при коде не 0 или сбое; TimeoutError по сроку."""
+def _git(cwd, timeout, *args, root, input=None):
+    """stdout `git -C cwd <args>` с stdin input байтами; None при коде не 0 или сбое; TimeoutError по сроку.
+    root — корень проекта (common.project_root), cwd — он или каталог под ним: git ищет репозиторий не выше
+    root (common.git_env); None — проект неизвестен или cwd вне него, окружение наследуется."""
+    env = None if root is None else common.git_env(root)
     try:
-        proc = subprocess.run(["git", "-C", str(cwd), *args], input=input, capture_output=True, timeout=timeout)
+        proc = subprocess.run(["git", "-C", str(cwd), *args], input=input, capture_output=True, timeout=timeout,
+                              env=env)
     except subprocess.TimeoutExpired:
         raise TimeoutError("git не уложился в срок") from None
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -130,6 +244,10 @@ def _git(cwd, timeout, *args, input=None):
 # revert — при конфликте они не закоммичены, а файл уже с их правкой; revert возвращает версию до
 # отменяемого коммита (REVERT_HEAD^).
 _REPO_REFS = ("HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REBASE_HEAD", "REVERT_HEAD", "REVERT_HEAD^")
+# Стороны конфликта в индексе: база, наша, их. Их пишет git при конфликте любой операции, в том числе
+# `git stash pop|apply`, `git merge --squash`, `git cherry-pick -n`, которые ref в _REPO_REFS не оставляют;
+# держатся до `git add` или `git rm` файла.
+_INDEX_STAGES = (":1:", ":2:", ":3:")
 
 
 def _objects(out):
@@ -156,19 +274,35 @@ def _blobs(out):
     return [data for kind, data in filter(None, _objects(out)) if kind == b"blob"]
 
 
-def head_names(path, kind, timeout):
-    """Имена манифеста path вместе с транзитивными (manifests.known_names) в версиях _REPO_REFS его
-    репозитория, объединённые; None — нет репозитория, файла ни в одной версии или ни одна не разобрана.
-    `cat-file --batch` отдаёт байты блобов без textconv и фильтров одним вызовом git."""
+def _inside(path, root):
+    """Каталог path — root или под ним, символические ссылки разрешены."""
+    path, root = os.path.realpath(path), os.path.realpath(root)
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        # Разные диски Windows.
+        return False
+
+
+def head_names(path, kind, timeout, root=None):
+    """Имена манифеста path вместе с транзитивными (manifests.known_names) в версиях _REPO_REFS и сторонах
+    конфликта _INDEX_STAGES его репозитория, объединённые; None — нет репозитория, файла ни в одной версии или
+    ни одна не разобрана. `cat-file --batch` отдаёт байты блобов без textconv и фильтров одним вызовом git.
+    root — корень проекта (common.project_root) или None; файл под root ищет репозиторий не выше root (_git),
+    файл вне root и при None — свой репозиторий без ограничения."""
     name = os.path.basename(path)
     cwd = os.path.dirname(path) or "."
+    if root is not None and not _inside(cwd, root):
+        root = None
     if "\n" in name or "\r" in name:
-        # Ввод --batch построчный: имя с переводом строки — только версия HEAD отдельным вызовом.
-        out = _git(cwd, timeout, "cat-file", "blob", f"HEAD:./{name}")
+        # Ввод --batch построчный: имя с переводом строки или возвратом каретки — только версия HEAD отдельным
+        # вызовом.
+        out = _git(cwd, timeout, "cat-file", "blob", f"HEAD:./{name}", root=root)
         blobs = [] if out is None else [out]
     else:
-        out = _git(cwd, timeout, "cat-file", "--batch",
-                   input=os.fsencode("".join(f"{ref}:./{name}\n" for ref in _REPO_REFS)))
+        out = _git(cwd, timeout, "cat-file", "--batch", root=root,
+                   input=os.fsencode("".join(f"{ref}:./{name}\n" for ref in _REPO_REFS)
+                                     + "".join(f"{stage}./{name}\n" for stage in _INDEX_STAGES)))
         blobs = [] if out is None else _blobs(out)
     found = [manifests.known_names(kind, b.decode("utf-8", "replace")) for b in blobs if len(b) <= MAX_MANIFEST_BYTES]
     found = [names for names in found if names is not None]
@@ -206,32 +340,36 @@ def edit_names(kind, before, after, head, project=frozenset):
 
 
 def project_names(root, kind, deadline):
-    """Имена манифестов реестра вида kind (manifests.registry) под root с транзитивными и имена пакетов
-    самого проекта этого реестра.
-    Не разобранный и больший MAX_MANIFEST_BYTES манифест не даёт ничего. Unavailable и TimeoutError —
-    как у list_manifests."""
-    _, found = list_manifests(root, deadline)
+    """Имена манифестов реестра вида kind (manifests.registry) под root и, в git, манифестов и файлов _LEGACY
+    версии HEAD (_tree_names) с транзитивными и имена пакетов самого проекта этого реестра; файлы _LEGACY
+    рабочего дерева имён не дают. Не разобранный и больший MAX_MANIFEST_BYTES манифест не даёт ничего.
+    Unavailable и TimeoutError — как у list_manifests и _tree_names."""
+    mode, found = list_manifests(root, deadline)
+    registry = manifests.registry(kind)
     out = set()
     for rel in found:
         _remaining(deadline)
         other = watched_kind(rel)
-        if manifests.registry(other) != manifests.registry(kind):
+        if manifests.registry(other) != registry:
             continue
         known, own = _parse(os.path.join(root, rel), other)
         out.update(known or ())
         out.add(own)
     out.discard(None)
+    if mode == "git":
+        out.update((_tree_names(root, "HEAD", deadline) or {}).get(registry, ()))
     return frozenset(out)
 
 
-def check_edit(tool, tool_input, path, kind, project=frozenset):
-    """Новые имена правки манифеста path; project — как у fresh_names. None — правку не вычислить.
-    Unavailable — не проверить: не разобран или манифесты проекта не перечислить."""
+def check_edit(tool, tool_input, path, kind, project=frozenset, root=lambda: None):
+    """Новые имена правки манифеста path; project — как у fresh_names; root() — корень проекта для head_names
+    или None, зовётся только для версий git. None — правку не вычислить. Unavailable — не проверить: не
+    разобран или манифесты проекта не перечислить."""
     texts = edit_texts(tool, tool_input, path)
     if texts is None:
         return None
     before, after = texts
-    return edit_names(kind, before, after, lambda: head_names(path, kind, HEAD_TIMEOUT), project)
+    return edit_names(kind, before, after, lambda: head_names(path, kind, HEAD_TIMEOUT, root()), project)
 
 
 def _remaining(deadline):
@@ -242,7 +380,8 @@ def _remaining(deadline):
 
 
 def _walk(root, deadline):
-    """Манифесты под root обходом каталогов без FOREIGN_DIRS; Unavailable — файлов больше MAX_WALK_FILES."""
+    """Пути манифестов (watched_kind) под root обходом каталогов без FOREIGN_DIRS; Unavailable — файлов больше
+    MAX_WALK_FILES."""
     found, seen = [], 0
     for dirpath, dirnames, filenames in os.walk(root):
         _remaining(deadline)
@@ -259,10 +398,11 @@ def _walk(root, deadline):
 
 
 def list_manifests(root, deadline):
-    """("git" или "walk", [путь манифеста от root]). В git — отслеживаемые и неотслеживаемые не
-    исключённые файлы (`ls-files -co --exclude-standard`), вне git — обход; в обоих режимах без каталогов
-    FOREIGN_DIRS (watched_kind). Unavailable — манифестов больше MAX_MANIFESTS; TimeoutError — срок."""
-    out = _git(root, _remaining(deadline), "ls-files", "-z", "-c", "-o", "--exclude-standard")
+    """("git" или "walk", [путь манифеста от root]); манифест — путь, где watched_kind не None. В git —
+    отслеживаемые и неотслеживаемые не исключённые файлы (`ls-files -co --exclude-standard`), вне git — обход;
+    в обоих режимах без каталогов FOREIGN_DIRS. Unavailable — манифестов больше MAX_MANIFESTS; TimeoutError —
+    срок."""
+    out = _git(root, _remaining(deadline), "ls-files", "-z", "-c", "-o", "--exclude-standard", root=root)
     if out is None:
         mode, found = _walk(root, deadline)
     else:
@@ -292,18 +432,19 @@ def _text(path):
 
 
 def _parse(path, kind):
-    """(имена с транзитивными или None, имя пакета самого манифеста или None)."""
+    """(имена с транзитивными или None, имя пакета самого манифеста или None) манифеста."""
     text = _text(path)
     if text is None:
         return None, None
-    return manifests.known_names(kind, text), manifests.own_name(kind, text)
+    return _known(kind, text), manifests.own_name(kind, text)
 
 
 def take(root, deadline):
     """Снимок: {"root", "mode", "ts", "files": {путь: [size, mtime_ns, имена с транзитивными или None,
-    имя пакета манифеста или None]}}."""
+    имя пакета манифеста или None]}}; поле "known" (restored_names) добавляет вызывающий. Файлы _LEGACY
+    рабочего дерева в снимок не входят."""
     mode, found = list_manifests(root, deadline)
-    files = {}
+    entry = {"root": str(root), "mode": mode, "ts": time.time(), "files": {}}
     for rel in found:
         _remaining(deadline)
         path = os.path.join(root, rel)
@@ -311,8 +452,8 @@ def take(root, deadline):
         if st is None:
             continue
         known, own = _parse(path, watched_kind(rel))
-        files[rel] = [*st, None if known is None else sorted(known), own]
-    return {"root": str(root), "mode": mode, "ts": time.time(), "files": files}
+        entry["files"][rel] = [*st, None if known is None else sorted(known), own]
+    return entry
 
 
 def compare(entry, deadline, skip=frozenset()):
@@ -320,9 +461,10 @@ def compare(entry, deadline, skip=frozenset()):
 
     Новый манифест сравнивается с пустым; пропавший — ничего; манифест с тем же size и mtime не
     перечитывается; манифест, чей realpath в skip, не проверяется. Имя из любого манифеста того же реестра
-    (manifests.registry) в снимке, из ref до начала сессии (entry["known"], restored_names) и имя пакета
-    самого проекта (в снимке или в манифесте после команды) — не новое: перенос, копия, член workspace,
-    возврат работы автора. Unavailable — снимок другого режима."""
+    (manifests.registry) в снимке, из ref до начала сессии (entry["known"], restored_names), в git — из
+    манифестов и файлов _LEGACY версии HEAD (_tree_names, читается, только если после old и версий файла
+    что-то осталось) и имя пакета самого проекта (в снимке или в манифесте после команды) — не новое: перенос,
+    копия, член workspace, возврат работы автора. Unavailable — снимок другого режима."""
     root = entry["root"]
     mode, found = list_manifests(root, deadline)
     if mode != entry["mode"]:
@@ -354,6 +496,13 @@ def compare(entry, deadline, skip=frozenset()):
         own = manifests.own_name(kind, text)
         project.setdefault(manifests.registry(kind), set()).update(() if own is None else (own,))
         changed.append((rel, path, kind, new, was))
+    head_tree = []
+
+    def project_of(kind):
+        if mode == "git" and not head_tree:
+            head_tree.append(_tree_names(root, "HEAD", deadline) or {})
+        registry = manifests.registry(kind)
+        return frozenset(project.get(registry, ())).union(head_tree[0].get(registry, ()) if head_tree else ())
     added = {}
     for rel, path, kind, new, was in changed:
         if was is None:
@@ -362,9 +511,9 @@ def compare(entry, deadline, skip=frozenset()):
             old = None if was[2] is None else frozenset(was[2])
 
         def head(path=path, kind=kind):
-            return head_names(path, kind, _remaining(deadline)) if mode == "git" else None
+            return head_names(path, kind, _remaining(deadline), root) if mode == "git" else None
         try:
-            names = fresh_names(old, new, head, lambda kind=kind: frozenset(project[manifests.registry(kind)]))
+            names = fresh_names(old, new, head, lambda kind=kind: project_of(kind))
         except Unavailable:
             unknown.append(rel)
             continue
@@ -468,7 +617,8 @@ def _old_trees(root, refs, start, deadline):
             primary.append(False)
     if not lines:
         return []
-    out = _git(root, _remaining(deadline), "cat-file", "--batch", input=os.fsencode("".join(f"{l}\n" for l in lines)))
+    out = _git(root, _remaining(deadline), "cat-file", "--batch", root=root,
+               input=os.fsencode("".join(f"{l}\n" for l in lines)))
     if out is None:
         return []
     trees, accepted = [], False
@@ -487,11 +637,41 @@ def _old_trees(root, refs, start, deadline):
     return list(dict.fromkeys(trees))
 
 
+def _tree_names(root, tree, deadline):
+    """{реестр: имена с транзитивными} манифестов и файлов _LEGACY (source_kind) дерева tree — ref или SHA
+    дерева; None — git не прочитал дерево (нет HEAD, не репозиторий). Пути с переводом строки не ложатся в
+    построчный ввод --batch и пропускаются. Unavailable — манифестов в дереве больше MAX_MANIFESTS;
+    TimeoutError — срок deadline."""
+    listed = _git(root, _remaining(deadline), "ls-tree", "-r", "-z", "--name-only", "--full-tree", tree, root=root)
+    if listed is None:
+        return None
+    paths = [p for p in (os.fsdecode(e) for e in listed.split(b"\0") if e)
+             if source_kind(p) and "\n" not in p and "\r" not in p]
+    if len(paths) > MAX_MANIFESTS:
+        raise Unavailable(f"манифестов в {tree} больше {MAX_MANIFESTS}")
+    known = {}
+    if not paths:
+        return known
+    out = _git(root, _remaining(deadline), "cat-file", "--batch", root=root,
+               input=os.fsencode("".join(f"{tree}:{p}\n" for p in paths)))
+    if out is None:
+        return None
+    for path, obj in zip(paths, _objects(out)):
+        if obj is None or obj[0] != b"blob" or len(obj[1]) > MAX_MANIFEST_BYTES:
+            continue
+        kind = source_kind(path)
+        names = _known(kind, obj[1].decode("utf-8", "replace"))
+        if names:
+            known.setdefault(_registry(kind), set()).update(names)
+    return known
+
+
 def restored_names(root, command, start, deadline):
-    """{реестр: имена с транзитивными} манифестов ref, откуда command возвращает файлы (command_refs), если
-    ref создан до start — начала сессии (session_start); это работа до сессии, после команды такие имена не
-    новые. start None, ref моложе, не найден, манифестов в дереве больше MAX_MANIFESTS или срок deadline вышел —
-    имена не добавляются: сравнение блокирует, как без ref.
+    """{реестр: имена с транзитивными} манифестов и файлов _LEGACY ref, откуда command возвращает файлы
+    (command_refs), если ref создан до start — начала сессии (session_start); это работа до сессии, после
+    команды такие имена не новые. start None, ref моложе или не найден — имена не добавляются: сравнение
+    блокирует, как без ref. Unavailable — имена ref не прочитаны: срок deadline вышел, манифестов в дереве больше
+    MAX_MANIFESTS или git не прочитал дерево.
 
     Время ref — время коммиттера: коммит с поддельной датой (GIT_COMMITTER_DATE) проходит как старый."""
     refs = command_refs(command)
@@ -500,24 +680,13 @@ def restored_names(root, command, start, deadline):
     known = {}
     try:
         for tree in _old_trees(root, refs, start, deadline):
-            listed = _git(root, _remaining(deadline), "ls-tree", "-r", "-z", "--name-only", "--full-tree", tree)
-            if listed is None:
-                continue
-            paths = [p for p in (os.fsdecode(e) for e in listed.split(b"\0") if e)
-                     if watched_kind(p) and "\n" not in p and "\r" not in p]
-            if not paths or len(paths) > MAX_MANIFESTS:
-                continue
-            out = _git(root, _remaining(deadline), "cat-file", "--batch",
-                       input=os.fsencode("".join(f"{tree}:{p}\n" for p in paths)))
-            for path, obj in zip(paths, _objects(out or b"")):
-                if obj is None or obj[0] != b"blob" or len(obj[1]) > MAX_MANIFEST_BYTES:
-                    continue
-                kind = watched_kind(path)
-                names = manifests.known_names(kind, obj[1].decode("utf-8", "replace"))
-                if names:
-                    known.setdefault(manifests.registry(kind), set()).update(names)
+            names = _tree_names(root, tree, deadline)
+            if names is None:
+                raise Unavailable(f"дерево ref {tree} не прочитано")
+            for registry, found in names.items():
+                known.setdefault(registry, set()).update(found)
     except TimeoutError:
-        return {}
+        raise Unavailable("имена ref команды не прочитаны за срок") from None
     return {registry: sorted(names) for registry, names in known.items()}
 
 

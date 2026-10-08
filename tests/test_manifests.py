@@ -1,7 +1,8 @@
 import pathlib
 import sys
-import time
 import unittest
+
+from tests.helpers import assert_linear
 
 PLANKA_DIR = pathlib.Path(__file__).resolve().parent.parent / "plugin" / "planka"
 sys.path.insert(0, str(PLANKA_DIR))
@@ -71,6 +72,16 @@ CORPUS = {
     "pyproject-uv-workspace/pyproject.toml": {"tqdm"},
     "gemfile-path/Gemfile": {"rails", "puma", "debug", "rspec-rails"},
     "gomod-replace-local/go.mod": {"github.com/go-chi/chi/v5", "google.golang.org/grpc"},
+    # Зависимости `[project.optional-dependencies]` — имена; meson-python и wheel — бэкенды сборки.
+    "pyproject-gyp-next/pyproject.toml": {"packaging", "setuptools", "pytest", "ruff"},
+    "pyproject-pandas/pyproject.toml": set("""
+        meson cython numpy versioneer python-dateutil tzdata hypothesis pytest pytest-xdist pyarrow bottleneck
+        numba numexpr scipy xarray fsspec s3fs gcsfs odfpy openpyxl python-calamine pyxlsb xlrd xlsxwriter
+        pyiceberg tables pyreadstat sqlalchemy psycopg2 adbc-driver-postgresql pymysql adbc-driver-sqlite
+        beautifulsoup4 html5lib lxml matplotlib jinja2 tabulate pyqt5 qtpy zstandard pytz fastparquet""".split()),
+    # Директива `tool` называет команду модуля из `require`; сама не объявляет зависимость.
+    "gomod-tool/go.mod": {"golang.org/x/net", "golang.org/x/tools", "golang.org/x/text", "github.com/golang/mock",
+                          "honnef.co/go/tools"},
 }
 
 # Имя самого пакета манифеста корпуса (manifests.own_name); не перечисленные — None.
@@ -89,13 +100,32 @@ OWN = {
     "gomod-otel/go.mod": "go.opentelemetry.io/otel",
     "gomod-wintun/go.mod": "golang.zx2c4.com/wintun",
     "gomod-replace-local/go.mod": "example.com/monorepo/api",
+    "pyproject-gyp-next/pyproject.toml": "gyp-next",
+    "pyproject-pandas/pyproject.toml": "pandas",
+    "gomod-tool/go.mod": "example.com/my/thing",
+}
+
+
+# Ожидаемые известные имена (manifest_watch._known) файлов PyPI без проверки (manifest_watch._LEGACY) корпуса;
+# путь — относительно FIXTURES.
+LEGACY_CORPUS = {
+    "legacy-requests/setup.py": set("""
+        certifi chardet charset-normalizer idna pysocks pytest pytest-cov pytest-httpbin pytest-mock pytest-xdist
+        urllib3""".split()),
+    "legacy-pytest/setup.cfg": set("""
+        argcomplete attrs colorama exceptiongroup hypothesis importlib-metadata iniconfig mock nose packaging pluggy
+        pygments requests setuptools setuptools-scm tomli xmlschema""".split()),
+    "legacy-pipenv/Pipfile": set("""
+        atomicwrites build click colorama exceptiongroup gunicorn importlib-metadata invoke myst-parser parse pipenv
+        pre-commit pypiserver pytest-cov pytz pyyaml semver sphinx sphinx-click sphinxcontrib-spelling stdeb tomli
+        twine typing-extensions waitress zipp""".split()),
 }
 
 
 class CorpusTest(unittest.TestCase):
     def test_every_fixture_has_expectation(self):
         files = {p.relative_to(FIXTURES).as_posix() for p in FIXTURES.rglob("*") if p.is_file()}
-        self.assertEqual(files, set(CORPUS))
+        self.assertEqual(files, set(CORPUS) | set(LEGACY_CORPUS))
 
     def test_corpus(self):
         for rel, expected in CORPUS.items():
@@ -110,7 +140,8 @@ class CorpusTest(unittest.TestCase):
                 self.assertEqual(manifests.own_name(kind, text), OWN.get(rel))
 
     def test_corpus_one_added_line(self):
-        # Добавление одной зависимости в настоящий манифест видно ровно одним именем.
+        # Добавление одной зависимости в настоящий манифест видно ровно одним именем; в сгенерированный файл
+        # требований — ни одним: его пакеты транзитивные.
         cases = {
             "npm-cc-harness/package.json": ('"zustand": "^4.5.5"', '"zustand": "^4.5.5",\n    "left-pad": "1.3.0"',
                                             ["left-pad"]),
@@ -124,6 +155,10 @@ class CorpusTest(unittest.TestCase):
             "gomod-grpc/go.mod": ("\tgonum.org/v1/gonum v0.17.0",
                                   "\tgonum.org/v1/gonum v0.17.0\n\tgithub.com/evil/pkg v1.0.0", ["github.com/evil/pkg"]),
             "gemfile-cmock/Gemfile": ('gem "diy"', 'gem "diy"\ngem "nokogiri", "~> 1.16"', ["nokogiri"]),
+            "pyproject-gyp-next/pyproject.toml": ('dev = ["pytest", "ruff"]', 'dev = ["pytest", "ruff", "mypy"]',
+                                                  ["mypy"]),
+            "gomod-tool/go.mod": ("\thonnef.co/go/tools v0.6.1",
+                                  "\thonnef.co/go/tools v0.6.1\n\tgithub.com/evil/pkg v1.0.0", ["github.com/evil/pkg"]),
         }
         for rel, (old, new, expected) in cases.items():
             with self.subTest(rel):
@@ -161,7 +196,9 @@ class KindTest(unittest.TestCase):
         for path in ["package-lock.json", "composer.lock", "Cargo.lock", "go.sum", "Gemfile.lock",
                      "poetry.lock", "uv.lock", "notes.txt", "/p/docs/requirements.md", "constraints.txt",
                      "tsconfig.json", "/p/package.json/x", "setup.py", "setup.cfg", "/p/requirements/README.md",
-                     "my-requirements.txt", "go.mod.bak", "cargo.toml", "gemfile", ""]:
+                     "my-requirements.txt", "go.mod.bak", "cargo.toml", "gemfile", "/p/docs/notes.txt", "src/x.in",
+                     "C:\\p\\docs\\notes.txt", "", "requirements.txt\n", "/p/requirements/base.txt\n",
+                     "requirements.in\n"]:
             with self.subTest(path):
                 self.assertIsNone(manifests.kind(path))
 
@@ -341,6 +378,9 @@ ruff = "*"
             ('pytest = "^8"', 'pytest = "^8"\nevil = { git = "https://x/evil.git" }', ["evil"]),
             ('requests = "^2"', 'requests = "^3"', []),
             ('python = "^3.11"', 'python = "^3.12"', []),
+            ('python = "^3.11"', 'Python = "^3.11"', []),
+            # Ссылка на свои extras по имени `tool.poetry.name`.
+            ('ruff = "*"', 'ruff = "*"\n\n[dependency-groups]\ndev = ["App[test]"]', []),
             ('local = { path = "../local", develop = true }', 'local = { path = "../local2" }\nother = { path = "../o" }',
              []),
         ]
@@ -406,6 +446,7 @@ class RequirementsTest(unittest.TestCase):
             ("numpy ; sys_platform == 'linux'", ["numpy"]),
             ("pkg@https://x/pkg.zip", ["pkg"]),
             ("-e git+https://x/repo.git@v1#egg=Evil_Pkg&subdirectory=sub", ["evil-pkg"]),
+            ("git+https://x/repo.git#subdirectory=sub&egg=evil4", ["evil4"]),
             ("--editable=git+https://x/repo.git#egg=evil2", ["evil2"]),
             ("git+https://x/repo.git#egg=evil3", ["evil3"]),
             ("https://x/files/Some_Pkg-1.0-py3-none-any.whl", ["some-pkg"]),
@@ -433,6 +474,10 @@ class RequirementsTest(unittest.TestCase):
             # Продолжение строки опции: `constraints` — значение `-c`, не пакет.
             "requests\n-c \\\n  constraints\n",
             "requests==2.31#notcomment\ndjango\n",
+            # Колесо по `file:` и архив по относительному пути — локальные.
+            "requests\nfile:///tmp/w/Local_Pkg-1.0-py3-none-any.whl\nlibs/pkg-1.0.tar.gz\nlibs\\pkg2-1.0.tar.gz\n",
+            # Продолжение строки с переводом CRLF.
+            "requests\r\n-c \\\r\n  constraints\r\n",
         ]:
             with self.subTest(new):
                 self.assertEqual(_added("requirements.txt", self.OLD, new), [])
@@ -652,6 +697,23 @@ end
         new = self.OLD + "path '../engines' do\n  gem 'a'\nend\ngem 'pg'\n"
         self.assertEqual(_added("Gemfile", self.OLD, new), ["pg"])
 
+    def test_keyword_blocks_inside_path_block(self):
+        # `end` условия и цикла внутри блока `path … do` закрывает их, не сам блок.
+        cases = [
+            'path "engines" do\n  if ENV["X"]\n    gem "a"\n  end\n  gem "local_b"\nend\ngem "rails"\n',
+            'path "engines" do\n  unless ENV["X"]\n    gem "a"\n  else\n    gem "c"\n  end\n  gem "local_b"\nend\n'
+            'gem "rails"\n',
+            'path "engines" do\n  case RUBY_ENGINE\n  when "jruby"\n    gem "a"\n  end\n  begin\n    gem "c"\n  end\n'
+            '  gem "local_b"\nend\ngem "rails"\n',
+            'path "engines" do\n  while false\n  end\n  until true\n  end\n  for x in [] do\n  end\n'
+            '  gem "local_b"\nend\ngem "rails"\n',
+            # Условие-модификатор и условие в одну строку блок не открывают.
+            'path "engines" do\n  gem "a" if ENV["X"]\n  if ENV["Y"] then gem "c" end\nend\ngem "rails"\n',
+        ]
+        for text in cases:
+            with self.subTest(text):
+                self.assertEqual(manifests.names("gemfile", text), frozenset({"rails"}))
+
     def test_never_unparseable(self):
         self.assertEqual(manifests.names("gemfile", "gem (\n"), frozenset())
 
@@ -711,29 +773,93 @@ class AddedContractTest(unittest.TestCase):
     def test_unknown_kind_names(self):
         self.assertIsNone(manifests.names("unknown", "x"))
 
-    def test_large_file_fast(self):
-        # Каждый вид разбирает файл около 1 МБ быстрее секунды.
-        big = {
-            "package.json": "{\"dependencies\": {" + ", ".join(f'"p{i}": "^1.0.{i}"' for i in range(40000)) + "}}",
-            "pyproject.toml": "[project]\ndependencies = [\n" + "".join(f'  "p{i}>=1.{i}",\n' for i in range(50000)) + "]\n",
-            "requirements.txt": "".join(f"p{i}==1.{i} --hash=sha256:{'0' * 40} \\\n  # c\n" for i in range(15000)),
-            "Cargo.toml": "[dependencies]\n" + "".join(f'p{i} = {{ version = "1.{i}" }}\n' for i in range(40000)),
-            "go.mod": "module m\nrequire (\n" + "".join(f"\tgithub.com/o/p{i} v1.0.{i}\n" for i in range(30000)) + ")\n",
-            "Gemfile": "".join(f"gem 'p{i}', '~> 1.{i}'\n" for i in range(50000)),
-            "composer.json": "{\"require\": {" + ", ".join(f'"v/p{i}": "^1.{i}"' for i in range(40000)) + "}}",
-        }
-        for name, text in big.items():
+    # Входы разбора по числу записей n: около 1 МБ при n = SIZE.
+    BIG = {
+        "package.json": lambda n: ("{\"dependencies\": {" + ", ".join(f'"p{i}": "^1.0.{i}"' for i in range(n))
+                                   + "}}"),
+        "pyproject.toml": lambda n: ("[project]\ndependencies = [\n" + "".join(f'  "p{i}>=1.{i}",\n' for i in range(n))
+                                     + "]\n"),
+        "requirements.txt": lambda n: "".join(f"p{i}==1.{i} --hash=sha256:{'0' * 40} \\\n  # c\n" for i in range(n)),
+        "Cargo.toml": lambda n: "[dependencies]\n" + "".join(f'p{i} = {{ version = "1.{i}" }}\n' for i in range(n)),
+        "go.mod": lambda n: ("module m\nrequire (\n" + "".join(f"\tgithub.com/o/p{i} v1.0.{i}\n" for i in range(n))
+                             + ")\n"),
+        "Gemfile": lambda n: "".join(f"gem 'p{i}', '~> 1.{i}'\n" for i in range(n)),
+        "composer.json": lambda n: "{\"require\": {" + ", ".join(f'"v/p{i}": "^1.{i}"' for i in range(n)) + "}}",
+    }
+    SIZE = {"package.json": 40000, "pyproject.toml": 50000, "requirements.txt": 15000, "Cargo.toml": 40000,
+            "go.mod": 30000, "Gemfile": 50000, "composer.json": 40000}
+    # Строка без переводов строки и патологический ввод регулярных выражений; n = 1 — около 1 МБ.
+    PATHOLOGICAL = {
+        "requirements.txt": lambda n: "a" * (1_000_000 // n) + "[" + " " * (100_000 // n),
+        "Gemfile": lambda n: "gem " + "'" * (500_000 // n) + " " * (500_000 // n),
+        "go.mod": lambda n: "require (" + " " * (1_000_000 // n),
+    }
+
+    def test_large_file_linear(self):
+        for name, make in self.BIG.items():
             with self.subTest(name):
-                self.assertGreater(len(text), 900_000)
-                start = time.monotonic()
-                result = _added(name, text, text + "\n")
-                self.assertLess(time.monotonic() - start, 1.0)
-                self.assertEqual(result, [])
-        # Строка без переводов строки и патологический ввод регулярных выражений.
-        for name, text in {"requirements.txt": "a" * 1_000_000 + "[" + " " * 100_000,
-                           "Gemfile": "gem " + "'" * 500_000 + " " * 500_000,
-                           "go.mod": "require (" + " " * 1_000_000}.items():
+                small, large = make(self.SIZE[name] // 4), make(self.SIZE[name])
+                self.assertGreater(len(large), 900_000)
+                self.assertEqual(_added(name, large, large + "\n"), [])
+                assert_linear(self, lambda: _added(name, small, small + "\n"),
+                              lambda: _added(name, large, large + "\n"))
+        for name, make in self.PATHOLOGICAL.items():
             with self.subTest(name + " pathological"):
-                start = time.monotonic()
-                _added(name, None, text)
-                self.assertLess(time.monotonic() - start, 1.0)
+                small, large = make(4), make(1)
+                assert_linear(self, lambda: _added(name, None, small), lambda: _added(name, None, large))
+
+
+class LegacySourcesTest(unittest.TestCase):
+    """Имена файлов зависимостей PyPI без проверки (manifest_watch._known на видах _LEGACY)."""
+
+    def test_corpus(self):
+        for rel, expected in LEGACY_CORPUS.items():
+            name = rel.rsplit("/", 1)[1]
+            with self.subTest(rel):
+                self.assertEqual(manifest_watch.source_kind(rel), name)
+                self.assertIsNone(manifest_watch.watched_kind(rel))
+                text = (FIXTURES / rel).read_text(encoding="utf-8")
+                self.assertEqual(manifest_watch._known(name, text), frozenset(expected))
+
+    def test_edges(self):
+        cases = [
+            # setup.py: требования, собранные кодом, не видны; присваивание и `+` — видны; словарь аргументов.
+            ("setup.py", "from setuptools import setup\nsetup(install_requires=open('r.txt').read().splitlines())\n",
+             set()),
+            ("setup.py", "base = ['a']\nsetup(install_requires=base + ['b'], setup_requires=('c',))\n",
+             {"a", "b", "c"}),
+            ("setup.py", "kw = {'install_requires': ['a'], 'name': 'x'}\nsetup(**kw)\n", {"a"}),
+            # Цикл присваиваний и глубокая цепочка имён: каждое имя разрешается один раз, глубина не ограничена.
+            ("setup.py", "a = [b, 'x']\nb = [a, 'y']\nsetup(install_requires=a)\n", {"x", "y"}),
+            ("setup.py", "a0 = ['deep']\n" + "".join(f"a{i} = [a{i - 1}]\n" for i in range(1, 30))
+             + "setup(install_requires=a29)\n", {"deep"}),
+            ("setup.py", "setup(\n", None),
+            ("setup.cfg", "[options]\ninstall_requires = file: requirements.in\n", set()),
+            ("setup.cfg", "[options\n", None),
+            ("setup.cfg", "[metadata]\nname = x\n", set()),
+            ("Pipfile", "[packages\n", None),
+            ("Pipfile", '[scripts]\nstart = "python -m app"\n[pipenv]\nallow_prereleases = true\n', set()),
+        ]
+        for kind, text, expected in cases:
+            with self.subTest(kind=kind, text=text):
+                self.assertEqual(manifest_watch._known(kind, text), expected)
+
+    def test_not_legacy(self):
+        for path in ("setup.py.bak", "tests/fixtures/x/setup.py", "node_modules/x/Pipfile", "src/setup_utils.py"):
+            with self.subTest(path):
+                self.assertIsNone(manifest_watch.source_kind(path))
+
+    @staticmethod
+    def _fanout(refs, levels=6):
+        """setup.py, где каждое из levels имён ссылается refs раз на предыдущее: дерево подстановок — refs**levels
+        узлов, текст — около levels * refs ссылок."""
+        lines = ["a0 = ['x0']"]
+        for i in range(1, levels + 1):
+            lines.append(f"a{i} = [{', '.join([f'a{i - 1}'] * refs)}, 'x{i}']")
+        return "\n".join(lines) + f"\nsetup(install_requires=a{levels})\n"
+
+    def test_setup_py_references_linear(self):
+        small, large = self._fanout(4), self._fanout(16)
+        self.assertEqual(manifest_watch._known("setup.py", large), frozenset(f"x{i}" for i in range(7)))
+        assert_linear(self, lambda: manifest_watch._known("setup.py", small),
+                      lambda: manifest_watch._known("setup.py", large))

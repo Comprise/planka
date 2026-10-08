@@ -60,9 +60,10 @@ def _settings_files(config, project):
 
 
 def _auto_memory_overrides(config, project):
-    """Абсолютные значения autoMemoryDirectory (~ раскрыта) из всех файлов _settings_files. Claude Code берёт
-    одно по приоритету источников; здесь — все: файл без значения, с ошибкой чтения, не строкой или
-    относительным путём пропускается."""
+    """Абсолютные значения autoMemoryDirectory из всех файлов _settings_files в кодировке файловой системы
+    (common.input_path). Claude Code берёт одно по приоритету источников; здесь — все: файл без значения, с
+    ошибкой чтения, не с объектом JSON, значение не строкой, относительным путём (~ раскрывается при проверке),
+    с NUL или не кодируемое в файловую систему (одиночный суррогат) пропускается."""
     found = []
     for path in _settings_files(config, project):
         try:
@@ -70,7 +71,14 @@ def _auto_memory_overrides(config, project):
                 value = json.load(f).get("autoMemoryDirectory")
         except (OSError, ValueError, AttributeError):
             continue
-        if isinstance(value, str) and value and os.path.isabs(os.path.expanduser(value)):
+        if not isinstance(value, str) or not value or "\0" in value:
+            continue
+        value = common.input_path(value)
+        try:
+            os.fsencode(value)
+        except UnicodeEncodeError:
+            continue
+        if os.path.isabs(os.path.expanduser(value)):
             found.append(value)
     return found
 
@@ -112,19 +120,24 @@ def _repository_file(path, project):
     """Путь в рабочем дереве git проекта project и не исключён git проекта (.gitignore, info/exclude,
     core.excludesFile): файл репозитория, а не память — память вне репозитория (rules/memory.md).
     Отслеживаемый файл git check-ignore не считает исключённым. Путь во вложенном репозитории
-    (_nested_repository) — не файл рабочего дерева проекта, хотя git проекта отвечает о нём 1. Вне
-    репозитория, без git или при ошибке git — False."""
+    (_nested_repository) — не файл рабочего дерева проекта, хотя git проекта отвечает о нём 1. Репозиторий
+    проекта — тот, что дал корень common.project_root: git ищет его не выше корня (common.git_env), и
+    репозиторий dotfiles в домашнем каталоге над проектом без своего git не отвечает. Корня нет на диске,
+    вне репозитория, без git или при ошибке git — False."""
     path, project = os.path.realpath(path), os.path.realpath(project)
     if _nested_repository(path, project):
         return False
-    # Каталог проекта может не существовать (CLAUDE_PROJECT_DIR удалён): git спрашивается из ближайшего
-    # существующего предка.
+    root = common.project_root(project)
+    if not os.path.isdir(root):
+        return False
+    # Каталога проекта может не быть (CLAUDE_PROJECT_DIR удалён), корень — вершина репозитория над ним: git
+    # спрашивается из ближайшего существующего предка проекта, он под корнем.
     base = project
     while not os.path.isdir(base) and os.path.dirname(base) != base:
         base = os.path.dirname(base)
     try:
         proc = subprocess.run(["git", "-C", base, "check-ignore", "-q", "--", path],
-                              capture_output=True, timeout=CHECK_IGNORE_TIMEOUT)
+                              capture_output=True, timeout=CHECK_IGNORE_TIMEOUT, env=common.git_env(root))
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
     # 0 — исключён, 1 — не исключён, 128 — не репозиторий, путь вне репозитория или ошибка.
@@ -283,12 +296,12 @@ def write_text(data):
 
 
 def render_content(data, target, transcript):
-    """Содержимое судьи: реплика автора и ответы на AskUserQuestion (prompts.author_context), последние
-    сообщения агента перед репликой автора и перед записью, цель и текст записи."""
+    """Содержимое судьи: прежние реплики автора, текущая и ответы на AskUserQuestion (prompts.author_context),
+    последние сообщения агента перед репликой автора и перед записью, цель и текст записи."""
     before = transcript.message_before_author
     last = transcript.turn_messages[-1] if transcript.turn_messages else ""
     none = "(нет)"
-    parts = [prompts.author_context(transcript.author_turn, transcript.author_answers), "",
+    parts = [prompts.author_context(transcript.author_turn, transcript.author_answers, transcript.earlier_turns), "",
              "Последнее сообщение агента перед репликой автора:", _clip(before, keep_tail=True) or none, "",
              "Последнее сообщение агента перед записью:", _clip(last, keep_tail=True) or none, "",
              f"Цель записи: {target}", "Текст записи:", _clip(write_text(data)) or none]

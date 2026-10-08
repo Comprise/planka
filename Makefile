@@ -7,8 +7,10 @@ test:
 # в кодировке ascii (Env.environ ставит им PYTHONUTF8=0). Чужие git-настройки — подпись коммитов и игнор *.py
 # через GIT_CONFIG_GLOBAL, GIT_CONFIG_COUNT/KEY/VALUE, GIT_CONFIG_PARAMETERS (их экспортирует git -c при
 # rebase -x) и XDG_CONFIG_HOME/git/{ignore,attributes} — и CLAUDE_PROJECT_DIR, CLAUDE_CONFIG_DIR проверяют
-# изоляцию тестов: tests/__init__.py и Env.environ их подменяют, до кода плагина они не доходят. Устойчивость
-# плагина к чужому git-конфигу проверяет tests/test_hostile_git.py — в обеих целях.
+# изоляцию тестов: tests/__init__.py и Env.environ их подменяют, до кода плагина они не доходят. Тесты guard_memory
+# ставят CLAUDE_CONFIG_DIR сами: что Env.environ вычищает каждую переменную окружения сессии, проверяет
+# EnvIsolationTest в tests/test_common.py. Устойчивость плагина к чужому git-конфигу проверяет
+# tests/test_hostile_git.py — в обеих целях.
 test-hostile:
 	@cfg=$$(mktemp) && ign=$$(mktemp) && xdg=$$(mktemp -d) && \
 	trap 'rm -rf "$$cfg" "$$ign" "$$xdg"' EXIT && \

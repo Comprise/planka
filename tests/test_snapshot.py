@@ -15,6 +15,7 @@ PLANKA_DIR = pathlib.Path(__file__).resolve().parent.parent / "plugin" / "planka
 sys.path.insert(0, str(PLANKA_DIR))
 import common  # noqa: E402
 import snapshot  # noqa: E402
+from tests.helpers import cpu_seconds  # noqa: E402
 
 
 def files_of(dirs):
@@ -75,6 +76,26 @@ class WalkCaptureTest(unittest.TestCase):
         self.write(".gitignore", "*.min.js\n")
         self.write("a.min.js"); self.write("a.js")
         self.assertEqual(sorted(walk_files(self.root)), [".gitignore", "a.js"])
+
+    def test_gitignore_ext_needs_dot_before_it(self):
+        self.write(".gitignore", "*.log\n")
+        self.write("changelog"); self.write("a.log"); self.write(".log"); self.write("a.log.txt")
+        self.assertEqual(sorted(walk_files(self.root)), [".gitignore", "a.log.txt", "changelog"])
+
+    def test_walk_cost_independent_of_ext_count(self):
+        # Каждое имя сверяется со множеством расширений, не с каждым расширением по очереди.
+        # Обход при 2000 расширениях против обхода при одном: перебор расширений — в сотни раз дольше.
+        for i in range(4000):
+            self.write(f"d{i % 20}/f{i}.py")
+
+        def walk(count):
+            self.write(".gitignore", "".join(f"*.e{i}\n" for i in range(count)))
+            seconds = cpu_seconds(lambda: snapshot._walk_dirs(self.root, None))
+            self.assertEqual(len(files_of(snapshot._walk_dirs(self.root, None))), 4001)
+            return seconds
+
+        one = walk(1)
+        self.assertLess(walk(2000), 4 * max(one, 0.001))
 
     def test_nested_gitignore_anchored_name(self):
         self.write("sub/.gitignore", "/cache\n")
@@ -382,6 +403,16 @@ class ChangedSinceGitTest(unittest.TestCase):
         self.write("a.py", "edited in turn")
         self.assertEqual(snapshot.changed_since(self.root, snap), [("a.py", True)])
 
+    def test_dirty_at_start_same_length_edit_found_by_mtime(self):
+        self.write("a.py", "before"); self.write("old.py", "before")
+        snap = self.roundtrip()
+        for rel in ("a.py", "old.py"):
+            path = self.root / rel
+            mtime = path.stat().st_mtime_ns
+            path.write_text("edited", encoding="utf-8")
+            os.utime(path, ns=(mtime + 10**9, mtime + 10**9))
+        self.assertEqual(snapshot.changed_since(self.root, snap), [("a.py", True), ("old.py", True)])
+
     def test_untracked_new_and_deleted(self):
         snap = self.roundtrip()
         self.write("pkg/new.go"); (self.root / "b.py").unlink()
@@ -515,6 +546,11 @@ class ChangedSinceGitTest(unittest.TestCase):
             with self.assertRaises(snapshot.TooManyFiles):
                 snapshot.capture(self.root)
 
+    def test_dirty_exactly_max_files_captured(self):
+        self.write("u1"); self.write("u2")
+        with mock.patch.object(snapshot, "MAX_FILES", 2):
+            self.assertEqual(sorted(snapshot.capture(self.root)["dirty"]), ["u1", "u2"])
+
     def test_deadline(self):
         snap = snapshot.capture(self.root)
         with self.assertRaises(TimeoutError):
@@ -579,6 +615,14 @@ class ChangedSinceWalkTest(unittest.TestCase):
         state.mkdir(exist_ok=True)
         snapshot.store(state, "s", "p", self.root, snapshot.capture(self.root))
         return snapshot.load(state, "s")
+
+    def test_walk_same_length_edit_found_by_mtime(self):
+        path = self.root / "a.py"
+        snap = self.roundtrip()
+        mtime = path.stat().st_mtime_ns
+        path.write_text("y", encoding="utf-8")
+        os.utime(path, ns=(mtime + 10**9, mtime + 10**9))
+        self.assertEqual(snapshot.changed_since(self.root, snap), [("a.py", True)])
 
     def test_walk_tree_beyond_count_limit_finds_edit(self):
         for i in range(12):
@@ -726,3 +770,79 @@ class StoreLoadDiffTest(unittest.TestCase):
         new = {"": self.block(("a", 1, 1), ("b", 2, 1), ("d", 1, 1)), "keep": same, "new": same}
         self.assertEqual(snapshot.diff(old, new), [("b", True), ("c", False), ("d", True), ("gone/x", False),
                                                    ("new/x", True)])
+
+
+class SnapshotStateTest(unittest.TestCase):
+    """Снимок, не отмеченный Stop проверенным, и запомненная неудача снимка."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.state = self.root / "state"
+        self.state.mkdir()
+        self.snap = {"mode": "git", "head": None, "sub_heads": {}, "repos": {"": None}, "dirty": {"a.py": [1, 2]}}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_unchecked_snapshot_carried_over_to_next_prompt(self):
+        snapshot.store(self.state, "s", "p-1", self.root, self.snap)
+        self.assertTrue(snapshot.carry_over(self.state, "s", "p-2", self.root))
+        got = snapshot.load(self.state, "s")
+        self.assertEqual((got["prompt_id"], got["dirty"], got["checked"]), ("p-2", {"a.py": [1, 2]}, False))
+
+    def test_walk_snapshot_carried_over_intact(self):
+        dirs = {"": b"a.py\0" + snapshot._STAT.pack(1, 2)}
+        snapshot.store(self.state, "s", "p-1", self.root, {"mode": "walk", "head": None, "sub_heads": {},
+                                                           "dirs": dirs})
+        self.assertTrue(snapshot.carry_over(self.state, "s", "p-2", self.root))
+        self.assertEqual(snapshot.load(self.state, "s")["dirs"], dirs)
+
+    def test_checked_snapshot_not_carried_over(self):
+        snapshot.store(self.state, "s", "p-1", self.root, self.snap)
+        snapshot.mark_checked(self.state, "s", "p-1")
+        self.assertTrue(snapshot.load(self.state, "s")["checked"])
+        self.assertFalse(snapshot.carry_over(self.state, "s", "p-2", self.root))
+        self.assertEqual(snapshot.load(self.state, "s")["prompt_id"], "p-1")
+
+    def test_mark_checked_ignores_other_prompt(self):
+        snapshot.store(self.state, "s", "p-1", self.root, self.snap)
+        snapshot.mark_checked(self.state, "s", "p-0")
+        self.assertFalse(snapshot.load(self.state, "s")["checked"])
+        snapshot.mark_checked(self.state, "none", "p-1")
+        self.assertFalse((self.state / "none.snap.json").exists())
+
+    def test_other_root_not_carried_over(self):
+        snapshot.store(self.state, "s", "p-1", self.root, self.snap)
+        self.assertFalse(snapshot.carry_over(self.state, "s", "p-2", self.root / "other"))
+        self.assertEqual(snapshot.load(self.state, "s")["prompt_id"], "p-1")
+
+    def test_other_format_not_carried_over(self):
+        snapshot.store(self.state, "s", "p-1", self.root, self.snap)
+        path = self.state / "s.snap.json"
+        for fmt in (snapshot.FORMAT - 1, None):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if fmt is None:
+                data.pop("format")
+            else:
+                data["format"] = fmt
+            common.atomic_write_json(path, data)
+            self.assertFalse(snapshot.carry_over(self.state, "s", "p-2", self.root), fmt)
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["prompt_id"], "p-1", fmt)
+
+    def test_snapshot_without_checked_field_not_carried_over(self):
+        data = {**self.snap, "format": snapshot.FORMAT, "prompt_id": "p-1", "root": str(self.root)}
+        common.atomic_write_json(self.state / "s.snap.json", data)
+        self.assertFalse(snapshot.carry_over(self.state, "s", "p-2", self.root))
+        self.assertFalse(snapshot.carry_over(self.state, "none", "p-2", self.root))
+
+    def test_failure_remembered_per_root(self):
+        self.assertIsNone(snapshot.failure(self.state, "s", self.root))
+        snapshot.mark_failed(self.state, "s", self.root, "причина")
+        snapshot.mark_failed(self.state, "s", self.root / "b", "другая")
+        self.assertEqual(snapshot.failure(self.state, "s", self.root), "причина")
+        self.assertEqual(snapshot.failure(self.state, "s", self.root / "b"), "другая")
+        self.assertIsNone(snapshot.failure(self.state, "s", self.root / "c"))
+        self.assertIsNone(snapshot.failure(self.state, "other", self.root))
+        self.assertEqual(json.loads((self.state / "s.snapfail.json").read_text(encoding="utf-8")),
+                         {str(self.root): "причина", str(self.root / "b"): "другая"})

@@ -12,8 +12,8 @@ import tomllib
 # Ошибки разбора JSON и TOML (TOMLDecodeError — подкласс ValueError); RecursionError — на глубокой вложенности.
 _PARSE_ERRORS = (ValueError, RecursionError)
 
-_REQUIREMENTS_NAME = re.compile(r"requirements.*\.(?:txt|in)$")
-_REQUIREMENTS_DIR_FILE = re.compile(r".*\.(?:txt|in)$")
+_REQUIREMENTS_NAME = re.compile(r"requirements.*\.(?:txt|in)\Z")
+_REQUIREMENTS_DIR_FILE = re.compile(r".*\.(?:txt|in)\Z")
 _KINDS = {
     "package.json": "package.json",
     "composer.json": "composer.json",
@@ -334,18 +334,24 @@ _GEM_PATH = re.compile(r"(?:\bpath:|:path\s*=>)")
 # Блок `path "каталог" do … end`: гемы в нём — из каталога.
 _GEM_PATH_BLOCK = re.compile(r"""\s*path\s*\(?\s*['"].*\bdo\s*(?:\|[^|]*\|)?\s*(?:#.*)?$""")
 _RUBY_BLOCK_OPEN = re.compile(r"\bdo\s*(?:\|[^|]*\|)?\s*(?:#.*)?$")
+# Ключевое слово в начале строки, которое открывает блок до `end`; условие-модификатор стоит после выражения.
+_RUBY_KEYWORD_OPEN = re.compile(r"\s*(?:if|unless|case|begin|while|until|for|def|class|module)\b")
+# Блок в одну строку: `if x then y end`.
+_RUBY_LINE_END = re.compile(r"\bend\s*(?:#.*)?$")
 _RUBY_BLOCK_END = re.compile(r"\s*end\b")
 
 
 def _gemfile(text):
     """Гемы строк `gem` с буквальным именем, кроме местных: с `path:` и внутри блока `path … do`.
-    Вложенность блоков считается по `do` в конце строки и `end` в начале; незакрытый блок `path` идёт
-    до конца файла."""
+    Вложенность блоков считается по `do` в конце строки, ключевому слову блока (`if`, `unless`, `case`,
+    `begin`, `while`, `until`, `for`, `def`, `class`, `module`) в начале строки без `end` в конце и `end` в
+    начале; незакрытый блок `path` идёт до конца файла."""
     names = set()
     depth = 0
     for line in text.splitlines():
         if depth:
-            if _RUBY_BLOCK_OPEN.search(line):
+            if _RUBY_BLOCK_OPEN.search(line) or (_RUBY_KEYWORD_OPEN.match(line)
+                                                   and not _RUBY_LINE_END.search(line)):
                 depth += 1
             elif _RUBY_BLOCK_END.match(line):
                 depth -= 1

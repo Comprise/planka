@@ -1,0 +1,42 @@
+# источник: grpc-gateway v2.30.0, .github/workflows/ci.yml, строки 60–100 (run: с индикатором «|» на следующей строке, heredoc)
+    container:
+      image: ghcr.io/grpc-ecosystem/grpc-gateway/build-env:latest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /home/vscode/.cache/_grpc_gateway_bazel
+          key: v2-bazel-output-${{ hashFiles('.bazelversion', 'MODULE.bazel.lock', 'repositories.bzl') }}
+          restore-keys: |
+            v2-bazel-output-${{ hashFiles('.bazelversion') }}-
+            v2-bazel-output-
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /home/vscode/.cache/bazel_repo
+          key: v2-bazel-repo-${{ hashFiles('.bazelversion', 'MODULE.bazel.lock', 'repositories.bzl') }}
+          restore-keys: |
+            v2-bazel-repo-${{ hashFiles('.bazelversion') }}-
+            v2-bazel-repo-
+        # Required with newer versions of Git
+        # https://github.com/actions/checkout/issues/766
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Configure bazel
+        run:
+          | # put .bazelrc in $HOME so that it's read before project's .bazelrc
+          cat > /home/vscode/.bazelrc << EOF
+          startup --output_base=/home/vscode/.cache/_grpc_gateway_bazel
+          build --repository_cache=/home/vscode/.cache/bazel_repo
+          build --@io_bazel_rules_go//go/config:race
+          # Workaround https://github.com/bazelbuild/bazel/issues/3645
+          # See https://docs.bazel.build/versions/0.23.0/command-line-reference.html
+          build --local_ram_resources=7168 # Github runners have 7G of memory
+          build --local_cpu_resources=2    # Github runners have 2 vCPU
+          EOF
+      - name: Check that Bazel BUILD files are up-to-date
+        run: bazel run //:gazelle && git add -N . && git diff --exit-code
+      - name: Check that repositories.bzl is up-to-date
+        run: |
+          bazel run //:gazelle -- update-repos -from_file=go.mod -to_macro=repositories.bzl%go_repositories &&
+          git add -N . && git diff --exit-code
+      - name: Check formatting of Bazel BUILD files
