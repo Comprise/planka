@@ -705,6 +705,16 @@ class RulesMatchJudgeTest(unittest.TestCase):
         behaviour = self.flat(common.philosophy_sections("Поведение"))
         self.assertIn("без «не X, а Y» — отрицания в начале; «X, а не Y» — утверждение", behaviour)
 
+    def test_affected_tests_only_by_default(self):
+        # Правило автора: прогоняются тесты затронутого функционала, полный набор — только по просьбе автора (набор
+        # может идти сутки). Ядро («Планы» 6) и шлюз verification.md говорят одно и то же.
+        plans = self.flat(common.philosophy_sections("Планы"))
+        self.assertIn("гоняет проверки затронутого волной функционала", plans)
+        self.assertIn("Полный набор — только по просьбе автора", plans)
+        gate = " ".join(common.rule_texts("verification").split())
+        self.assertIn("это прогон тестов затронутого функционала", gate)
+        self.assertIn("Полный прогон — только по просьбе автора", gate)
+
     def test_recommendation_premises_checked(self):
         # Правило — plugin/philosophy.md, «Решения» 4; судья Stop его проверяет (видит шаги реплики), судьям вопроса
         # и плана пункт вырезается из рубрики (prompts.without_premises).
