@@ -25,6 +25,7 @@ import warnings
 import common
 import depcheck
 import manifests
+import pkgmanagers
 import snapshot
 
 # Срок снимка манифестов перед командой Bash и сравнения после неё, секунды от старта хука; без
@@ -817,7 +818,7 @@ def _operands(args, value_flags):
         if a == "--":
             return out, True
         if a.startswith("-") and a != "-":
-            i += 2 if depcheck._takes_value(a, value_flags) else 1
+            i += 2 if pkgmanagers._takes_value(a, value_flags) else 1
             continue
         out.append(a)
         i += 1
@@ -850,14 +851,14 @@ def command_refs(command):
     refs = []
     for segment in depcheck._segments(command):
         words, _ = depcheck._command(segment.strip())
-        if not words or depcheck._basename(words[0]) != "git":
+        if not words or pkgmanagers._basename(words[0]) != "git":
             continue
-        sub = depcheck._subcommand(words, _GIT_VALUE_FLAGS)
+        sub = pkgmanagers._subcommand(words, _GIT_VALUE_FLAGS)
         if len(sub) < 2:
             continue
         name, args = sub[1], sub[2:]
         if name == "stash" and args[:1] in (["pop"], ["apply"]):
-            operands, _ = _operands(args[1:], depcheck._NO_VALUE_FLAGS)
+            operands, _ = _operands(args[1:], pkgmanagers._NO_VALUE_FLAGS)
             rev = operands[0] if operands else "0"
             refs.append((f"stash@{{{rev}}}" if rev.isdigit() else rev, True))
         elif name == "merge" and "--squash" in args:
@@ -958,9 +959,9 @@ def command_patches(command):
     out = []
     for segment in depcheck._segments(command):
         words, _ = depcheck._command(segment.strip())
-        if not words or depcheck._basename(words[0]) != "git":
+        if not words or pkgmanagers._basename(words[0]) != "git":
             continue
-        sub = depcheck._subcommand(words, _GIT_VALUE_FLAGS)
+        sub = pkgmanagers._subcommand(words, _GIT_VALUE_FLAGS)
         if sub[1:2] != ["apply"]:
             continue
         args = sub[2:]

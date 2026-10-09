@@ -7,6 +7,7 @@ import unittest
 PLANKA_DIR = pathlib.Path(__file__).resolve().parent.parent / "plugin" / "planka"
 sys.path.insert(0, str(PLANKA_DIR))
 import depcheck  # noqa: E402
+import pkgmanagers  # noqa: E402
 from tests.helpers import assert_linear  # noqa: E402
 
 # Корпус команд Bash: source — transcript (команды из транскриптов Claude Code автора в этом проекте, санитизированы:
@@ -1792,7 +1793,7 @@ class DoubtTest(unittest.TestCase):
 
     def test_loosened_flags_limit(self):
         # Склеиваются первые _LOOSE_FLAGS пар «флаг значение»; пятая пара — пропуск (README).
-        self.assertEqual(depcheck._LOOSE_FLAGS, 4)
+        self.assertEqual(pkgmanagers._LOOSE_FLAGS, 4)
         self.assertIsNotNone(depcheck.dependency_doubt("npm " + "--a v " * 4 + "i x"))
         self.assertIsNone(depcheck.dependency_doubt("npm " + "--a v " * 5 + "i x"))
 
@@ -1939,8 +1940,8 @@ class GluedValueFlagTest(unittest.TestCase):
 
     def test_value_flag_last(self):
         self.assertIsNone(depcheck.dependency_add("pip install -qr req.txt"))
-        self.assertTrue(depcheck._takes_value("-qr", {"-r"}))
-        self.assertFalse(depcheck._takes_value("-rq", {"-r"}))
+        self.assertTrue(pkgmanagers._takes_value("-qr", {"-r"}))
+        self.assertFalse(pkgmanagers._takes_value("-rq", {"-r"}))
 
 
 class AppendAssignmentTest(unittest.TestCase):
@@ -2585,7 +2586,7 @@ class MinorFormsTest(unittest.TestCase):
 class DryValueFlagsKeysTest(unittest.TestCase):
     def test_reachable(self):
         # _dry_run берёт флаги со значением только у _DRY_RUN_MANAGERS (и pip): прочие ключи недостижимы.
-        self.assertLessEqual(set(depcheck._DRY_VALUE_FLAGS), depcheck._DRY_RUN_MANAGERS)
+        self.assertLessEqual(set(pkgmanagers._DRY_VALUE_FLAGS), pkgmanagers._DRY_RUN_MANAGERS)
 
 
 class ComputedScriptDoubtTest(unittest.TestCase):

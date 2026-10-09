@@ -73,7 +73,8 @@
 `judge_tool.py` (`PreToolUse`, а на `Bash` и MCP-инструментах `mcp__*` ещё `PostToolUse` и `PostToolUseFailure` —
 проверка манифестов), `guard_memory.py`, `judge_stop.py`, `debug_watch.py`, `model_watch.py` (`SessionStart`,
 `PostModelSwitch` — модель сессии для судьи); остальное — их модули, среди них `manifests.py` (разбор манифестов) и
-`manifest_watch.py` (проверка манифестов после правки и команды; роли — `context/architecture.md`, «Компоненты»).
+`manifest_watch.py` (проверка манифестов после правки и команды; роли — `context/architecture.md`, «Компоненты»),
+`depcheck.py` (разбор команды Bash для детектора зависимостей) и `pkgmanagers.py` (семантика менеджеров над словами).
 
 Инварианты:
 

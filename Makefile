@@ -1,4 +1,4 @@
-.PHONY: test test-hostile validate check
+.PHONY: test test-hostile validate check bashdiff
 
 test:
 	python3 -m unittest discover -s tests -t . -v
@@ -27,3 +27,10 @@ validate:
 	claude plugin validate plugin
 
 check: test test-hostile validate
+
+# Дифференциальный фаззер детектора зависимостей против настоящего bash (tests/tools/bashdiff.py): формы только
+# генератора, исполнение — только в bwrap (без него — выход с кодом 2). Зерно и число форм фиксированы; каталог
+# расхождений — BASHDIFF_OUT, по умолчанию новый временный. В check не входит: нужен bwrap, прогон долгий.
+BASHDIFF_OUT ?= $(shell mktemp -d)
+bashdiff:
+	python3 tests/tools/bashdiff.py --target detector --engine old --seed 1 --count 20000 --out $(BASHDIFF_OUT)

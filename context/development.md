@@ -24,6 +24,8 @@ planka@planka` с перезапуском сессии (`README.md`, «Уста
 ## Код
 
 - Только стандартная библиотека Python 3.11+ (`tomllib` в `manifests.py`); новый пакет — вопрос автору.
+- Скрипты разработки — в `tests/tools/` (`context/testing.md`); фаззеру `make bashdiff` нужны bash 5.3 и `bwrap`
+  (bubblewrap): без песочницы он формы не исполняет.
 - Новая точка входа хука — регистрация в `plugin/hooks/hooks.json` с таймаутом, тело `main()` через
   `common.run_hook(main)`, первой строкой `main` — `common.barrier_active()`; тесты — подпроцессом
   через `tests.helpers.Env` (`context/testing.md`); строка в таблицах хуков `README.md`, «Как это

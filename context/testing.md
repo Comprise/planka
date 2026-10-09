@@ -5,7 +5,15 @@ make test           # python3 -m unittest discover -s tests -t . -v
 make test-hostile   # тот же прогон в локали C и с выводом latin-1, с проверкой изоляции
 make validate       # claude plugin validate . и plugin: маркетплейс и плагин
 make check          # test, test-hostile и validate
+make bashdiff       # фаззер детектора против bash 5.3 в песочнице bwrap (в check не входит)
 ```
+
+`make bashdiff` (`tests/tools/bashdiff.py`) — дифференциальный фаззер: генератор форм с маркерами `touch P<n>` (единственный
+источник форм; корпуса и транскрипты фаззер не читает и не исполняет), исполнение — обёрткой инструмента Bash Claude
+Code (`eval` после `shopt -u extglob`) внутри `bwrap` (корень только для чтения, сеть выключена; без `bwrap` или при
+провале пробы песочницы — выход с кодом 2). Режимы: `--target detector --engine old|new` (маркер исполнен, а детектор
+молчит, — потеря, код 1), `--target parser` (исполненные маркеры против `shparse.simple_commands`), `--compare`.
+`tests/tools/` без `__init__.py`: unittest его не собирает.
 
 CI нет; цели — в `Makefile`. Проверяются два разных свойства:
 
@@ -64,6 +72,12 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
     комментарий образца (известный ложный отказ или неочевидное сомнение — переменная цикла подкомандой `pnpm $a` — и
     обход); `test_depcheck` (`CorpusTest`) сверяет с ожиданием `dependency_add`, затем `dependency_doubt` каждой
     команды; настоящих команд в корпусе больше 1000 — тест держит это число;
+  - `bash-transcripts.jsonl` — все команды `Bash` из транскриптов автора (`tests/tools/build_corpus.py`: повторы
+    убраны, пути `/home/<имя>`, UUID, адреса почты и имя пользователя заменены, личные слова из `--private слово,…`
+    (список передаётся при запуске, в репозиторий не пишется) — на `private`, строки с похожими на секреты значениями
+    выброшены — печатается номер и вид шаблона, не значение) с записанным вердиктом `add`/`doubt` версии, на которой
+    корпус собран; `test_bash_corpus` сверяет с ним `dependency_add`, затем `dependency_doubt` каждой строки. Строка
+    меняет вердикт только по согласию автора;
   - `manifests/<образец>/<манифест>` — настоящие `package.json`, `composer.json`, `pyproject.toml`, `requirements*.txt`,
     `Cargo.toml`, `go.mod`, `Gemfile` (источник — комментарием, в JSON — ключом `"//"`); `test_manifests` (`CorpusTest`)
     сверяет имена каждого с `CORPUS` (ожидание есть у каждого файла корпуса: файлом корпуса считается файл, который git

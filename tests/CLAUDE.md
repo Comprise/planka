@@ -24,6 +24,9 @@ unittest плагина; запуск — `make test` из корня.
   `helpers.py`.
 - Вход хука — `Env.hook_input(event, **fields)`: `cwd` — каталог проекта `Env`, `transcript_path` —
   `Env.transcript` с ответом ассистента модели `claude-test-model`.
+- `tools/` — скрипты разработки без `__init__.py` (unittest их не собирает): `build_corpus.py` собирает
+  `fixtures/bash-transcripts.jsonl`, `bashdiff.py` — фаззер `make bashdiff` в песочнице `bwrap`. Команды корпусов не
+  исполняются никогда; в bash идут только формы генератора фаззера.
 - `fixtures/` — корпуса настоящих форм входа; какой тест читает какой корпус и что сверяет —
   `context/testing.md`, «Устройство тестов». Новый край разборщика — образцом в корпус.
 
