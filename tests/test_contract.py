@@ -715,6 +715,24 @@ class RulesMatchJudgeTest(unittest.TestCase):
         self.assertIn("это прогон тестов затронутого функционала", gate)
         self.assertIn("Полный прогон — только по просьбе автора", gate)
 
+    def test_findings_tail_asks_author(self):
+        # plugin/rules/debugging.md и его строка в индексе plugin/philosophy.md: два круга правок подряд с новым
+        # классом находок — вопрос автору, продолжать или записать остаток долгом.
+        rules = " ".join(common.rule_texts("debugging").split())
+        self.assertIn("два круга правок подряд находят новый класс того же рода", rules)
+        self.assertIn("продолжать круги — первым — или записать остаток долгом", rules)
+        index = self.flat(common.philosophy_sections("Модули"))
+        self.assertIn("круги правок находят всё новые находки", index)
+
+    def test_tier_choice_rules(self):
+        # plugin/rules/subagents.md: фронтир основной сессии делегирует механику, дешёвый ярус — при решённом задании и
+        # независимой проверке, проверяющий не ниже исполнителя.
+        rules = " ".join(common.rule_texts("subagents").split())
+        self.assertIn("делегируйте лёгкому или стандартному ярусу", rules)
+        self.assertIn("задание решено до конца", rules)
+        self.assertIn("дешёвая независимая проверка", rules)
+        self.assertIn("Проверяющий — того же яруса, что исполнитель, или выше", rules)
+
     def test_recommendation_premises_checked(self):
         # Правило — plugin/philosophy.md, «Решения» 4; судья Stop его проверяет (видит шаги реплики), судьям вопроса
         # и плана пункт вырезается из рубрики (prompts.without_premises).
