@@ -5,6 +5,8 @@ make test           # python3 -m unittest discover -s tests -t . -v
 make test-hostile   # тот же прогон в локали C и с выводом latin-1, с проверкой изоляции
 make validate       # claude plugin validate . и plugin: маркетплейс и плагин
 make check          # test, test-hostile и validate
+# По умолчанию гоняются тесты затронутого функционала: python3 -m unittest tests.test_<модуль> …;
+# make test и make check — только по просьбе автора (plugin/rules/verification.md).
 make bashdiff       # фаззер детектора против bash 5.3 в песочнице bwrap (в check не входит)
 ```
 

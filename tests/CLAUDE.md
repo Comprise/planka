@@ -1,6 +1,7 @@
 # tests/
 
-unittest плагина; запуск — `make test` из корня.
+unittest плагина; запуск из корня — тесты затронутого модуля (`python3 -m unittest tests.test_<модуль>`), весь
+набор (`make test`, `make check`) — только по просьбе автора.
 
 ## Инварианты
 

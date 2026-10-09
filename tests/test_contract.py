@@ -706,8 +706,8 @@ class RulesMatchJudgeTest(unittest.TestCase):
         self.assertIn("без «не X, а Y» — отрицания в начале; «X, а не Y» — утверждение", behaviour)
 
     def test_affected_tests_only_by_default(self):
-        # Правило автора: прогоняются тесты затронутого функционала, полный набор — только по просьбе автора (набор
-        # может идти сутки). Ядро («Планы» 6) и шлюз verification.md говорят одно и то же.
+        # plugin/philosophy.md («Планы» 6) и шлюз plugin/rules/verification.md требуют прогона тестов затронутого
+        # функционала и полного набора только по просьбе автора.
         plans = self.flat(common.philosophy_sections("Планы"))
         self.assertIn("гоняет проверки затронутого волной функционала", plans)
         self.assertIn("Полный набор — только по просьбе автора", plans)
