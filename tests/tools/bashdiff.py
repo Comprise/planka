@@ -15,7 +15,9 @@
 Режимы:
 - `--target detector --engine old|new` — маркер исполнен, а детектор на той же форме с `npm i evil` вместо маркеров
   молчит — потеря; не исполнен ни один, а детектор отказал — строгость (счётчик).
-- `--target parser` — множество исполненных маркеров против имён `touch P<n>` среди `shparse.simple_commands`.
+- `--target parser` — множество исполненных маркеров против имён `touch P<n>` среди `shparse.simple_commands`;
+  исполненный маркер, которого в дереве нет, но текст которого стоит в подстановке в слове команды, — вид `output`
+  (имя или аргумент команды — вывод подстановки; семантика исполнения), не потеря.
 - `--compare old new` — расхождения вердиктов двух движков детектора на одних формах (bash не нужен).
 
 Расхождения — JSON-строками в файл внутри `--out`; итог — в stdout; код выхода 1 при потере или ошибке разбора."""
@@ -657,14 +659,46 @@ def verdict(engine, form):
 
 
 def parsed_markers(shparse, form):
+    """Маркеры среди команд дерева: имя — `touch`, перед ним только подстановки и параметры (`` `…`touch ``: пустой
+    вывод даёт имя `touch`), аргумент начинается литералом `P<n>`, за ним — только подстановки и параметры
+    (`` P1`…` ``). Текст в кавычках маркером не считается: `echo 'touch P1'` маркер прятал бы."""
     names = set()
+    expansions = (shparse.Sub, shparse.Param)
     for simple in shparse.simple_commands(shparse.parse(form)):
         words = simple.words
-        if len(words) >= 2 and words[0].literal() == "touch":
-            arg = words[1].literal()
-            if arg and MARKER_FILE.fullmatch(arg):
-                names.add(arg)
+        if len(words) < 2:
+            continue
+        name, arg = words[0].parts, words[1].parts
+        if not (name and isinstance(name[-1], shparse.Lit) and name[-1].text == "touch"
+                and all(isinstance(p, expansions) for p in name[:-1])):
+            continue
+        # `touch` создаёт файл по каждому аргументу: маркер — любой аргумент такого вида (`touch P4`…`touch P7`).
+        for word in words[1:]:
+            arg = word.parts
+            if (arg and isinstance(arg[0], shparse.Lit) and MARKER_FILE.fullmatch(arg[0].text)
+                    and all(isinstance(p, expansions) for p in arg[1:])):
+                names.add(arg[0].text)
     return names
+
+
+def output_markers(shparse, form, lost):
+    """Маркеры из lost, текст которых стоит в теле или данных подстановки в слове команды (Simple.words): имя или
+    аргумент команды — вывод подстановки, bash исполняет его при раскрытии (`${ printf 'touch P1'; }`,
+    `$(cat <<E` ⏎ `touch P1` ⏎ `E` ⏎ `)`). Это семантика исполнения: дерево такой команды не показывает."""
+    found = set()
+    script = shparse.parse(form)
+    for simple in shparse.simple_commands(script):
+        for word in simple.words:
+            for part in word.parts:
+                if not isinstance(part, shparse.Sub):
+                    continue
+                texts = [form[part.start:part.end]]
+                texts += [node.body_text for node in shparse.walk(part.body) if isinstance(node, shparse.Heredoc)]
+                for marker in lost - found:
+                    pattern = re.compile(re.escape(marker) + r"(?!\d)")
+                    if any(pattern.search(text) for text in texts):
+                        found.add(marker)
+    return found
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -708,7 +742,12 @@ def run_case(index):
         elif cfg["target"] == "parser":
             parsed = parsed_markers(cfg["shparse"], form)
             record["parsed"] = sorted(parsed, key=lambda m: int(m[1:]))
-            if set(executed) - parsed:
+            lost = set(executed) - parsed
+            output = output_markers(cfg["shparse"], form, lost) if lost else set()
+            if output:
+                record["output"] = sorted(output, key=lambda m: int(m[1:]))
+                kinds.append("output")
+            if lost - output:
                 kinds.append("loss")
             if parsed - set(executed):
                 kinds.append("strict")
@@ -797,6 +836,8 @@ def main(argv):
           f"таймаутов: {totals['timeout']}, форм в секунду: {rate:.1f}")
     if args.target:
         print(f"форм с исполненным маркером: {totals['executed']}")
+    if args.target == "parser":
+        print(f"вывод подстановки исполнен командой (output, не потеря): {totals['output']}")
     print("классы: " + ", ".join(f"{name} {n}" for name, n in sorted(classes.items())))
     print(f"расхождения: {report}")
     return 1 if totals["loss"] or totals["error"] else 0
