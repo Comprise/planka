@@ -19,6 +19,8 @@
 | [Детектор зависимостей перечисляет формы записи установки](depcheck-enumerated-forms.md) | средний |
 | [Разбор shell: хвост расхождений с bash на глубокой вложенности](shparse-depth3-tail.md) | средний |
 | [Ярус модели судьи](judge-tier-cascade.md) | низкий |
+| [`debug_watch._paren_pairs` не вызывается кодом плагина](debug-watch-paren-pairs-unused.md) | низкий |
+| [`depcheck.heredocs` не вызывается кодом плагина](depcheck-heredocs-unused.md) | низкий |
 | [Данные из недокументированного транскрипта](transcript-turn-data.md) | низкий |
 
 Остальные ограничения эвристик — фильтры `Stop`, детектор зависимостей (в том числе отказы с сомнением) и проверка
