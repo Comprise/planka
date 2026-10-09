@@ -1,0 +1,10 @@
+# источник: формы pdm-project.org/latest/usage/dependency/, «Override the resolved package versions»
+[project]
+name = "pdm-app"
+version = "0.1.0"
+dependencies = ["django", "requests"]
+
+[tool.pdm.resolution.overrides]
+asgiref = "3.2.10"  # exact version
+urllib3 = ">=1.26.2"  # version range
+pytz = "https://mypypi.org/packages/pytz-2020.9-py3-none-any.whl"  # absolute URL

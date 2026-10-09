@@ -19,6 +19,8 @@ import manifest_watch  # noqa: E402
 import manifests  # noqa: E402
 
 FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures" / "manifests"
+# Подключение файла: равно только подключению, не строке `include <путь>`.
+INC = manifests.Include
 
 # Ожидаемые имена каждого манифеста корпуса; путь — относительно FIXTURES.
 CORPUS = {
@@ -72,7 +74,10 @@ CORPUS = {
                                                "wxpython-phoenix @ http://wxpython.org/Phoenix/snapshot-builds/",
                                                "myproject @ git+https://git.example.com/MyProject",
                                                "urllib3 @ https://github.com/urllib3/urllib3/archive/refs/tags/",
-                                               "fooproject", "rejected", "green"},
+                                               "fooproject", "rejected", "green",
+                                               # `-r` и `-c` подключают файлы, которые pip ставит, а проверка не
+                                               # видит (`-c` — тоже: его `-r` ставит пакеты, опции меняют индекс).
+                                               INC("other-requirements.txt"), INC("constraints.txt")},
     "cargo-libgit-rs/Cargo.toml": {"autocfg"},
     "cargo-libgit-sys/Cargo.toml": {"libz-sys", "autocfg", "make-cmd"},
     # Источник не из crates.io — имя с источником (`git`, `registry`).
@@ -112,6 +117,34 @@ CORPUS = {
     # Директива `tool` называет команду модуля из `require`; сама не объявляет зависимость.
     "gomod-tool/go.mod": {"example.com/fork/net", "golang.org/x/net", "golang.org/x/tools", "golang.org/x/text",
                           "github.com/golang/mock", "honnef.co/go/tools"},
+    # Шаблон cookiecutter: строки Jinja `{%- … %}` — не требования; `-r` — подключение.
+    "requirements-cookiecutter-django/requirements/local.txt": {
+        INC("base.txt"), "werkzeug", "ipdb", "psycopg", "watchfiles", "mypy", "django-stubs", "pytest",
+        "pytest-sugar", "djangorestframework-stubs", "sphinx", "sphinx-autobuild", "flake8", "flake8-isort",
+        "coverage", "black", "djlint", "pylint-django", "pylint-celery", "pre-commit", "factory-boy",
+        "django-debug-toolbar", "django-extensions", "django-coverage-plugin", "pytest-django"},
+    # Замена каталогом с версией касается только этой версии: x/text v0.13.0 при require v0.14.0 — из сети;
+    # `..` — каталог.
+    "gomod-replace-versioned/go.mod": {"golang.org/x/text", "golang.org/x/sync", "example.com/fork/sync"},
+    # git_source Bundler (github, gist, bitbucket, gitlab), ключ опции строкой, plugin — гем, eval_gemfile —
+    # подключение; `"path" =>` — местный.
+    "gemfile-bundler-dsl/Gemfile": {"bundler-graph", "rails", "rack @ github:rack/rack",
+                                    "nokogiri @ git+https://github.com/sparklemotion/nokogiri.git",
+                                    "redis @ git+https://github.com/redis/redis-rb.git", "the_gist @ gist:4815162342",
+                                    "bb_gem @ bitbucket:mybitbucketuser/bb_gem", "gl_gem @ gitlab:mygroup/gl_gem",
+                                    INC("Gemfile.local")},
+    # Замена и ограничение uv пакета не добавляют; с URL — меняют его источник.
+    "pyproject-uv-overrides/pyproject.toml": {"werkzeug", "pydantic", "pydantic-core @ https://example.com/wheels/",
+                                              "anyio @ git+https://github.com/agronholm/anyio"},
+    "pyproject-pdm-overrides/pyproject.toml": {"django", "requests", "pytz @ https://mypypi.org/packages/"},
+    # Список ограничений poetry: источник каждого элемента, `path` — местный.
+    "pyproject-poetry-multiple/pyproject.toml": {"foo", "example @ https://example.com/", "example @ index:pypi",
+                                                 "local"},
+    # packageExtensions pnpm дописывает зависимости в чужие пакеты — они ставятся.
+    "npm-pnpm-extensions/package.json": {"react-redux", "react", "react-dom", "cookie-parser", "fsevents"},
+    # Пакет в репозитории `package` — источник этого пакета (dist и source).
+    "composer-package-repo/composer.json": {"smarty/smarty", "smarty/smarty @ https://www.smarty.net/files/",
+                                            "smarty/smarty @ http://smarty-php.googlecode.com/svn/"},
 }
 
 # Имя самого пакета манифеста корпуса (manifests.own_name); не перечисленные — None.
@@ -133,6 +166,11 @@ OWN = {
     "pyproject-gyp-next/pyproject.toml": "gyp-next",
     "pyproject-pandas/pyproject.toml": "pandas",
     "gomod-tool/go.mod": "example.com/my/thing",
+    "gomod-replace-versioned/go.mod": "example.com/root/tools",
+    "pyproject-uv-overrides/pyproject.toml": "project",
+    "pyproject-pdm-overrides/pyproject.toml": "pdm-app",
+    "pyproject-poetry-multiple/pyproject.toml": "poetry-multi",
+    "npm-pnpm-extensions/package.json": "pnpm-app",
 }
 
 
@@ -154,7 +192,10 @@ LEGACY_CORPUS = {
 
 class CorpusTest(unittest.TestCase):
     def test_every_fixture_has_expectation(self):
-        files = {p.relative_to(FIXTURES).as_posix() for p in FIXTURES.rglob("*") if p.is_file()}
+        # Фикстура — файл, который git не игнорирует: кэши инструментов (.ruff_cache) в каталоге корпуса — не образцы.
+        listed = subprocess.run(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "."],
+                                cwd=FIXTURES, capture_output=True, check=True).stdout
+        files = {name for name in os.fsdecode(listed).split("\0") if name}
         self.assertEqual(files, set(CORPUS) | set(LEGACY_CORPUS))
 
     def test_corpus(self):
@@ -221,6 +262,19 @@ class KindTest(unittest.TestCase):
             with self.subTest(path):
                 self.assertEqual(manifests.kind(path), expected)
 
+    def test_folded(self):
+        # Без учёта регистра (файловая система без учёта регистра) — тот же вид, но только базовое имя из
+        # постоянных имён видов: имена requirements и каталоги — как написаны, проза в `Requirements/` — не манифест.
+        cases = {"/p/PACKAGE.JSON": "package.json", "cargo.toml": "cargo", "gemfile": "gemfile",
+                 "/p/REQUIREMENTS/Gems.RB": "gemfile", "GO.MOD": "gomod", "notes.txt": None,
+                 "Requirements-Dev.TXT": None, "/p/Requirements/base.txt": None, "ci/Requirements/notes.txt": None,
+                 "requirements-dev.txt": "requirements", "/p/requirements/Base.TXT": None}
+        for path, expected in cases.items():
+            with self.subTest(path):
+                self.assertEqual(manifests.kind(path, fold=True), expected)
+                if expected is not None and path != path.lower():
+                    self.assertIsNone(manifests.kind(path))
+
     def test_not_manifests(self):
         for path in ["package-lock.json", "composer.lock", "Cargo.lock", "go.sum", "Gemfile.lock",
                      "poetry.lock", "uv.lock", "notes.txt", "/p/docs/requirements.md", "constraints.txt",
@@ -282,8 +336,9 @@ class PackageJsonTest(unittest.TestCase):
         self.assertIsNone(_added("package.json", self.OLD, '{"dependencies": {"x": '))
         self.assertIsNone(_added("package.json", self.OLD, "[1, 2]"))
         self.assertIsNone(manifests.names("package.json", "[" * 200000))
-        # Старый текст не разобрать — что добавлено, неизвестно.
-        self.assertIsNone(_added("package.json", "{oops", self.OLD))
+        # Старый текст не разобрать и версии в git нет — сравнение с пустым: битый манифест и затем зависимость не
+        # проходят в два шага.
+        self.assertEqual(_added("package.json", "{oops", self.OLD), ["react", "vite"])
 
     def test_odd_sections_ignored(self):
         self.assertEqual(manifests.names("package.json", '{"dependencies": ["x"], "devDependencies": null}'),
@@ -464,7 +519,7 @@ poetry = 1
     def test_broken(self):
         self.assertIsNone(_added("pyproject.toml", self.OLD, self.OLD + "\n[project\n"))
         self.assertIsNone(_added("pyproject.toml", self.OLD, self.OLD + '\n[project]\nname = "dup"\n'))
-        self.assertIsNone(_added("pyproject.toml", "[x", self.OLD))
+        self.assertEqual(_added("pyproject.toml", "[x", self.OLD), ["click", "pydantic", "pytest", "requests", "ruff"])
 
 
 class RequirementsTest(unittest.TestCase):
@@ -483,6 +538,14 @@ class RequirementsTest(unittest.TestCase):
             ("https://x/files/Some_Pkg-1.0-py3-none-any.whl",
              ["some-pkg @ https://x/files/"]),
             ("a \\\n  >= 1", ["a"]),
+            # Подключение файла, которого проверка не видит (`-c` тоже ставит пакеты своих `-r`), и строка с
+            # переменной окружения: значение подставит pip.
+            ("-r other.txt", [INC("other.txt")]),
+            ("-c constraints.txt", [INC("constraints.txt")]),
+            ("-c \\\n  constraints", [INC("constraints")]),
+            ("${PKG}", ["${PKG}"]),
+            ("--extra-index-url https://${PRIVATE_INDEX_TOKEN}@pypi.example.com/simple",
+             ["--extra-index-url https://${PRIVATE_INDEX_TOKEN}@pypi.example.com/simple"]),
             ("b==1 --hash=sha256:00 \\\n    --hash=sha256:11", ["b"]),
             ("c==1  # comment with requests-two", ["c"]),
             ("d\te", ["d"]),
@@ -495,21 +558,19 @@ class RequirementsTest(unittest.TestCase):
         for new in [
             "requests==2.32\ndjango>=5\n",
             "",
-            "-r base.txt\n-r other.txt\n-c constraints.txt\n--pre\n",
+            "-r base.txt\n--pre\n--require-hashes\n",
             "requests==2.31\n# flask\n   # numpy\n\n",
             "requests\nDJANGO\n",
             "-e .\n-e ./sub\n./dist/x-1.0-py3-none-any.whl\n/abs/y.tar.gz\n../z\nfile:///tmp/q\n~/w\n",
             "https://x/archive/master.zip\n",
-            "${PKG}\n",
             "requests\ndjango\n#egg=fake\n",
             "requests \\\n",
-            # Продолжение строки опции: `constraints` — значение `-c`, не пакет.
-            "requests\n-c \\\n  constraints\n",
             "requests==2.31#notcomment\ndjango\n",
             # Колесо по `file:` и архив по относительному пути — локальные.
             "requests\nfile:///tmp/w/Local_Pkg-1.0-py3-none-any.whl\nlibs/pkg-1.0.tar.gz\nlibs\\pkg2-1.0.tar.gz\n",
-            # Продолжение строки с переводом CRLF.
-            "requests\r\n-c \\\r\n  constraints\r\n",
+            # Продолжение строки с переводом CRLF: `--pre` — опция, `django` — значение-позиционный аргумент, pip его
+            # не ставит.
+            "requests\r\n--pre \\\r\n  django\r\n",
         ]:
             with self.subTest(new):
                 self.assertEqual(_added("requirements.txt", self.OLD, new), [])
@@ -545,6 +606,94 @@ class RequirementsTest(unittest.TestCase):
 
     def test_new_file(self):
         self.assertEqual(_added("/p/requirements/dev.txt", None, "pytest\nblack\n"), ["black", "pytest"])
+
+    def test_lines_as_pip_reads_them(self):
+        # Ожидания сверены с pip 26.2 (req_file: join_lines, ignore_comments, break_args_options, optparse).
+        cases = {
+            # `\` склеивает строки без пробела; строка-комментарий не склеивается со следующей.
+            "django\\\n-evil==1\n": ["django-evil"],
+            "# note \\\nevil\n": ["evil"],
+            "django  # see \\\nevil\n": ["django"],
+            "git+https://x/\\\nevil.git#egg=evil\n": ["evil @ git+https://x/evil.git"],
+            # Сокращения длинных опций, склейка короткой со значением, несколько опций в строке.
+            "--edit git+https://x/e.git#egg=evil\n": ["evil @ git+https://x/e.git"],
+            "--extra https://evil/simple\n": ["index https://evil/simple"],
+            "-egit+https://x/e.git#egg=evil2\n": ["evil2 @ git+https://x/e.git"],
+            "--pre -e git+https://x/e.git#egg=evil3\n": ["evil3 @ git+https://x/e.git"],
+            "--pre --extra-index-url https://evil/simple\n": ["index https://evil/simple"],
+            "--trusted-host evil -i https://evil/simple\n": ["index https://evil/simple"],
+            "--requirement=extra.list\n": [INC("extra.list")],
+            # pip берёт первый `-r`, без него — первый `-c`, и первый `-f`.
+            "-r a.txt -r b.txt\n": [INC("a.txt")],
+            "-c a.txt -r b.txt\n": [INC("b.txt")],
+            "-f https://evil/links -f https://other/links\n": ["index https://evil/links"],
+            # Индекс в строке требования и при `--no-index` pip не берёт; позиционный аргумент опций не ставит.
+            "django --index-url https://evil/simple\n": ["django"],
+            "--no-index --extra-index-url https://evil/simple\n": [],
+            "--pre evil\n": [],
+            # Строку, которую pip не разберёт, он отвергает с файлом целиком.
+            "--req x.txt\n": [],
+            "django --foo\n": [],
+            "--extra-index-url \"unbalanced\n": [],
+            # Слова опций — как у shlex.split: кавычки, `\` вне кавычек и в "…" перед `"` и `\`; `--` кончает опции.
+            "-r 'a b.txt'\n": [INC("a b.txt")],
+            "-r a\\ b.txt\n": [INC("a b.txt")],
+            "-r \"a\\\"b\\x.txt\"\n": [INC('a"b\\x.txt')],
+            "-r a'b'\"c\"\n": [INC("abc")],
+            "-r ''\n": [INC("")],
+            "-r 'unbalanced\n": [],
+            "-r x\\ \n": [],
+            "-- -r a.txt\n": [],
+            "-ra.txt\n": [INC("a.txt")],
+            "--pre=1 -r a.txt\n": [],
+            "--no-index --index-url=https://evil/simple\n": [],
+        }
+        for text, expected in cases.items():
+            with self.subTest(text):
+                self.assertEqual(_added("requirements.txt", "", text), expected)
+
+    def test_env_variable_ref_same_source(self):
+        # Другая ссылка или фрагмент того же источника с переменной окружения — не новое имя; другой источник —
+        # новое; `${…}` в ссылке — строка как есть.
+        old = "git+https://${GITHUB_TOKEN}@github.com/org/repo.git@v1.0#egg=pkg\n"
+        self.assertEqual(_added("requirements.txt", old, old.replace("v1.0", "v1.1")), [])
+        self.assertEqual(_added("requirements.txt", "-e " + old, "-e " + old.replace("v1.0", "v1.1")), [])
+        self.assertEqual(_added("requirements.txt", old, old.replace("org/repo", "evil/repo")),
+                         ["git+https://${GITHUB_TOKEN}@github.com/evil/repo.git"])
+        ref = "git+https://github.com/org/repo.git@${REF}#egg=pkg\n"
+        self.assertEqual(_added("requirements.txt", old, ref), [ref.strip()])
+        self.assertEqual(_added("requirements.txt", ref, ref.replace("REF", "OTHER")),
+                         [ref.strip().replace("REF", "OTHER")])
+
+    def test_env_variable_archive_keeps_package(self):
+        # У архива с `${…}` в URL каталог — источник, а пакет — из имени файла: колесо — имя пакета, другой архив —
+        # файл целиком. Другая версия того же колеса в том же каталоге — не новое имя, другой пакет — новое.
+        wheels = "https://${PYPI_TOKEN}@pypi.corp/wheels/"
+        old = wheels + "internal_lib-1.0-py3-none-any.whl\n"
+        self.assertEqual(_added("requirements.txt", old, old + wheels + "evil_pkg-6.6-py3-none-any.whl\n"),
+                         ["evil-pkg @ " + wheels])
+        self.assertEqual(_added("requirements.txt", old, old.replace("1.0", "1.1")), [])
+        sdist = wheels + "internal_lib-1.0.tar.gz#sha256=ab\n"
+        self.assertEqual(_added("requirements.txt", sdist, sdist + wheels + "evil-6.6.tar.gz\n"),
+                         [wheels + "evil-6.6.tar.gz"])
+        self.assertEqual(_added("requirements.txt", sdist, wheels + "internal_lib-1.0.tar.gz#sha256=cd\n"), [])
+        named = wheels + "${NAME}-1.0-py3-none-any.whl"
+        self.assertEqual(_added("requirements.txt", old, old + named + "\n"), [named])
+
+    def test_linear_on_options(self):
+        # Слова опций и их разбор — один проход: 1 МиБ одиночных `-` и одно длинное значение `-i`.
+        for small, large in [(" -" * 131_072, " -" * 524_288), ("-i " + "x" * 262_144, "-i " + "x" * 1_048_576),
+                             ("-r '" + "x" * 262_144 + "'", "-r '" + "x" * 1_048_576 + "'"),
+                             ("-r " + "\\x" * 65_536, "-r " + "\\x" * 262_144)]:
+            with self.subTest(small[:8]):
+                assert_linear(self, lambda: manifests.names("requirements", small),
+                              lambda: manifests.names("requirements", large))
+
+    def test_linear_on_spaces(self):
+        # Комментарий ищется без отката по пробелам.
+        small, large = "a" * 250_000 + "[" + " " * 25_000, "a" * 1_000_000 + "[" + " " * 100_000
+        assert_linear(self, lambda: manifests.names("requirements", small),
+                      lambda: manifests.names("requirements", large))
 
 
 class CargoTest(unittest.TestCase):
@@ -671,6 +820,21 @@ replace github.com/a/one => ../one
             with self.subTest(new):
                 self.assertEqual(_added("go.mod", self.OLD, self.OLD.replace(old, new, 1)), [])
 
+    def test_versioned_local_replace(self):
+        # Замена каталогом с версией касается только этой версии (go проверен с GOPROXY=off): при другой версии в
+        # require модуль ставится из сети.
+        base = "module m\n\ngo 1.22\n\nrequire evil.com/x v1.2.0\n"
+        self.assertEqual(_added("go.mod", "", base + "replace evil.com/x v1.0.0 => ./x\n"), ["evil.com/x"])
+        self.assertEqual(_added("go.mod", "", base + "replace evil.com/x v1.2.0 => ./x\n"), [])
+        self.assertEqual(_added("go.mod", "", base + "replace (\n\tevil.com/x v1.0.0 => ./x\n)\n"), ["evil.com/x"])
+
+    def test_directory_forms(self):
+        # modfile.IsDirectoryPath: `.`, `..`, буква диска без разделителя.
+        for target in (".", "..", "C:", "c:x", ".\\x", "\\x"):
+            with self.subTest(target):
+                text = f"module m\nrequire example.com/root v0.0.0\nreplace example.com/root => {target}\n"
+                self.assertEqual(manifests.names("gomod", text), frozenset())
+
     def test_replace_to_module_is_package(self):
         new = self.OLD.replace("go 1.22", "go 1.22\nrequire example.com/x v1\nreplace example.com/x => example.com/y v1")
         self.assertEqual(_added("go.mod", self.OLD, new), ["example.com/x", "example.com/y"])
@@ -796,6 +960,21 @@ end
 
     def test_never_unparseable(self):
         self.assertEqual(manifests.names("gemfile", "gem (\n"), frozenset())
+
+    def test_parens_plugin_include(self):
+        # `(gem …)` — тот же вызов; `plugin` Bundler::Plugin::DSL ставит как gem; eval_gemfile подключает файл.
+        cases = {
+            '(gem "evil")\n': {"evil"},
+            '((gem("evil")))\n': {"evil"},
+            'plugin "bundler-evil"\n': {"bundler-evil"},
+            'plugin "bundler-evil", git: "https://evil/p"\n': {"bundler-evil @ git+https://evil/p"},
+            'eval_gemfile "extra.rb"\n': {INC("extra.rb")},
+            'eval_gemfile("extra.rb")\n': {INC("extra.rb")},
+            "eval_gemfile File.join(__dir__, 'x')\n": set(),
+        }
+        for text, expected in cases.items():
+            with self.subTest(text):
+                self.assertEqual(manifests.names("gemfile", text), frozenset(expected))
 
 
 class KnownNamesTest(unittest.TestCase):
@@ -961,6 +1140,31 @@ class SessionStartTtlTest(unittest.TestCase):
             self.assertEqual(manifest_watch.session_start("s"), 5)
 
 
+def _call_with_timeout(test, fn, *args):
+    """{"value": результат} или {"error": исключение} вызова fn(*args) в потоке; не вернулся за 5 с — провал теста,
+    а не зависший прогон."""
+    result = {}
+
+    def run():
+        try:
+            result["value"] = fn(*args)
+        except Exception as e:
+            result["error"] = e
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(5)
+    test.assertFalse(thread.is_alive(), "чтение FIFO зависло")
+    return result
+
+
+def _release_fifo(path):
+    """Писатель отпускает читателя, если разбор всё же открыл FIFO path в блокирующем режиме."""
+    try:
+        os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+    except OSError:
+        pass
+
+
 def _git(*args, cwd):
     subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args], cwd=cwd, check=True,
                    capture_output=True)
@@ -1050,13 +1254,22 @@ class OldPatchTest(unittest.TestCase):
         for command, start in cases.items():
             with self.subTest(command):
                 self.assertEqual(self.names(command, start), {})
-        with mock.patch.object(manifest_watch, "_remaining", return_value=1):
-            self.assertEqual(manifest_watch.restored_names(self.root, "git apply author.patch", None, 0), {})
 
+    def test_no_session_start_reads_nothing(self):
+        # Без начала сессии патч не читается: возраст не с чем сравнить.
+        with mock.patch.object(manifest_watch, "_old_patch_names") as read:
+            self.assertEqual(manifest_watch.restored_names(self.root, "git apply author.patch", None, self.deadline),
+                             {})
+        read.assert_not_called()
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "нет FIFO")
     def test_fifo_and_directory_not_read(self):
-        os.mkfifo(os.path.join(self.root, "pipe.patch"))
+        fifo = os.path.join(self.root, "pipe.patch")
+        os.mkfifo(fifo)
+        self.addCleanup(_release_fifo, fifo)
         os.mkdir(os.path.join(self.root, "dir.patch"))
-        self.assertEqual(self.names("git apply pipe.patch dir.patch"), {})
+        result = _call_with_timeout(self, self.names, "git apply pipe.patch dir.patch")
+        self.assertEqual(result.get("value"), {}, result)
 
     def test_large_patch_not_read(self):
         with open(self.patch, "a", encoding="utf-8") as f:
@@ -1219,6 +1432,55 @@ class SourceTest(unittest.TestCase):
             old.replace('gem "rails", "~> 7.1"\n', 'source "https://evil" do\n  gem "rails"\nend\n'):
                 ["rails @ https://evil"],
             old + 'source "https://evil"\n': ["index https://evil"],
+            # Ключ строкой (Bundler::Dsl.normalize_hash) и git_source gist, bitbucket, gitlab.
+            old.replace('"~> 7.1"', '"~> 7.1", "git" => "https://evil/rails"'): ["rails @ git+https://evil/rails"],
+            old.replace('"~> 7.1"', '"~> 7.1", "github" => "evil/rails"'): ["rails @ github:evil/rails"],
+            old.replace('"~> 7.1"', '"~> 7.1", bitbucket: "evil/rails"'): ["rails @ bitbucket:evil/rails"],
+            old.replace('"~> 7.1"', '"~> 7.1", gitlab: "evil/rails"'): ["rails @ gitlab:evil/rails"],
+            old.replace('"~> 7.1"', '"~> 7.1", :gist => "abc"'): ["rails @ gist:abc"],
+            old + 'gem "local", "path" => "../local"\n': [],
+        })
+
+    def test_override_sources(self):
+        # Замены и ограничения пакета не добавляют; URL в них меняет источник пакета графа (uv 0.12 качает его
+        # и для constraint-dependencies; pdm — «Override the resolved package versions»).
+        old = '[project]\nname = "app"\ndependencies = ["urllib3"]\n'
+        self.assert_added("pyproject.toml", old, {
+            old + '\n[tool.uv]\noverride-dependencies = '
+                  '["urllib3 @ https://evil/u/urllib3-9-py3-none-any.whl", "new"]\n':
+                ["urllib3 @ https://evil/u/"],
+            old + '\n[tool.uv]\nconstraint-dependencies = ["urllib3 @ git+https://evil/u", "urllib3<2"]\n':
+                ["urllib3 @ git+https://evil/u"],
+            old + '\n[tool.uv]\noverride-dependencies = ["urllib3 @ file:///tmp/u.whl"]\n': [],
+            old + '\n[tool.pdm.resolution.overrides]\nurllib3 = "https://evil/urllib3.whl"\nidna = "3.7"\n':
+                ["urllib3 @ https://evil/"],
+            old + '\n[tool.pdm.resolution.overrides]\nurllib3 = "file:///tmp/urllib3.whl"\n': [],
+        })
+        poetry = '[tool.poetry]\nname = "app"\n[tool.poetry.dependencies]\nfoo = "^1"\n'
+        self.assert_added("pyproject.toml", poetry, {
+            poetry.replace('foo = "^1"', 'foo = [{ version = "^1", python = "<3.8" }, { git = "https://evil/foo", '
+                                         'python = ">=3.8" }]'): ["foo @ git+https://evil/foo"],
+            poetry.replace('foo = "^1"', 'foo = [{ version = "^1", python = "<3.8" }, { version = "^2" }]'): [],
+        })
+
+    def test_pnpm_package_extensions(self):
+        old = '{"dependencies": {"react": "^18"}}'
+        self.assert_added("package.json", old, {
+            '{"dependencies": {"react": "^18"}, "pnpm": {"packageExtensions": {"react": {"dependencies": '
+            '{"evil-pkg": "^1"}, "peerDependencies": {"react": "*"}}}}}': ["evil-pkg"],
+            '{"dependencies": {"react": "^18"}, "pnpm": {"packageExtensions": {"react": {"optionalDependencies": '
+            '{"x": "github:evil/x"}}}}}': ["x @ github:evil/x"],
+        })
+
+    def test_composer_package_repository(self):
+        old = '{"require": {"monolog/monolog": "^3"}}'
+        repo = '{"require": {"monolog/monolog": "^3"}, "repositories": [{"type": "package", "package": %s}]}'
+        self.assert_added("composer.json", old, {
+            repo % '{"name": "Monolog/Monolog", "version": "3.0.0", '
+                   '"dist": {"url": "https://evil/m.zip", "type": "zip"}}':
+                ["monolog/monolog @ https://evil/"],
+            repo % '[{"name": "monolog/monolog", "version": "3.0.0", "source": {"url": "https://evil/m.git", '
+                   '"type": "git", "reference": "x"}}]': ["monolog/monolog @ https://evil/m.git"],
         })
 
     def test_archive_url_source_is_directory(self):
@@ -1360,28 +1622,10 @@ class FifoManifestTest(unittest.TestCase):
         os.mkfifo(self.fifo)
         os.makedirs(os.path.join(self.root, "sub"))
         os.symlink(self.fifo, os.path.join(self.root, "sub", "requirements-dev.txt"))
-        self.addCleanup(self.release)
-
-    def release(self):
-        # Писатель отпускает читателя, если разбор всё же открыл FIFO в блокирующем режиме.
-        try:
-            os.close(os.open(self.fifo, os.O_WRONLY | os.O_NONBLOCK))
-        except OSError:
-            pass
+        self.addCleanup(_release_fifo, self.fifo)
 
     def call(self, fn, *args):
-        result = {}
-
-        def run():
-            try:
-                result["value"] = fn(*args)
-            except Exception as e:
-                result["error"] = e
-        thread = threading.Thread(target=run, daemon=True)
-        thread.start()
-        thread.join(5)
-        self.assertFalse(thread.is_alive(), "разбор FIFO завис")
-        return result
+        return _call_with_timeout(self, fn, *args)
 
     def test_project_names(self):
         result = self.call(manifest_watch.project_names, self.root, "requirements", time.monotonic() + 30)
@@ -1393,3 +1637,323 @@ class FifoManifestTest(unittest.TestCase):
                 result = self.call(manifest_watch.edit_texts, "Write", {"content": "flask\n"}, path)
                 self.assertIsInstance(result.get("error"), manifest_watch.Unavailable, result)
 
+
+
+class EditTargetTest(unittest.TestCase):
+    """Правка файловым инструментом по имени в другом регистре и по жёсткой ссылке правит манифест."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = os.path.realpath(tmp.name)
+        _write(self.root, "package.json", '{"dependencies": {"react": "^18"}}\n')
+        self.manifest = os.path.join(self.root, "package.json")
+
+    def targets(self, rel):
+        return manifest_watch.edit_targets(os.path.join(self.root, rel), lambda: self.root)
+
+    def check(self, rel, content):
+        """Новые имена Write content по пути rel: {путь от корня: имена} по каждому манифесту edit_targets."""
+        targets, problem = self.targets(rel)
+        self.assertIsNone(problem)
+        return {os.path.relpath(path, self.root): manifest_watch.check_edit("Write", {"content": content}, path, kind,
+                                                                            root=lambda: self.root)
+                for path, kind in targets}
+
+    def test_hard_link_is_manifest(self):
+        os.link(self.manifest, os.path.join(self.root, "notes.json"))
+        self.assertEqual(self.targets("notes.json"), ([(self.manifest, "package.json")], None))
+        self.assertEqual(self.check("notes.json", '{"dependencies": {"react": "^18", "evil": "1"}}'),
+                         {"package.json": ["evil"]})
+
+    def test_hard_link_with_manifest_name_checked_by_each_kind(self):
+        # Ссылка с именем манифеста другого вида: файл — и package.json, и sub/Gemfile, каждый по своему виду.
+        os.makedirs(os.path.join(self.root, "sub"))
+        os.link(self.manifest, os.path.join(self.root, "sub", "Gemfile"))
+        targets, problem = self.targets("sub/Gemfile")
+        self.assertIsNone(problem)
+        self.assertEqual(sorted(targets), sorted([(os.path.join(self.root, "sub", "Gemfile"), "gemfile"),
+                                                  (self.manifest, "package.json")]))
+        self.assertEqual(self.check("sub/Gemfile", '{"dependencies": {"react": "^18", "evil": "1"}}'),
+                         {"package.json": ["evil"], "sub/Gemfile": []})
+
+    def test_hard_link_in_foreign_dir(self):
+        # Ссылка под FOREIGN_DIRS сама не манифест, но правит манифест проекта.
+        os.makedirs(os.path.join(self.root, "fixtures"))
+        os.link(self.manifest, os.path.join(self.root, "fixtures", "package.json"))
+        self.assertEqual(self.targets("fixtures/package.json"), ([(self.manifest, "package.json")], None))
+        self.assertEqual(self.check("fixtures/package.json", '{"dependencies": {"react": "^18", "evil": "1"}}'),
+                         {"package.json": ["evil"]})
+
+    def test_plain_file_not_manifest(self):
+        _write(self.root, "notes.json", "{}")
+        os.link(os.path.join(self.root, "notes.json"), os.path.join(self.root, "notes2.json"))
+        self.assertEqual(self.targets("notes.json"), ([], None))
+        self.assertEqual(self.targets("absent.json"), ([], None))
+
+    def test_single_link_not_listed(self):
+        # Одна ссылка или не обычный файл — перечень манифестов не нужен.
+        _write(self.root, "notes.json", "{}")
+        os.mkfifo(os.path.join(self.root, "pipe.json"))
+        with mock.patch.object(manifest_watch, "list_manifests", side_effect=AssertionError("перечень")):
+            self.assertEqual(self.targets("notes.json"), ([], None))
+            self.assertEqual(self.targets("pipe.json"), ([], None))
+            self.assertEqual(self.targets("package.json"), ([(self.manifest, "package.json")], None))
+
+    def test_hard_link_unlisted_unavailable(self):
+        os.link(self.manifest, os.path.join(self.root, "notes.json"))
+        with mock.patch.object(manifest_watch, "MAX_MANIFESTS", 0):
+            targets, problem = self.targets("notes.json")
+            self.assertEqual(targets, [])
+            self.assertRegex(problem, "^жёсткая ссылка не сверена с манифестами проекта: манифестов больше 0$")
+            # Манифест по имени проверяется и без перечня.
+            self.assertEqual(self.targets("package.json")[0], [(self.manifest, "package.json")])
+
+    def test_other_case_on_case_insensitive_fs(self):
+        # Файловая система без учёта регистра: запись `PACKAGE.JSON` — тот же файл, что package.json (здесь —
+        # жёсткая ссылка), путь проверки — каноническая запись каталога.
+        os.link(self.manifest, os.path.join(self.root, "PACKAGE.JSON"))
+        with mock.patch.object(manifest_watch.common, "case_insensitive", return_value=True):
+            self.assertEqual(self.targets("PACKAGE.JSON"), ([(self.manifest, "package.json")], None))
+            # Нового файла ещё нет: он и будет манифестом.
+            self.assertEqual(self.targets("sub/GEMFILE"),
+                             ([(os.path.join(self.root, "sub", "GEMFILE"), "gemfile")], None))
+            self.assertEqual(self.targets("tests/fixtures/GEMFILE"), ([], None))
+            # Регистр сворачивается только у имён видов: проза в `Requirements/` — не манифест.
+            self.assertEqual(self.targets("ci/Requirements/notes.txt"), ([], None))
+            self.assertEqual(self.targets("Requirements.TXT"), ([], None))
+
+    def test_other_case_components_on_case_insensitive_fs(self):
+        # Файловая система без учёта регистра: имя в другом регистре находит ту же запись каталога, а realpath регистр
+        # не правит. Здесь запись в другом регистре — ссылка (по одной за раз: на такой файловой системе двух записей,
+        # различных только регистром, не бывает), а realpath ссылки не разрешает. Каталоги и имена requirements
+        # сверяются по настоящим записям: `REQUIREMENTS/base.txt` — манифест requirements/base.txt, а
+        # `requirements/notes.txt` в настоящем каталоге `Docs/Requirements` — нет.
+        _write(self.root, "requirements.txt", "django\n")
+        _write(self.root, "requirements/base.txt", "django\n")
+        _write(self.root, "Docs/Requirements/notes.txt", "prose\n")
+        top, base = os.path.join(self.root, "requirements.txt"), os.path.join(self.root, "requirements", "base.txt")
+        cases = [("REQUIREMENTS.TXT", "requirements.txt", "REQUIREMENTS.TXT", [(top, "requirements")]),
+                 ("Requirements.txt", "requirements.txt", "Requirements.txt", [(top, "requirements")]),
+                 ("REQUIREMENTS", "requirements", "REQUIREMENTS/base.txt", [(base, "requirements")]),
+                 ("requirements/BASE.TXT", "base.txt", "requirements/BASE.TXT", [(base, "requirements")]),
+                 ("Docs/requirements", "Requirements", "Docs/requirements/notes.txt", [])]
+        with mock.patch.object(manifest_watch.common, "case_insensitive", return_value=True), \
+                mock.patch("os.path.realpath", os.path.abspath):
+            for alias, target, rel, expected in cases:
+                with self.subTest(rel):
+                    link = os.path.join(self.root, alias)
+                    os.symlink(target, link)
+                    try:
+                        self.assertEqual(self.targets(rel), (expected, None))
+                        if expected:
+                            self.assertEqual(self.check(rel, "django\nevil\n"),
+                                             {os.path.relpath(expected[0][0], self.root): ["evil"]})
+                    finally:
+                        os.unlink(link)
+
+    def test_other_case_through_link_on_case_insensitive_fs(self):
+        # Регистр сворачивается и у разрешённого пути: ссылка `notes.txt` с именем, не похожим на манифест, ведёт в
+        # файл `Package.json`, который на такой файловой системе — package.json; по самому имени path вида нет.
+        target = os.path.join(self.root, "Package.json")
+        _write(self.root, "Package.json", "{}")
+        os.symlink("Package.json", os.path.join(self.root, "notes.txt"))
+        with mock.patch.object(manifest_watch.common, "case_insensitive", return_value=True):
+            self.assertEqual(self.targets("notes.txt"), ([(target, "package.json")], None))
+
+    def test_other_case_on_case_sensitive_fs(self):
+        _write(self.root, "GEMFILE", "gem 'x'\n")
+        self.assertEqual(self.targets("GEMFILE"), ([], None))
+        self.assertEqual(self.targets("cargo.toml"), ([], None))
+
+
+class IncludeTest(unittest.TestCase):
+    """Подключение файла (`-r`, `-c`, eval_gemfile) — новое имя, если файл не проверяется сам: не манифест из
+    перечня проекта (list_manifests) по пути от каталога манифеста."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = os.path.realpath(tmp.name)
+        for rel in ("requirements-dev.txt", "requirements/constraints.txt", "requirements/base.txt",
+                    "requirements.txt", "engines/Gemfile", "vendor/requirements.txt"):
+            _write(self.root, rel, "")
+
+    def added(self, rel, content):
+        path = os.path.join(self.root, rel)
+        return manifest_watch.check_edit("Write", {"content": content}, path, manifest_watch.watched_kind(rel),
+                                         root=lambda: self.root)
+
+    def test_includes(self):
+        cases = [
+            ("requirements.txt", "-r requirements-dev.txt\n", []),
+            ("requirements.txt", "-c requirements/constraints.txt\n", []),
+            ("requirements/dev.txt", "-r base.txt\n", []),
+            ("requirements/dev.txt", "-r ../requirements.txt\n", []),
+            ("requirements.txt", "-r extra.list\n", [INC("extra.list")]),
+            ("requirements.txt", "-c constraints.txt\n", [INC("constraints.txt")]),
+            # Каталог FOREIGN_DIRS, вне корня и URL — файл не проверяется.
+            ("requirements.txt", "-r vendor/requirements.txt\n", [INC("vendor/requirements.txt")]),
+            ("requirements.txt", "-r ../out/requirements.txt\n", [INC("../out/requirements.txt")]),
+            ("requirements.txt", "-r https://evil/requirements.txt\n", [INC("https://evil/requirements.txt")]),
+            ("Gemfile", 'eval_gemfile "engines/Gemfile"\n', []),
+            ("Gemfile", 'eval_gemfile "Gemfile.local"\n', [INC("Gemfile.local")]),
+            # Файла нет — он не в перечне манифестов проекта.
+            ("requirements.txt", "-r requirements-absent.txt\n", [INC("requirements-absent.txt")]),
+        ]
+        for rel, content, expected in cases:
+            with self.subTest(rel=rel, content=content):
+                self.assertEqual(self.added(rel, content), expected)
+
+    def test_package_named_include_not_dropped(self):
+        # Пакет `include` с источником — имя пакета, не подключение, даже если текст как у подключения манифеста.
+        name = "include @ git+https://evil.example/requirements.txt"
+        for rel, content in [("requirements.txt", name + "\n"),
+                             ("pyproject.toml", f'[project]\nname = "app"\ndependencies = ["{name}"]\n')]:
+            with self.subTest(rel):
+                self.assertEqual(self.added(rel, content), [name])
+                self.assertNotIsInstance(self.added(rel, content)[0], manifests.Include)
+        self.assertEqual(self.added("requirements.txt", "include ${X}/requirements.txt\n"),
+                         ["include ${X}/requirements.txt"])
+        self.assertNotEqual(INC("x"), "include x")
+        self.assertNotIn("include x", {INC("x")})
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_ignored_include_not_checked(self):
+        # Файл, исключённый git, не в перечне манифестов: его подключение — новое имя и после команды.
+        _git("init", "-q", cwd=self.root)
+        _write(self.root, ".gitignore", "requirements-local.txt\n")
+        _write(self.root, "requirements.txt", "requests\n")
+        entry = manifest_watch.take(self.root, time.monotonic() + 30)
+        _write(self.root, "requirements-local.txt", "evilpkg\n")
+        self.assertEqual(self.added("requirements.txt", "requests\n-r requirements-local.txt\n"),
+                         [INC("requirements-local.txt")])
+        _write(self.root, "requirements.txt", "requests\n-r requirements-local.txt\n")
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30),
+                         ({"requirements.txt": [INC("requirements-local.txt")]}, [], None))
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_include_named_by_target_from_project_root(self):
+        # Подключение — путь цели от корня проекта, разрешённый от каталога манифеста: `-r base.txt` в
+        # requirements/dev.txt — requirements/base.txt и не маскирует `-r base.txt` корневого файла, исключённого git;
+        # `-r ../extra.list` в requirements/dev.txt — тот же extra.list, что `-r extra.list` в корне.
+        _git("init", "-q", cwd=self.root)
+        _write(self.root, ".gitignore", "/base.txt\n")
+        _write(self.root, "requirements/dev.txt", "-r base.txt\n-r ../extra.list\npytest\n")
+        _write(self.root, "requirements.txt", "requests\n")
+        _git("add", "-A", cwd=self.root)
+        _git("-c", "user.name=a", "-c", "user.email=a@b", "commit", "-qm", "i", cwd=self.root)
+        entry = json.loads(json.dumps(manifest_watch.take(self.root, time.monotonic() + 30)))
+        self.assertIn({"include": "requirements/base.txt"}, entry["files"]["requirements/dev.txt"][3])
+        _write(self.root, "base.txt", "evilpkg\n")
+
+        def project():
+            return manifest_watch.project_names(self.root, "requirements", time.monotonic() + 30)
+        path = os.path.join(self.root, "requirements.txt")
+        for content, expected in [("requests\n-r base.txt\n", [INC("base.txt")]),
+                                  ("requests\n-r ./sub/../base.txt\n", [INC("base.txt")]),
+                                  ("requests\n-r extra.list\n", [])]:
+            with self.subTest(content):
+                self.assertEqual(manifest_watch.check_edit("Write", {"content": content}, path, "requirements",
+                                                           project, root=lambda: self.root), expected)
+        _write(self.root, "requirements.txt", "requests\n-r base.txt\n-r extra.list\n")
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30),
+                         ({"requirements.txt": [INC("base.txt")]}, [], None))
+
+    def test_snapshot_keeps_include_type(self):
+        # Подключение в снимке остаётся подключением: прежнее `-r extra.list` после команды не новое.
+        _write(self.root, "requirements.txt", "django\n-r extra.list\n")
+        entry = manifest_watch.take(self.root, time.monotonic() + 30)
+        entry = json.loads(json.dumps(entry))
+        self.assertIn({"include": "extra.list"}, entry["files"]["requirements.txt"][3])
+        _write(self.root, "requirements.txt", "django\n-r extra.list\nflask\n")
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30),
+                         ({"requirements.txt": ["flask"]}, [], None))
+
+    def test_symlink_out_of_project(self):
+        # Ссылка-манифест проекта на файл вне его — в перечне, снимок читает файл по ссылке: подключение ссылки
+        # проверяется само; тот же файл по пути вне проекта — не в перечне.
+        with tempfile.TemporaryDirectory() as out:
+            out = os.path.realpath(out)
+            _write(out, "requirements.txt", "evil\n")
+            os.symlink(os.path.join(out, "requirements.txt"), os.path.join(self.root, "requirements-x.txt"))
+            self.assertEqual(self.added("requirements.txt", "-r requirements-x.txt\n"), [])
+            os.unlink(os.path.join(self.root, "requirements-x.txt"))
+            target = os.path.join(out, "requirements.txt")
+            self.assertEqual(self.added("requirements.txt", f"-r {target}\n"), [INC(target)])
+
+    def test_compare_drops_checked_include(self):
+        _write(self.root, "requirements.txt", "django\n")
+        entry = manifest_watch.take(self.root, time.monotonic() + 30)
+        _write(self.root, "requirements.txt", "django\n-r requirements-dev.txt\n-r extra.list\n")
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30),
+                         ({"requirements.txt": [INC("extra.list")]}, [], None))
+
+
+class BrokenOldSideTest(unittest.TestCase):
+    """Старая сторона, которую не разобрать и которой нет в версиях git, — пустая: битый манифест и затем
+    зависимость не проходят в два шага."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+
+    def test_edit_two_steps(self):
+        with self.assertRaises(manifest_watch.Unavailable):
+            manifest_watch.edit_names("package.json", None, "{", lambda: None)
+        self.assertEqual(manifest_watch.edit_names("package.json", "{", '{"dependencies": {"evil": "1"}}',
+                                                   lambda: None), ["evil"])
+        # Версия git есть — сравнение с ней.
+        self.assertEqual(manifest_watch.edit_names("package.json", "{", '{"dependencies": {"evil": "1"}}',
+                                                   lambda: frozenset({"evil"})), [])
+
+    def test_command_two_steps(self):
+        path = os.path.join(self.root, "package.json")
+        entry = manifest_watch.take(self.root, time.monotonic() + 30)
+        _write(self.root, "package.json", "{")
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30), ({}, ["package.json"], None))
+        entry = manifest_watch.take(self.root, time.monotonic() + 30)
+        _write(self.root, "package.json", '{"dependencies": {"evil": "1"}}')
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30), ({"package.json": ["evil"]}, [], None))
+
+
+class CompareLostListTest(unittest.TestCase):
+    """Смена режима за команду и переполнение списка манифестов: пути снимка всё равно сверяются, причина — третьим
+    элементом и при найденных именах."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+        _write(self.root, "requirements.txt", "django\n")
+        self.entry = manifest_watch.take(self.root, time.monotonic() + 30)
+
+    def compare(self):
+        return manifest_watch.compare(self.entry, time.monotonic() + 30)
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_mode_change(self):
+        _write(self.root, "requirements.txt", "django\nevil\n")
+        _git("init", "-q", cwd=self.root)
+        self.assertEqual(self.compare(), ({"requirements.txt": ["evil"]}, [],
+                                          "за команду корень проекта стал git-репозиторием"))
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_mode_change_without_names(self):
+        _git("init", "-q", cwd=self.root)
+        self.assertEqual(self.compare(), ({}, [], "за команду корень проекта стал git-репозиторием"))
+
+    def test_overflow(self):
+        _write(self.root, "requirements.txt", "django\nevil\n")
+        _write(self.root, "a/requirements.txt", "x\n")
+        with mock.patch.object(manifest_watch, "MAX_MANIFESTS", 1):
+            self.assertEqual(self.compare(), ({"requirements.txt": ["evil"]}, [], "манифестов больше 1"))
+            _write(self.root, "requirements.txt", "django\n")
+            self.assertEqual(self.compare(), ({}, [], "манифестов больше 1"))
+
+    def test_walk_overflow(self):
+        _write(self.root, "requirements.txt", "django\nevil\n")
+        with mock.patch.object(manifest_watch, "MAX_WALK_FILES", 0):
+            self.assertEqual(self.compare(), ({"requirements.txt": ["evil"]}, [], "вне git больше 0 файлов"))

@@ -87,6 +87,11 @@ def judge_question(data):
                     content)
 
 
+FILES_HINT = ("Если файл задача только читает, пожалуйста, пометьте его «(только чтение)» или уберите из её списка "
+              "(«Файлы: нет» для задачи без правок); общий файл, который правят несколько задач, пожалуйста, "
+              "отдайте одной задаче волны или схождению после неё.")
+
+
 def judge_plan(data):
     session = data.get("session_id", "")
     transcript = common.read_transcript(data.get("transcript_path"))
@@ -108,8 +113,9 @@ def judge_plan(data):
     conflicts = planparse.shared_files(tasks) if tasks else None
     if conflicts:
         reason = ("planka: в одной волне файл принадлежит нескольким задачам:\n"
-                  + planparse.format_conflicts(conflicts))
-        _deny("plan", data, reason, "deny-files", plan, reason=reason)
+                  + planparse.format_conflicts(conflicts) + "\n" + FILES_HINT)
+        # В журнал — число конфликтов: пути файлов из плана — содержимое.
+        _deny("plan", data, reason, "deny-files", plan, conflicts=len(conflicts))
         return
     rubric = common.rubric(("Решения", "Планы"), ("planning", "subagents", "refactoring", "design-patterns", "heuristics"))
     rubric = prompts.without_premises(rubric) if rubric is not None else None
@@ -157,6 +163,9 @@ def judge_bash(data):
 
 MANIFEST_HOOK = "manifest"
 EDIT_TOOLS = {"Write", "Edit", "MultiEdit"}
+# MCP-инструменты правят файлы своими путями (mcp__filesystem__write_file, mcp__serena__replace_content): что они
+# правят, хук не знает, поэтому манифесты сравниваются до и после вызова, как у Bash.
+MCP_PREFIX = "mcp__"
 MANIFEST_REASON = ("planka: новая зависимость — вопрос автору (ядро, «Границы»): правка {path} добавляет "
                    "{names}. Пожалуйста, назовите пакет, зачем он и что из stdlib или уже установленного задачу не "
                    "закрывает; прочитайте {rules}/dependencies.md. После согласия автора, пожалуйста, добавьте пакет "
@@ -170,6 +179,18 @@ COMMAND_REASON = ("planka: после команды в манифесте но�
                   "прочитайте {rules}/dependencies.md. Если автор против, пожалуйста, откатывайте только свою "
                   "правку. Команду, которая по согласию автора добавляет пакет, пожалуйста, запускайте с {marker} "
                   "прямо перед ней в её сегменте.")
+MCP_REASON = ("planka: после вызова {tool} в манифесте новая зависимость — вопрос автору (ядро, «Границы»): "
+              "{added}. Правка уже в файле, и хук не знает, чья она. Пожалуйста, не откатывайте манифест вслепую "
+              "— спросите автора: назовите пакет, зачем он и что из stdlib или уже установленного задачу не "
+              "закрывает; прочитайте {rules}/dependencies.md. Если автор против, пожалуйста, откатывайте только "
+              "свою правку. После согласия автора пакет, пожалуйста, добавляйте командой Bash с {marker} прямо "
+              "перед ней в её сегменте.")
+
+
+# Срок проверки манифестов одного файла с несколькими жёсткими ссылками, секунды от начала проверки правки: второй и
+# следующий манифест проверяется, только если его версии git (HEAD_TIMEOUT) и манифесты проекта (SNAPSHOT_BUDGET)
+# укладываются в него; меньше timeout PreToolUse (tests/test_contract.py, TimeoutsTest).
+LINKED_BUDGET = 60
 
 
 def _session(data):
@@ -198,7 +219,9 @@ def _project_names(root, kind):
 
 def judge_manifest_edit(data):
     """Write, Edit, MultiEdit манифеста с новым именем зависимости отклоняются без модели и без лимита
-    отказов. Правку, которую инструмент сам отклонит, и не манифесты хук пропускает молча."""
+    отказов; файл — манифесты manifest_watch.edit_targets, каждый по своему виду. Правку, которую инструмент сам
+    отклонит, и не манифесты хук пропускает молча. Жёсткая ссылка не сверена с манифестами проекта — предупреждение
+    раз на сессию и пропуск в журнале на каждую правку, манифест по имени проверяется."""
     tool, tool_input = data.get("tool_name"), data.get("tool_input")
     if not isinstance(tool_input, dict):
         return
@@ -211,52 +234,94 @@ def judge_manifest_edit(data):
     project = os.environ.get("CLAUDE_PROJECT_DIR") or common.input_path(cwd) or ""
     known_project = isinstance(project, str) and os.path.isabs(project)
     root = functools.cache(lambda: common.project_root(cwd) if known_project else None)
-    target = manifest_watch.edit_target(path, root)
-    if target is None:
-        return
-    path, kind = target
     session = _session(data)
-    try:
-        names = manifest_watch.check_edit(tool, tool_input, path, kind, lambda: _project_names(root, kind), root)
-    except manifest_watch.Unavailable as e:
-        _manifest_skip(session, f"манифест {path} {e}: новые зависимости не проверены", tool=tool)
+    started = time.monotonic()
+    listed = manifest_watch.listing(root)
+    edited = path
+    targets, problem = manifest_watch.edit_targets(edited, root, listed)
+    if problem is not None:
+        msg = f"файл {edited}: {problem}, новые зависимости через жёсткие ссылки не проверяются"
+        common.warn_once(session, "manifest-hardlink", msg)
+        common.log_event(MANIFEST_HOOK, session, verdict="skipped", error=msg, tool=tool)
+    added = []
+    for i, (path, kind) in enumerate(targets):
+        cost = manifest_watch.HEAD_TIMEOUT + manifest_watch.SNAPSHOT_BUDGET
+        if i and time.monotonic() - started + cost > LINKED_BUDGET:
+            _manifest_skip(session, f"манифест {path}: жёсткие ссылки не проверены за срок, новые зависимости не "
+                                    f"проверены", tool=tool)
+            continue
+        try:
+            names = manifest_watch.check_edit(tool, tool_input, path, kind,
+                                              lambda kind=kind: _project_names(root, kind), root, listed)
+        except manifest_watch.Unavailable as e:
+            _manifest_skip(session, f"манифест {path} {e}: новые зависимости не проверены", tool=tool)
+            continue
+        except TimeoutError:
+            _manifest_skip(session, f"манифест {path}: git или обход проекта не уложились в срок, новые зависимости "
+                                    f"не проверены", tool=tool)
+            continue
+        if names:
+            added.append((path, names))
+    if not added:
         return
-    except TimeoutError:
-        _manifest_skip(session, f"манифест {path}: git или обход проекта не уложились в срок, новые зависимости "
-                                f"не проверены", tool=tool)
-        return
-    if not names:
-        return
-    reason = MANIFEST_REASON.format(path=path, names=", ".join(names), rules=common.rules_dir(),
-                                    marker=depcheck.DEP_OK_MARKER)
+    if len(added) == 1:
+        (path, names), = added
+        listed = ", ".join(names)
+    else:
+        # Жёсткие ссылки: один файл — несколько манифестов; имена — по каждому.
+        path = edited
+        listed = "; ".join(f"{target}: {', '.join(names)}" for target, names in added)
+    reason = MANIFEST_REASON.format(path=path, names=listed, rules=common.rules_dir(), marker=depcheck.DEP_OK_MARKER)
     # Ответ запоминается до записи журнала: сбой записи не отменяет отказ.
     common.emit(common.deny_output(reason))
-    common.log_event(MANIFEST_HOOK, session, verdict="deny-dep", tool=tool, added=len(names),
+    common.log_event(MANIFEST_HOOK, session, verdict="deny-dep", tool=tool, added=sum(len(n) for _, n in added),
                      content=tool_input.get("content") if tool == "Write" else common.dumps(tool_input))
 
 
+def _is_mcp(data):
+    tool = data.get("tool_name")
+    return isinstance(tool, str) and tool.startswith(MCP_PREFIX)
+
+
 def _command_and_id(data):
+    """(команда, tool_use_id) вызова Bash или MCP-инструмента; у MCP-инструмента команды нет — она пустая строка
+    (без маркера согласия и ref для сверки). Команда None — у Bash нет команды; tool_use_id None — нет во входе."""
     tool_input = data.get("tool_input")
-    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    command = "" if _is_mcp(data) else tool_input.get("command") if isinstance(tool_input, dict) else None
     tool_use_id = data.get("tool_use_id")
-    if not isinstance(command, str) or not isinstance(tool_use_id, str) or not tool_use_id:
-        return None, None
-    return command, tool_use_id
+    return (command if isinstance(command, str) else None,
+            tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None)
+
+
+def _snapshot_skip(session, msg):
+    """Снимок манифестов не снят: предупреждение раз на сессию и пропуск в журнале на каждую команду."""
+    common.warn_once(session, "manifest-snapshot", msg)
+    try:
+        common.log_event(MANIFEST_HOOK, session, verdict="skipped", error=msg)
+    except OSError:
+        # Каталог данных недоступен: предупреждение уже выдано.
+        pass
 
 
 def snapshot_manifests(data):
-    """Снимок имён манифестов проекта перед командой Bash с именами ref до начала сессии, откуда команда
-    возвращает файлы (manifest_watch.restored_names); команда с маркером согласия не снимается. Сбой снимка или
-    чтения имён ref — предупреждение раз на сессию и пропуск в журнале на каждую команду, снимок не сохраняется,
-    команда идёт без проверки манифестов."""
+    """Снимок имён манифестов проекта перед командой Bash или вызовом MCP-инструмента с именами ref до начала
+    сессии, откуда команда возвращает файлы (manifest_watch.restored_names); команда с маркером согласия не
+    снимается. Сбой снимка или чтения имён ref и вызов без tool_use_id (снимок не с чем сопоставить после вызова) —
+    предупреждение раз на сессию и пропуск в журнале на каждую команду, снимок не сохраняется, команда идёт без
+    проверки манифестов."""
     command, tool_use_id = _command_and_id(data)
     cwd = data.get("cwd")
     if command is None or manifest_watch.has_marker(command) or not isinstance(cwd, str) or not cwd:
         return
-    deadline = time.monotonic() + manifest_watch.SNAPSHOT_BUDGET
     session = _session(data)
+    if tool_use_id is None:
+        _snapshot_skip(session, "снимок манифестов не снят (у вызова нет tool_use_id): новые зависимости от команд "
+                                "Bash и MCP-инструментов не проверяются")
+        return
     try:
         root = common.project_root(cwd)
+        # Срок снимка отсчитывается после корня проекта: git rev-parse (GIT_ROOT_TIMEOUT) его не съедает.
+        deadline = time.monotonic() + manifest_watch.SNAPSHOT_BUDGET
         entry = manifest_watch.take(root, deadline)
         # Имена ref до начала сессии, откуда команда git возвращает файлы, и старых патчей — работа автора;
         # относительный путь патча — от каталога команды до неё.
@@ -267,25 +332,18 @@ def snapshot_manifests(data):
         manifest_watch.store(session, tool_use_id, entry)
     except (manifest_watch.Unavailable, OSError) as e:
         # TimeoutError — подкласс OSError.
-        msg = f"снимок манифестов не снят ({e}): новые зависимости от команд Bash не проверяются"
-        try:
-            common.warn_once(session, "manifest-snapshot", msg)
-        except OSError:
-            # Каталог состояния недоступен: отметку раз на сессию не записать.
-            common.warn(msg)
-        try:
-            common.log_event(MANIFEST_HOOK, session, verdict="skipped", error=msg)
-        except OSError:
-            # Каталог данных недоступен: предупреждение уже выдано.
-            pass
+        _snapshot_skip(session, f"снимок манифестов не снят ({e}): новые зависимости от команд Bash и "
+                                f"MCP-инструментов не проверяются")
 
 
 def check_command_manifests(data):
-    """После команды Bash: новые имена в манифестах против снимка — блок PostToolUse с причиной агенту."""
-    if data.get("tool_name") != "Bash":
+    """После команды Bash или вызова MCP-инструмента: новые имена в манифестах против снимка — блок PostToolUse с
+    причиной агенту. Новые манифесты не проверены (manifest_watch.compare, третий элемент) или манифест не разобран
+    — предупреждение, блок по найденным именам остаётся."""
+    if data.get("tool_name") != "Bash" and not _is_mcp(data):
         return
     command, tool_use_id = _command_and_id(data)
-    if command is None:
+    if command is None or tool_use_id is None:
         return
     session = _session(data)
     deadline = time.monotonic() + manifest_watch.CHECK_BUDGET
@@ -303,17 +361,23 @@ def check_command_manifests(data):
     if entry is None or manifest_watch.has_marker(command):
         return
     try:
-        added, unknown = manifest_watch.compare(entry, deadline)
+        added, unknown, lost = manifest_watch.compare(entry, deadline)
     except (manifest_watch.Unavailable, OSError) as e:
         _manifest_skip(session, f"манифесты после команды не проверены: {e}")
         return
+    if lost is not None:
+        _manifest_skip(session, f"новые манифесты после команды не проверены: {lost}")
     if unknown:
         _manifest_skip(session, f"манифест не разобран до или после команды, новые зависимости не проверены: "
                                 f"{', '.join(unknown)}")
     if not added:
         return
     listed = "; ".join(f"{rel}: {', '.join(names)}" for rel, names in sorted(added.items()))
-    reason = COMMAND_REASON.format(added=listed, rules=common.rules_dir(), marker=depcheck.DEP_OK_MARKER)
+    if _is_mcp(data):
+        reason = MCP_REASON.format(tool=data["tool_name"], added=listed, rules=common.rules_dir(),
+                                   marker=depcheck.DEP_OK_MARKER)
+    else:
+        reason = COMMAND_REASON.format(added=listed, rules=common.rules_dir(), marker=depcheck.DEP_OK_MARKER)
     common.emit(common.block_output(reason))
     common.log_event(MANIFEST_HOOK, session, verdict="block-dep", manifests=len(added),
                      added=sum(map(len, added.values())), content=command)
@@ -346,6 +410,8 @@ def main():
         judge_bash(data)
     elif tool in EDIT_TOOLS:
         judge_manifest_edit(data)
+    elif _is_mcp(data):
+        snapshot_manifests(data)
 
 
 if __name__ == "__main__":

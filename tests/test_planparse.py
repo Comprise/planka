@@ -90,6 +90,21 @@ class FilesLineTest(unittest.TestCase):
         self.assertEqual(planparse.shared_files(tasks), [])
         self.assertIsNone(planparse.parse_plan("### Задача 1: A\nФайлы: нет\n### Задача 2: B\nFiles: -\n"))
 
+    def test_placeholder_values_are_no_files(self):
+        for value in ("N/A", "n/a", "TBD", "–", "…", "ничего"):
+            with self.subTest(value):
+                plan = f"## Волна 1\n### Задача 1: A\nFiles: {value}\n### Задача 2: B\nFiles: `b.py`\n"
+                self.assertEqual(_structure(plan), [(1, "2", ["b.py"])])
+
+    def test_etc_tail_under_files_list_is_not_a_path(self):
+        plan = "## Волна 1\n### Задача 1: A\n- Files:\n  - `a.py`\n  - etc.\n"
+        self.assertEqual(_structure(plan), [(1, "1", ["a.py"])])
+
+    def test_etc_tail_of_bare_list_is_not_a_path(self):
+        for value in ("a.py, etc", "a.py, etc.", "a.py, ETC."):
+            with self.subTest(value):
+                self.assertEqual(_structure(f"## Волна 1\n### Задача 1: A\nFiles: {value}\n"), [(1, "1", ["a.py"])])
+
     def test_several_backticked_paths_on_one_item(self):
         plan = "### Task 1: A\n**Files:**\n- Test: `a.py`, `b.py:3-9`\n"
         self.assertEqual(planparse.parse_plan(plan)[0].files, ["a.py", "b.py"])
@@ -195,6 +210,12 @@ class NestedNonOwnershipTest(unittest.TestCase):
     def test_nested_items_under_files_head_stay_owned(self):
         plan = "## Волна 1\n### Задача 1: A\n- **Файлы:**\n  - `a.py`\n  - Test: `t.py`\n"
         self.assertEqual(_structure(plan), [(1, "1", ["a.py", "t.py"])])
+
+    def test_non_path_item_inside_skipped_block_keeps_mark(self):
+        plan = ("## Волна 1\n### Задача 1: A\n- **Файлы:** `a.py`\n- **Не трогать:**\n  - `src/lexer.py`\n"
+                "  - всё в `legacy/`\n  - `src/api.py`\n### Задача 2: B\n- **Файлы:** `src/api.py`\n")
+        self.assertEqual(_structure(plan), [(1, "1", ["a.py"]), (1, "2", ["src/api.py"])])
+        self.assertEqual(planparse.shared_files(planparse.parse_plan(plan)), [])
 
     def test_sibling_item_after_nested_skip_is_owned_again(self):
         plan = "### Задача 1: A\n- Файлы: `a.py`\n- Не трогать:\n  - `s.py`\n- Create: `b.py`\n"
@@ -600,6 +621,10 @@ CORPUS = {
         [(1, "1", ["src/bucket.py", "tests/test_bucket.py"]),
          (1, "2", ["src/store.py", "tests/test_store.py"]),
          (1, "3", ["docs/limiter.md"])],
+        []),
+    "plan-readonly-prose-nested.md": (
+        [(1, "1", ["src/parser.py", "tests/test_parser.py"]),
+         (1, "2", ["src/api.py"])],
         []),
 }
 

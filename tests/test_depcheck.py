@@ -1352,7 +1352,7 @@ class ParserEdgesTest(unittest.TestCase):
         beyond = head + "-D " * 1362 + "left-pad"
         self.assertIsNotNone(depcheck.dependency_add(inside))
         self.assertIsNone(depcheck.dependency_add(beyond))
-        self.assertIn("4096", depcheck.dependency_doubt(beyond)[1])
+        self.assertEqual(depcheck.dependency_doubt(beyond)[1], depcheck._WHY_CUT)
 
 
 class NestedQuotesInSubstitutionTest(unittest.TestCase):
@@ -1709,39 +1709,40 @@ class DoubtTest(unittest.TestCase):
     NESTED = _nest("cd app && npm install x", 6)
     FORMS = [
         # Флаг со значением вне известных наборов перед подкомандой.
-        ("npm --weird val i -g x", "npm --weird val i -g x", "флаг"),
-        ("cd app && pip --weird val install requests", "pip --weird val install requests", "флаг"),
-        ("apt-get --weird val install jq", "apt-get --weird val install jq", "флаг"),
-        ("npm -g --a 1 --b 2 install x", "npm -g --a 1 --b 2 install x", "флаг"),
-        ("cargo +nightly --weird v install ripgrep", "cargo +nightly --weird v install ripgrep", "флаг"),
-        ("npx npm --weird val i x", "npx npm --weird val i x", "флаг"),
-        ("uv run npm --weird val i x", "uv run npm --weird val i x", "флаг"),
+        ("npm --weird val i -g x", "npm --weird val i -g x", depcheck._WHY_FLAG),
+        ("cd app && pip --weird val install requests", "pip --weird val install requests", depcheck._WHY_FLAG),
+        ("apt-get --weird val install jq", "apt-get --weird val install jq", depcheck._WHY_FLAG),
+        ("npm -g --a 1 --b 2 install x", "npm -g --a 1 --b 2 install x", depcheck._WHY_FLAG),
+        ("cargo +nightly --weird v install ripgrep", "cargo +nightly --weird v install ripgrep", depcheck._WHY_FLAG),
+        ("npx npm --weird val i x", "npx npm --weird val i x", depcheck._WHY_FLAG),
+        ("uv run npm --weird val i x", "uv run npm --weird val i x", depcheck._WHY_FLAG),
         # `--dry-run` значением чужого флага.
-        ("pip install --target --dry-run x", "pip install --target --dry-run x", "--dry-run"),
-        ("cargo install --root --dry-run ripgrep", "cargo install --root --dry-run ripgrep", "--dry-run"),
-        ("brew install --cc --dry-run jq", "brew install --cc --dry-run jq", "--dry-run"),
-        ("python -m pip install --target --dry-run x", "python -m pip install --target --dry-run x", "--dry-run"),
-        ("conda run -n e pip install -t --dry-run x", "conda run -n e pip install -t --dry-run x", "--dry-run"),
-        ("pdm run pip install -t --dry-run x", "pdm run pip install -t --dry-run x", "--dry-run"),
+        ("pip install --target --dry-run x", "pip install --target --dry-run x", depcheck._WHY_DRY),
+        ("cargo install --root --dry-run ripgrep", "cargo install --root --dry-run ripgrep", depcheck._WHY_DRY),
+        ("brew install --cc --dry-run jq", "brew install --cc --dry-run jq", depcheck._WHY_DRY),
+        ("python -m pip install --target --dry-run x", "python -m pip install --target --dry-run x", depcheck._WHY_DRY),
+        ("conda run -n e pip install -t --dry-run x", "conda run -n e pip install -t --dry-run x", depcheck._WHY_DRY),
+        ("pdm run pip install -t --dry-run x", "pdm run pip install -t --dry-run x", depcheck._WHY_DRY),
         # Пакеты из stdin xargs.
-        ("echo x | xargs npm install", "xargs npm install", "xargs"),
-        ("cat req.txt | xargs -n 1 pip install", "xargs -n 1 pip install", "xargs"),
-        ("echo x@1 | xargs go install", "xargs go install", "xargs"),
+        ("echo x | xargs npm install", "xargs npm install", depcheck._WHY_XARGS),
+        ("cat req.txt | xargs -n 1 pip install", "xargs -n 1 pip install", depcheck._WHY_XARGS),
+        ("echo x@1 | xargs go install", "xargs go install", depcheck._WHY_XARGS),
         # Вложенность глубже 4 уровней.
-        ("eval " * 5 + "npm install x", "eval " * 5 + "npm install x", "4"),
-        (NESTED, NESTED, "4"),
-        ("eval " * 5 + "sudo -E env A=1 npm install x", "eval " * 5 + "sudo -E env A=1 npm install x", "4"),
-        ("npx " * 6 + "npm install x", "npx " * 6 + "npm install x", "4"),
-        ("uv run " * 6 + "pip install x", "uv run " * 6 + "pip install x", "4"),
-        ("eval " * 5 + "npx -y pnpm@9 add x", "eval " * 5 + "npx -y pnpm@9 add x", "4"),
-        ("eval " * 12 + "npm install x", "eval " * 12 + "npm install x", "4"),
-        (_nest("npm install x", 6), _nest("npm install x", 6), "4"),
-        (_nest('echo "$(npm install x)"', 4), _nest('echo "$(npm install x)"', 4), "4"),
-        ("npx " * 12 + "npm install x", "npx " * 12 + "npm install x", "4"),
-        ("python -m " * 12 + "pip install x", "python -m " * 12 + "pip install x", "4"),
-        ("uv run " * 12 + "pip install x", "uv run " * 12 + "pip install x", "4"),
+        ("eval " * 5 + "npm install x", "eval " * 5 + "npm install x", depcheck._WHY_DEPTH),
+        (NESTED, NESTED, depcheck._WHY_DEPTH),
+        ("eval " * 5 + "sudo -E env A=1 npm install x", "eval " * 5 + "sudo -E env A=1 npm install x",
+         depcheck._WHY_DEPTH),
+        ("npx " * 6 + "npm install x", "npx " * 6 + "npm install x", depcheck._WHY_DEPTH),
+        ("uv run " * 6 + "pip install x", "uv run " * 6 + "pip install x", depcheck._WHY_DEPTH),
+        ("eval " * 5 + "npx -y pnpm@9 add x", "eval " * 5 + "npx -y pnpm@9 add x", depcheck._WHY_DEPTH),
+        ("eval " * 12 + "npm install x", "eval " * 12 + "npm install x", depcheck._WHY_DEPTH),
+        (_nest("npm install x", 6), _nest("npm install x", 6), depcheck._WHY_DEPTH),
+        (_nest('echo "$(npm install x)"', 4), _nest('echo "$(npm install x)"', 4), depcheck._WHY_DEPTH),
+        ("npx " * 12 + "npm install x", "npx " * 12 + "npm install x", depcheck._WHY_DEPTH),
+        ("python -m " * 12 + "pip install x", "python -m " * 12 + "pip install x", depcheck._WHY_DEPTH),
+        ("uv run " * 12 + "pip install x", "uv run " * 12 + "pip install x", depcheck._WHY_DEPTH),
         # Пакет дальше 4096 символов команды.
-        (LONG, LONG, "4096"),
+        (LONG, LONG, depcheck._WHY_CUT),
     ]
 
     def test_forms(self):
@@ -1751,7 +1752,7 @@ class DoubtTest(unittest.TestCase):
                 found = depcheck.dependency_doubt(cmd)
                 self.assertIsNotNone(found)
                 self.assertEqual(found[0], segment)
-                self.assertIn(why, found[1])
+                self.assertEqual(found[1], why)
 
     def test_not_doubt(self):
         for cmd in [
@@ -1768,19 +1769,26 @@ class DoubtTest(unittest.TestCase):
             "eval " * 5 + "echo npm install x", "eval " * 5 + "make test", "eval " * 5 + "sudo -E",
             "npm -- val i x", "npm -- -g val i x", "npm --a=1 v i x", "npm help foo install x",
             _nest("git commit -m 'go get coffee'", 6),
-            # Длинный сегмент не менеджера или без команды установки.
-            'git commit -m "' + "x " * 3000 + '; npm install x"', "npm run build " + "a " * 3000,
+            # Длинный сегмент не менеджера.
+            'git commit -m "' + "x " * 3000 + '; npm install x"',
             # За 4096 символами — продолжение значения флага или только флаги, а не новое слово.
             'npm install --tag "' + "a b " * 2000 + '"', "npm install " + "-D " * 1400 + "--save >log",
         ]:
             with self.subTest(cmd[:60]):
                 self.assertIsNone(depcheck.dependency_doubt(cmd))
 
+    def test_cut_manager_false_doubt(self):
+        # README: слово-не-флаг менеджера, начатое за _WORDS_LIMIT, — сомнение и без команды установки в видимых
+        # словах (ложный отказ, обход — маркер): какие слова менеджер прочтёт подкомандой, разбор за пределом не видит.
+        cmd = "npm run build " + "a " * 3000
+        self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_CUT)
+        self.assertIsNone(depcheck.dependency_doubt("PLANKA_DEP_OK=1 " + cmd))
+
     def test_boolean_flag_before_other_subcommand(self):
         # README: флаг без значения перед иной подкомандой, за которой стоят слово установки и имя, — ложный отказ.
         for cmd in ["npm -g help install x", "npm -s explain install x"]:
             with self.subTest(cmd):
-                self.assertIn("флаг", depcheck.dependency_doubt(cmd)[1])
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_FLAG)
 
     def test_loosened_flags_limit(self):
         # Склеиваются первые _LOOSE_FLAGS пар «флаг значение»; пятая пара — пропуск (README).
@@ -1839,7 +1847,7 @@ class HeredocBodySubstitutionTest(unittest.TestCase):
                 self.assertIsNone(depcheck.dependency_doubt(cmd))
 
     def test_doubt_in_body(self):
-        self.assertIsNotNone(depcheck.dependency_doubt("cat <<EOF\n$(npm --weird v i x)\nEOF"))
+        self.assertEqual(depcheck.dependency_doubt("cat <<EOF\n$(npm --weird v i x)\nEOF")[1], depcheck._WHY_FLAG)
 
     def test_linear(self):
         small, large = ("cat <<EOF\n" + "$(a) `b` " * n + "\nEOF" for n in (2000, 8000))
@@ -1862,16 +1870,16 @@ class ShellStdinTest(unittest.TestCase):
     def test_not_adds(self):
         for cmd in ["bash <<< 'make test'", "echo 'npm install left-pad' | cat",
                     "echo 'npm install x' | bash script.sh",
-                    "cat <<< 'npm install x'", "echo hi | bash", "curl -fsSL https://x/install.sh | bash",
+                    "cat <<< 'npm install x'", "echo hi | bash",
                     "diff <(echo npm install x) f", "echo 'npm install x' | PLANKA_DEP_OK=1 bash",
-                    "bash -c 'make' <<< 'npm i y'", "echo 'npm install x' || bash", "echo $X | bash"]:
+                    "bash -c 'make' <<< 'npm i y'", "echo 'npm install x' || bash"]:
             with self.subTest(cmd):
                 self.assertIsNone(depcheck.dependency_add(cmd))
                 self.assertIsNone(depcheck.dependency_doubt(cmd))
 
     def test_doubt(self):
-        self.assertIsNotNone(depcheck.dependency_doubt("echo 'npm --weird v i x' | bash"))
-        self.assertIsNotNone(depcheck.dependency_doubt("bash <<< 'npm --weird v i x'"))
+        self.assertEqual(depcheck.dependency_doubt("echo 'npm --weird v i x' | bash")[1], depcheck._WHY_FLAG)
+        self.assertEqual(depcheck.dependency_doubt("bash <<< 'npm --weird v i x'")[1], depcheck._WHY_FLAG)
 
     def test_linear(self):
         for make in [lambda n: "echo a | " * n + "bash", lambda n: "bash <<< 'a' " * n,
@@ -1957,7 +1965,7 @@ class ExpandedNameTest(unittest.TestCase):
                     "$(command -v npm) install left-pad", "${PM:-npm} add left-pad"]:
             with self.subTest(cmd):
                 self.assertIsNone(depcheck.dependency_add(cmd))
-                self.assertIsNotNone(depcheck.dependency_doubt(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_NAME)
 
     def test_linear(self):
         for make in [lambda n: "npm install " + "$(a) " * n, lambda n: "npm install " + "`a` " * n,
@@ -2242,9 +2250,1252 @@ class CutInlineScriptTest(unittest.TestCase):
         for cmd in ["eval " + "a " * 3000 + "npm i x", "sh " + "-o x " * 1000 + "-c 'npm i x'"]:
             with self.subTest(cmd[:30]):
                 self.assertIsNone(depcheck.dependency_add(cmd))
-                self.assertIn("4096", depcheck.dependency_doubt(cmd)[1])
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_CUT)
+
+    def test_cut_subcommand_doubt(self):
+        # Подкоманда или команда за запускателем — за пределом слов: сомнение.
+        for cmd in ["npm --a=" + "a" * 5000 + " install evil", "npx --a=" + "a" * 5000 + " npm install evil"]:
+            with self.subTest(cmd[:30]):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_CUT)
+
+    def test_cut_manager_doubt(self):
+        # Видимое имя команды — менеджер или запускатель: слово-не-флаг за пределом может быть подкомандой или
+        # пакетом, в каком бы порядке их ни ставил менеджер.
+        long = "a" * 5000
+        for form in ["dotnet --a=%s add package x", "dotnet add --a=%s package x", "dotnet tool --a=%s install x",
+                     "dart --a=%s pub add x", "flutter pub --a=%s add x", "swift package --a=%s add-dependency x",
+                     "pacman --a=%s -S x", "nix-env --a=%s -i x", "python --a=%s -m pip install x",
+                     "pnpx --a=%s pnpm add x", "corepack --a=%s pnpm add x", "pip --a=%s install x"]:
+            cmd = form % long
+            with self.subTest(form):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_CUT)
 
     def test_not_doubt(self):
-        for cmd in ["sh -c 'make' " + "a " * 3000, "bash script.sh " + "a " * 3000, "eval " + "a " * 100]:
+        for cmd in ["sh -c 'make' " + "a " * 3000, "bash script.sh " + "a " * 3000, "eval " + "a " * 100,
+                    "echo " + "a " * 3000, "git add " + "a " * 3000]:
             with self.subTest(cmd[:30]):
                 self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_python_script_not_doubt(self):
+        # `python` со скриптом или `-c` в видимых словах: слова за пределом — их аргументы, python пакет не ставит.
+        for cmd in ["python3 gen.py " + "a " * 3000, "python -X dev -W error gen.py " + "a " * 3000,
+                    "python3 -c 'print(1)' " + "a " * 3000, "python3 -Ic 'print(1)' " + "a " * 3000,
+                    "python3 - " + "a " * 3000]:
+            with self.subTest(cmd[:30]):
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+        # Одни флаги до предела или `-m`: модуль или пакет может стоять дальше.
+        for cmd in ["python3 -X " + "a" * 5000 + " -m pip install x", "python3 -m pip install " + "-q " * 2000 + "x",
+                    "python3 " + "-B " * 3000 + "-m pip install x"]:
+            with self.subTest(cmd[:30]):
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_CUT)
+
+
+class SudoLongFlagsTest(unittest.TestCase):
+    """Флаги sudo со значением — короткие и длинные (`sudo --help`, sudo 1.9.17): значение не команда."""
+
+    def test_detected(self):
+        for cmd in ["sudo --user root npm install x", "sudo --user=root npm install x", "sudo -R / npm install x",
+                    "sudo --chroot / npm i x", "sudo --chdir /app npm i x", "sudo --group g --host h npm i x",
+                    "sudo --prompt p --close-from 3 npm i x", "sudo --command-timeout 5 npm i x",
+                    "sudo --other-user u npm i x", "sudo -a t -c c npm i x", "sudo --role r --type t npm i x",
+                    "sudo --login-class c --auth-type t npm i x"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in ["sudo --user root ls", "sudo -R / make"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+
+class GemCommandFormsTest(unittest.TestCase):
+    """RubyGems: псевдоним `i` и однозначные сокращения `install`; `--` кончает флаги gem."""
+
+    def test_detected(self):
+        for cmd in ["gem i rails", "gem ins rails", "gem inst rails", "gem instal rails",
+                    "gem install rails -- --dry-run", "pip install x -- --dry-run"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        # `in` неоднозначно (`info`, `install`): gem отвечает ошибкой.
+        for cmd in ["gem in rails", "gem info rails", "gem install --dry-run rails", "gem install rails --dry-run"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+
+class LineContinuationJoinTest(unittest.TestCase):
+    """`\\` с переводом строки bash удаляет, не вставляя пробела: слова по краям склеиваются."""
+
+    def test_detected(self):
+        for cmd in ["pip ins\\\ntall requests", "n\\\npm install left-pad", "npm install \\\n  left-pad",
+                    "echo x\\\n#y; npm i x", '"np\\\nm" install x', "sh -c 'n\\\npm i x'"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_comment_after_blank(self):
+        self.assertIsNone(depcheck.dependency_add("echo a \\\n# npm i x"))
+
+
+class ParameterExpansionSeparatorsTest(unittest.TestCase):
+    """`#`, `;`, `&`, `|` внутри `${…}` вне кавычек — часть раскрытия, не комментарий и не граница команды."""
+
+    def test_detected(self):
+        for cmd in ["echo ${x:- #}; npm install left-pad", "echo ${x:-a|b}; npm i x", "echo ${x:-(}; npm i x"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in ["echo ${x:-a;npm install x}", "echo ${x:-a && npm i x}"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+
+class ParameterExpansionSubstitutionTest(unittest.TestCase):
+    """Подстановка `$(…)` и `` `…` `` в слове `${…}` и в арифметике `$[…]` вне кавычек bash исполняет; `${…}`
+    кончается на первой `}` вне кавычек: голые `{…}` в значении не вкладываются (bash 5.3)."""
+
+    def test_detected(self):
+        for cmd in ["echo ${x:-$(npm install y)}", "echo ${x:-`npm install y`}", "echo $[1+$(npm install y)]",
+                    ": ${x:=$(npm install y)}", "echo ${x:-${y:-$(npm i z)}}", "echo ${x:-\"a\"$(npm i z)}",
+                    "echo ${x:-{a,b}$(npm i z)}"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in ["echo ${x:-'$(npm i z)'}", "echo ${x:-$((1+2))} npm i z", "echo ${x:-\\$(npm i z)}",
+                    "echo ${x:-a}$'$(npm i z)'", "echo $[1]'$(npm i z)'"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+
+class SshOptionsAfterHostTest(unittest.TestCase):
+    """OpenSSH разбирает флаги и после имени хоста; `--` кончает флаги."""
+
+    def test_detected(self):
+        for cmd in ["ssh host -p 22 npm install x", "ssh host -- npm install x", "ssh -o A=b host -t npm install x",
+                    "ssh -- host npm i x", "ssh host -p 22 <<'EOF'\nnpm i x\nEOF"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in ["ssh host -p 22", "ssh host -t ls", "ssh host -- ls <<'EOF'\nnpm i x\nEOF"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+
+class AnsiCQuotingTest(unittest.TestCase):
+    """`$'…'` раскрывает escape-последовательности bash."""
+
+    def test_detected(self):
+        for cmd in ["$'\\x6epm' install x", "$'\\156pm' install x", "$'\\u006epm' i x", "$'\\U0000006epm' i x",
+                    "npm $'\\x69nstall' x", "$'n\\x70m' i x"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_decoding(self):
+        for text, word in [("$'a\\tb'", "a\tb"), ("$'\\''", "'"), ("$'\\x'", "\\x"), ("$'\\q'", "\\q"),
+                           ("$'\\cA'", "\x01"), ("$'a\\0b'", "a"), ("$'\\e'", "\x1b"), ("$'\\x41\\101'", "AA")]:
+            with self.subTest(text):
+                self.assertEqual(depcheck._split(text)[0][0], word)
+
+
+class BraceExpansionTest(unittest.TestCase):
+    """Фигурные скобки вне кавычек bash раскрывает в слова (`{a,b}`, `{1..3}`), кроме `${…}`, присваиваний и
+    перенаправлений."""
+
+    def test_detected(self):
+        for cmd in ["{npm,install,left-pad}", "{npm,} install x", "npm install {left-pad,lodash}",
+                    "npm {install,} x", "{npm,i} x", "npm i{,} x",
+                    "npm install {" + "-D," * 100 + "left-pad}", '{"npm",install} x', "npm install {a..c}"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in ["echo {npm,install,x}", "mkdir -p src/{a,b}", "'{npm,install,x}'", "find . -exec rm {} \\;",
+                    "echo ${X:-{npm,i}}", "{npm} install x", '"{npm,}" install x', "{'npm,'} install x",
+                    "A={npm,install} x", "npm i > {a,b}", "npm run {build,test}"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+    def test_words(self):
+        for text, words in [("{a}{b,c}", ["{a}b", "{a}c"]), ("{a,b}{", ["a{", "b{"]), ("{a,b}}", ["a}", "b}"]),
+                            ("a{b,c{d,e}f}g", ["abg", "acdfg", "acefg"]), ("{{a,b},c}", ["a", "b", "c"]),
+                            ("{a,{b}}", ["a", "{b}"]), ("{a,b\\}c}", ["a", "b}c"]), ("{,}", []),
+                            ("{a..e..2}", ["a", "c", "e"]), ("{3..1}", ["3", "2", "1"]),
+                            ("{01..3}", ["01", "02", "03"]),
+                            ("{a..}", ["{a..}"]), ("{-1..1}", ["-1", "0", "1"]), ("{1..2..0}", ["1", "2"]),
+                            ('{a,"b,"c}', ["a", "b,c"]), ("x{a,b}${X}{c,d}", ["xa${X}c", "xa${X}d", "xb${X}c",
+                                                                              "xb${X}d"])]:
+            with self.subTest(text):
+                self.assertEqual([w for w, _ in depcheck._split(text, braces=True)], words)
+
+    def test_linear(self):
+        for make in [lambda n: "{a,b}" * n + " npm i x", lambda n: "echo " + "{" * n, lambda n: "echo " + "{a}" * n,
+                     lambda n: "npm i {" + "-D," * n + "x}", lambda n: "echo {1.." + "9" * n + "}",
+                     lambda n: "echo " + "{" * n + "a,b" + "}" * n]:
+            small, large = make(2000), make(8000)
+            with self.subTest(small[:30]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+
+    def test_budget_per_segment(self):
+        # Предел _BRACE_BUDGET — на весь вызов: много слов с раскрытием не дороже текста той же длины.
+        braced = "echo " + "{1..99}{1..99} " * 1000
+        plain = "echo " + "abcdefghijklmn " * 1000
+        assert_linear(self, lambda: depcheck.dependency_add(plain), lambda: depcheck.dependency_add(braced))
+
+    def test_over_budget_doubt(self):
+        # Слова за пределом раскрытия не видны, как за _WORDS_LIMIT: команда установки без видимого пакета — сомнение
+        # со своим доводом.
+        for cmd in ["npm {install,%s} x" % ("a" * 9000), "npm i {%s,b}{c,d}" % ("a" * 5000)]:
+            with self.subTest(cmd[:30]):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_BRACES)
+
+    def test_over_budget_any_command_doubt(self):
+        # Слова за пределом раскрытия не видны у любой команды: сомнение, обход — маркер.
+        for cmd in ["for i in {1..10000}; do echo $i; done", "echo {a,b}{c,d}" * 2000, "touch f{1..5000}.txt"]:
+            with self.subTest(cmd[:30]):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_BRACES)
+                self.assertIsNone(depcheck.dependency_doubt("PLANKA_DEP_OK=1 " + cmd))
+
+
+class FunctionDefinitionTest(unittest.TestCase):
+    """Тело функции `function f { …; }` и сопроцесса `coproc NAME { …; }` — команды."""
+
+    def test_detected(self):
+        for cmd in ["function f { npm install x; }; f", "coproc NAME { npm install x; }", "function f() { npm i x; }",
+                    "coproc W while true; do npm i x; done"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in ["function npm { :; }", "coproc npm { :; }"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+
+class ArraySubscriptAssignmentTest(unittest.TestCase):
+    """Присваивание элементу массива перед командой (`a[0]=1 cmd`) bash исполняет как присваивание."""
+
+    def test_detected(self):
+        # Индекс кончается на первой `]` вне кавычек и `\\` с учётом вложенных `[…]` (bash 5.3).
+        for cmd in ["a[0]=1 npm install x", "a[1]+=x npm i x", 'a["k y"]=1 npm i x', "a[$i]=1 npm i x",
+                    'a["]"]=1 npm install x', "a[']']=1 npm i x", "a[\\]]=1 npm i x", "a[b[1]]=1 npm i x"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_assignment(self):
+        # Не присваивание: слово — имя команды, которой нет.
+        for cmd in ["a[x]y]=1 npm i x", 'a[x]"="1 npm i x', "'a[0]=1' npm i x"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+    def test_marker(self):
+        self.assertIsNone(depcheck.dependency_add("a[0]=1 PLANKA_DEP_OK=1 npm i x"))
+
+
+class SourceStdinTest(unittest.TestCase):
+    """`source` и `.` со скриптом `-` или `/dev/stdin` исполняют stdin; со скриптом-файлом stdin — данные."""
+
+    def test_detected(self):
+        for cmd in ["source /dev/stdin <<< 'npm install x'", ". /dev/stdin <<EOF\nnpm install x\nEOF",
+                    ". - <<<'npm i x'", "echo 'npm i x' | source /dev/stdin"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in ["echo 'npm i x' | source script.sh", "source script.sh <<< 'npm i x'",
+                    "source s.sh <(echo npm i x)", ". s.sh <<'EOF'\nnpm i x\nEOF"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+
+class FindPlaceholderTest(unittest.TestCase):
+    """`{}` под `find -exec` — найденный путь: с начальной точкой поиска впереди (`./a.tgz`), у `-execdir` — `./`."""
+
+    def test_not_adds(self):
+        for cmd in ["find . -name '*.tgz' -exec npm install {} \\;", "find . -type d -execdir npm install {} \\;",
+                    "find /opt -name '*.whl' -exec pip install {} +", "find -name '*.tgz' -exec npm i {} +",
+                    "find src -name '*.whl' -exec pip install {} \\;", "find . -exec sh -c 'npm i {}' \\;",
+                    # `$HOME`, `$PWD`, `$OLDPWD`, `$TMPDIR` — абсолютные пути, пустые — `/…`.
+                    "find $HOME/x -name '*.tgz' -exec npm i {} +", 'find "$PWD" -exec npm i {} +',
+                    "find ${TMPDIR}/p -exec npm i {} +"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+    def test_detected(self):
+        # npm читает `src/a` без `./` как репозиторий GitHub `src/a`. Значение `$DIR` неизвестно: путь может быть
+        # таким же (README, «Известные ограничения»; обход — маркер).
+        for cmd in ["find src -maxdepth 1 -type d -exec npm install {} \\;", "find . -exec npm i x {} \\;",
+                    'find "$DIR" -exec npm i {} +', "find $HOMEDIR -exec npm i {} +"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+
+class GitLaunchTest(unittest.TestCase):
+    """Команды, которые git запускает из своих слов: `submodule foreach`, `bisect run`, `rebase -x/--exec`, псевдоним
+    `-c alias.<имя>='!…'` (имя без учёта регистра)."""
+
+    def test_detected(self):
+        for cmd in ["git submodule foreach npm install x", "git submodule foreach 'npm i x'",
+                    "git submodule --quiet foreach --recursive 'npm i x'", "git bisect run npm install x",
+                    "git rebase -x 'npm i x' main", "git rebase --exec='npm i x' main", "git rebase -ix 'npm i x' main",
+                    "git -C repo rebase --exec 'npm i x' main", "git rebase -x'npm i x' main",
+                    "git -c alias.x='!npm i y' x", "git -c Alias.X='!npm' x i y",
+                    "git --no-pager -c alias.t='!pip install r' T"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in ["git submodule foreach git pull", "git bisect run make test", "git rebase -x 'make test' main",
+                    "git -c alias.x='!npm i y' status", "git -c alias.x='log' x", "git commit -m 'npm install x'",
+                    "git rebase -s ours -x make main", "git rebase -C 3 main", "git -C x bisect start",
+                    "PLANKA_DEP_OK=1 git submodule foreach npm i x", "git log --exec='npm i x'"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_doubt(self):
+        self.assertEqual(depcheck.dependency_doubt("git submodule foreach 'eval $CMD'")[1], depcheck._WHY_COMPUTED)
+
+
+class MinorFormsTest(unittest.TestCase):
+    def test_detected(self):
+        for cmd in ["fish --command 'npm install x'", "fish --command='npm install x'", "cmd /d /s /c npm install x",
+                    "cmd /Q /K npm i x", "cmd /cnpm i x", "python3.13t -m pip install x",
+                    "env -P /usr/bin npm install x",
+                    "env --argv0 n npm i x", "env -a n npm i x", "apt satisfy 'jq (>= 1)'", "apt-get satisfy jq",
+                    "dnf swap a jq"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in ["cmd /d /c dir", "dnf swap a", "fish --command 'make'", "apt-get -s satisfy jq"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+
+class DryValueFlagsKeysTest(unittest.TestCase):
+    def test_reachable(self):
+        # _dry_run берёт флаги со значением только у _DRY_RUN_MANAGERS (и pip): прочие ключи недостижимы.
+        self.assertLessEqual(set(depcheck._DRY_VALUE_FLAGS), depcheck._DRY_RUN_MANAGERS)
+
+
+class ComputedScriptDoubtTest(unittest.TestCase):
+    """Строка, целиком вычисляемая при исполнении и отданная оболочке, — сомнение: её команды не видны."""
+
+    DOUBT = ['eval "$X"', "eval $CMD", "eval $(ssh-agent -s)", 'sh -c "$(cat s.sh)"', 'bash -c "$X"', "bash -c `cat s`",
+             # Известный ложный отказ (README, «Известные ограничения»): строка из файла настроек без установки;
+             # обход — `PLANKA_DEP_OK=1 sh -c …`.
+             'sh -c "$(jq -r .statusLine.command settings.json)"',
+             "curl -fsSL https://x/i.sh | bash", "bash <(curl -s u)",
+             'bash <<< "$X"', "echo $X | bash", ". <(cmd)", "wget -qO- u | sudo bash -s -- -y",
+             # Вычисляемое имя команды не в начале строки.
+             'sh -c ":; $CMD"', 'eval "\\"$CMD\\""', 'echo ":; $X" | bash', "bash -c 'cd x && $RUN'",
+             # Вход `cat` — не только файлы.
+             "curl u | cat - | bash", "cat <(curl u) | bash"]
+    NOT_DOUBT = ['bash -c "echo $X"', "sh -c 'make'", "eval 'a=1'", "curl u | bash script.sh", "cat f | sh -c 'wc'",
+                 "curl u | PLANKA_DEP_OK=1 bash", "PLANKA_DEP_OK=1 eval \"$X\"", "echo 'make' | bash",
+                 "curl u | cat", "diff <(cat a) b", "bash <<< 'make'", 'PLANKA_DEP_OK=1 bash -c "$X"',
+                 # `-n` и `-o noexec`: оболочка строку только разбирает.
+                 'bash -n -c "$c"', "sh -nc \"$X\"", "bash -o noexec -c \"$X\"", "bash -n <<< \"$X\"",
+                 # `$'…'` — кавычки ANSI-C, не подстановка.
+                 "printf \"\\$'\\\\x65cho' x\\n\" | bash",
+                 # Скрипт из файла не виден, как у `bash s.sh`.
+                 "cat s.sh | sh", "cat a.sh b.sh | bash -s", "git show HEAD:x.sh | bash",
+                 "cat s.sh | source /dev/stdin", "source <(cat f)"]
+
+    def test_noexec_not_adds(self):
+        for cmd in ["bash -n -c 'npm i x'", "sh -nc 'npm i x'", "bash -n <<< 'npm i x'", "zsh -o noexec -c 'npm i x'"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_ansi_c_detected(self):
+        self.assertIsNotNone(depcheck.dependency_add("printf \"\\$'n\\\\x70m' i x\\n\" | bash"))
+
+    def test_doubt(self):
+        for cmd in self.DOUBT:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_COMPUTED)
+
+    def test_not_doubt(self):
+        for cmd in self.NOT_DOUBT:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+
+class HeredocCatPipeTest(unittest.TestCase):
+    """`cat` без файлов отдаёт оболочке тело своего heredoc: тело уже разобрано командами, вход не вычисляемый."""
+
+    def test_not_doubt(self):
+        # `cat f` с heredoc читает файл, не stdin: скрипт из файла, как у `sh f`.
+        for cmd in ["cat <<'EOF' | sh\nls\nEOF", "cat <<EOF | bash\necho hi\nEOF", "cat - <<EOF | sh\nls\nEOF",
+                    "cat <<-EOF | bash -s\n\tmake\n\tEOF", "cat <<EOF f | sh\nls\nEOF"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_detected(self):
+        for cmd in ["cat <<'EOF' | sh\nnpm i x\nEOF", "cat - <<EOF | bash\npip install requests\nEOF"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_doubt(self):
+        # Вывод `cat -n` и вход `source`, у которого тело heredoc — данные, не видны.
+        for cmd in ["cat -n <<EOF | sh\nls\nEOF", "cat <<EOF | source\nls\nEOF"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_COMPUTED)
+
+
+class UnknownLauncherDoubtTest(unittest.TestCase):
+    """Неизвестная детектору программа, в чьих словах подряд стоят менеджер и его глагол установки, — сомнение:
+    программа может запустить их командой."""
+
+    DOUBT = ["direnv exec . npm install x", "taskset -c 0 npm install x", "parallel npm install ::: x",
+             "docker exec c npm install x", "devbox run pip install x", "chrt -f 1 apt-get install jq",
+             "$RUN npm i x", "docker exec c python -m pip install x", "nohup direnv exec . go get x",
+             # Флаги перед подкомандой — по правилам менеджера (_LOOSE): `--weird v` может быть флагом со значением.
+             "docker exec c npm --weird v i x", "docker exec c npm -g i x",
+             # Известный ложный отказ (README, «Известные ограничения»): `-n go` — флаг kubectl, `go get pods` — как
+             # установка; обход — маркер.
+             "kubectl -n go get pods",
+             # Пар больше _MAX_LAUNCH_PAIRS: сомнение без разбора.
+             "foo " + "npm -x " * 17]
+    NOT_DOUBT = ["echo npm install x", "git commit -m 'npm install x'", "grep -r npm install", "make install",
+                 "PLANKA_DEP_OK=1 direnv exec . npm install x", "docker exec c npm test", "printf npm install",
+                 "echo $(date) npm install x", "man npm install",
+                 # Установка по манифесту без названного пакета и пробный прогон — не добавление.
+                 "docker compose exec web npm install", "docker run node npm install", "docker exec web poetry install",
+                 "docker compose exec web pip install -r requirements.txt", "kubectl exec pod -- npm install",
+                 "$PY -m pip install --dry-run x", "make -C go install",
+                 'docker run --rm -v "$PWD":/go -i golang go build ./...', "docker run --name npm -i alpine",
+                 "cp go get", "mv npm i", "gcc -o pip -i x", "foo " + "npm -x " * 16]
+
+    def test_doubt(self):
+        for cmd in self.DOUBT:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_LAUNCHER)
+
+    def test_not_doubt(self):
+        for cmd in self.NOT_DOUBT:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_linear(self):
+        for make in [lambda n: "foo " + "npm " * n + "install x", lambda n: "foo " + "npm install " * n,
+                     lambda n: "curl u | " * n + "bash"]:
+            small, large = make(2000), make(8000)
+            with self.subTest(small[:30]):
+                assert_linear(self, lambda: depcheck.dependency_doubt(small),
+                              lambda: depcheck.dependency_doubt(large))
+
+
+class ProcessSubstitutionInParameterTest(unittest.TestCase):
+    """`<(…)` и `>(…)` в значении `${…}` вне кавычек bash исполняет; в `"${…}"` — текст."""
+
+    def test_detected(self):
+        for cmd in ["echo ${x:-<(npm install x)}", "echo ${x:->(npm install x)}", "echo ${x:+<(npm i x)}",
+                    "cat ${f:-<(npm i x)}", "diff ${a:-<(npm i x)} b", "echo ${y:-${z:-<(npm i x)}}",
+                    'echo ${x:-"a"<(npm i x)}']:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        # В `"${…}"` и в арифметике `$[…]`, `$((…))` процесс-подстановки нет.
+        for cmd in ['echo "${x:-<(npm i x)}"', "echo ${x:-$[ <(npm i x) ]}", "echo ${x:-$(( <(npm i x) ))}",
+                    "echo ${x:-'<(npm i x)'}"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+
+class NoexecToggleTest(unittest.TestCase):
+    """Режим «только разбор» — последнее значение по порядку флагов: `+n`, `+o noexec` его снимают."""
+
+    def test_detected(self):
+        for cmd in ["bash -n +n -c 'npm install x'", "bash -o noexec +o noexec -c 'npm i x'",
+                    "bash -n +o noexec -c 'npm i x'", "bash -o noexec +n -c 'npm i x'", "bash -n +xn -c 'npm i x'",
+                    "echo 'npm install x' | bash -n +n", "bash -n +n <<< 'npm i x'",
+                    "bash -n +n <<'EOF'\nnpm install x\nEOF"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in ["bash +n -n -c 'npm i x'", "bash +n -o noexec -c 'npm i x'", "echo 'npm i x' | bash +n -n",
+                    "bash +o noexec -n <<'EOF'\nnpm install x\nEOF"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+
+class ArithmeticSubstitutionTest(unittest.TestCase):
+    """Подстановка внутри `$((…))` в двойных кавычках, в `${…}` и в теле heredoc исполняется; кавычки внутри
+    арифметики её не прячут."""
+
+    def test_detected(self):
+        for cmd in ['echo "$(( $(npm install x) + 1 ))"', 'echo "$(( `npm i x` ))"',
+                    "cat <<EOF\n$(( $(npm install x) ))\nEOF", "echo ${y:-$(( $(npm i x) ))}",
+                    'echo "$(( "$(npm i x)" + 1 ))"', "echo \"$(( '$(npm i x)' ))\"",
+                    'echo "$(( (1) + $(npm i x) ))"', 'echo "$(( $(( 1 )) + $(npm i x) ))"',
+                    "echo ${x:-$(( '$(npm i x)' ))}"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_subshell_fallback(self):
+        # `$((` и `((`, где `)` нулевой глубины стоит не перед второй `)`, bash 5.3 читает подстановкой `$(` или
+        # подоболочкой `(` с подоболочкой внутри.
+        for cmd in ['echo "$((npm install evil) )"', "echo ${y:-$((npm install evil) )}",
+                    "cat <<EOF\n$((npm install evil) )\nEOF", 'echo "$((cd /tmp && npm install evil); true)"',
+                    "echo $((npm install evil) )", 'echo "$((a) )"; npm i x', 'echo "$((a) )" && npm i x',
+                    "echo \"$((echo '$(true)') )\"; npm i x", 'echo "$(( (a) ) )"; npm i x']:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_subshell_fallback_quotes(self):
+        # Тело `$(` после отката — команда: `'…'` в нём прячет подстановку, как в bash.
+        self.assertEqual(depcheck._quoted_substitutions("echo \"$((echo '$(npm i x)') )\""),
+                         ["(echo '$(npm i x)') "])
+        self.assertIsNone(depcheck.dependency_add("echo \"$((echo '$(npm i x)') )\""))
+
+    def test_subshell_fallback_heredoc(self):
+        # `((` с подоболочкой: `<<` после её конца — heredoc.
+        self.assertEqual(depcheck.heredocs("((true) ) <<EOF"), [("EOF", False)])
+        self.assertEqual(depcheck.heredocs("(( x << 2 ))"), [])
+
+    def test_not_adds(self):
+        # После `))` арифметики в `"…"` снова двойные кавычки: `'` — символ.
+        for cmd in ['echo "$(( 1 + 2 ))"', "echo \"$(( 1 ))'\" 'npm i x'", "cat <<EOF\n$(( 1 + 2 ))\nEOF",
+                    'echo "$((1) )"', "echo \"$((echo a) )'\" 'npm i x'"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+    def test_linear(self):
+        for make in [lambda n: 'echo "' + "$(( " * n + "1" + " ))" * n + '"',
+                     lambda n: 'echo "' + "$(( (" * n + "1" + ") ))" * n + '"']:
+            small, large = make(1000), make(4000)
+            with self.subTest(small[:30]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+
+
+class BraceBudgetPerCallTest(unittest.TestCase):
+    """Предел раскрытия фигурных скобок _BRACE_BUDGET — один на вызов dependency_add и dependency_doubt: общий для
+    всех сегментов и вложенных строк."""
+
+    def test_linear(self):
+        for make in [lambda n: "echo {1..99}{1..99}; " * n, lambda n: "echo {1..99}{1..99}\n" * n,
+                     lambda n: "echo {1..99}{1..99} | " * n + "cat",
+                     lambda n: "echo " + "$(echo {1..99}{1..99}) " * n,
+                     lambda n: "bash -c 'echo {1..99}{1..99}; " * n + "'"]:
+            small, large = make(250), make(1000)
+            with self.subTest(small[:30]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+                assert_linear(self, lambda: depcheck.dependency_doubt(small),
+                              lambda: depcheck.dependency_doubt(large))
+
+    def test_cost_of_plain_text(self):
+        # Раскрытие во многих сегментах не дороже текста той же длины без скобок больше, чем на сам предел.
+        braced = "echo {1..99}{1..99}; " * 2000
+        plain = "echo abcdefghijklm; " * 2000
+        assert_linear(self, lambda: depcheck.dependency_doubt(plain), lambda: depcheck.dependency_doubt(braced))
+
+    def test_exhausted_doubt(self):
+        # Предел кончился в прошлом сегменте: пакет в скобках дальше не виден — сомнение со своим доводом.
+        for cmd in ["echo {1..99}{1..99}; npm install {x,y}", "npm install {--a{1..99}{1..99},x}",
+                    "echo {1..99}{1..99} && bash -c 'npm i {x,y}'"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_BRACES)
+
+    def test_after_exhausted(self):
+        # Слова без скобок предел не тратят: установка за исчерпанным пределом видна.
+        for cmd in ["echo {1..99}{1..99}; npm install x", "echo {1..99}{1..99}; npm i x{,}"]:
+            with self.subTest(cmd):
+                self.assertTrue(depcheck.dependency_add(cmd) or depcheck.dependency_doubt(cmd))
+        self.assertIsNotNone(depcheck.dependency_add("echo {1..99}{1..99}; npm install x"))
+
+    def test_exhausted_hidden_command(self):
+        # Предел кончился до слова команды, подкоманды или команды за запускателем: они не видны — сомнение.
+        spent = "echo {1..99}{1..99}; "
+        for tail in ["{npm,install,evil}", "{bash,-c,'npm install evil'}", "{npm,i} evil", "n{p,}m install evil",
+                     "npm {install,} evil", "{sudo,} npm i evil", "env {A=1,} npm i evil", "{eval,'npm i evil'}",
+                     "pip {install,} x", "npx {pnpm,} add x"]:
+            with self.subTest(tail):
+                self.assertIsNone(depcheck.dependency_add(spent + tail))
+                self.assertEqual(depcheck.dependency_doubt(spent + tail)[1], depcheck._WHY_BRACES)
+
+    def test_exhausted_any_command(self):
+        # Предел кончился в прошлом сегменте (с маркером): слова со скобками дальше не видны у любой команды —
+        # сомнение у этого сегмента, в том числе когда флаг со значением съел бы глагол хвоста.
+        spent = "PLANKA_DEP_OK=1 echo {1..99}{1..99}; "
+        for tail in ["touch f{1..9}.txt", "mkdir -p {a,b}", "echo {a,b}", "yarn --cwd {d,} add x",
+                     "uv --directory {d,} add x", "uv --project {d,} pip install x", "poetry -C {d,} add x",
+                     "composer --working-dir {d,} require x", "npx --cache {d,} npm i x", "dotnet {add,} package x",
+                     "dotnet add {package,} x", "dotnet {tool,} install x", "dart {pub,} add x",
+                     "flutter {pub,} add x", "swift {package,} add-dependency x", "swift package {add-dependency,} x",
+                     "pacman {-S,} x", "nix-env {-i,} x", "python {-m,} pip install x"]:
+            with self.subTest(tail):
+                self.assertIsNone(depcheck.dependency_add(spent + tail))
+                self.assertEqual(depcheck.dependency_doubt(spent + tail), (tail, depcheck._WHY_BRACES))
+        self.assertIsNone(depcheck.dependency_doubt(spent + "ls"))
+
+    def test_same_segment_twice(self):
+        # Сегмент, который разбор читает несколько раз, тратит предел один раз: без ложного сомнения.
+        cmd = "cat <<EOF | bash -s {1..40}{1..40}\nls\nEOF"
+        self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+
+class SubscriptParameterTest(unittest.TestCase):
+    """`]` внутри `${…}` в индексе массива индекс не кончает (skipsubscript bash)."""
+
+    def test_detected(self):
+        for cmd in ["a[${x:-]}]=1 npm install x", "a[${x:-${y:-]}}]=1 npm i x", "a[${x}]=1 npm i x",
+                    # `${` в кавычках — текст: индекс кончает первая `]`.
+                    "a['${']=1 npm i x"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in ["a[x]y]=1 npm i x", "a[${x:-]y]=1 npm i x"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+
+class GitRebaseExecAbbreviationTest(unittest.TestCase):
+    """git принимает однозначный префикс длинной опции: `--ex`, `--exe` у `rebase` — `--exec`; `--e` неоднозначен."""
+
+    def test_detected(self):
+        for cmd in ["git rebase --exe 'npm install x' main", "git rebase --exe='npm i x' main",
+                    "git rebase --ex 'npm i x' main", "git rebase --ex='npm i x' main"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in ["git rebase --e 'npm i x' main", "git rebase --empty=drop main"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+
+
+class CatStdinOperandTest(unittest.TestCase):
+    """`cat` с операндом stdin (`/dev/stdin`, `/dev/fd/N`, `-`) отдаёт не только файлы: here-string — текст для
+    оболочки, вход из конвейера — неизвестный."""
+
+    def test_doubt(self):
+        for cmd in ["cat x.sh /dev/stdin <<< 'npm install x' | bash", "cat x.sh /dev/fd/0 <<< 'npm i x' | bash",
+                    "curl u | cat x.sh /dev/stdin | bash", "cat f <(echo 'npm i x') | bash"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_COMPUTED)
+
+    def test_not_doubt(self):
+        # Тело heredoc в оболочке той же строки разобрано командами; файл не виден, как у `bash файл`.
+        for cmd in ["cat /dev/stdin <<'EOF' | bash\nls\nEOF", "cat x.sh /dev/stdin <<'EOF' | bash\nls\nEOF",
+                    "cat x.sh y.sh | bash", "cat /proc/self/fd/0 <<'EOF' | bash\nls\nEOF"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_detected(self):
+        for cmd in ["cat x.sh /dev/stdin <<'EOF' | bash\nnpm install x\nEOF",
+                    "cat /dev/fd/0 <<'EOF' | bash\nnpm i x\nEOF"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+
+class HeredocPipelineContinuedTest(unittest.TestCase):
+    """Конвейер, продолженный за телом heredoc (`cat <<EOF |` ⏎ тело ⏎ `EOF` ⏎ `bash`): тело — вход приёмника на
+    следующей строке."""
+
+    def test_detected(self):
+        for cmd in ["cat <<'EOF' |\nnpm install x\nEOF\nbash", "cat <<EOF |\nnpm i x\nEOF\nbash -s",
+                    "cat <<'EOF' | tee log |\nnpm i x\nEOF\nsh", "cat <<'A' <<'B' |\nls\nA\nnpm i x\nB\nbash",
+                    "cat <<'EOF' |\nnpm i x\nEOF\n\nbash"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in ["cat <<'EOF' |\nnpm install x\nEOF\ngrep npm", "cat <<'EOF' |\nls\nEOF\nbash",
+                    "cat <<'EOF' |\nnpm install x\nEOF\nbash -n"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_linear(self):
+        for make in [lambda n: "cat <<'EOF' |\nls\nEOF\n" * n + "bash",
+                     lambda n: ("cat <<'EOF' |\nls\nEOF\nbash\n") * n]:
+            small, large = make(500), make(2000)
+            with self.subTest(small[:30]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+                assert_linear(self, lambda: depcheck.dependency_doubt(small),
+                              lambda: depcheck.dependency_doubt(large))
+
+
+class BacktickOutsideQuotesTest(unittest.TestCase):
+    """`` `…` `` вне кавычек, в `$(…)`, `${…}` и арифметике кончается на первой неэкранированной обратной кавычке:
+    кавычки и `#` в теле границу не меняют (bash 5.3); тело — вложенная команда со своими кавычками."""
+
+    def test_after_detected(self):
+        for cmd in ["echo `'` && npm i x", "echo `echo don't` ; npm i x", "echo `'`\nnpm i x",
+                    "echo `echo a #b` ; npm i x", "echo \"$(echo `'`)\"; npm i x", "echo $(echo `'`); npm i x",
+                    "echo ${x:-`'`}; npm i x", "echo `cat <<EOF`\nnpm i x\nEOF",
+                    "echo `echo \\`echo '\\`` ; npm i x"]:
+            with self.subTest(cmd):
+                self.assertEqual(depcheck.dependency_add(cmd), "npm i x")
+        self.assertEqual(depcheck.dependency_add("x=`'` npm i x"), "x=`'` npm i x")
+        # Пустая подстановка на месте имени команды: bash исполняет слова за ней.
+        self.assertEqual(depcheck.dependency_doubt("`'` npm i x")[1], depcheck._WHY_LAUNCHER)
+
+    def test_body_detected(self):
+        for cmd in ["echo `npm i x`", "echo `echo 'a;b'; npm i x`", "echo `echo a\nnpm i x`",
+                    "PLANKA_DEP_OK=1 echo `npm i x`", "x=`npm i x` true"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_body_quotes_are_data(self):
+        for cmd in ["echo `echo 'a; npm i x'`", 'echo `echo "a; npm i x"`', "echo `echo a #; npm i x`"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_heredoc_inside_backticks_ignored(self):
+        self.assertEqual(depcheck.heredocs("echo `cat <<EOF` <<END"), [("END", False)])
+
+    def test_heredoc_inside_open_backticks(self):
+        # `` `…` `` не закрыта до конца строки: тело heredoc в ней идёт следующими строками (bash читает подстановку
+        # до закрывающей обратной кавычки и разбирает тело заново).
+        self.assertEqual(depcheck.heredocs("x=`cat <<EOF"), [("EOF", False)])
+        # Тело heredoc из `` `…` `` идёт первым: bash читает подстановку до её конца со всеми телами, затем тела
+        # строки (5.3: `` cat <<A; x=`cat <<B `` ⏎ тело B ⏎ `B` ⏎ `` ` `` ⏎ тело A ⏎ `A`).
+        self.assertEqual(depcheck.heredocs("cat <<A; x=`cat <<-B"), [("B", True), ("A", False)])
+        self.assertEqual(depcheck.heredocs("x=\"`cat <<EOF"), [("EOF", False)])
+        self.assertEqual(depcheck.heredocs("x=`echo \\` <<B"), [("B", False)])
+        self.assertEqual(depcheck.heredocs("x=`cat <<B \\`"), [("B", False)])
+        self.assertEqual(depcheck.heredocs("x=`echo '<<B'"), [])
+        self.assertEqual(depcheck.heredocs("echo '`' <<A"), [("A", False)])
+        small, large = "x=`" + "\\`" * 20000, "x=`" + "\\`" * 80000
+        assert_linear(self, lambda: depcheck.heredocs(small), lambda: depcheck.heredocs(large))
+
+    def test_linear(self):
+        for make in [lambda n: "echo " + "`a 'b'` " * n + "; npm i x", lambda n: "echo `" + "a ' " * n,
+                     lambda n: "echo `" + "a\n" * n + "`", lambda n: "echo $(" + "`'` " * n + ")"]:
+            small, large = make(2000), make(8000)
+            with self.subTest(small[:20]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+                assert_linear(self, lambda: depcheck.dependency_doubt(small),
+                              lambda: depcheck.dependency_doubt(large))
+
+
+class ArithmeticQuotesTest(unittest.TestCase):
+    """Кавычки в арифметике `$((…))` и `$[…]` — свой уровень для поиска её конца (bash 5.3): `'…'` прячет скобки, но
+    не подстановки, `"…"` — как двойные кавычки."""
+
+    def test_detected(self):
+        for cmd in ["echo \"$((echo '$(' ) ; npm i x)\"", "echo \"$((echo '`' ) ; npm i x)\"",
+                    "echo \"$((echo '))' ) ; npm i x)\"", 'echo "$(( 1 ))" "$((echo "))" ) ; npm i x)"',
+                    "cat <<E\n$((echo '$(' ) ; npm i x)\nE", 'cat <<E\n$((echo "))" ) ; npm i x)\nE',
+                    "echo \"$(( '$(npm i x)' ))\"", "echo \"$(( '`npm i x`' ))\"", "echo $[ '$(npm i x)' ]",
+                    "cat <<E\n$(( '))' + $(npm i x) ))\nE"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_quotes_bound_substitution(self):
+        # Подстановка в `'…'` арифметики кончается не дальше кавычки, и когда за кавычкой на строке есть ещё текст
+        # и перевод строки.
+        self.assertEqual(depcheck._quoted_substitutions("echo \"$(( '$(echo ' )) $(npm i x)\""),
+                         ["echo ", "npm i x"])
+        self.assertEqual(depcheck._quoted_substitutions("echo \"$(( '$(echo ' + '1) $(npm i x)' ))\"\n"),
+                         ["echo ", "npm i x"])
+        # Тело `` `…` `` в `'…'` арифметики — без экранирования обратной кавычки (bash 5.3).
+        self.assertEqual(depcheck._quoted_substitutions("echo $[ '`echo \\`b\\``' ]"), ["echo `b`"])
+        # Подстановка сразу за закрывающей кавычкой — снова в арифметике.
+        self.assertEqual(depcheck._quoted_substitutions("echo \"$(( '1'$(npm i x) ))\""), ["npm i x"])
+
+    def test_linear(self):
+        for make in [lambda n: 'echo "$(( ' + "'$(\"' " * n + '))"', lambda n: 'echo "$(( ' + '"$(( ' * n,
+                     lambda n: "echo $[ " + "'`a' " * n + "]", lambda n: 'echo "$(( ' + "'$(a) `b` ' " * n + '))"']:
+            small, large = make(2000), make(8000)
+            with self.subTest(small[:20]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+                assert_linear(self, lambda: depcheck.dependency_doubt(small),
+                              lambda: depcheck.dependency_doubt(large))
+
+
+class BacktickEscapesTest(unittest.TestCase):
+    """Тело `` `…` `` bash разбирает после снятия `\\` перед `\\`, `` ` ``, `$`, в двойных кавычках — и перед `"`
+    (5.3): `` \\` `` в теле — вложенная подстановка, `\\\\` — один `\\`."""
+
+    def test_detected(self):
+        for cmd in ["echo `echo \\`npm i evil\\``", "x=`echo \\`npm i evil\\``", "echo \"`echo \\`npm i evil\\``\"",
+                    "echo `echo \"\\`npm i evil\\`\"`", "cat <<E\n`echo \\`npm i evil\\``\nE",
+                    "echo `echo \\$(npm i evil)`", "cat <<E\n`echo \\\"a; npm i x\\\"`\nE",
+                    "echo `echo \\\"a; npm i x\\\"`"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in ["echo `echo \\\\\\`npm i evil\\\\\\``", "echo `echo '\\`npm i evil\\`'`",
+                    "echo \"`echo \\\"a; npm i x\\\"`\""]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_body(self):
+        self.assertEqual(depcheck._quoted_substitutions("echo `a \\\\ \\` \\$ \\\" \\x`"), ['a \\ ` $ \\" \\x'])
+        self.assertEqual(depcheck._quoted_substitutions("echo \"`a \\\\ \\` \\$ \\\" \\x`\""), ['a \\ ` $ " \\x'])
+
+
+class ComputedSubcommandTest(unittest.TestCase):
+    """Подкоманда менеджера — подстановка или переменная: установка она или нет, известно только при исполнении
+    (сомнение _WHY_SUBCOMMAND); слово может раскрыться и во флаг (`pip $FLAGS install x`), и в несколько слов
+    (`npm $(echo i evil)`)."""
+
+    def test_doubt(self):
+        for cmd in ["npm $(echo i) evil", "yarn `echo add` x", "pip `echo install` evil", "npm $X evil",
+                    "V=install; npm $V lodash", "npm $(echo i evil)", "pip $FLAGS install x", "npm \"$CMD\" x",
+                    "pnpm -C sub ${V:-add} x", "uv $X npm i x", "conda $X numpy", "gem $X rails", "apt-get $X foo",
+                    "brew $X foo", "npx pnpm $X evil", "uv run npm $X evil", "python -m pip $X evil",
+                    "npx $X i evil", "npm exec $X i evil", "sudo npm $X -g evil", "npm $X -- -h evil",
+                    # У winget `-h` — `--silent` (справка — `-?`, `--help`), у nuget справка — `-help`, `-?`; у
+                    # port, nix, scoop, vcpkg `-h` справкой не задокументирован.
+                    "winget $X foo -h", "nuget $X foo -h", "port $X foo -h", "nix $X nixpkgs#foo -h",
+                    "scoop $X foo -h", "vcpkg $X foo -h"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_SUBCOMMAND)
+
+    def test_not_doubt(self):
+        for cmd in ["npm run $SCRIPT", "npm --prefix $D test", "echo npm $X evil", "npm test $X", "uv run $X",
+                    "python $SCRIPT", "git $X", "PLANKA_DEP_OK=1 npm $X evil", "uv $c --help", "pnpm $a -h x",
+                    "apt-get $X --help", "winget $X foo -?", "winget $X foo --help", "nuget $X foo -Help",
+                    "nuget $X foo -?", "choco $X foo -h"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+
+class ArithmeticOutsideQuotesTest(unittest.TestCase):
+    """Арифметику вне `"…"` bash раскрывает, как текст в `"…"`: `$(…)` и `` `…` `` в её `'…'` исполняются (5.3) —
+    `$((…))`, `((…))`, `for ((…))`, индекс в присваивании `a[…]=` (и в `declare`, в элементе массива `([…]=…)`),
+    индекс `${a[…]}` и смещение `${x:…}`."""
+
+    DETECTED = ["echo $(( '$(npm i x)' ))", "(( '$(npm i x)' ))", "for (( i='$(npm i x)'; 0; )); do :; done",
+                "echo $(( '`npm i x`' ))", "x=$(( '$(npm i x)' ))", "echo $(( 1 +\n '$(npm i x)' ))",
+                "echo $(( '))' + '$(npm i x)' ))", "(( 1 )) && (( '$(npm i x)' ))", "echo $(( ( '$(npm i x)' ) ))",
+                "a['$(npm i x)']=1", "a['$(npm i x)']+=1", "a[b[1]+'$(npm i x)']=1", "a[1 + '$(npm i x)']=3",
+                "declare b['$(npm i x)']=1",
+                "typeset b['$(npm i x)']=1", "a=(['$(npm i x)']=1 [1]=2)", "a+=(x ['$(npm i x)']=1)",
+                "x=1; echo ${x:'$(npm i x)'}", "x=1; echo ${x: '$(npm i x)'}", "x=1; echo ${x:1:'$(npm i x)'}",
+                "echo ${a['$(npm i x)']}", "echo ${a['$(npm i x)']:-z}", "echo ${a[ 1 + '$(npm i x)' ]}",
+                "echo ${!a['$(npm i x)']}", "echo ${@:'$(npm i x)'}", "echo ${x:-1}${a['$(npm i x)']:-z}",
+                "a[1]=1; echo ${a[1]:'$(npm i x)'}", "echo ${x:-$(( '$(npm i x)' ))}"]
+    NOT_ADDS = ["echo ${x:-'$(npm i x)'}", "echo ${x:+'$(npm i x)'}", "echo ${x:='$(npm i x)'}",
+                "echo ${x:?'$(npm i x)'}", "echo ${x/'$(npm i x)'/}", "echo ${x:1}${y:-'$(npm i x)'}",
+                "echo ${a[1]:-'$(npm i x)'}", "echo $(( 1 )) '$(npm i x)'", "(( 1 )) && echo '$(npm i x)'",
+                "echo a['$(npm i x)']", "echo $((echo '$(npm i x)') )", "((echo '$(npm i x)') )",
+                "[[ $x == '$(npm i x)' ]]", "a[1]=1 '$(npm i x)'", "echo ${a[1]} '$(npm i x)'",
+                "( (echo '$(npm i x)'))", "echo ${x:1} '$(npm i x)'"]
+
+    def test_detected(self):
+        for cmd in self.DETECTED:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in self.NOT_ADDS:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_bodies(self):
+        self.assertEqual(depcheck._quoted_substitutions("echo ${a['$(b)']:-'$(c)'} ${x:'`d`'}"), ["b", "d"])
+        self.assertEqual(depcheck._quoted_substitutions("a['$(b)'] c['$(d)']=1"), ["d"])
+        # Индекс не закрыт до конца текста: не присваивание.
+        self.assertEqual(depcheck._quoted_substitutions("a['$(b)' c"), [])
+
+    def test_linear(self):
+        for make in [lambda n: "echo " + "$(( '$(a)' )) " * n, lambda n: "echo " + "(( " * n,
+                     lambda n: "echo " + "$((x " * n + ") " * n, lambda n: "a[" * n + "=1",
+                     lambda n: "a[ " * n + "'", lambda n: "echo " + "${a[ " * n, lambda n: "echo " + "${x:" * n,
+                     lambda n: "echo " + "${a[1]:'" * n, lambda n: "x " + "a['$(b)'] " * n,
+                     lambda n: "echo " + "$(( " * n + "))" * n, lambda n: "((x) " * n + ")" * n]:
+            small, large = make(2000), make(8000)
+            with self.subTest(small[:20]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+                assert_linear(self, lambda: depcheck.dependency_doubt(small),
+                              lambda: depcheck.dependency_doubt(large))
+
+
+class ParameterExpansionSpaceTest(unittest.TestCase):
+    """Пробел и перевод строки внутри `${…}` вне кавычек — часть слова: bash читает `${…}` до `}` целиком (5.3:
+    `${x:- }npm i x` после деления раскрытия на слова — `npm i x`)."""
+
+    def test_doubt(self):
+        for cmd in ["${x:- }npm i evil", "${x:-a b}npm i evil", "${x:+a b}npm i evil", "${x:-${y:- }}npm i evil",
+                    "${x:-\n}npm i evil", "${x:-npm i evil}", "${x:- npm i evil }+", "${x:-npm i evil}1]",
+                    "${x:-npm} i evil", "${x:-sudo npm} i evil"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_NAME)
+
+    def test_detected(self):
+        for cmd in ["echo ${x:- }; npm i evil", "echo ${x:-a b}\nnpm i evil", "X=${x:- } npm i evil"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_doubt(self):
+        for cmd in ["echo ${x:- } && npm test", "echo ${x:-a b} npm i x", "echo ${x:-a }}npm i x",
+                    "echo ${x:-'}'  } npm i x"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_words(self):
+        self.assertEqual([w for w, _ in depcheck._split("a ${x:- b}c ${y:-\\}} d", braces=True)],
+                         ["a", "${x:- b}c", "${y:-}}", "d"])
+        self.assertEqual([w for w, _ in depcheck._split("a ${x:- b}c d")], ["a", "${x:- b}c", "d"])
+
+    def test_linear(self):
+        for make in [lambda n: "echo " + "${x:- " * n, lambda n: "echo " + "${x:- a} " * n + "; npm i x"]:
+            small, large = make(2000), make(8000)
+            with self.subTest(small[:20]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+                assert_linear(self, lambda: depcheck.dependency_doubt(small),
+                              lambda: depcheck.dependency_doubt(large))
+
+
+class SubscriptWordQuotesTest(unittest.TestCase):
+    """Слово с `[` без `=` за `]` — не присваивание: отбрасываются только тела из `'…'` прямо в его индексе (вне
+    присваивания `'…'` — литерал), а `"$(…)"`, `` `…` `` и `${…}` в слове — подстановки, bash их исполняет
+    (`[ -n "$(npm i x)" ]`)."""
+
+    DETECTED = ['[ "$(npm i evil)" = x ]', '[ -n "$(npm i evil)" ]', '[[ "$(npm i evil)" == x ]]',
+                '[ -n "`npm i evil`" ]', 'if [ "$(npm i evil)" ]; then :; fi', '[ x = "$(npm i evil)" ] && echo y',
+                'echo [ "$(npm i evil)" ]', '[a "$(npm i evil)" ]', '[ "$(npm i evil)"', 'a[ "$(npm i evil)" ]',
+                '[ ${x:-"$(npm i evil)"} ]', '[ "${x:-$(npm i evil)}" ]', 'echo x [ "$(npm i evil)"',
+                "[ -n `npm i evil` ]", "echo [ `npm i evil`", "[[ `npm i evil` ]]",
+                "if [[ -z `npm i evil` ]]; then :; fi", "a['$(npm i evil)' \"$(npm i evil)\"]",
+                "a['x' $(( '$(npm i evil)' ))]", "x=1; a[${x:'$(npm i evil)'}]"]
+    NOT_ADDS = ["[ '$(npm i x)' ]", "[[ '`npm i x`' == a ]]", "a['$(npm i x)' \"y\"]", "[ 'x' '$(npm i x)'"]
+
+    def test_detected(self):
+        for cmd in self.DETECTED:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in self.NOT_ADDS:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_bodies(self):
+        self.assertEqual(depcheck._quoted_substitutions('[ "$(b)" = \'$(c)\' ]'), ["b"])
+        self.assertEqual(depcheck._quoted_substitutions("a['$(b)' \"$(c)\" `d`]"), ["c", "d"])
+        self.assertEqual(depcheck._quoted_substitutions("a['$(b)' \"$(c)\""), ["c"])
+
+    def test_linear(self):
+        for make in [lambda n: '"$(b)" ' * n + "a['$(c)'] " * n, lambda n: "a[" + "'$(b)' \"$(c)\" " * n,
+                     lambda n: "[ " + "'$(b)' " * n + "]", lambda n: ("\"$(b)\" " * n + "a['$(c)'] ") * 4]:
+            small, large = make(2000), make(8000)
+            with self.subTest(small[:20]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+                assert_linear(self, lambda: depcheck.dependency_doubt(small),
+                              lambda: depcheck.dependency_doubt(large))
+
+
+class DoubleDollarTest(unittest.TestCase):
+    """`$$` — параметр PID целиком: `{` за ним не открывает `${…}` (bash 5.3: `x=$${ echo RAN }` — присваивание
+    `x=<pid>{` и команда `echo RAN }`)."""
+
+    DETECTED = ["x=$${ npm i evil }", "FOO=$${ npm i evil }", "env x=$${ npm i evil }", "x=a$${ npm i evil}",
+                "x=$${\nnpm i evil }", "x=$${a npm i evil }", "echo $${a; npm i evil }", "echo $${a | npm i evil }",
+                "echo $$$${a; npm i evil }", "echo $$'\\' \"$(npm i evil)\"", 'echo "$$(cat <<E)"\nnpm i evil\nE']
+    # `$$(` в `"…"` не начинает подстановку: `--dry-run` — отдельное слово; в `'…'` арифметики — текст.
+    NOT_ADDS = ["echo $${x:-a} npm", "echo $$ npm i x", "echo \"$$(npm i x)\"", 'npm i "$$(" --dry-run ")"',
+                "echo \"$(( '$$(npm i x)' ))\"", "echo $(( '$$(npm i x)' ))"]
+
+    def test_detected(self):
+        for cmd in self.DETECTED:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in self.NOT_ADDS:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_words(self):
+        self.assertEqual([w for w, _ in depcheck._split("x=$${ a b }", braces=True)], ["x=$${", "a", "b", "}"])
+        self.assertEqual([w for w, _ in depcheck._split("x=$${ a b }")], ["x=$${", "a", "b", "}"])
+        self.assertEqual(depcheck.heredocs("echo $${a; cat <<E"), [("E", False)])
+
+    def test_linear(self):
+        for make in [lambda n: "echo " + "$${ " * n, lambda n: "x=" + "$$" * n + "{ npm i x }",
+                     lambda n: "echo \"" + "$$(" * n + "\""]:
+            small, large = make(2000), make(8000)
+            with self.subTest(small[:20]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+                assert_linear(self, lambda: depcheck.dependency_doubt(small),
+                              lambda: depcheck.dependency_doubt(large))
+
+
+class FunctionSubstitutionTest(unittest.TestCase):
+    """Подстановка функции bash 5.3: `${ …; }` (за `{` — пробел, таб или перевод строки) и `${| …; }` — тело
+    исполняется командами, как у `$(…)`. Конец — `}` там, где bash принимает зарезервированное слово (после `;`,
+    `&`, `|`, перевода строки, `(`, `)` подоболочки или шаблона `case`, зарезервированного слова, `]]`, `))`, имени
+    после `function` и `coproc`); `{` там же открывает группу со своей `}`. Сверено с bash 5.3 (`echo RAN`)."""
+
+    DETECTED = [
+        "echo ${ npm i evil; }", 'echo "${ npm i evil; }"', "x=${ npm i evil; }", "echo ${| npm i evil; }",
+        'echo "${| npm i evil; }"', "echo ${|npm i evil; }", "echo ${\tnpm i evil; }", 'echo "${\nnpm i evil\n}"',
+        "echo ${\nnpm i evil\n}", "echo ${x:-${ npm i evil; }}", 'echo "${x:-${ npm i evil; }}"',
+        "echo $(( ${ npm i evil; } ))", "echo $[ ${ npm i evil; } ]", "cat <<E\n${ npm i evil; }\nE",
+        "echo $(( '${ npm i evil; }' ))", 'echo "${ echo }; npm i evil; }"', 'echo "${ { echo a; }; npm i evil; }"',
+        'echo "${ if true; then { echo a; }; fi; npm i evil; }"', 'echo "${ function f { echo; }; npm i evil; }"',
+        'echo "${ [[ a ]] && npm i evil; }"', 'echo "${ echo then }; npm i evil; }"',
+        'echo "${ (echo a) }"; npm i evil', 'echo "${ [[ a ]] }"; npm i evil', 'echo "${ ((1)) }"; npm i evil',
+        'echo "${ if true; then echo b; fi }"; npm i evil', 'echo "${ echo \\\n}; npm i evil; }"',
+        'echo "${ echo a; }}"; npm i evil', 'echo "${ case a in a) echo;; esac }"; npm i evil',
+        'echo "${ echo a <(echo b) }; npm i evil; }"', 'echo "${ coproc { echo a; }; npm i evil; }"',
+        'echo "${ echo a; }x"; npm i evil', 'echo "${ x=1 }; npm i evil; }"', 'echo "${ echo fi}; npm i evil; }"',
+        'echo "${ echo "}"; npm i evil; }"', 'echo "${ echo \\}; npm i evil; }"',
+        'echo "${ f() { echo; }; npm i evil; }"', 'echo "${ echo a >& }; npm i evil; }"',
+        'echo "${ echo a # }\nnpm i evil; }"', 'echo "${ echo $(echo x) }; npm i evil; }"',
+        'echo "${ echo ${ echo; } }; npm i evil; }"', 'echo "${ ! true; npm i evil; }"',
+        'echo "${ while false; do :; done }"; npm i evil', 'echo "${ for x in a; do { echo; }; done; npm i evil; }"',
+        'echo "${ [[ a ]]\n}"; npm i evil', 'echo "${ [[ a &&\n b ]] }"; npm i evil',
+        'echo "${ echo $$ }; npm i evil; }"', 'echo "${ cat <<E\n}\nE\nnpm i evil; }"']
+    NOT_ADDS = ["echo \"${ echo 'npm i x'; }\"", 'echo "${ echo a; } npm i x"', "echo '${ npm i x; }'",
+                'echo "${x} npm i x"', "echo ${ echo a; } npm i x", 'echo "$${ npm i x; }"']
+
+    def test_detected(self):
+        for cmd in self.DETECTED:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in self.NOT_ADDS:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_bodies(self):
+        self.assertEqual(depcheck._quoted_substitutions('echo "${ a; }" ${| b; } x'), [" a; ", " b; "])
+        self.assertEqual(depcheck._quoted_substitutions('echo "${ { a; }; }"'), [" { a; }; "])
+        self.assertEqual([w for w, _ in depcheck._split("x=${ a b; } c", braces=True)], ["x=${ a b; }", "c"])
+        self.assertEqual(depcheck.heredocs('echo "${ cat <<E'), [("E", False)])
+
+    def test_linear(self):
+        for make in [lambda n: "echo " + "${ " * n, lambda n: 'echo "' + "${ { " * n,
+                     lambda n: 'echo "${ ' + "echo } " * n + '; }"', lambda n: 'echo "${ ' + "then " * n + '}"',
+                     lambda n: "echo ${ " + "a; } " * n, lambda n: 'echo "${ ' + "[[ " * n + '}"',
+                     lambda n: 'echo "${ ' + "\\\n" * n + '}"', lambda n: "echo " + "${ x; }" * n + " npm i x"]:
+            small, large = make(2000), make(8000)
+            with self.subTest(small[:20]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+                assert_linear(self, lambda: depcheck.dependency_doubt(small),
+                              lambda: depcheck.dependency_doubt(large))
+
+
+class HeredocInSubstitutionEndTest(unittest.TestCase):
+    """Heredoc внутри `$(…)` или `${ …; }`: строка с терминатором в начале и `)` или `}` в остатке кончает тело,
+    остаток bash читает заново командами (5.3, make_here_document: `$(cat <<E` ⏎ `x` ⏎ `Ezz y); …` исполняет
+    `zz y` и команду за подстановкой)."""
+
+    DETECTED = ['echo "$(cat <<E\nx\nE) b"; npm i evil', "echo $(cat <<E\nx\nE); npm i evil",
+                "echo $(\ncat <<E\nx\nE); npm i evil", "echo $(cat <<E\nx\nEzz y); npm i evil",
+                'echo "${ (cat <<E\nx\nE foo}\n); npm i evil; }"', 'echo "${ cat <<E\nx\nE} b"; npm i evil',
+                "echo ${ cat <<E\nx\nE }; npm i evil", "x=$(cat <<-E\n\tx\n\tE ); npm i evil",
+                'echo "a ${| { echo b; }\necho fi} | cat <<E\n}\nE }|| } b"x; npm i evil',
+                'echo "${\nfunction f { echo g; } || cat <<E\n}\nE\\ & }"; npm i evil',
+                'echo "${ cat <<\'E\'\nE}${ npm i evil; }"',
+                # Группа и подоболочка знак не меняют: тело `${ …; }` разбирается заново со своим знаком.
+                "x=${ { cat <<E\nx\nE}\nnpm i evil\nE\n} }",
+                "${ cat <<E\nnpm i evil \\${| [[ [ ${| \nE)]=then \"\nE}fi\nnpm i evil"]
+    # Остаток с закрывающим знаком закрывает подстановку, команда за ним — текст строки; heredoc вне подстановки
+    # кончается только своим терминатором; знак другой подстановки, чем самая внутренняя, тело не кончает (bash 5.3).
+    NOT_ADDS = ['echo "$(cat <<E\nx\nE ); npm i x; ) b"', 'echo "${ cat <<E\nx\nE }; npm i x; } b"',
+                "cat <<E\nx\nE); npm i x\nE", "x=$(cat <<E\nx\nE}\nnpm i x\nE\n)",
+                "x=$( (cat <<E\nx\nE}\nnpm i x\nE\n) )", "(cat <<E\nx\nE)\nnpm i x\nE\n)",
+                "x=${ (cat <<E\nx\nE)\nnpm i x\nE\n); }", "x=${ echo $(cat <<E\nx\nE}\nnpm i x\nE\n); }",
+                "x=$( echo ${ cat <<E\nx\nE)\nnpm i x\nE\n}; )"]
+
+    def test_detected(self):
+        for cmd in self.DETECTED:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in self.NOT_ADDS:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_linear(self):
+        # Много heredoc на одной строке и строка из их терминаторов: тела кончаются по одному.
+        for make in [lambda n: "echo $(cat <<E\n" + "E x\n" * n + "E)", lambda n: "echo $(" + "cat <<E\nE );" * n,
+                     lambda n: 'echo "${ ' + "cat <<E\nE };" * n + '"',
+                     lambda n: "x=$(cat" + " <<-E" * n + "\n" + "E" * n + ")\n)\n",
+                     lambda n: "x=$(\ncat" + " <<-E" * n + "\n" + "E" * n + ")\n)\n",
+                     lambda n: 'x="$(cat' + " <<E" * n + "\n" + "E" * n + ')\n)"',
+                     lambda n: "x=${ cat" + " <<E" * n + "\n" + "E" * n + "}\n}",
+                     lambda n: "cat <<X\n${ cat" + " <<E" * n + "\n" + "E" * n + "}\nX",
+                     lambda n: "x=${ " + "(" * n + "cat" + " <<E" * n + "\n" + "E)\n" * n + ")" * n + "}",
+                     lambda n: "x=${ { " + "(\n" * n + "cat" + " <<E" * n + "\n" + "E}\n" * n + ")" * n + "} }",
+                     lambda n: "x=$(cat" + " <<-E" * n + "\n" + "\t" * n + "E" * n + ")\n)\n"]:
+            small, large = make(2000), make(8000)
+            with self.subTest(small[:20]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+                assert_linear(self, lambda: depcheck.dependency_doubt(small),
+                              lambda: depcheck.dependency_doubt(large))
+
+
+class EscapedBlankCommentTest(unittest.TestCase):
+    """`#` за пробельным символом с `\\` перед ним — не комментарий, а часть слова (bash 5.3: `echo \\ #$(…)`
+    исполняет подстановку); за `\\\\` и пробелом — комментарий."""
+
+    DETECTED = ["echo \\ #$(npm i evil)", "echo \\\t#$(npm i evil)", "echo $(echo \\ #; npm i evil)",
+                'echo "$(echo \\ #)"; npm i evil', "x=\\\n#$(npm i evil)"]
+
+    def test_detected(self):
+        for cmd in self.DETECTED:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_comment(self):
+        self.assertIsNone(depcheck.dependency_add("echo \\\\ #$(npm i x)"))
+        self.assertIsNone(depcheck.dependency_doubt("echo \\\\ #$(npm i x)"))
+        self.assertEqual(depcheck.heredocs("echo \\ #<<E"), [("E", False)])
+        self.assertEqual(depcheck.heredocs("echo \\\\ #<<E"), [])
+
+    def test_linear(self):
+        for make in [lambda n: "echo " + "\\ #" * n, lambda n: "echo " + "\\" * n + " #$(npm i x)",
+                     lambda n: "echo $(" + "\\\\ #\n" * n + ")"]:
+            small, large = make(2000), make(8000)
+            with self.subTest(small[:20]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+                assert_linear(self, lambda: depcheck.dependency_doubt(small),
+                              lambda: depcheck.dependency_doubt(large))
+
+
+class ArrayAssignmentHeredocTest(unittest.TestCase):
+    """Оператор в скобках присваивания массива (`x=(…`, `x+=(`, `a[1]=(`, после `declare`, `local`) — `;`, `&`, `|`,
+    перенаправление, `(` не за `<`, `>`, `$` — синтаксическая ошибка bash 5.3: строка отбрасывается целиком вместе с
+    телами своих heredoc, следующая строка читается заново командами (в том числе внутри кавычек, подстановок и
+    `${ …; }`). `<(…)`, `>(…)` в скобках — процесс-подстановка, heredoc в ней — настоящий."""
+
+    DETECTED = ["x=(<<E\nnpm i evil\nE\n)", "x+=(<<E)\nnpm i evil", "x=( a <<E )\nnpm i evil",
+                "declare -a x=(<<E)\nnpm i evil", "local x=(<<E)\nnpm i evil", "a[1]=(<<E)\nnpm i evil",
+                "echo $(x=(<<E)\nnpm i evil\n)", "x=(( `cat <<E\nnpm i evil\nE\n`)",
+                "x=((a `cat <<E\nnpm i evil\nE\n`))", "x=(a (b) `cat <<E\nnpm i evil\nE\n`)",
+                "echo \"${\ttime echo q & x=(1; echo '}' || }\"\nnpm i evil",
+                "x=( ; ) <<E\nnpm i evil\nE", "cat <<E; x=( a | b )\nnpm i evil\nE", "x=( a >b ) <<E\nnpm i evil\nE",
+                "echo $(x=( a & ) <<E\nnpm i evil\nE\n)", 'echo "$(x=( a ; ) <<E\nnpm i evil\nE\n)"',
+                'x=( a <<<b ) "$(cat <<E\nnpm i evil\nE\n)"', "x=( #]\r; #(${\n;; esac`cat <<E\nnpm i evil\n",
+                "x=(\n|;; esaccat <<'E'\nnpm i evil", 'x=( a\n(b) "$(cat <<E\nnpm i evil\nE\n)" )',
+                "x=(\n<<E\nnpm i evil\nE\n)", 'x=( "a\nb" ; <<E\nnpm i evil\nE\n)']
+    # Процесс-подстановка в скобках и heredoc за скобками, закрытыми на следующей строке: тело — данные.
+    NOT_ADDS = ["x=( <(cat <<E\nnpm i x\nE\n) )", "x=( >(cat <<E\nnpm i x\nE\n) )",
+                'x=( a "$(cat <<E\nnpm i x\nE\n)" )', "x=(\na\n) <<E\nnpm i x\nE"]
+
+    def test_detected(self):
+        for cmd in self.DETECTED:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in self.NOT_ADDS:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_heredocs(self):
+        self.assertEqual(depcheck.heredocs("x=(<<E"), [])
+        self.assertEqual(depcheck.heredocs("x=( $(cat <<E) )"), [("E", False)])
+        self.assertEqual(depcheck.heredocs("(cat <<E)"), [("E", False)])
+        self.assertEqual(depcheck.heredocs("x=( <(cat <<E) )"), [("E", False)])
+        self.assertEqual(depcheck.heredocs("cat <<E; x=( a ; b )"), [])
+        self.assertEqual(depcheck.heredocs("x=( a ) <<E"), [("E", False)])
+
+    def test_linear(self):
+        for make in [lambda n: "x=" + "(" * n + "<<E" * n, lambda n: "x=(\n" + "(<<E\n" * n,
+                     lambda n: "x=( a ;" + " <<E" * n + "\nnpm i x\n" + "E\n" * n,
+                     lambda n: 'echo "' + "${ x=(; }" * n + '"\n' + "x=( a ; ) <<E\n" * n]:
+            small, large = make(2000), make(8000)
+            with self.subTest(small[:20]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+                assert_linear(self, lambda: depcheck.dependency_doubt(small),
+                              lambda: depcheck.dependency_doubt(large))
+
+
+class WordWhitespaceTest(unittest.TestCase):
+    """Разделители слов bash — только пробел, таб и перевод строки: `\\r`, `\\v`, `\\f`, `\\x1c`, неразрывный и
+    прочие пробелы Unicode — часть слова (5.3): `X=1\\recho npm i x` — присваивание и команда `npm`, `a\\r#…` — не
+    комментарий, `;\\xa0}` в `${ …; }` — слово, не конец тела."""
+
+    DETECTED = ['echo "${ echo;\xa0} ; npm i evil; }"', 'echo "${ echo;\r} ; npm i evil; }"',
+                'echo "${ echo;\x0b} ; npm i evil; }"', 'echo "${ echo;\x0c} ; npm i evil; }"',
+                'echo "${ echo; } ; npm i evil; }"', "X=1\recho npm i evil", "x=\r\\\n[ npm i evil",
+                "echo a\r#$(npm i evil)", "echo a\x0b#$(npm i evil)", "echo a\x0c#$(npm i evil)",
+                "echo a\x1c#$(npm i evil)", "echo a\xa0#$(npm i evil)", "echo a #$(npm i evil)",
+                'echo "${ echo a\r#; npm i evil; }"', "x=\r\\\n#$(npm i evil)"]
+
+    def test_detected(self):
+        for cmd in self.DETECTED:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_words(self):
+        self.assertEqual([w for w, _ in depcheck._split("X=1\recho a")], ["X=1\recho", "a"])
+        self.assertEqual(depcheck.heredocs("echo a\r#<<E"), [("E", False)])
+
+
+class HeredocLineJoinTest(unittest.TestCase):
+    """Тело heredoc с терминатором без кавычек bash читает строками, склеенными по `\\` с переводом строки (5.3,
+    read_secondary_line: `\\` перед `\\` — пара, перевод строки за ней не снимается); с терминатором сравнивается
+    склеенная строка (ведущие табы `<<-` снимаются только в её начале), подстановки ищутся в склеенном теле.
+    Терминатор в кавычках — без склейки."""
+
+    DETECTED = ["echo ${ cat <<E\nE\\\n}; npm i evil\nE\n}",
+                'echo "${\ncat <<E\n}\nE$ && echo \\\n} & echo $$\n}"\nnpm i evil', "cat <<E\nE\\\n\nnpm i evil",
+                "x=$(cat <<E\nE\\\n)\nnpm i evil\nE\n)", "x=$(cat <<E\nE \\\n)\nnpm i evil",
+                "cat <<E\n$(echo a #\\\n)\nnpm i evil)\nE",
+                'cat <<E\n${| echo "}" || echo a # }; echo \\\n}\nnpm i evil & (echo d) & }; npm i evil\nE',
+                "cat <<E\n${\necho fi} & echo #\\\n} || x=1 || echo '}'\nnpm i evil;}\nE",
+                "cat <<-E\n\tE\\\n\nnpm i evil", "cat <<-E\n\t\\\n\tE\nnpm i evil", "cat <<EOF\nEO\\\nF\nnpm i evil",
+                "x=$(cat <<E\nE)\\\n; npm i evil\nE\n)", "x=$(cat <<E\nE\\\n\\\n)\nnpm i evil\nE\n)",
+                'echo "$(cat <<E\nE\\\n)"; npm i evil']
+    # Склеенная строка — не терминатор; `\\\\` в конце строки — пара, без склейки; терминатор в кавычках.
+    NOT_ADDS = ["cat <<E\nx\\\nE\nnpm i x", "cat <<E\nE\\\nE\nnpm i x", "cat <<'E'\nE\\\n\nnpm i x",
+                "cat <<E\nE\\\\\n\nnpm i x", "cat <<E\nE\\\\\\\n\nnpm i x", "cat <<-E\n\tE\\\n\t\nnpm i x",
+                "cat <<E\nE\\\n)\nnpm i x"]
+
+    def test_detected(self):
+        for cmd in self.DETECTED:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_not_adds(self):
+        for cmd in self.NOT_ADDS:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_linear(self):
+        for make in [lambda n: "cat <<E\n" + "x\\\n" * n + "E\n", lambda n: "x=$(cat <<E\n" + "E\\\n" * n + ")\n)",
+                     lambda n: "cat <<E\n" + "\\" * n + "\nE\n", lambda n: "cat <<E\n" + "$(a #\\\n" * n + "E\n"]:
+            small, large = make(2000), make(8000)
+            with self.subTest(small[:20]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+                assert_linear(self, lambda: depcheck.dependency_doubt(small),
+                              lambda: depcheck.dependency_doubt(large))

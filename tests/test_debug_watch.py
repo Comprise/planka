@@ -156,7 +156,7 @@ class DebugWatchTest(unittest.TestCase):
         r = self.failure()
         self.assertEqual(r.returncode, 0)
         self.assertIsNone(output(r))
-        self.assertIn("planka:", "\n".join(messages(r)))
+        self.assertIn("счётчик неудач команд не записан", "\n".join(messages(r)))
 
     def test_garbage_stdin(self):
         r = self.env.run("debug_watch.py", "not json")
@@ -427,12 +427,81 @@ class SegmentsTest(unittest.TestCase):
         self.assertEqual(debug_watch._segments("echo $((1<<2))\ngrep x f"),
                          [("", "echo $((1<<2))"), ("\n", "grep x f")])
 
+    def test_heredoc_body_quote_does_not_hide_arithmetic_pairs(self):
+        # Апостроф в теле heredoc не открывает кавычку для _paren_pairs: «((…))» после терминатора — арифметика.
+        self.assertEqual(debug_watch._segments("cat <<EOF\ndon't\nEOF\n(( x = 1 << 2 )); make test\nmake lint"),
+                         [("", "cat <<EOF"), ("\n", "(( x = 1 << 2 ))"), (";", " make test"), ("\n", "make lint")])
+        self.assertEqual(debug_watch._segments("cat <<EOF\ndon't\nEOF\n((x>0 && y>0)) && make test"),
+                         [("", "cat <<EOF"), ("\n", "((x>0 && y>0)) "), ("&&", " make test")])
+
+    def test_separators_inside_arithmetic_do_not_split(self):
+        self.assertEqual(debug_watch._segments("echo $((1|2)) && ls"), [("", "echo $((1|2)) "), ("&&", " ls")])
+        self.assertEqual(debug_watch._segments("echo $[1|2; 3] | wc"), [("", "echo $[1|2; 3] "), ("|", " wc")])
+        self.assertEqual(debug_watch._segments("(( a = 1 | 2 )); ls"), [("", "(( a = 1 | 2 ))"), (";", " ls")])
+
+    def test_nested_subshell_is_not_arithmetic(self):
+        # «((» — арифметика, только если её «(» закрывается «))», как у bash (parse_arith_cmd); иначе — подоболочка в
+        # подоболочке, и разделители внутри неё делят команды.
+        self.assertEqual(debug_watch._segments("((cd a && make test); false)"),
+                         [("", "((cd a "), ("&&", " make test)"), (";", " false)")])
+        self.assertEqual(debug_watch._segments("((cd a) || make)"), [("", "((cd a) "), ("||", " make)")])
+        self.assertEqual(debug_watch._segments("(( (a) | b )); ls"), [("", "(( (a) | b ))"), (";", " ls")])
+        self.assertEqual(debug_watch._segments("((echo ')'; make) | wc)"),
+                         [("", "((echo ')'"), (";", " make) "), ("|", " wc)")])
+        self.assertTrue(debug_watch.code1_is_answer("((cd a; make); grep x f)"))
+
+    def test_nested_parens_linear(self):
+        small, large = ("((" * n for n in (25000, 100000))
+        assert_linear(self, lambda: debug_watch._segments(small), lambda: debug_watch._segments(large))
+
+    def test_subscript_inside_legacy_arithmetic_keeps_separators(self):
+        # «]» индекса внутри «$[…]» закрывает индекс, а не арифметику; вложенная «$[…]» закрывается своей «]».
+        self.assertEqual(debug_watch._segments("echo $[a[1]] && false"), [("", "echo $[a[1]] "), ("&&", " false")])
+        self.assertEqual(debug_watch._segments("echo $[a[b[1]]+$[2]]\nmake test"),
+                         [("", "echo $[a[b[1]]+$[2]]"), ("\n", "make test")])
+        self.assertEqual(debug_watch._segments("echo $[a[1]|2; 3] | wc"), [("", "echo $[a[1]|2; 3] "), ("|", " wc")])
+
+    def test_legacy_arithmetic_shift_is_not_heredoc(self):
+        self.assertEqual(debug_watch._segments("x=$[1<<2]\ngrep x f"), [("", "x=$[1<<2]"), ("\n", "grep x f")])
+        self.assertEqual(debug_watch._segments("echo $[ (1+2)<<3 ]\nls"), [("", "echo $[ (1+2)<<3 ]"), ("\n", "ls")])
+
+    def test_shift_does_not_hide_later_arithmetic_pairs(self):
+        # «<<» внутри «((…))» и «$[…]» — сдвиг и для _paren_pairs: строки после него — не тело heredoc, «((…))» за
+        # ними — арифметика.
+        for first in ("(( n = x << 2 ))", "echo $[1<<2]", "echo $[a[1]<<2]", "echo $[$[1]<<2]"):
+            with self.subTest(first=first):
+                self.assertEqual(debug_watch._segments(f"{first}\n((x>0 && y>0)) && make test\nmake lint"),
+                                 [("", first), ("\n", "((x>0 && y>0)) "), ("&&", " make test"), ("\n", "make lint")])
+
+    def test_heredoc_beside_arithmetic_does_not_hide_arithmetic_pairs(self):
+        # «<<» в подоболочке «(» и после закрытой «((…))» — heredoc: апостроф его тела не кавычка.
+        for first in ("(cat <<EOF\ndon't\nEOF\n)", "(( n = 1 ))\ncat <<EOF\ndon't\nEOF"):
+            with self.subTest(first=first):
+                self.assertEqual(debug_watch._segments(f"{first}\n((x>0 && y>0)) && make test")[-2:],
+                                 [("\n", "((x>0 && y>0)) "), ("&&", " make test")])
+
+    def test_here_string_does_not_hide_arithmetic_pairs(self):
+        self.assertEqual(debug_watch._segments("cat <<< 'x'\n((x>0 && y>0)) && make test"),
+                         [("", "cat <<< 'x'"), ("\n", "((x>0 && y>0)) "), ("&&", " make test")])
+
+    def test_tab_stripped_heredoc_does_not_hide_arithmetic_pairs(self):
+        # Терминатор «<<-» с табуляцией в начале закрывает тело и для _paren_pairs: апостроф тела не кавычка.
+        self.assertEqual(debug_watch._segments("cat <<-EOF\n\tdon't\n\tEOF\n((x>0 && y>0)) && make test"),
+                         [("", "cat <<-EOF"), ("\n", "((x>0 && y>0)) "), ("&&", " make test")])
+
+    def test_shift_after_open_parens_linear(self):
+        small, large = ("( " * n + "< " * n + "((1))" for n in (2500, 10000))
+        assert_linear(self, lambda: debug_watch._segments(small), lambda: debug_watch._segments(large))
+
     def test_unclosed_test_brackets_linear(self):
         small, large = ("[[ " * n for n in (25000, 100000))
         assert_linear(self, lambda: debug_watch._segments(small), lambda: debug_watch._segments(large))
 
 
 class Code1IsAnswerTest(unittest.TestCase):
+    def test_hash_inside_word_is_not_comment(self):
+        self.assertTrue(debug_watch.code1_is_answer("VAR=a#b grep x f"))
+
     def test_corpus(self):
         for sample in corpus():
             with self.subTest(command=sample["command"]):

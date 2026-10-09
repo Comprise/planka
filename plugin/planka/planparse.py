@@ -22,7 +22,8 @@ _ITEM_MARK = re.compile(r"^(?:[-*+]|\d+[.)])\s+")
 _PREFIX = re.compile(r"^\**\s*(?:Create|Created|Modify|Modified|Test|Tests|Delete|Deleted|Update|Updated|Edit|"
                      r"Создать|Изменить|Тест|Тесты|Удалить|Обновить)(?:\s*\([^()]*\))?[\s*]*:[\s*]*",
                      re.IGNORECASE)
-_NO_FILES = {"", "нет", "none", "empty", "—", "-"}
+# Заглушки «файлов нет» и хвост перечня «etc.»: первое слово значения строки файлов или пункта списка.
+_NO_FILES = {"", "нет", "none", "empty", "—", "–", "-", "…", "n/a", "tbd", "ничего", "etc"}
 # Серия путей в обратных кавычках: между путями — пробелы, запятые и пометки в скобках.
 _SEP = re.compile(r"[\s,;]*")
 _NOTE = re.compile(r"\(([^()]*)\)")
@@ -114,7 +115,7 @@ def _split(fragment):
 
     Пути строки файлов: ведущая серия `…` через пробелы, запятые и пометки в скобках, а без
     кавычек — токены без пробелов через запятую; описание, путь с пробелом и маркер
-    «нет»/«none»/«empty»/«—» путём не считаются.
+    «нет»/«none»/«empty»/«—»/«n/a»/«tbd»/«etc» путём не считаются.
 
     Без префикса владения путь с пометкой чтения — в скобках сразу за ним или после тире в конце
     серии — не владение; пометка относится только к пути перед ней.
@@ -152,6 +153,9 @@ def _split(fragment):
     if first in _NO_FILES:
         return [], ""
     parts = [p.strip() for p in text.split(",")]
+    # Хвост перечня «etc.» — не путь.
+    if len(parts) > 1 and parts[-1].lower().rstrip(".") == "etc":
+        parts.pop()
     if not all(p and not any(c.isspace() for c in p) for p in parts):
         return [], ""
     if read_last:
@@ -284,7 +288,8 @@ def parse_plan(text):
             # пропускается, после пустой строки — заканчивает список. Вложенные пункты пропущенного пункта
             # («Не трогать:» и его пути) ему принадлежат, а не списку файлов задачи.
             owned = item and (_PREFIX.match(item.group(1).strip()) or _is_whole_path(item.group(1).strip()))
-            if owned and skip_indent is not None and indent > skip_indent:
+            if item and skip_indent is not None and indent > skip_indent:
+                # Вложенный в пропущенный пункт: отметка остаётся, пока не придёт пункт того же уровня или мельче.
                 owned = False
             elif item:
                 skip_indent = None

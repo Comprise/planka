@@ -16,10 +16,10 @@ planka@planka` с перезапуском сессии (`README.md`, «Уста
 по имени (`import common`), каталог скрипта — первый в `sys.path`.
 
 Точки входа: `remind.py` (`UserPromptSubmit`; хук на каждую часть ядра, `python3 …/remind.py <номер>`), `judge_tool.py`
-(`PreToolUse`; на `Bash` ещё
-`PostToolUse`, `PostToolUseFailure`), `guard_memory.py` (`PreToolUse`), `judge_stop.py` (`Stop`),
-`debug_watch.py` (`PostToolUse`, `PostToolUseFailure`), `model_watch.py` (`SessionStart`, `PostModelSwitch`). Один
-скрипт на нескольких событиях различает их по `hook_event_name` входа (`judge_tool.POST_EVENTS`).
+(`PreToolUse`, в том числе MCP-инструменты `mcp__*`; на `Bash` и `mcp__*` ещё `PostToolUse`, `PostToolUseFailure`),
+`guard_memory.py` (`PreToolUse`), `judge_stop.py` (`Stop`), `debug_watch.py` (`PostToolUse`, `PostToolUseFailure`),
+`model_watch.py` (`SessionStart`, `PostModelSwitch`). Один скрипт на нескольких событиях различает их по
+`hook_event_name` входа (`judge_tool.POST_EVENTS`).
 
 ## Код
 
@@ -33,7 +33,8 @@ planka@planka` с перезапуском сессии (`README.md`, «Уста
   текстами правил». Имя из вызова `common.rubric`, `common.philosophy_sections`, `common.rule_texts`
   или константы `MODULE` тест находит в коде и сам (`test_names_taken_by_code_exist`); ручной список —
   обратная проверка, что код имя ещё берёт. Имя, переданное иначе (переменной из другого места,
-  текстом причины, как `dependencies` в `judge_tool.DEP_REASON`), тест в коде не видит.
+  текстом причины, как `dependencies` в причинах отказа `judge_tool`: `DEP_REASON`, `DEP_DOUBT_REASON`,
+  `MANIFEST_REASON`, `COMMAND_REASON`, `MCP_REASON`), тест в коде не видит.
 - Новый срок внутри хука (бюджет, таймаут вызова) — в сумму `TimeoutsTest` в `tests/test_contract.py`
   и в `context/architecture.md`, «Сроки»: сумма сроков хука меньше его `timeout` в `hooks/hooks.json`.
 - Хук с судьёй: лимит отказов до вызова судьи (`common.deny_budget_left`) и при отказе

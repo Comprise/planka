@@ -94,10 +94,12 @@ class RemindTest(unittest.TestCase):
         self.assertFalse((self.env.data / "state").exists())
 
     def test_bad_part_number_warns(self):
-        for arg in ("0", str(remind.PARTS + 1), "x"):
+        for arg in ("0", str(remind.PARTS + 1), "x", "²", "١"):
             r = self.run_part(arg)
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertEqual(messages(r), [f"planka: неверный номер части ядра: {arg!r}"], arg)
+            # В локали C (make test-hostile) хук читает аргумент как ascii с surrogateescape.
+            seen = {arg, arg.encode("utf-8").decode("ascii", "surrogateescape")}
+            self.assertIn(messages(r), [[f"planka: неверный номер части ядра: {a!r}"] for a in seen], arg)
             self.assertNotIn("hookSpecificOutput", json.loads(r.stdout))
 
     def test_part_over_limit_warned_and_emitted(self):
@@ -128,14 +130,14 @@ class RemindTest(unittest.TestCase):
         r = self.env.run("remind.py", self.env.hook_input("UserPromptSubmit"))
         self.assertEqual(r.returncode, 0)
         self.assertIsNone(output(r))
-        self.assertIn("planka:", "\n".join(messages(r)))
+        self.assertEqual(messages(r), [f"planka: нет файла правил {self.env.root / 'philosophy.md'}"])
 
     def test_non_utf8_file_warns_and_emits_nothing(self):
         (self.env.root / "philosophy.md").write_bytes(b"# \xff\xfe\n")
         r = self.env.run("remind.py", self.env.hook_input("UserPromptSubmit"))
         self.assertEqual(r.returncode, 0)
         self.assertIsNone(output(r))
-        self.assertIn("planka:", "\n".join(messages(r)))
+        self.assertEqual(messages(r), [f"planka: файл правил {self.env.root / 'philosophy.md'} не в UTF-8"])
         self.assertNotIn("Traceback", r.stderr)
 
     def test_garbage_stdin(self):

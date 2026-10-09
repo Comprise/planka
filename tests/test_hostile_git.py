@@ -26,7 +26,7 @@ import time
 import unittest
 from unittest import mock
 
-from tests.helpers import Env, PLANKA_DIR
+from tests.helpers import Env, PLANKA_DIR, prompt_block
 
 sys.path.insert(0, str(PLANKA_DIR))
 import comments  # noqa: E402
@@ -292,7 +292,8 @@ class HostileRootTest(HostileCase):
 # Версия package.json из HEAD объединена с версией из MERGE_HEAD (lodash) незавершённого слияния; у
 # cf/requirements.txt — версия HEAD (attrs) и стороны конфликта индекса :1:, :2:, :3: (base, ours, theirs).
 # Имена ref команды — из манифестов и setup.py их деревьев. Имена проекта: манифесты рабочего дерева и манифесты и
-# setup.py версии HEAD (legacydep).
+# setup.py версии HEAD (legacydep). Жёсткая ссылка notes.json на package.json — манифест package.json: его находит
+# git ls-files манифестов проекта.
 EXPECTED_MANIFESTS = ("git", ["cf/requirements.txt", "new/requirements.txt", "nl/requirements\r.txt",
                               "package.json", "sp ace/Cargo.toml", "ü/requirements.txt"],
                       {"package.json": ["lodash", "react"], "ü/requirements.txt": ["rich"],
@@ -301,12 +302,14 @@ EXPECTED_MANIFESTS = ("git", ["cf/requirements.txt", "new/requirements.txt", "nl
                       {"npm": ["lodash", "react"], "pypi": ["attrs", "click", "flask", "legacydep", "rich"],
                        "crates.io": ["serde"]},
                       ["attrs", "flask", "httpx", "legacydep", "rich"],
-                      ({"new/requirements.txt": ["evilpkg"]}, []))
+                      ({"new/requirements.txt": ["evilpkg"]}, [], None),
+                      ([("package.json", "package.json")], None))
 
 
 class HostileManifestTest(HostileCase):
-    """Манифесты проекта (git ls-files), их версии в HEAD (git cat-file) и имена ref, откуда команда возвращает
-    файлы (git cat-file и git ls-tree restored_names), под враждебным конфигом."""
+    """Манифесты проекта (git ls-files, в том числе для жёсткой ссылки в edit_targets), их версии в HEAD (git cat-file)
+    и имена ref, откуда команда возвращает файлы (git cat-file и git ls-tree restored_names), под враждебным
+    конфигом."""
 
     def manifest_scenario(self, cfg):
         root = self.repo()
@@ -365,7 +368,11 @@ class HostileManifestTest(HostileCase):
         write(root, "new/requirements.txt", "flask\nlegacydep\nevilpkg\n")
         with hostile(cfg):
             compared = manifest_watch.compare(entry, time.monotonic() + 30)
-        return mode, sorted(found), heads, restored, project, compared
+        os.link(root / "package.json", root / "notes.json")
+        with hostile(cfg):
+            targets, problem = manifest_watch.edit_targets(str(root / "notes.json"), lambda: root)
+        return (mode, sorted(found), heads, restored, project, compared,
+                ([(os.path.relpath(path, root), kind) for path, kind in targets], problem))
 
     def test_baseline(self):
         self.assertEqual(self.manifest_scenario(os.devnull), EXPECTED_MANIFESTS)
@@ -443,7 +450,7 @@ class HostileHookTest(unittest.TestCase):
                                                     stop_hook_active=False),
                     PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec), **extra)
         self.assertEqual(r.stdout, "", r.stderr)
-        return rec.read_text(encoding="utf-8").split("\n<content>\n", 1)[1].split("\n</content>\n", 1)[0]
+        return prompt_block(rec.read_text(encoding="utf-8"), "content")
 
     def test_hooks_under_hostile_config(self):
         with tempfile.TemporaryDirectory() as d:

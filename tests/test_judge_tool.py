@@ -274,7 +274,17 @@ class PlanTest(unittest.TestCase):
         self.assertIn("файл x.py принадлежит задачам 1 и 2 волны 1", out["permissionDecisionReason"])
         self.assertTrue(out["permissionDecisionReason"].startswith("planka: "))
         self.assertFalse(rec.exists())
+        self.assertIn("(только чтение)", out["permissionDecisionReason"])
+        self.assertIn("Файлы: нет", out["permissionDecisionReason"])
         self.assertEqual(self.env.log_lines()[-1]["verdict"], "deny-files")
+
+    def test_conflict_log_has_metadata_only(self):
+        self.exit_plan(self.with_plan(PLAN_CONFLICT))
+        last = self.env.log_lines()[-1]
+        self.assertEqual(last["verdict"], "deny-files")
+        self.assertEqual(last["conflicts"], 1)
+        self.assertNotIn("reason", last)
+        self.assertNotIn("x.py", json.dumps(last, ensure_ascii=False))
 
     def test_plan_without_waves_goes_to_judge(self):
         rec = self.env.data / "rec.txt"
@@ -783,6 +793,76 @@ class ManifestEditTest(unittest.TestCase):
         last = self.env.log_lines()[-1]
         self.assertEqual((last["hook"], last["verdict"]), ("manifest", "skipped"))
 
+    def test_hard_link_not_matched_warns(self):
+        # Жёсткая ссылка notes.json на манифест: манифесты проекта не перечислены — пропуск с предупреждением.
+        self.write("requirements.txt", REQUIREMENTS)
+        os.link(self.env.project / "requirements.txt", self.env.project / "notes.json")
+        with mock.patch.object(manifest_watch, "MAX_MANIFESTS", 0):
+            out = run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                "PreToolUse", tool_name="Edit", tool_input={
+                    "file_path": str(self.env.project / "notes.json"), "old_string": "rich>=13",
+                    "new_string": "rich>=13\nflask"}))
+            self.assertEqual(set(out), {"systemMessage"})
+            self.assertIn("жёсткая ссылка не сверена с манифестами проекта: манифестов больше 0", out["systemMessage"])
+            last = self.env.log_lines()[-1]
+            self.assertEqual((last["hook"], last["verdict"]), ("manifest", "skipped"))
+            # Предупреждение — раз на сессию (жёсткие ссылки pnpm в node_modules), пропуск в журнале — на каждую правку.
+            out = run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                "PreToolUse", tool_name="Edit", tool_input={
+                    "file_path": str(self.env.project / "notes.json"), "old_string": "rich>=13",
+                    "new_string": "rich>=13\nflask"}))
+        self.assertIsNone(out)
+        logged = [(e["hook"], e["verdict"]) for e in self.env.log_lines()]
+        self.assertEqual(logged, [("manifest", "skipped")] * 2)
+
+    def test_hard_link_named_as_other_manifest_denied(self):
+        # Жёсткая ссылка sub/Gemfile на package.json: файл проверяется и как package.json.
+        self.write("package.json", PACKAGE_JSON)
+        (self.env.project / "sub").mkdir()
+        os.link(self.env.project / "package.json", self.env.project / "sub" / "Gemfile")
+        r = self.tool("Write", {"file_path": str(self.env.project / "sub" / "Gemfile"),
+                                "content": PACKAGE_JSON.replace('"react"', '"left-pad": "1", "react"', 1)})
+        self.assert_denied(r, "left-pad", str(self.env.project / "package.json"))
+
+    def test_hard_link_targets_beyond_budget_skipped(self):
+        # Второй манифест того же файла не укладывается в LINKED_BUDGET: пропуск с предупреждением, первый проверен.
+        self.write("package.json", PACKAGE_JSON)
+        (self.env.project / "sub").mkdir()
+        os.link(self.env.project / "package.json", self.env.project / "sub" / "Gemfile")
+        content = PACKAGE_JSON.replace('"react"', '"left-pad": "1", "react"', 1)
+        with mock.patch.object(judge_tool, "LINKED_BUDGET", 0):
+            out = run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                "PreToolUse", tool_name="Write", tool_input={
+                    "file_path": str(self.env.project / "package.json"), "content": content}))
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("left-pad", out["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertEqual(out["systemMessage"], f"planka: манифест {self.env.project / 'sub' / 'Gemfile'}: жёсткие "
+                                               f"ссылки не проверены за срок, новые зависимости не проверены")
+
+    def test_hard_link_listing_shared(self):
+        # Перечень манифестов для жёсткой ссылки и подключения — один за правку (манифесты проекта здесь не читаются).
+        self.write("requirements.txt", REQUIREMENTS)
+        os.link(self.env.project / "requirements.txt", self.env.project / "notes.txt")
+        calls = []
+        real = manifest_watch.list_manifests
+
+        def counted(*args):
+            calls.append(args)
+            return real(*args)
+        with mock.patch.object(manifest_watch, "list_manifests", side_effect=counted), \
+                mock.patch.object(judge_tool, "_project_names", return_value=frozenset()):
+            out = run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                "PreToolUse", tool_name="Write", tool_input={
+                    "file_path": str(self.env.project / "notes.txt"), "content": REQUIREMENTS + "-r extra.list\n"}))
+        self.assertIn("include extra.list", out["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertEqual(len(calls), 1, calls)
+
+    def test_hard_link_to_plain_file_silent(self):
+        self.write("notes.json", "{}")
+        os.link(self.env.project / "notes.json", self.env.project / "notes2.json")
+        self.assert_silent(self.tool("Write", {"file_path": str(self.env.project / "notes.json"),
+                                               "content": '{"dependencies": {"evil": "1"}}'}))
+
     def test_large_manifest_warns(self):
         self.write("requirements.txt", REQUIREMENTS)
         with mock.patch.object(manifest_watch, "MAX_MANIFEST_BYTES", len(REQUIREMENTS) - 1):
@@ -837,12 +917,12 @@ class ManifestEditTest(unittest.TestCase):
         self.assertEqual((last["hook"], last["verdict"]), ("manifest", "skipped"))
         assert_not_logged(self, self.env, "left-pad")
 
-    def test_broken_old_without_git_warns(self):
+    def test_broken_old_without_git_compared_as_empty(self):
+        # До правки не разобран, версии в git нет — сравнение с пустым манифестом.
         self.write("package.json", "{broken")
         r = self.tool("Write", {"file_path": str(self.env.project / "package.json"), "content": PACKAGE_JSON})
-        self.assertIsNone(output(r))
-        self.assertEqual(len(messages(r)), 1, messages(r))
-        self.assertIn("не разобран", messages(r)[0])
+        self.assertEqual(output(r)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(messages(r), [])
 
     def test_fixture_manifest_passes(self):
         r = self.tool("Write", {"file_path": str(self.env.project / "tests" / "fixtures" / "x" / "package.json"),
@@ -1137,6 +1217,39 @@ class ManifestBashTest(unittest.TestCase):
         for content in ("0.27.0", "^18.2.0", "1.0.0", "scripts"):
             self.assertNotIn(content, dumped)
 
+    def mcp_call(self, tool="mcp__filesystem__write_file", event="PostToolUse", edit=True, tool_use_id="m1"):
+        """Pre, правка requirements.txt (если edit) вне хука, как делает MCP-инструмент, Post; ответ Post."""
+        tool_input = {"path": "requirements.txt", "content": "flask\n"}
+        pre = self.env.run("judge_tool.py", self.env.hook_input(
+            "PreToolUse", tool_name=tool, tool_input=tool_input, tool_use_id=tool_use_id))
+        self.assertEqual(pre.stdout, "", pre.stderr)
+        if edit:
+            with open(self.p / "requirements.txt", "a", encoding="utf-8") as f:
+                f.write("flask\n")
+        fields = {"tool_response": {}} if event == "PostToolUse" else {"error": "boom", "is_interrupt": False}
+        return self.env.run("judge_tool.py", self.env.hook_input(
+            event, tool_name=tool, tool_input=tool_input, tool_use_id=tool_use_id, **fields))
+
+    def test_mcp_tool_manifest_edit_blocked(self):
+        for tool in ("mcp__filesystem__write_file", "mcp__serena__replace_content"):
+            for event in ("PostToolUse", "PostToolUseFailure"):
+                with self.subTest(tool=tool, event=event):
+                    (self.p / "requirements.txt").write_text(REQUIREMENTS, encoding="utf-8")
+                    r = self.mcp_call(tool, event)
+                    self.assert_blocked(r, "requirements.txt: flask")
+                    self.assertIn(tool, output(r)["reason"])
+                    self.assertEqual(self.state(), {})
+
+    def test_mcp_tool_without_manifest_change_silent(self):
+        r = self.mcp_call(edit=False)
+        self.assertEqual(r.stdout, "", r.stderr)
+        self.assertEqual(self.state(), {})
+
+    def test_mcp_pre_takes_snapshot_by_tool_use_id(self):
+        self.env.run("judge_tool.py", self.env.hook_input(
+            "PreToolUse", tool_name="mcp__serena__find_symbol", tool_input={}, tool_use_id="m1"))
+        self.assertEqual(sorted(self.state()), ["m1"])
+
     def test_broken_manifest_after_command_warns(self):
         r = self.run_command("printf '{broken' > web/package.json")
         self.assertIsNone(output(r))
@@ -1194,16 +1307,15 @@ class ManifestBashTest(unittest.TestCase):
         self.assertIn("flask", output(r)["reason"])
         self.assertTrue(any("внутренняя ошибка" in m for m in messages(r)), messages(r))
 
-    def test_unparsed_manifest_without_version_unknown(self):
-        # До команды не разобран, версии в репозитории нет: сравнить не с чем — предупреждение, не блок.
+    def test_unparsed_manifest_without_version_compared_as_empty(self):
+        # До команды не разобран, версии в репозитории нет — сравнение с пустым манифестом.
         (self.p / "api").mkdir()
         (self.p / "api" / "package.json").write_text("{broken", encoding="utf-8")
         r = self.run_command("printf '{\"dependencies\": {\"axios\": \"1\"}}' > api/package.json")
-        self.assertIsNone(output(r))
-        self.assertEqual(messages(r), ["planka: манифест не разобран до или после команды, новые зависимости не "
-                                       "проверены: api/package.json"])
+        self.assertEqual(output(r)["decision"], "block")
+        self.assertIn("api/package.json: axios", output(r)["reason"])
         last = self.env.log_lines()[-1]
-        self.assertEqual((last["hook"], last["verdict"]), ("manifest", "skipped"))
+        self.assertEqual((last["hook"], last["verdict"]), ("manifest", "block-dep"))
 
     @staticmethod
     def pyproject_command(deps):
@@ -1491,7 +1603,7 @@ class ManifestBashGitTest(ManifestBashTest):
                 "PreToolUse", tool_name="Bash", tool_input={"command": "git checkout old -- requirements.txt"},
                 tool_use_id="b1"))
         self.assertEqual(out, {"systemMessage": "planka: снимок манифестов не снят (имена ref команды не прочитаны "
-                                                "за срок): новые зависимости от команд Bash не проверяются"})
+                                                "за срок): новые зависимости от команд Bash и MCP-инструментов не проверяются"})
         self.assertEqual(self.state(), {})
         last = self.env.log_lines()[-1]
         self.assertEqual((last["hook"], last["verdict"]), ("manifest", "skipped"))
@@ -1746,6 +1858,25 @@ class ManifestFailureBranchesTest(unittest.TestCase):
             out = self.post()
         self.assert_skipped(out, "planka: манифесты после команды не проверены: нет доступа")
 
+    def test_lost_with_names_blocks_and_warns(self):
+        # Манифестов после команды не перечислить: манифест снимка с новым именем — блок, новые манифесты —
+        # предупреждение.
+        path = self.env.project / "requirements.txt"
+        path.write_text("rich\n", encoding="utf-8")
+        run_in_process(self.env, judge_tool.main, self.env.hook_input(
+            "PreToolUse", tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="b1"))
+        path.write_text("rich\nflask\n", encoding="utf-8")
+        (self.env.project / "new").mkdir()
+        (self.env.project / "new" / "requirements.txt").write_text("evilpkg\n", encoding="utf-8")
+        with mock.patch.object(manifest_watch, "MAX_MANIFESTS", 1):
+            out = self.post()
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("requirements.txt: flask", out["reason"])
+        self.assertEqual(out["systemMessage"],
+                         "planka: новые манифесты после команды не проверены: манифестов больше 1")
+        logged = [(e["hook"], e["verdict"]) for e in self.env.log_lines()]
+        self.assertEqual(logged[-2:], [("manifest", "skipped"), ("manifest", "block-dep")])
+
     def test_edit_timeout(self):
         path = self.env.project / "requirements.txt"
         path.write_text("rich\n", encoding="utf-8")
@@ -1774,7 +1905,7 @@ class ManifestDeadlineTest(unittest.TestCase):
 
         def compare(entry, deadline):
             seen["compare"] = deadline - time.monotonic()
-            return {}, []
+            return {}, [], None
         with mock.patch.object(manifest_watch, "take", side_effect=take), \
                 mock.patch.object(manifest_watch, "compare", side_effect=compare):
             for event in ("PreToolUse", "PostToolUse"):
@@ -1782,6 +1913,23 @@ class ManifestDeadlineTest(unittest.TestCase):
                     event, tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="b1"))
         self.assertTrue(manifest_watch.SNAPSHOT_BUDGET - 1 < seen["take"] <= manifest_watch.SNAPSHOT_BUDGET, seen)
         self.assertTrue(manifest_watch.CHECK_BUDGET - 1 < seen["compare"] <= manifest_watch.CHECK_BUDGET, seen)
+
+    def test_snapshot_budget_counts_after_project_root(self):
+        # Корень проекта (git rev-parse, GIT_ROOT_TIMEOUT) срок снимка не съедает.
+        seen = {}
+
+        def take(root, deadline):
+            seen["take"] = deadline - time.monotonic()
+            return {"root": str(root), "mode": "walk", "ts": time.time(), "files": {}}
+
+        def slow_root(cwd):
+            time.sleep(1.5)
+            return self.env.project
+        with mock.patch.object(manifest_watch, "take", side_effect=take), \
+                mock.patch.object(common, "project_root", side_effect=slow_root):
+            run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                "PreToolUse", tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="b1"))
+        self.assertTrue(manifest_watch.SNAPSHOT_BUDGET - 0.5 < seen["take"] <= manifest_watch.SNAPSHOT_BUDGET, seen)
 
     def test_restored_ref_within_snapshot_budget(self):
         # git ref, названного командой, — в том же сроке SNAPSHOT_BUDGET, что и снимок.
@@ -1828,7 +1976,7 @@ class ManifestSnapshotFailureTest(unittest.TestCase):
             out = run_in_process(self.env, judge_tool.main, self.env.hook_input(
                 "PreToolUse", tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="b1"))
             self.assertEqual(out, {"systemMessage": "planka: снимок манифестов не снят (манифестов больше 1): "
-                                                    "новые зависимости от команд Bash не проверяются"})
+                                                    "новые зависимости от команд Bash и MCP-инструментов не проверяются"})
             out = run_in_process(self.env, judge_tool.main, self.env.hook_input(
                 "PreToolUse", tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="b2"))
             self.assertIsNone(out)
@@ -1836,6 +1984,20 @@ class ManifestSnapshotFailureTest(unittest.TestCase):
         logged = [(e["hook"], e["verdict"]) for e in self.env.log_lines()]
         self.assertEqual(logged, [("manifest", "skipped")] * 2)
         self.assertIn("манифестов больше 1", self.env.log_lines()[-1]["error"])
+
+    def test_missing_tool_use_id_warns_once(self):
+        # Без tool_use_id снимок не сопоставить с вызовом после него: предупреждение раз на сессию, пропуск в журнале
+        # на каждый вызов, снимка нет.
+        (self.env.project / "requirements.txt").write_text("rich\n", encoding="utf-8")
+        outs = [run_in_process(self.env, judge_tool.main,
+                               self.env.hook_input("PreToolUse", tool_name=tool, tool_input=inp))
+                for tool, inp in (("Bash", {"command": "ls"}), ("mcp__serena__find_symbol", {}))]
+        msg = ("planka: снимок манифестов не снят (у вызова нет tool_use_id): новые зависимости от команд Bash и "
+               "MCP-инструментов не проверяются")
+        self.assertEqual(outs, [{"systemMessage": msg}, None])
+        logged = [(e["hook"], e["verdict"]) for e in self.env.log_lines()]
+        self.assertEqual(logged, [("manifest", "skipped")] * 2)
+        self.assertFalse((self.env.data / "state" / "sess-1.manifests.json").exists())
 
     def test_unusable_data_dir_warns_without_internal_error(self):
         blocker = self.env.data / "file"
@@ -2064,12 +2226,13 @@ class ManifestWatchStateTest(unittest.TestCase):
         path = self.env.project / "requirements.txt"
         path.write_text("rich\n", encoding="utf-8")
         entry = manifest_watch.take(self.env.project, time.monotonic() + 30)
-        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30), ({}, []))
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30), ({}, [], None))
         st = path.stat()
         time.sleep(0.05)
         path.write_text("flsk\n", encoding="utf-8")
         os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
-        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30), ({"requirements.txt": ["flsk"]}, []))
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30),
+                         ({"requirements.txt": ["flsk"]}, [], None))
 
     def test_same_size_new_mtime_reread(self):
         # Правка той же длины (`sed -i s/left-pad/evilpkg1/`) меняет mtime: манифест перечитывается.
@@ -2080,23 +2243,23 @@ class ManifestWatchStateTest(unittest.TestCase):
         path.write_text("evilpkg1\n", encoding="utf-8")
         os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
         self.assertEqual(path.stat().st_size, st.st_size)
-        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30), ({"requirements.txt": ["evilpkg1"]}, []))
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30),
+                         ({"requirements.txt": ["evilpkg1"]}, [], None))
 
     @unittest.skipUnless(shutil.which("git"), "нет git")
-    def test_mode_change_unavailable(self):
+    def test_mode_change_lost(self):
         root = self.env.project
         (root / "requirements.txt").write_text("rich\n", encoding="utf-8")
         entry = manifest_watch.take(root, time.monotonic() + 30)
         self.assertEqual(entry["mode"], "walk")
         git("init", "-q", cwd=root)
-        with self.assertRaisesRegex(manifest_watch.Unavailable, "^за команду корень проекта стал git-репозиторием$"):
-            manifest_watch.compare(entry, time.monotonic() + 30)
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30),
+                         ({}, [], "за команду корень проекта стал git-репозиторием"))
         entry = manifest_watch.take(root, time.monotonic() + 30)
         self.assertEqual(entry["mode"], "git")
         shutil.rmtree(root / ".git")
-        with self.assertRaisesRegex(manifest_watch.Unavailable,
-                                    "^за команду корень проекта перестал быть git-репозиторием$"):
-            manifest_watch.compare(entry, time.monotonic() + 30)
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30),
+                         ({}, [], "за команду корень проекта перестал быть git-репозиторием"))
 
     def test_large_manifest_after_command_unknown(self):
         path = self.env.project / "requirements.txt"
@@ -2104,9 +2267,10 @@ class ManifestWatchStateTest(unittest.TestCase):
         entry = manifest_watch.take(self.env.project, time.monotonic() + 30)
         path.write_text("rich\nflask\n", encoding="utf-8")
         with mock.patch.object(manifest_watch, "MAX_MANIFEST_BYTES", 10):
-            self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30), ({}, ["requirements.txt"]))
+            self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30), ({}, ["requirements.txt"], None))
         with mock.patch.object(manifest_watch, "MAX_MANIFEST_BYTES", 11):
-            self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30), ({"requirements.txt": ["flask"]}, []))
+            self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30),
+                             ({"requirements.txt": ["flask"]}, [], None))
 
 
 class ManifestBypassTest(unittest.TestCase):

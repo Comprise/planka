@@ -504,7 +504,7 @@ def session_model_path(state_dir, session_id):
 def stored_session_model(session_id):
     """Модель сессии, записанная model_watch; нет файла, битый файл, негодная модель или сбой — None.
     Чтение без state_lock: файл пишется целиком через atomic_write_json, а не дописывается."""
-    if not isinstance(session_id, str):
+    if not isinstance(session_id, str) or not session_id:
         return None
     try:
         model = read_json(session_model_path(data_dir() / "state", session_id), dict).get("model")
@@ -546,6 +546,26 @@ def input_path(path):
         return os.fsdecode(path.encode("utf-8", "surrogateescape"))
     except UnicodeEncodeError:
         return path
+
+
+def case_insensitive(path):
+    """Файловая система пути не различает регистр: путь или его предок находится и по имени с обращённым регистром,
+    и это тот же файл (os.path.samefile). Проверяется каждый уровень: том без учёта регистра монтируется и внутрь
+    чувствительного к нему."""
+    base = path
+    while True:
+        name = os.path.basename(base)
+        swapped = name.swapcase()
+        if swapped != name:
+            try:
+                if os.path.samefile(base, os.path.join(os.path.dirname(base), swapped)):
+                    return True
+            except (OSError, ValueError):
+                pass
+        parent = os.path.dirname(base)
+        if parent == base:
+            return False
+        base = parent
 
 
 def _utf8(text):

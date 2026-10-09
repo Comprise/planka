@@ -1,0 +1,19 @@
+# источник: формы python-poetry.org/docs/dependency-specification/, «Multiple constraints dependencies» и «Combining git / url / path dependencies with source repositories»
+[tool.poetry]
+name = "poetry-multi"
+version = "0.1.0"
+
+[tool.poetry.dependencies]
+python = "^3.9"
+foo = [
+    { version = "<=1.9", python = ">=3.6,<3.8" },
+    { version = "^2.0", python = ">=3.8" }
+]
+example = [
+    { platform = "darwin", url = "https://example.com/example-1.0-py3-none-any.whl" },
+    { platform = "linux", version = "^1.0", source = "pypi" },
+]
+local = [
+    { path = "../local", platform = "linux" },
+    { version = "^1.0", platform = "darwin" },
+]

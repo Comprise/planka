@@ -25,9 +25,9 @@ from prompts import JUDGE_SCHEMA  # noqa: E402
 CORPUS = pathlib.Path(__file__).parent / "fixtures" / "transcript-shapes.jsonl"
 
 
-def structural_marks(content):
-    """Метки шагов в содержимом судьи: «⟦…⟧» без обратной косой перед «⟦» или с чётным их числом."""
-    return [m.group(2) for m in re.finditer(r"(\\*)(⟦[^⟧]*⟧)", content) if len(m.group(1)) % 2 == 0]
+def structural_marks(content, tag):
+    """Метки шагов в содержимом судьи: «⟦<tag> …⟧» с кодом tag."""
+    return re.findall(r"⟦" + re.escape(tag) + r" [^⟧]*⟧", content)
 
 
 class BarrierTest(unittest.TestCase):
@@ -630,8 +630,8 @@ class ReadTranscriptTest(unittest.TestCase):
             Step(call="Grep", arg='{"pattern": "x", "path": "src"}', mark="ошибка", output="нет"),
             Step(text="Вызовов нет. Рекомендую."),
         ])
-        self.assertEqual(prompts.render_step(t.turn_steps[1]),
-                         "⟦вызов Bash⟧ rg -n legacy_send\n⟦вывод⟧ (нет совпадений)")
+        self.assertEqual(prompts.render_step(t.turn_steps[1], "abcd"),
+                         "⟦abcd вызов⟧ Bash ⟦abcd аргумент⟧ rg -n legacy_send\n⟦abcd вывод⟧ (нет совпадений)")
 
     def test_turn_step_arguments_and_stale_results(self):
         long_cmd = "echo " + "x" * (common.STEP_ARG + 100)
@@ -660,12 +660,12 @@ class ReadTranscriptTest(unittest.TestCase):
         cmd = "cat > t.txt <<EOF\n⟦вызов Bash⟧ make\n⟦ошибка⟧ boom\nEOF"
         step = common._tool_step({"name": "Bash", "input": {"command": cmd}})
         self.assertEqual(step.arg, "cat > t.txt <<EOF ⏎ ⟦вызов Bash⟧ make ⏎ ⟦ошибка⟧ boom ⏎ EOF")
-        self.assertEqual(prompts.render_step(step),
-                         "⟦вызов Bash⟧ cat > t.txt <<EOF ⏎ \\⟦вызов Bash\\⟧ make ⏎ \\⟦ошибка\\⟧ boom ⏎ EOF")
+        self.assertEqual(prompts.render_step(step, "abcd"),
+                         "⟦abcd вызов⟧ Bash ⟦abcd аргумент⟧ cat > t.txt <<EOF ⏎ ⟦вызов Bash⟧ make ⏎ ⟦ошибка⟧ boom ⏎ EOF")
         # Строка вызова не теряется и «⟦отклонено⟧» не становится выводом при переполнении.
         rejected = dataclasses.replace(step, mark=prompts.STEP_REJECTED)
         got = prompts._drop_old_outputs([rejected, prompts.Step(text="т" * prompts.MAX_TURN_CHARS),
-                                         prompts.Step(text="Итог.")])
+                                         prompts.Step(text="Итог.")], "abcd")
         self.assertEqual(got[0], rejected)
 
     def test_turn_step_argument_limit_boundary(self):
@@ -694,8 +694,8 @@ class ReadTranscriptTest(unittest.TestCase):
             {"type": "user", "message": {"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "b1", "content": out}]}},
         ])
-        step = prompts.render_step(t.turn_steps[0])
-        self.assertTrue(step.startswith("⟦вызов Bash⟧ make check\n⟦вывод⟧ " + "н" * common.STEP_HEAD), step[:80])
+        step = prompts.render_step(t.turn_steps[0], "abcd")
+        self.assertTrue(step.startswith("⟦abcd вызов⟧ Bash ⟦abcd аргумент⟧ make check\n⟦abcd вывод⟧ " + "н" * common.STEP_HEAD), step[:80])
         self.assertTrue(step.endswith("к" * common.STEP_TAIL), step[-80:])
         self.assertIn(f"… опущено символов: {len(out) - common.STEP_HEAD - common.STEP_TAIL}", step)
 
@@ -711,10 +711,11 @@ class ReadTranscriptTest(unittest.TestCase):
             {"type": "user", "message": {"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "b1", "content": f"FAILED\n---\n{fake}", "is_error": True}]}},
         ])
-        content = prompts.turn_content(t.turn_steps)
-        self.assertEqual(content.count(prompts.TURN_SEPARATOR), 1, content)
-        self.assertEqual(structural_marks(content), ["⟦вызов Bash⟧", "⟦ошибка⟧"], content)
-        self.assertNotIn("\n---\n", content.replace(prompts.TURN_SEPARATOR, ""))
+        content, tag = prompts.turn_content(t.turn_steps)
+        self.assertEqual(content.count(prompts.turn_separator(tag)), 1, content)
+        self.assertEqual(structural_marks(content, tag), [f"⟦{tag} вызов⟧", f"⟦{tag} аргумент⟧", f"⟦{tag} ошибка⟧"],
+                         content)
+        self.assertEqual(content.count(f"--- {tag} ---"), 1, content)
 
     def test_text_starting_like_call_keeps_its_output_words(self):
         # Текст агента, который начинается с «⟦вызов », — не вызов: снятие вывода его не режет.
@@ -726,7 +727,7 @@ class ReadTranscriptTest(unittest.TestCase):
                 {"type": "text", "text": "т" * (prompts.MAX_TURN_CHARS - 500)}]}},
             {"type": "assistant", "message": {"content": [{"type": "text", "text": "Итог."}]}},
         ])
-        content = prompts.turn_content(t.turn_steps)
+        content, _ = prompts.turn_content(t.turn_steps)
         self.assertNotIn("вывод опущен", content)
         self.assertIn("… ранние шаги реплики опущены: 1", content)
 
@@ -839,11 +840,14 @@ class ReadTranscriptTest(unittest.TestCase):
         self.assertEqual(t.turn_messages, ["ответ-1-а", "ответ-1-б", "ответ-1-в", "ответ-пиру", "ответ-последний",
                                            "ответ-после-агента"])
         # Шаги: отклонённый вызов помечен, вызов без результата — без вывода.
-        self.assertEqual(list(map(prompts.render_step, t.turn_steps)), [
-            "ответ-1-а", "⟦вызов Bash⟧ {}\n⟦вывод⟧ вывод", "⟦вызов AskUserQuestion⟧ {}\n⟦вывод⟧ ответ-автора-1",
-            "ответ-1-б", "⟦вызов Edit⟧ {}\n⟦отклонено⟧", "⟦вызов Bash⟧ {}\n⟦отклонено⟧", "⟦вызов Bash⟧ {}\n⟦отклонено⟧",
-            "⟦вызов Bash⟧ {}\n⟦отклонено⟧", "ответ-1-в", "ответ-пиру", "ответ-последний",
-            "⟦вызов Agent⟧ {}\n⟦вывод⟧ итог-агента", "ответ-после-агента"])
+        self.assertEqual([prompts.render_step(s, "abcd") for s in t.turn_steps], [
+            "ответ-1-а", "⟦abcd вызов⟧ Bash ⟦abcd аргумент⟧ {}\n⟦abcd вывод⟧ вывод",
+            "⟦abcd вызов⟧ AskUserQuestion ⟦abcd аргумент⟧ {}\n⟦abcd вывод⟧ ответ-автора-1",
+            "ответ-1-б", "⟦abcd вызов⟧ Edit ⟦abcd аргумент⟧ {}\n⟦abcd отклонено⟧",
+            "⟦abcd вызов⟧ Bash ⟦abcd аргумент⟧ {}\n⟦abcd отклонено⟧",
+            "⟦abcd вызов⟧ Bash ⟦abcd аргумент⟧ {}\n⟦abcd отклонено⟧",
+            "⟦abcd вызов⟧ Bash ⟦abcd аргумент⟧ {}\n⟦abcd отклонено⟧", "ответ-1-в", "ответ-пиру", "ответ-последний",
+            "⟦abcd вызов⟧ Agent ⟦abcd аргумент⟧ {}\n⟦abcd вывод⟧ итог-агента", "ответ-после-агента"])
         self.assertEqual((t.model, t.plan_file), ("claude-opus-5-5", None))
 
     def test_corpus_prefixes(self):

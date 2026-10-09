@@ -1,6 +1,7 @@
 """Извлечение строк комментариев из изменённых файлов для судьи."""
 import codecs
 import functools
+import html
 import os
 import re
 import subprocess
@@ -28,11 +29,11 @@ class _Syntax:
     """Синтаксис комментариев и строковых литералов одного языка.
 
     line — (маркер, правило) строчного комментария: правило "any" — маркер везде, "word" — в начале строки
-    или после пробела, "code" — не сразу после «$», «{» и «\\», "php" — «#» не перед «[», "css" — не сразу после
+    или после пробела, "code" — не сразу после «$», «${» и «\\», "php" — «#» не перед «[», "css" — не сразу после
     «:» (url(http://…) без кавычек), "start" — только пробелы перед маркером, "make" — в строке рецепта (с
-    табуляции) как "word" и сразу за префиксами «@», «-», «+» (_MAKE_PREFIX), в прочих как "code", "vim" и
-    "vim9" — по _vim_quote и _marker_ok. blocks —
-    (открытие, закрытие) блочного комментария; nested — блоки вкладываются (счётчик глубины). strings —
+    табуляции) как "word" и сразу за префиксами «@», «-», «+» (_MAKE_PREFIX), в прочих — не сразу после «$», «{»
+    и «\\», "vim" и "vim9" — по _vim_quote и _marker_ok. blocks — (открытие, закрытие) блочного комментария;
+    nested — блоки вкладываются (счётчик глубины). strings —
     (открытие, закрытие, многострочный ли, escape): многострочный — True, False или "cont" (на следующую строку —
     только за нечётной серией «\\» в конце строки, Groovy); escape "\\" — обратная косая, "`" — обратная кавычка
     PowerShell, "double" — удвоенная закрывающая кавычка, "nix" — escape строк '' Nix, None — нет; однострочный
@@ -52,12 +53,15 @@ class _Syntax:
     "svelte": файл — разметка однофайлового компонента (_sfc, _markup), код — JavaScript в «{{…}}» Vue и «{…}»
     Svelte. sigil — сигилы Elixir «~r/…/», «~w(…)», с тройными кавычками. block_scalar — блочные скаляры YAML
     «key: |», «- >-»: строки с отступом больше родителя (_yaml_block) — скрипт по _yaml_script_ext, иначе данные.
+    interp — ({открытие строки: _Interp}, правило префикса) строк с подстановками кода (_interp_at): escape такой
+    строки — _Interp, её закрытие ищет _close_interp. php — файл PHP: вне «<?php … ?>», «<?= … ?>», «<? … ?>» —
+    HTML (_php_html), «?>» кончает и строчный комментарий.
     """
 
     def __init__(self, line=(), blocks=(), strings=(), char=False, quote_word=False, docstring=False,
                  heredoc=None, lua=False, raw=None, zig=False, shebang=False, nested=False, prefix=None,
                  rem=None, line_block=None, exdoc=False, regex=None, jsx=False, sigil=False, block_scalar=False,
-                 sfc=None):
+                 sfc=None, interp=None, php=False):
         self.line, self.blocks, self.char, self.quote_word = line, blocks, char, quote_word
         # Длинное открытие проверяется раньше короткого: «"""» раньше «"».
         self.strings = sorted(strings, key=lambda s: -len(s[0]))
@@ -65,6 +69,12 @@ class _Syntax:
             docstring, heredoc, lua, raw, zig, shebang)
         self.nested, self.prefix, self.rem, self.line_block, self.exdoc = nested, prefix, rem, line_block, exdoc
         self.regex, self.jsx, self.sigil, self.block_scalar, self.sfc = regex, jsx, sigil, block_scalar, sfc
+        self.interp, self.php = interp, php
+        for it in (interp[0].values() if interp else ()):
+            for one in (it if isinstance(it, tuple) else (it,)):
+                one.syn = self
+                if one.spec:
+                    one.spec.syn = self
         firsts = {m[0] for m, _ in line} | {o[0] for o, _ in blocks} | {s[0][0] for s in strings}
         firsts |= {"'"} if char else set()
         firsts |= {"<"} if heredoc in ("tf", "ruby", "perl", "php") else set()
@@ -81,6 +91,7 @@ class _Syntax:
         firsts |= {"%", '"', "`"} if regex == "ruby" else set()
         firsts |= {"<"} if jsx else set()
         firsts |= {"~"} if sigil else set()
+        firsts |= {"?"} if php else set()
         # Операторы-кавычки Perl начинаются с буквы, специальные переменные «$"», «$'», «$`» — с «$»: ищутся своей
         # регуляркой, а не каждая буква и каждый «$».
         extra = "|" + _PERL_QUOTE.pattern if regex == "perl" else ""
@@ -132,6 +143,45 @@ _PERL_QUOTE = re.compile(r"(?<![\w$@%&:>])(?:tr|qr|qq|qw|qx|[msqy])(?=[^\w\s=})\
 # (перевод строки внутри «(» и «[» лексер Groovy пропускает).
 _BRACKETS = {"js": "()", "groovy": "()[]{}"}
 
+class _Interp:
+    """Escape строки с подстановками кода («"${f("x")}"» Kotlin, «"$(cmd)"» shell): закрывающую кавычку ищет
+    _close_interp, строки в коде подстановки — свои. esc — escape текста строки ("\\", "double", "raw", None; "raw" —
+    сырая f-строка Python: «\\» берёт следующий знак, только если это первый знак закрытия или «\\»); subst —
+    (открытие подстановки, открывающая скобка или None, закрывающая) — скобки считаются, закрывающая на нулевой
+    глубине кончает подстановку; literal — знаки текста, которые подстановку не открывают («{{», «$${»). code_esc —
+    «\\» в коде подстановки берёт следующий знак (shell). spec — _Interp текста спецификации формата Python: «:» на
+    нулевой глубине скобок кода подстановки открывает этот текст до закрывающей скобки подстановки. syn — синтаксис
+    языка (_Syntax ставит сам): по нему узнаются строки в коде подстановки."""
+
+    def __init__(self, esc, subst, literal=(), code_esc=False, spec=None):
+        self.esc, self.subst, self.literal, self.syn = esc, subst, literal, None
+        self.code_esc, self.spec = code_esc, spec
+        self._text, self._code = {}, {}
+
+    def text_re(self, close):
+        """Регулярка текста строки с закрытием close: escape-знаки литерала, открытия подстановок, закрытие,
+        обратная косая; длинное раньше короткого («\\(» Swift раньше «\\»)."""
+        if close not in self._text:
+            toks = self.literal + tuple(o for o, _, _ in self.subst) + (close,)
+            toks += ("\\",) if self.esc in ("\\", "raw") else ()
+            self._text[close] = re.compile("|".join(map(re.escape, toks)))
+        return self._text[close]
+
+    def code_re(self, opening, closing):
+        """Регулярка кода подстановки: её скобки, первые знаки строк и символьных литералов языка; «\\» при code_esc;
+        «:» и скобки «()[]» при spec."""
+        key = opening, closing
+        if key not in self._code:
+            syn = self.syn
+            chars = {opening, closing} - {None} | {s[0][0] for s in syn.strings}
+            chars |= {"'"} if syn.char else set()
+            chars |= {'"'} if syn.raw else set()
+            chars |= {"\\"} if self.code_esc else set()
+            chars |= set(":()[]") if self.spec else set()
+            self._code[key] = re.compile("[" + "".join(re.escape(c) for c in sorted(chars)) + "]")
+        return self._code[key]
+
+
 _SYNTAX = {}
 
 
@@ -143,10 +193,36 @@ def _add(exts, **kw):
 _add(("c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx", "m", "mm"),
      line=_SLASH, blocks=_C_BLOCK, strings=(_DQ,), char=True, raw="cpp")
 _add(("java",), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ, _DQ), char=True)
-# Блоки «/* */» Kotlin, Scala, Swift, Rust, Dart вкладываются; в C, Java, JS, Go, C#, Groovy — нет.
-_add(("kt", "kts", "scala"), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ_RAW, _DQ), char=True, nested=True)
-_add(("swift",), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ, _DQ), raw="swift", nested=True)
-_add(("cs",), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ_RAW, _DQ), char=True, raw="cs")
+# Подстановки строк: «${…}» Kotlin, Groovy, Dart, Terraform; «\\(…)» Swift; «{…}» C# «$"…"» и f-строк Python;
+# «#{…}» Elixir; «$(…)», «${…}», «`…`» shell.
+_DOLLAR_BRACE = (("${", "{", "}"),)
+_KT_INTERP = {'"': _Interp("\\", _DOLLAR_BRACE), '"""': _Interp(None, _DOLLAR_BRACE)}
+_SWIFT_INTERP = _Interp("\\", (("\\(", "(", ")"),))
+_CS_SUBST = (("{", "{", "}"),)
+_CS_INTERP = _Interp("\\", _CS_SUBST, ("{{",))
+# Verbatim «$@"…"», «@$"…"»: escape — удвоенная кавычка (_raw_string); в таблице interp C# — под ключом "verbatim",
+# не открытием строки.
+_CS_VERBATIM_INTERP = _Interp("double", _CS_SUBST, ("{{",))
+# f-строки и t-строки Python: (обычная, сырая с «r» в префиксе). Спецификация формата «{x:'>{w}}» — текст без
+# escape с подстановками «{…}», у которых тоже бывает спецификация.
+_PY_SPEC = _Interp(None, _CS_SUBST)
+_PY_SPEC.spec = _PY_SPEC
+_PY_INTERP = {q: (_Interp("\\", _CS_SUBST, ("{{",), spec=_PY_SPEC), _Interp("raw", _CS_SUBST, ("{{",), spec=_PY_SPEC))
+              for q in ('"', "'", '"""', "'''")}
+_PY_PREFIXES = frozenset(("f", "rf", "fr", "t", "rt", "tr"))
+_DART_INTERP = _Interp("\\", _DOLLAR_BRACE)
+_EX_INTERP = _Interp("\\", (("#{", "{", "}"),))
+_SH_INTERP = _Interp("\\", (("$(", "(", ")"), ("${", "{", "}"), ("`", None, "`")), code_esc=True)
+_TF_INTERP = _Interp("\\", (("${", "{", "}"), ("%{", "{", "}")), ("$${", "%%{"))
+# Блоки «/* */» Kotlin, Scala, Swift, Rust, Dart вкладываются; в C, Java, JS, Go, C#, Groovy — нет. Строка Scala
+# без интерполятора («s"…"») подстановок не знает.
+_add(("kt", "kts"), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ_RAW, _DQ), char=True, nested=True,
+     interp=(_KT_INTERP, None))
+_add(("scala",), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ_RAW, _DQ), char=True, nested=True)
+_add(("swift",), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ, _DQ), raw="swift", nested=True,
+     interp=({'"': _SWIFT_INTERP, '"""': _SWIFT_INTERP}, None))
+_add(("cs",), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ_RAW, _DQ), char=True, raw="cs",
+     interp=({'"': _CS_INTERP, "verbatim": _CS_VERBATIM_INTERP}, "cs"))
 _add(("rs",), line=_SLASH, blocks=_C_BLOCK, strings=(('"', '"', True, "\\"),), char=True, raw="rust",
      nested=True)
 _add(("go",), line=_SLASH, blocks=_C_BLOCK, strings=(("`", "`", True, None), _DQ), char=True)
@@ -155,15 +231,22 @@ _add(("go",), line=_SLASH, blocks=_C_BLOCK, strings=(("`", "`", True, None), _DQ
 _JS_STRINGS = (_DQ, _SQ)
 _add(("mjs", "cjs", "ts", "mts", "cts"), line=_SLASH, blocks=_C_BLOCK, strings=_JS_STRINGS, regex="js")
 _add(("js", "jsx", "tsx"), line=_SLASH, blocks=_C_BLOCK, strings=_JS_STRINGS, regex="js", jsx=True)
-_add(("dart",), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ, _T_SQ, _DQ, _SQ), nested=True)
+_add(("dart",), line=_SLASH, blocks=_C_BLOCK, strings=(_T_DQ, _T_SQ, _DQ, _SQ), nested=True,
+     interp=(dict.fromkeys(('"', "'", '"""', "'''"), _DART_INTERP), "dart"))
 # Groovy: строка в кавычках продолжается на следующей строке за «\\» в конце строки (multiline "cont").
 _add(("groovy", "gradle"), line=_SLASH, blocks=_C_BLOCK,
-     strings=(_T_DQ, _T_SQ, ('"', '"', "cont", "\\"), ("'", "'", "cont", "\\")), regex="groovy")
-_add(("php",), line=_SLASH + (("#", "php"),), blocks=_C_BLOCK, strings=(_DQ, _SQ), heredoc="php", shebang=True)
+     strings=(_T_DQ, _T_SQ, ('"', '"', "cont", "\\"), ("'", "'", "cont", "\\")), regex="groovy",
+     interp=(dict.fromkeys(('"', '"""'), _Interp("\\", _DOLLAR_BRACE)), None))
+# PHP: строки «'…'», «"…"», «`…`» многострочны, «?>» в них — текст.
+_add(("php",), line=_SLASH + (("#", "php"),), blocks=_C_BLOCK, strings=(_DQ_ML, _SQ_ML, _BT_ML), heredoc="php",
+     shebang=True, php=True)
 _add(("proto", "sol"), line=_SLASH, blocks=_C_BLOCK, strings=(_DQ, _SQ))
 _add(("zig",), line=_SLASH, strings=(_DQ,), char=True, zig=True)
-_add(("py", "pyi"), line=_H, strings=(_T_DQ, _T_SQ, _DQ, _SQ), docstring=True, shebang=True)
-_add(("sh", "bash", "zsh"), line=(("#", "word"),), strings=(_DQ, _SQ_RAW), heredoc="shell", shebang=True)
+_add(("py", "pyi"), line=_H, strings=(_T_DQ, _T_SQ, _DQ, _SQ), docstring=True, shebang=True,
+     interp=(_PY_INTERP, "py"))
+# Shell: «$'…'» — строка с escape обратной косой (ANSI-C quoting bash и zsh), «'…'» — без escape.
+_add(("sh", "bash", "zsh"), line=(("#", "word"),), strings=(("$'", "'", False, "\\"), _DQ, _SQ_RAW), heredoc="shell",
+     shebang=True, interp=({'"': _SH_INTERP}, None))
 _RUBY_NAMES = ("rakefile", "gemfile")
 # Ruby: «"…"» и «`…`» с подстановками «#{…}» разбирает _template.
 _add(("rb",) + _RUBY_NAMES, line=_H, strings=(_SQ_ML,), quote_word=True, shebang=True, heredoc="ruby",
@@ -189,11 +272,11 @@ _add(("ini", "cfg"), line=_H + ((";", "word"),), strings=(_DQ, _SQ), quote_word=
 _add(("ps1",), line=_H, blocks=(("<#", "#>"),),
      strings=(('@"', '"@', True, None), ("@'", "'@", True, None), ('"', '"', True, "`"), ("'", "'", True, None)),
      quote_word=True, shebang=True)
-_add(("tf",), line=_H + _SLASH, blocks=_C_BLOCK, strings=(_DQ,), heredoc="tf")
+_add(("tf",), line=_H + _SLASH, blocks=_C_BLOCK, strings=(_DQ,), heredoc="tf", interp=({'"': _TF_INTERP}, None))
 _add(("nix",), line=_H, blocks=_C_BLOCK, strings=(("''", "''", True, "nix"), ('"', '"', True, "\\")), shebang=True)
 _add(("jl",), line=_H, blocks=(("#=", "=#"),), strings=(_T_DQ, _DQ_ML), char=True, shebang=True, nested=True)
 _add(("ex", "exs"), line=_H, strings=(_T_DQ, _T_SQ, _DQ, _SQ), shebang=True, prefix=("?", _QUESTION_CHAR, True),
-     exdoc=True, sigil=True)
+     exdoc=True, sigil=True, interp=(dict.fromkeys(('"', "'", '"""', "'''"), _EX_INTERP), None))
 _add(("sql",), line=(("--", "any"),), blocks=_C_BLOCK, strings=(_DQ, _SQ))
 _add(("lua",), line=(("--", "any"),), strings=(_DQ, _SQ), lua=True)
 _add(("hs",), line=(("--", "any"),), blocks=(("{-", "-}"),), strings=(_DQ,), char=True, nested=True)
@@ -253,7 +336,8 @@ def _marker_ok(raw, i, rule):
     if rule == "word":
         return i == 0 or raw[i - 1].isspace()
     if rule == "code":
-        return i == 0 or raw[i - 1] not in "${\\"
+        # «${#x}» — переменная PowerShell с именем «#x», «{#» без «$» — скобка и комментарий.
+        return i == 0 or raw[i - 1] not in "$\\" and raw[i - 2:i] != "${"
     if rule == "php":
         return not raw.startswith("[", i + 1)
     if rule == "css":
@@ -262,7 +346,8 @@ def _marker_ok(raw, i, rule):
         return _back(raw, i, str.isspace) == 0
     if rule == "make":
         if not raw.startswith("\t"):
-            return _marker_ok(raw, i, "code")
+            # «#» в вызове функции и ссылке на переменную GNU make буквален: «$(shell echo $${#A})».
+            return i == 0 or raw[i - 1] not in "${\\"
         return i == _MAKE_PREFIX.match(raw).end() or _marker_ok(raw, i, "word")
     if rule == "vim":
         return _vim_quote(raw, i)
@@ -291,7 +376,9 @@ def _rem(raw, i, seps):
 
 def _close(raw, i, close, esc):
     """Индекс за маркером close, первым от i с учётом escape; -1, если в строке его нет. Время — линейное
-    по длине строки."""
+    по длине строки. esc _Interp — строка с подстановками (_close_interp)."""
+    if isinstance(esc, _Interp):
+        return _close_interp(raw, i, close, esc)
     j = -1
     while True:
         # Найденный j остаётся первым маркером от i, пока i до него не дошёл.
@@ -317,6 +404,110 @@ def _close(raw, i, close, esc):
             i = j + (4 if raw[j + 2] == "\\" else 3)
             continue
         return j + len(close)
+
+
+def _close_interp(raw, i, close, it):
+    """_close для строки с подстановками it (_Interp): стек кадров — строк (закрытие, _Interp) и кода подстановок
+    [открывающая скобка, закрывающая, глубина, глубина «()[]» при spec, _Interp строки]; строка в коде подстановки —
+    свой кадр или литерал до закрытия (_string_at); «:» на нулевых глубинах при spec меняет кадр кода на кадр текста
+    спецификации формата. -1 — строка или подстановка не закрыта в строке файла. Время — линейное по длине строки:
+    каждый шаг сдвигает i вперёд."""
+    stack = [(close, it)]
+    while True:
+        top = stack[-1]
+        if len(top) == 2:
+            closing, cur = top
+            m = cur.text_re(closing).search(raw, i)
+            if m is None:
+                return -1
+            tok, i = m.group(), m.end()
+            if tok == closing:
+                if cur.esc == "double" and raw.startswith(closing, i):
+                    i += len(closing)
+                    continue
+                stack.pop()
+                if not stack:
+                    return i
+            elif tok == "\\":
+                if cur.esc == "\\" or raw.startswith((closing[0], "\\"), i):
+                    i += 1
+            elif tok not in cur.literal:
+                stack.append([*next((o, c) for t, o, c in cur.subst if t == tok), 0, 0, cur])
+            continue
+        cur = top[4]
+        m = cur.code_re(top[0], top[1]).search(raw, i)
+        if m is None:
+            return -1
+        k = m.start()
+        ch, i = raw[k], k + 1
+        if ch == top[1]:
+            if not top[2]:
+                stack.pop()
+            else:
+                top[2] -= 1
+        elif ch == top[0]:
+            top[2] += 1
+        elif ch == "\\" and cur.code_esc:
+            i = k + 2
+        elif cur.spec and ch in "()[]":
+            top[3] += 1 if ch in "([" else -1
+        elif cur.spec and ch == ":":
+            if not top[2] and not top[3]:
+                stack[-1] = (top[1], cur.spec)
+        else:
+            found = _string_at(cur.syn, raw, k)
+            if found is None:
+                continue
+            if found[0] == "skip":
+                i = found[1]
+                continue
+            start, closing, esc = found
+            if isinstance(esc, _Interp):
+                stack.append((closing, esc))
+                i = start
+            else:
+                i = _close(raw, start, closing, esc)
+                if i < 0:
+                    return -1
+
+
+def _string_at(syn, raw, k):
+    """Строка, открытая в k кода подстановки, как у _token: (начало текста, закрытие, escape); ("skip", конец) —
+    символьный литерал; None — не строка."""
+    c = raw[k]
+    if c == "'" and syn.char:
+        m = _CHAR.match(raw, k)
+        return ("skip", m.end()) if m else None
+    if c == '"' and syn.raw:
+        found = _raw_string(syn.raw, raw, k)
+        if found:
+            return found[2], found[0], found[1]
+    for opening, closing, _, esc in syn.strings:
+        if raw.startswith(opening, k):
+            return k + len(opening), closing, _interp_at(syn, raw, k, opening) or esc
+    return None
+
+
+def _interp_at(syn, raw, i, opening):
+    """_Interp строки с открытием opening в i или None — строка без подстановок. Правило префикса syn.interp: "py" —
+    префикс f или t (с r — сырая), "cs" — «$» перед кавычкой, "dart" — не сырая «r'…'»; None — любая такая строка."""
+    if syn.interp is None:
+        return None
+    table, rule = syn.interp
+    it = table.get(opening)
+    if it is None:
+        return None
+    if rule == "py":
+        k = _back(raw, i, str.isalpha)
+        prefix = raw[k:i].lower()
+        if prefix not in _PY_PREFIXES or k and _is_word(raw[k - 1]):
+            return None
+        return it[1] if "r" in prefix else it[0]
+    if rule == "cs":
+        return it if raw[i - 1:i] == "$" else None
+    if rule == "dart" and raw[i - 1:i] == "r" and not (i > 1 and _is_word(raw[i - 2])):
+        return None
+    return it
 
 
 def _block_opens(raw, i, opening):
@@ -373,7 +564,8 @@ def _raw_string(mode, raw, i):
                 return ")" + m.group(1) + '"', None, m.end()
     elif mode == "cs":
         if raw[i - 1:i] == "@" or raw[max(0, i - 2):i] == "@$":
-            return '"', "double", i + 1
+            # «$@"…"» и «@$"…"» — verbatim с подстановками «{…}».
+            return '"', _CS_VERBATIM_INTERP if "$" in raw[max(0, i - 2):i] else "double", i + 1
     elif mode == "swift":
         # «#"…"#», «##"…"##», «#"""…"""#»: закрытие — кавычки и столько же «#».
         k = _back(raw, i, lambda c: c == "#")
@@ -705,15 +897,39 @@ def _jsx_opens(raw, i):
     return _is_ident(raw[k])
 
 
+def _html_tag(raw, i):
+    """Открывает ли «<» в i тег разметки компонента Vue или Svelte: за ним буква ASCII (токенизатор HTML,
+    «tag open state»; парсеры Vue и Svelte так же)."""
+    c = raw[i + 1:i + 2]
+    return c.isascii() and c.isalpha()
+
+
+# Директивы Vue: «v-if», «v-on:click», «:x», «@click», «#slot», «.prop» — их значение выражение JavaScript.
+_VUE_DIRECTIVE = ("v-", ":", "@", "#", ".")
+
+
+def _vue_directive(raw, i):
+    """Стоит ли перед кавычкой в i через пробелы «имя=» директивы Vue (_VUE_DIRECTIVE). Назад — пробелы и имя
+    атрибута: время на кавычку — по длине имени."""
+    j = _back(raw, i, str.isspace)
+    if not j or raw[j - 1] != "=":
+        return False
+    k = _back(raw, j - 1, str.isspace)
+    start = _back(raw, k, lambda c: not c.isspace() and c not in "\"'>/=")
+    return raw[start:k].startswith(_VUE_DIRECTIVE)
+
+
 def _markup(raw, i, ctx, n, banned, sfc=None):
     """Разбор разметки JSX с позиции i: вершина ctx — текст или тег. Действие — как у _token; ctx меняется на
     месте. Элементы стека: ["text", позиция открытия] — дети элемента, ["tag", позиция] — открывающий тег,
     ["close"] — закрывающий тег, ["code", глубина] — код в фигурных скобках.
 
     sfc — разметка однофайлового компонента Vue или Svelte (как их компиляторы): корень стека — текст всего файла
-    (позиция None), вложенность элементов не ведётся (пустые элементы HTML «<br>» без закрытия); «<!-- -->» —
-    комментарий; код — «{{…}}» Vue и «{…}» Svelte (в Svelte и в теге), «{/if}», «{:else}» Svelte — не код; в теге
-    «//» и «/*» — текст."""
+    (позиция None), тег открывает «<» и буква ASCII (_html_tag), вложенность элементов не ведётся (пустые элементы
+    HTML «<br>» без закрытия); «<!-- -->» — комментарий; код — «{{…}}» Vue и «{…}» Svelte (в Svelte и в теге, и в
+    строке атрибута — вершина ["tpl", позиция, кавычка, ""] для _template), «{/if}», «{:else}» Svelte — не код;
+    значение директивы Vue (_vue_directive) — литерал со второй частью "expr": _parse разбирает его текст как
+    JavaScript (_vue_expr); в теге «//» и «/*» — текст."""
     top = ctx[-1]
     if top[0] == "text":
         m = (_SFC_TEXT if sfc else _JSX_TEXT).search(raw, i)
@@ -736,7 +952,7 @@ def _markup(raw, i, ctx, n, banned, sfc=None):
         elif raw.startswith("</", i):
             ctx.append(["close"])
             return "skip", i + 2
-        elif (n, i) not in banned and _jsx_opens(raw, i):
+        elif (n, i) not in banned and (_html_tag(raw, i) if sfc else _jsx_opens(raw, i)):
             ctx.append(["tag", (n, i)])
         return "skip", i + 1
     m = (_SFC_TAG[sfc] if sfc else _JSX_TAG).search(raw, i)
@@ -748,7 +964,13 @@ def _markup(raw, i, ctx, n, banned, sfc=None):
         ctx.append(["code", 0])
         return "skip", i + 1
     if c in "\"'":
-        # Строка атрибута — без escape и может занимать несколько строк.
+        # Строка атрибута — без escape, до первой такой же кавычки, и может занимать несколько строк. Svelte читает код
+        # «{…}» и в ней; значение директивы Vue — выражение JavaScript.
+        if sfc == "svelte" and (n, i) not in banned:
+            ctx.append(["tpl", (n, i), c, ""])
+            return "skip", i + 1
+        if sfc == "vue" and _vue_directive(raw, i):
+            return "open", c, None, False, i, i + 1, None, None, "expr", False
         return "open", c, None, False, i, i + 1
     if c == "/":
         if raw.startswith("//", i) and not sfc:
@@ -774,6 +996,8 @@ def _markup(raw, i, ctx, n, banned, sfc=None):
 # «/…${…}/». Ключ — (кавычка, знак подстановки); в тексте — escape, закрывающая кавычка, открытие подстановки.
 _TEMPLATE = {(q, d): re.compile("[" + re.escape(q) + r"\\]|" + re.escape(d) + r"\{")
              for q, d in (("`", "$"), ('"', "#"), ("`", "#"), ("/", "$"))}
+# Строка атрибута Svelte в кавычках: текст без escape с кодом «{…}».
+_TEMPLATE.update({(q, ""): re.compile(re.escape(q) + r"|\{") for q in "\"'"})
 
 
 def _template(raw, i, ctx):
@@ -792,16 +1016,113 @@ def _template(raw, i, ctx):
         ctx.pop()
         return "skip", i + 1
     ctx.append(["code", 0])
-    return "skip", i + 2
+    return "skip", i + 1 + len(top[3])
+
+
+# Открытие блока PHP: «<?php» перед пробелом или концом строки, «<?=», короткое «<?» (не «<?xml»).
+_PHP_OPEN = r"<\?(?:php(?=\s|$)|=|(?!xml))"
+_PHP_HTML = re.compile(_PHP_OPEN + r"|<!--|<(script|style)(?![\w-])", re.I)
+_PHP_STAG = re.compile(_PHP_OPEN + r"|[\"'>]", re.I)
+_PHP_RAW = {kind: re.compile(_PHP_OPEN + "|</" + kind + r"(?=[\s/>]|$)", re.I) for kind in ("script", "style")}
+# Тип «<script>» с JavaScript; прочий («text/html», «text/template») — данные.
+_SCRIPT_TYPE = re.compile(r"""(?<![\w:-])type\s*=\s*["']?([^"'\s>]*)""", re.I)
+_JS_TYPES = frozenset(("", "module", "text/javascript", "application/javascript", "application/x-javascript",
+                       "text/ecmascript", "application/ecmascript"))
+
+
+def _php_html(raw, i, ctx, n, out, deadline):
+    """Разбор HTML файла PHP с позиции i: вершина ctx — ["html"] — текст, ["stag", тег, [куски атрибутов]] —
+    открывающий тег «<script» или «<style» до «>», ["raw", тег, синтаксис или None, первая строка, {номер: [куски
+    текста]}] — их содержимое до «</script», «</style». Действие — как у _token; ctx меняется на месте. Открытие
+    блока PHP (_PHP_OPEN) кладёт ["php"] — код PHP до «?>» (_code); «<!-- -->» — комментарий. Содержимое «<script>»
+    и «<style>», где блок PHP заменён именем «_», разбирается по своему синтаксису (_php_raw_done), как блоки _sfc."""
+    top = ctx[-1]
+    if top[0] == "html":
+        m = _PHP_HTML.search(raw, i)
+        if m is None:
+            return "skip", len(raw)
+        if m.group() == "<!--":
+            return "open", "-->", None, True, m.start(), m.end()
+        ctx.append(["stag", m.group(1).lower(), []] if m.group(1) else ["php"])
+        return "skip", m.end()
+    if top[0] == "stag":
+        m = _PHP_STAG.search(raw, i)
+        if m is None:
+            top[2].append(raw[i:])
+            return "skip", len(raw)
+        k = m.start()
+        top[2].append(raw[i:k])
+        if raw[k] in "\"'":
+            # Значение атрибута — до такой же кавычки в строке, «>» и «<?» в нём не считаются.
+            j = raw.find(raw[k], k + 1)
+            j = len(raw) if j < 0 else j + 1
+            top[2].append(raw[k:j])
+            return "skip", j
+        if raw[k] == ">":
+            kind = top[1]
+            ext = "css"
+            if kind == "script":
+                t = _SCRIPT_TYPE.search("".join(top[2]))
+                ext = "mjs" if (t.group(1).lower() if t else "") in _JS_TYPES else None
+            ctx[-1] = ["raw", kind, ext, n, {}]
+            return "skip", k + 1
+        ctx.append(["php"])
+        return "skip", m.end()
+    body = top[4]
+    m = _PHP_RAW[top[1]].search(raw, i)
+    body.setdefault(n, []).append(raw[i:len(raw) if m is None else m.start()])
+    if m is None:
+        return "skip", len(raw)
+    if m.group().startswith("<?"):
+        # Блок PHP выводит значение: для разбора JS и CSS он — имя (_php_raw_done), а не пустое место: «/<?= $p ?>/g»
+        # — не «//g».
+        body[n].append(None)
+        ctx.append(["php"])
+        return "skip", m.end()
+    ctx.pop()
+    out.extend(_php_raw_done(top, n, deadline))
+    return "skip", m.start() + 2
+
+
+def _php_raw_done(top, last, deadline):
+    """Комментарии содержимого «<script>» или «<style>» файла PHP — кадра top (_php_html) — до строки last: строки
+    без блоков PHP, разбор — по синтаксису кадра, где на месте блока (None в кусках) стоит имя «_». Текст
+    комментария — тот же хвост строки без имени; хвост из одних блоков PHP — не комментарий."""
+    _, _, ext, first, body = top
+    if ext is None:
+        return []
+    lines = [body.get(k, ()) for k in range(first, last + 1)]
+    text = "\n".join("".join(p if p is not None else "_" for p in pieces) for pieces in lines)
+    out = []
+    for k, c in _comments(text, ext, deadline):
+        # c — хвост строки разбора без пробелов по краям: его начало, сдвинутое на имена до него, — начало хвоста
+        # в строке без имён.
+        pieces = lines[k - 1]
+        start = len("".join(p if p is not None else "_" for p in pieces).rstrip()) - len(c)
+        plain, pos = [], 0
+        for p in pieces:
+            if p is None:
+                pos += 1
+                continue
+            plain.append(p[max(0, start - pos):])
+            pos += len(p)
+        tail = "".join(plain).strip()
+        if tail:
+            out.append((first + k - 1, tail))
+    return out
 
 
 def _code(syn, raw, i, ctx, pending, unclosed, n, banned, fresh, names, known):
-    """Действие в коде: вне разметки и строк с подстановками или в фигурных скобках внутри них (вершина ctx —
-    ["code", глубина]). «`» в JS, «"» и «`» в Ruby, «/» в начале выражения Groovy (_groovy_slashy_ok) открывают
-    строку с подстановками, «<» в начале выражения — тег JSX («<<» — сдвиг); прочее — _token. known — как у
-    _expr_start."""
+    """Действие в коде: вне разметки и строк с подстановками, в фигурных скобках внутри них (вершина ctx —
+    ["code", глубина]) или в блоке PHP (вершина ["php"]: «?>» снимает её). «`» в JS, «"» и «`» в Ruby, «/» в начале
+    выражения Groovy (_groovy_slashy_ok) открывают строку с подстановками, «<» в начале выражения — тег JSX («<<» —
+    сдвиг); прочее — _token. known — как у _expr_start."""
     c = raw[i]
-    if ctx and c in "{}":
+    if syn.php and raw.startswith("?>", i) and ctx and ctx[-1][0] == "php":
+        # Конец блока PHP: дальше HTML.
+        ctx.pop()
+        return "skip", i + 2
+    if ctx and ctx[-1][0] == "code" and c in "{}":
         if c == "{":
             ctx[-1][1] += 1
         elif ctx[-1][1]:
@@ -953,8 +1274,10 @@ def _quote_parts(raw, k, two, n, banned, where, regex=False):
 def _line_rest_empty(raw, j):
     """Пусты ли строка с j или в ней за пробелами только комментарий «#»: вторая часть оператора s, tr, y Perl в
     скобках тогда — на следующих строках (perlop: между частями — пробелы и комментарии)."""
-    rest = raw[j:].lstrip()
-    return not rest or rest[0] == "#"
+    return _REST_EMPTY.match(raw, j) is not None
+
+
+_REST_EMPTY = re.compile(r"\s*(?:#|\Z)")
 
 
 def _second_part(raw, j, n, banned, where):
@@ -1085,6 +1408,7 @@ def _token(syn, raw, i, pending, unclosed, n=0, banned=frozenset(), fresh=True, 
         return None
     for opening, closing, multiline, esc in syn.strings:
         if raw.startswith(opening, i):
+            esc = _interp_at(syn, raw, i, opening) or esc
             # Однострочный литерал, не закрытый от кавычки, не закрывается и от следующих таких же кавычек строки:
             # каждая из них экранирована, и хвост строки не просматривается заново. Исключение — пустой литерал из пары
             # «''» при escape "double", комментария в нём нет.
@@ -1230,9 +1554,10 @@ _DEADLINE_EVERY = 1000
 # Разборов файла не больше стольких; каждый следующий отбрасывает хотя бы одно незакрытое к концу файла открытие:
 # heredoc, тег JSX, строку с подстановками, многострочный литерал.
 _MAX_REPARSE = 8
-# Вложенность вторых частей s{…}{…}e Perl, разбираемых как код: каждая строка разбирается не больше
-# _MAX_CODE_DEPTH + 1 раз.
-_MAX_CODE_DEPTH = 4
+# Повторный разбор вторых частей s{…}{…}e Perl как кода: всех вместе — не больше _CODE_BUDGET знаков на знак файла
+# (разбор линеен при любой вложенности), вложенность — не глубже _MAX_CODE_DEPTH (предел рекурсии Python).
+_CODE_BUDGET = 4
+_MAX_CODE_DEPTH = 64
 
 
 # Блоки однофайлового компонента: комментарий разметки и открывающие теги «<script>», «<style>»; атрибуты тега — до
@@ -1301,7 +1626,7 @@ def _statement_end(raw, j):
 
 def _comments(text, ext, deadline=None):
     """[(номер строки с 1, строка комментария)]; номер считается по «\\n», как в git diff. TimeoutError, если
-    срок deadline (time.monotonic) прошёл до конца разбора. Heredoc Ruby, Perl и Terraform без терминатора
+    срок deadline (time.monotonic) прошёл до конца разбора. Heredoc Ruby, Perl, PHP и Terraform без терминатора
     до конца файла — не heredoc: разбор повторяется без него, и тело читается как код. Так же тег JSX без
     закрытия до конца файла — не тег, а строка с подстановками и многострочный литерал (строка, оператор-кавычка
     Perl, литерал «%» Ruby, сигил Elixir) — однострочные: разбор повторяется без всех незакрытых открытий."""
@@ -1325,11 +1650,14 @@ def _reparse(text, syn, deadline):
     return out
 
 
-def _parse(text, syn, deadline, banned, level=0):
+def _parse(text, syn, deadline, banned, level=0, budget=None):
     """(комментарии, открытия без закрытия к концу файла: heredoc, теги JSX, строки с подстановками, многострочные
-    литералы); banned — позиции открытий, не открывающихся. level — вложенность text во вторые части s{…}{…}e Perl:
-    глубже _MAX_CODE_DEPTH они не разбираются, и разбор остаётся линейным."""
+    литералы); banned — позиции открытий, не открывающихся. level — вложенность text во вторые части s{…}{…}e Perl,
+    budget — [остаток знаков их повторного разбора] на весь файл, _CODE_BUDGET·len(text) у внешнего разбора: часть
+    длиннее остатка и глубже _MAX_CODE_DEPTH не разбирается кодом, и разбор остаётся линейным."""
     out = []
+    if budget is None:
+        budget = [_CODE_BUDGET * len(text)]
     # Открытый многострочный блок или литерал: (закрытие, escape, идут ли его строки в вывод, открытие
     # вложенного блока или None, глубина вложенности, позиция открытия литерала для отката или None, где вторая
     # часть оператора Perl s, tr, y — _quote_parts — или None, регулярное выражение ли с комментариями /x). Вторая
@@ -1339,8 +1667,8 @@ def _parse(text, syn, deadline, banned, level=0):
     pending = []
     # Конец открытого блока из целых строк (line_block) или None.
     line_block = None
-    # Стек разметки JSX (_markup) и строк с подстановками (_template); пуст — код вне них.
-    ctx = [["text", None]] if syn.sfc else []
+    # Стек разметки JSX (_markup), строк с подстановками (_template) и HTML файла PHP (_php_html); пуст — код вне них.
+    ctx = [["text", None]] if syn.sfc else [["html"]] if syn.php else []
     # Открытый блочный скаляр YAML: (отступ родителя, его строки [(номер, строка)] у скрипта или None у данных,
     # синтаксис скрипта — _yaml_script_ext) или None; стек ключей открытых отображений YAML, значения их ключей
     # uses, входы «script» шагов без uses и решённые из них (_yaml_key).
@@ -1453,7 +1781,7 @@ def _parse(text, syn, deadline, banned, level=0):
                     m = _XRE_COMMENT.search(raw, i, j - len(state[0]) if j >= 0 else len(raw))
                     if m:
                         start, xre_here = m.start(), True
-                if state[6] == "code":
+                if state[6] in ("code", "expr"):
                     body.append((n, raw[i:j - len(state[0]) if j >= 0 else len(raw)]))
                 if j < 0:
                     state = state[:4] + (depth,) + state[5:] if state[3] else state
@@ -1481,10 +1809,12 @@ def _parse(text, syn, deadline, banned, level=0):
                     if slashy and len(ctx) < depth:
                         # Закрытая slashy-строка — значение, хотя кончается знаком «/».
                         known[act[1]] = False
-                elif top and top != "code":
+                elif top in ("html", "stag", "raw"):
+                    act = _php_html(raw, i, ctx, n, out, deadline)
+                elif top not in (None, "code", "php"):
                     act = _markup(raw, i, ctx, n, banned, syn.sfc)
                 else:
-                    m = (syn.code_starts if ctx else syn.starts).search(raw, i)
+                    m = (syn.code_starts if top == "code" else syn.starts).search(raw, i)
                     if m is None:
                         break
                     i = m.start()
@@ -1504,9 +1834,14 @@ def _parse(text, syn, deadline, banned, level=0):
                     flags = _FLAGS.match(raw, j).group()
                 elif act is not None and act[0] == "skip":
                     flags = raw[_back(raw, act[1], str.isalpha):act[1]]
+                if then == "expr":
+                    out.extend(_vue_expr(body, deadline))
+                    body = None
                 if then == "code":
-                    if "e" in flags and level < _MAX_CODE_DEPTH:
-                        found = _parse("\n".join(t for _, t in body), syn, deadline, frozenset(), level + 1)[0]
+                    code = "\n".join(t for _, t in body)
+                    if "e" in flags and level < _MAX_CODE_DEPTH and budget[0] >= len(code):
+                        budget[0] -= len(code)
+                        found = _parse(code, syn, deadline, frozenset(), level + 1, budget)[0]
                         out.extend((body[k - 1][0], c) for k, c in found)
                     body = None
                 if xre is not None and (flags is not None or act is None):
@@ -1525,7 +1860,11 @@ def _parse(text, syn, deadline, banned, level=0):
                 cut = act[1] if len(act) > 1 else i
                 if start is None:
                     start = cut
-                break
+                k = raw.find("?>", cut) if syn.php and ctx[-1][0] == "php" else -1
+                if k < 0:
+                    break
+                # «?>» кончает строчный комментарий PHP: вывод — хвост строки, разбор идёт дальше в HTML.
+                cut, i = len(raw), k
             elif act[0] == "skip":
                 i = act[1]
             elif act[0] == "await":
@@ -1540,7 +1879,7 @@ def _parse(text, syn, deadline, banned, level=0):
                 state, i = (closing, esc, emit, rest[0], 1, *rest[1:]), end
                 if rest[3]:
                     xre = []
-                if rest[2] == "code":
+                if rest[2] in ("code", "expr"):
                     body = []
         if start is not None and raw[start:].strip():
             out.append((n, raw[start:].strip()))
@@ -1577,10 +1916,28 @@ def _parse(text, syn, deadline, banned, level=0):
             for part in lines:
                 out.extend(_yaml_script(part, "sh", deadline))
         out.sort(key=lambda e: e[0])
+    if syn.php:
+        # «<script>» и «<style>» без закрытия — до конца файла; вывод содержимого и строк PHP — по номерам строк.
+        for e in ctx:
+            if e[0] == "raw":
+                out.extend(_php_raw_done(e, n, deadline))
+        out.sort(key=lambda e: e[0])
     open_ = [(None, "ctx", e[1]) for e in ctx if e[0] in ("tag", "text", "tpl") and e[1] is not None]
     if state and state[5] and state[6] != "await":
         open_.append((None, "literal", state[5]))
     return out, pending + open_
+
+
+def _vue_expr(body, deadline):
+    """Комментарии значения директивы Vue: строки body [(номер, текст)], разбор — модуль JavaScript. Сущности HTML
+    раскрыты, как у компилятора Vue; строка, где раскрытие дало бы перевод строки («&#10;»), — без раскрытия, чтобы
+    номера строк не сдвинулись."""
+    lines = []
+    for _, t in body:
+        u = html.unescape(t)
+        lines.append(t if "\n" in u or "\r" in u else u)
+    found = _parse("\n".join(lines), _SYNTAX["mjs"], deadline, frozenset())[0]
+    return [(body[k - 1][0], c) for k, c in found]
 
 
 def _ext(relpath):

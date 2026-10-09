@@ -1,0 +1,24 @@
+{
+    "//": "источник: формы getcomposer.org/doc/05-repositories.md, «Package» (пакет в манифесте: dist zip и source svn)",
+    "repositories": [
+        {
+            "type": "package",
+            "package": {
+                "name": "smarty/smarty",
+                "version": "3.1.7",
+                "dist": {
+                    "url": "https://www.smarty.net/files/Smarty-3.1.7.zip",
+                    "type": "zip"
+                },
+                "source": {
+                    "url": "http://smarty-php.googlecode.com/svn/",
+                    "type": "svn",
+                    "reference": "tags/Smarty_3_1_7/distribution/"
+                }
+            }
+        }
+    ],
+    "require": {
+        "smarty/smarty": "3.1.*"
+    }
+}

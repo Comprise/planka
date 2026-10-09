@@ -36,8 +36,11 @@ def main():
             common.warn("PostModelSwitch без to_model, модель сессии не обновлена")
         return
     session_id = data.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        # Без id сессии записи не найти: common.stored_session_model её не читает.
+        return
     try:
-        store(session_id if isinstance(session_id, str) else "", model)
+        store(session_id, model)
     except OSError as e:
         common.warn(f"модель сессии не записана: {e}")
 

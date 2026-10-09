@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -771,6 +772,23 @@ class ManagedSettingsTest(unittest.TestCase):
             self.addCleanup(p.stop)
         self.addCleanup(self.tmp.cleanup)
 
+    def test_settings_fifo_not_opened(self):
+        # Открытие FIFO повесило бы хук: читает поток, чтобы тест падал, а не висел.
+        (self.project / ".claude").mkdir()
+        os.mkfifo(self.project / ".claude" / "settings.local.json")
+        result = []
+        reader = threading.Thread(target=lambda: result.append(
+            guard_memory._auto_memory_overrides(str(self.root / "cfg"), str(self.project))), daemon=True)
+        reader.start()
+        reader.join(2)
+        hung = reader.is_alive()
+        if hung:
+            # Отпустить читателя, чтобы поток не остался висеть.
+            os.close(os.open(self.project / ".claude" / "settings.local.json", os.O_WRONLY))
+            reader.join(2)
+        self.assertFalse(hung, "_auto_memory_overrides повис на FIFO")
+        self.assertEqual(result, [[]])
+
     def test_managed_file_and_drop_in(self):
         for name in ("managed-settings.json", "managed-settings.d/10-mem.json"):
             custom = self.root / f"mem-{name.replace('/', '-')}"
@@ -878,6 +896,14 @@ class ImportParseTest(unittest.TestCase):
         "**@bold.md**": {"/m/bold.md**", "/m/bold.md"},
         "```md\n@fenced.md\n```\n@after.md": {"/m/after.md"},
         "~~~\n@open.md": set(),
+        # Строка из серии кавычек и текста с кавычкой в остатке — код в строке (marked), не ограждение блока.
+        "```npm test```\n@notes/team.md": {"/m/notes/team.md"},
+        "Run ```npm test``` first.\n@a.md": {"/m/a.md"},
+        "```js `x`\n@a.md": {"/m/a.md"},
+        "```js\n@fenced.md\n```\n@after.md": {"/m/after.md"},
+        # «<!-->» и «<!--->» — закрытые комментарии (marked): импорт за ними разбирается.
+        "<!--> @a.md": {"/m/a.md"},
+        "<!---> @a.md": {"/m/a.md"},
         "<!-- @hidden.md -->\n@shown.md": {"/m/shown.md"},
     }
 
@@ -892,7 +918,9 @@ class ImportParseTest(unittest.TestCase):
         cases = {
             "<!-- open @a.md": "<!-- open @a.md",
             "<!-- x --> @a.md <!-- y": "  @a.md <!-- y",
-            "<!--->@a.md-->": " ",
+            # «<!-->» и «<!--->» закрыты сразу (marked: `<!--(?:-?>|…)`), «-->» после них — текст.
+            "<!-->@a.md": " @a.md",
+            "<!--->@a.md-->": " @a.md-->",
             "``code ` inside`` @a.md": "  @a.md",
             "` one `` two @a.md": "` one `` two @a.md",
             "t ```` x `` y ` z ```` `a` ``": "t     ``",
@@ -983,9 +1011,9 @@ class ImportParseTest(unittest.TestCase):
         # Каталог находится и по имени с обращённым регистром — тот же файл: файловая система без учёта регистра.
         # Linux различает регистр, такую систему подменяет ссылка.
         (self.root / "Data").mkdir()
-        self.assertFalse(guard_memory._case_insensitive(str(self.root / "Data" / "new" / "x.md")))
+        self.assertFalse(common.case_insensitive(str(self.root / "Data" / "new" / "x.md")))
         (self.root / "dATA").symlink_to(self.root / "Data")
-        self.assertTrue(guard_memory._case_insensitive(str(self.root / "Data" / "new" / "x.md")))
+        self.assertTrue(common.case_insensitive(str(self.root / "Data" / "new" / "x.md")))
 
 
 class ManagedDirTest(unittest.TestCase):

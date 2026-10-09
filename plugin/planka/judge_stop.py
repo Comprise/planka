@@ -10,7 +10,7 @@ import common
 import prompts
 import snapshot
 
-_LIST_ITEM = re.compile(r"^[ \t]*(?:[-*•]|\d+[.)])\s+\S", re.MULTILINE)
+_LIST_ITEM = re.compile(r"^[ \t]*(?:[-*•]|\d+[.)])[ \t]+\S", re.MULTILINE)
 # Целые слова: «подходит», «способный», «выборка», optional, adoption и тип Option<T> не совпадают.
 _KEYWORDS = re.compile(r"\b(?:рекоменд\w*|вариант\w*|подход(?:а|е|у|ы|ом|ов|ам|ами|ах)?|"
                        r"способ(?:а|е|у|ы|ом|ов|ам|ами|ах)?|выбор(?:а|е|у|ом)?|предлага\w*|совету\w*|"
@@ -24,7 +24,7 @@ def looks_like_options(text):
 
 # «готов» — только перед знаком препинания или концом строки: «Фикс готов.», но не «готов обсудить»;
 # «работает» — только после «всё», «все», «теперь», «снова», «уже»: не «как работает parse».
-_DONE = re.compile(r"\b(?:готов[оаы]|готов(?=[ \t]*(?:[.!?,;:)\n]|\Z))|сделан[оаы]?|исправлен[оаы]?|"
+_DONE = re.compile(r"\b(?:готов[оаы]|готов(?=[ \t]*(?:[.!?,;:)\r\n]|\Z))|сделан[оаы]?|исправлен[оаы]?|"
                    r"починен[оаы]?|выполнен[оаы]?|заверш[её]н[оаы]?|проход[яи]т|прош[её]л|прошли|зел[её]н\w*|"
                    r"(?:ис|по)правил[аи]?|починил[аи]?|сделал[аи]?|доделал[аи]?|реализовал[аи]?|добавил[аи]?|"
                    r"закончил[аи]?|завершил[аи]?|(?:вс[её]|теперь|снова|уже)[ \t]+работа[ею]т|"
@@ -78,7 +78,7 @@ def changed_this_turn(data):
 
 
 def docs_check(data):
-    """Аргументы prompts.render_docs_content после сообщения: (изменённые файлы, строки комментариев, обрезано ли,
+    """Аргументы prompts.render_docs_content: (изменённые файлы, строки комментариев, обрезано ли,
     нет ли CLAUDE.md в корне, файлы без известного синтаксиса, файлы, не разобранные к сроку), если со снимка
     текущей реплики изменился файл кода; иначе None. Ошибка — None с предупреждением."""
     try:
@@ -170,13 +170,12 @@ def judge(data, blocked=None):
         common.log_event("stop", session, verdict="skipped", error="нет раздела рубрики", **meta)
         return False
     transcript = common.read_transcript(data.get("transcript_path"))
-    content = prompts.turn_content(turn_messages(data, transcript, message))
-    if docs:
-        content = prompts.render_docs_content(content, *docs_info)
+    appendix = prompts.render_docs_content(*docs_info) if docs else ""
+    content, tag = prompts.turn_content(turn_messages(data, transcript, message), appendix)
     started = time.monotonic()
     verdict = common.run_judge(prompts.SYSTEM_PROMPT,
                                prompts.stop_prompt(rubric, content, options=options, done=done, docs=docs,
-                                                   label=prompts.TURN_LABEL,
+                                                   label=prompts.turn_label(tag, docs=docs),
                                                    author=prompts.author_context(transcript.author_turn,
                                                                                  transcript.author_answers,
                                                                                  transcript.earlier_turns)),

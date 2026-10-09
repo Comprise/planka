@@ -1,0 +1,10 @@
+# источник: формы документации uv, «Settings» (override-dependencies, constraint-dependencies) и «Resolution» (замена версии и URL)
+[project]
+name = "project"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["werkzeug", "pydantic"]
+
+[tool.uv]
+override-dependencies = ["werkzeug==2.3.0", "pydantic-core @ https://example.com/wheels/pydantic_core-2.18.4-cp312-none-any.whl"]
+constraint-dependencies = ["grpcio<1.65", "anyio @ git+https://github.com/agronholm/anyio@4.4.0"]

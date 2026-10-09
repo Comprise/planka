@@ -7,11 +7,14 @@
 того же реестра в проекте и в HEAD, из файла _LEGACY в HEAD, имя пакета самого проекта — манифеста в HEAD или
 члена workspace корня (монорепозиторий) — и, после команды, имя из манифестов ref, откуда команда git возвращает
 файлы (stash, ветка, коммит), если ref создан до начала сессии, и из изменённых строк манифестов в файле патча
-`git apply`, не менявшемся с начала сессии.
+`git apply`, не менявшемся с начала сессии. Подключение файла (manifests.Include) — путь цели от корня проекта
+(_rooted) в каждом источнике имён; не новое имя, если файл — манифест из перечня проекта, который проверяется сам
+(_unchecked).
 """
 import ast
 import configparser
 import os
+import pathlib
 import re
 import stat
 import subprocess
@@ -53,12 +56,13 @@ def has_marker(command):
     return any(depcheck._command(segment)[1] for segment in depcheck._segments(command))
 
 
-def watched_kind(path):
-    """Вид манифеста manifests.kind по пути; None — не манифест или в каталоге FOREIGN_DIRS."""
+def watched_kind(path, fold=False):
+    """Вид манифеста manifests.kind по пути (fold — без учёта регистра имени); None — не манифест или в каталоге
+    FOREIGN_DIRS."""
     parts = re.split(r"[\\/]", path)
     if FOREIGN_DIRS.intersection(parts[:-1]):
         return None
-    return manifests.kind(path)
+    return manifests.kind(path, fold)
 
 
 def _relative(path, root):
@@ -69,21 +73,137 @@ def _relative(path, root):
     return path if rel == os.pardir or rel.startswith(os.pardir + os.sep) else rel
 
 
-def edit_target(path, root):
-    """(путь, вид) манифеста, который правит файловый инструмент по пути path; None — не манифест. Вид —
-    watched_kind пути от корня проекта root() (None — путь как есть) и пути с разрешёнными символическими ссылками
-    от root() с разрешёнными ссылками: манифест хоть по одному из них — манифест. Путь — разрешённый, если манифест
-    он: ссылка `deps.json -> package.json` и каталог-ссылка `build -> .` правят манифест проекта. root зовётся,
-    только если имя файла по одному из путей — манифест (manifests.kind)."""
+def listing(root):
+    """Перечень манифестов проекта для жёстких ссылок и подключений: функция () → (корень root(), [путь от корня])
+    или None — проект неизвестен. list_manifests зовётся при первом вызове в срок HEAD_TIMEOUT и один раз за хук:
+    результат и ошибка (Unavailable, TimeoutError) запоминаются."""
+    memo = []
+
+    def listed():
+        if not memo:
+            try:
+                base = root()
+                memo.append((None if base is None else (base, list_manifests(base, time.monotonic() + HEAD_TIMEOUT)[1]),
+                             None))
+            except (Unavailable, TimeoutError) as e:
+                memo.append((None, e))
+        result, error = memo[0]
+        if error is not None:
+            raise error
+        return result
+    return listed
+
+
+def edit_targets(path, root, listed=None):
+    """([(путь, вид)] манифестов, которые правит файловый инструмент по пути path, причина или None), причина —
+    почему жёсткая ссылка не сверена с манифестами проекта.
+
+    Манифест по имени: вид — watched_kind пути от корня проекта root() (None — путь как есть) и пути с разрешёнными
+    символическими ссылками от root() с разрешёнными ссылками: манифест хоть по одному из них — манифест. Путь —
+    разрешённый, если манифест он: ссылка `deps.json -> package.json` и каталог-ссылка `build -> .` правят манифест
+    проекта. На файловой системе без учёта регистра (common.case_insensitive) пути и корень — с компонентами,
+    приведёнными к записям каталогов (_on_disk): `REQUIREMENTS/BASE.TXT` — манифест requirements/base.txt.
+    Файл с несколькими жёсткими ссылками — ещё все манифесты проекта с тем же файлом, каждый по своему виду, каким бы
+    ни было имя path и его каталог (_linked_targets; listed — перечень listing(root), None — свой). root зовётся,
+    только если путь без учёта регистра похож на манифест или у файла больше одной жёсткой ссылки."""
     real = os.path.realpath(path)
-    if manifests.kind(path) is None and manifests.kind(real) is None:
-        return None
+    # Приведение к записям каталогов меняет только регистр: манифестом станет лишь путь, который манифест в нижнем
+    # регистре; остальным пути проба регистра и обход каталогов не нужны.
+    if not any(manifests.kind(p.lower(), fold=True) for p in (path, real)):
+        named = None
+    elif common.case_insensitive(real):
+        named = _named_target(path, real, root, cased=True)
+    elif manifests.kind(path) is None and manifests.kind(real) is None:
+        named = None
+    else:
+        named = _named_target(path, real, root)
+    targets = [] if named is None else [named]
+    try:
+        linked = _linked_targets(real, listed or listing(root))
+    except Unavailable as e:
+        return targets, str(e)
+    seen = {(os.path.realpath(p), k) for p, k in targets}
+    targets += [(p, k) for p, k in linked if (os.path.realpath(p), k) not in seen]
+    return targets, None
+
+
+def _named_target(path, real, root, cased=False):
+    """(путь, вид) манифеста по имени path или real (manifests.kind) вне каталогов FOREIGN_DIRS; None — нет.
+
+    cased — файловая система без учёта регистра: пути и корень — _on_disk, вид — без учёта регистра базового имени
+    (fold): нового файла `PACKAGE.JSON` ещё нет в каталоге, а npm прочтёт его как package.json."""
     root = root()
-    kind = watched_kind(_relative(real, None if root is None else os.path.realpath(root)))
+    real_root = None if root is None else os.path.realpath(root)
+    if cased:
+        path, real = _on_disk(path), _on_disk(real)
+        root, real_root = (None, None) if root is None else (_on_disk(root), _on_disk(real_root))
+    kind = watched_kind(_relative(real, real_root), fold=cased)
     if kind is not None:
         return real, kind
-    kind = watched_kind(_relative(path, root))
+    kind = watched_kind(_relative(path, root), fold=cased)
     return None if kind is None else (path, kind)
+
+
+def _on_disk(path):
+    """Абсолютный path с компонентами, приведёнными к записям каталогов, для файловой системы без учёта регистра:
+    имя в другом регистре там находит ту же запись, а realpath регистр не правит. Компонент — запись своего каталога
+    с тем же именем без учёта регистра и тем же файлом (os.path.samefile), другая, чем написано, если такая есть;
+    компонента нет на диске (новый файл, нет доступа) — он и остальные как написаны."""
+    parts = pathlib.PurePath(os.path.abspath(path)).parts
+    current = parts[0]
+    for i, name in enumerate(parts[1:], 1):
+        try:
+            entries = sorted(os.listdir(current))
+        except (OSError, ValueError):
+            return os.path.join(current, *parts[i:])
+        written = os.path.join(current, name)
+        found = None
+        for entry in entries:
+            if entry.casefold() != name.casefold():
+                continue
+            try:
+                if os.path.samefile(os.path.join(current, entry), written):
+                    found = entry
+            except (OSError, ValueError):
+                continue
+            if found is not None and found != name:
+                break
+        if found is None:
+            return os.path.join(current, *parts[i:])
+        current = os.path.join(current, found)
+    return current
+
+
+def _linked_targets(real, listed):
+    """[(путь, вид)] манифестов проекта из перечня listed() (listing), которые — тот же файл, что real (совпали st_dev
+    и st_ino), если у real больше одной жёсткой ссылки; каждый — по своему виду (watched_kind). Пусто — нет файла, не
+    обычный файл, ссылка одна или проект неизвестен; в первых трёх случаях перечень не нужен. Unavailable —
+    манифесты проекта не перечислены (срок HEAD_TIMEOUT или предел list_manifests)."""
+    try:
+        st = os.stat(real)
+    except (OSError, ValueError):
+        return []
+    if st.st_nlink < 2 or not stat.S_ISREG(st.st_mode):
+        return []
+    try:
+        found = listed()
+    except TimeoutError:
+        raise Unavailable("жёсткая ссылка не сверена с манифестами проекта: не уложился в срок") from None
+    except Unavailable as e:
+        raise Unavailable(f"жёсткая ссылка не сверена с манифестами проекта: {e}") from None
+    if found is None:
+        return []
+    root, rels = found
+    out = []
+    for rel in rels:
+        path = os.path.join(root, rel)
+        try:
+            other = os.stat(path)
+        except (OSError, ValueError):
+            continue
+        if (other.st_dev, other.st_ino) == (st.st_dev, st.st_ino):
+            out.append((path, watched_kind(rel)))
+    return out
 
 
 # Файлы зависимостей PyPI, которые не проверяются как манифест: их имена только известные — перенос в
@@ -342,18 +462,16 @@ def head_names(path, kind, timeout, root=None):
 
 
 def fresh_names(old, new, head, project=frozenset):
-    """Отсортированные новые имена: из new (объявленные, manifests.names) нет в old, в версии HEAD и в
+    """Отсортированные новые имена: из new (объявленные, manifests.names) нет в old, в версиях git (head()) и в
     проекте. old и head() — имена с транзитивными (manifests.known_names), old None — не разобран, head()
     None — версии нет; project() — имена других манифестов того же реестра и пакетов самого проекта, зовётся,
-    только если после old и HEAD что-то осталось. Unavailable — сравнить не с чем: old не разобран и версии
-    в HEAD нет."""
+    только если после old и версий git что-то осталось. old не разобран и версии нет — сравнение с пустым: новы
+    все имена new, кроме имён проекта."""
     added = None if old is None else new - old
     if added is None or added:
         base = head()
         if added is None:
-            if base is None:
-                raise Unavailable("до правки не разобран, версии в HEAD нет")
-            added = new - base
+            added = new if base is None else new - base
         elif base is not None:
             added -= base
     if added:
@@ -361,14 +479,46 @@ def fresh_names(old, new, head, project=frozenset):
     return sorted(added)
 
 
-def edit_names(kind, before, after, head, project=frozenset):
+def edit_names(kind, before, after, head, project=frozenset, rel=None):
     """Новые имена манифеста вида kind с текстом before (None — файла не было) после правки в after;
-    head и project — как у fresh_names. Unavailable — не разобран."""
+    head и project — как у fresh_names; rel — путь манифеста от корня проекта для подключений (_rooted), None —
+    подключения как записаны. Unavailable — after не разобран."""
     new = manifests.names(kind, after)
     if new is None:
         raise Unavailable("после правки не разобран")
     old = frozenset() if before is None else manifests.known_names(kind, before)
+    if rel is not None:
+        new, old = _rooted(new, rel), _rooted(old, rel)
     return fresh_names(old, new, head, project)
+
+
+# Путь подключения со схемой URL (`https:`, `git+ssh:`): не файл проекта.
+_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
+
+
+def _rooted(names, rel):
+    """names манифеста по пути rel от корня проекта (вне проекта — абсолютному), где подключение manifests.Include —
+    путь цели от корня проекта: разрешённый от каталога манифеста, как его разрешают pip и Bundler, и нормализованный
+    os.path.normpath (без разрешения ссылок); у манифеста вне корня rel абсолютный — и путь цели абсолютный, путь со
+    схемой URL — как записан. Так одинаковый текст подключения в разных каталогах — разные имена, а один файл из
+    разных каталогов — одно. None — None."""
+    if names is None:
+        return None
+    return frozenset(
+        manifests.Include(os.path.normpath(os.path.join(os.path.dirname(rel), name.path)))
+        if isinstance(name, manifests.Include) and not _SCHEME.match(name.path) else name for name in names)
+
+
+def _project_rel(path, root):
+    """path от корня проекта root: от root как написан или с разрешёнными ссылками (edit_targets отдаёт и путь с
+    разрешёнными ссылками); вне корня и при None — path как есть."""
+    if root is None:
+        return path
+    for base in (root, os.path.realpath(root)):
+        rel = _relative(path, base)
+        if rel != path:
+            return rel
+    return path
 
 
 def _glob(pattern):
@@ -435,7 +585,7 @@ def project_names(root, kind, deadline):
         if manifests.registry(other) != registry:
             continue
         known, own = _parse(os.path.join(root, rel), other)
-        out.update(known or ())
+        out.update(_rooted(known, rel) or ())
         if _member(workspace, rel):
             out.add(own)
     out.discard(None)
@@ -444,15 +594,37 @@ def project_names(root, kind, deadline):
     return frozenset(out)
 
 
-def check_edit(tool, tool_input, path, kind, project=frozenset, root=lambda: None):
-    """Новые имена правки манифеста path; project — как у fresh_names; root() — корень проекта для head_names
-    или None, зовётся только для версий git. None — правку не вычислить. Unavailable — не проверить: не
-    разобран или манифесты проекта не перечислить."""
+def check_edit(tool, tool_input, path, kind, project=frozenset, root=lambda: None, listed=None):
+    """Новые имена правки манифеста path без подключений проверяемых манифестов (_unchecked); project — как у
+    fresh_names; root() — корень проекта для head_names и перечня или None, зовётся только для версий git и
+    подключений; listed — перечень listing(root), None — свой. None — правку не вычислить. Unavailable — не
+    проверить: не разобран или манифесты проекта не перечислить; TimeoutError — перечень манифестов для подключения
+    не уложился в HEAD_TIMEOUT."""
     texts = edit_texts(tool, tool_input, path)
     if texts is None:
         return None
     before, after = texts
-    return edit_names(kind, before, after, lambda: head_names(path, kind, HEAD_TIMEOUT, root()), project)
+    rel = _project_rel(path, root())
+    names = edit_names(kind, before, after, lambda: _rooted(head_names(path, kind, HEAD_TIMEOUT, root()), rel),
+                       project, rel)
+    return _unchecked(names, listed or listing(root))
+
+
+def _unchecked(names, listed):
+    """names без подключений manifests.Include файлов, которые проверяются сами: путь без схемы URL от корня проекта
+    (_rooted), с разрешёнными ссылками, — манифест из перечня проекта listed() = (корень, [путь от корня])
+    (list_manifests) или None — проект неизвестен, подключения остаются. Файл, исключённый git, в перечень не входит
+    и не проверяется: его подключение — новое имя. listed() зовётся, только если подключение есть."""
+    if not any(isinstance(name, manifests.Include) for name in names):
+        return names
+    found = listed()
+    if found is None:
+        return names
+    base, rels = found
+    checked = {os.path.realpath(os.path.join(base, rel)) for rel in rels}
+    return [name for name in names if not (
+        isinstance(name, manifests.Include) and not _SCHEME.match(name.path)
+        and os.path.realpath(os.path.join(base, name.path)) in checked)]
 
 
 def _remaining(deadline):
@@ -483,8 +655,8 @@ def _walk(root, deadline):
 def list_manifests(root, deadline):
     """("git" или "walk", [путь манифеста от root]); манифест — путь, где watched_kind не None. В git —
     отслеживаемые и неотслеживаемые не исключённые файлы (`ls-files -co --exclude-standard`), вне git — обход;
-    в обоих режимах без каталогов FOREIGN_DIRS. Unavailable — манифестов больше MAX_MANIFESTS; TimeoutError —
-    срок."""
+    в обоих режимах без каталогов FOREIGN_DIRS. Unavailable — манифестов больше MAX_MANIFESTS или вне git файлов
+    больше MAX_WALK_FILES (_walk); TimeoutError — срок."""
     out = _git(root, _remaining(deadline), "ls-files", "-z", "-c", "-o", "--exclude-standard", root=root)
     if out is None:
         mode, found = _walk(root, deadline)
@@ -524,8 +696,8 @@ def _parse(path, kind):
 
 
 def take(root, deadline):
-    """Снимок: {"root", "mode", "ts", "files": {путь: [size, mtime_ns, ctime_ns, имена с транзитивными или None,
-    имя пакета манифеста или None]}}; поле "known" (restored_names) добавляет вызывающий. Файлы _LEGACY
+    """Снимок: {"root", "mode", "ts", "files": {путь: [size, mtime_ns, ctime_ns, имена с транзитивными (_dump_names)
+    или None, имя пакета манифеста или None]}}; поле "known" (restored_names) добавляет вызывающий. Файлы _LEGACY
     рабочего дерева в снимок не входят."""
     mode, found = list_manifests(root, deadline)
     entry = {"root": str(root), "mode": mode, "ts": time.time(), "files": {}}
@@ -536,31 +708,58 @@ def take(root, deadline):
         if st is None:
             continue
         known, own = _parse(path, watched_kind(rel))
-        entry["files"][rel] = [*st, None if known is None else sorted(known), own]
+        entry["files"][rel] = [*st, None if known is None else _dump_names(_rooted(known, rel)), own]
     return entry
 
 
-def compare(entry, deadline):
-    """({путь: новые имена}, [пути, которые не проверить]) после команды против снимка entry.
+def _dump_names(names):
+    """Отсортированные имена для состояния JSON: manifests.Include — {"include": путь}, прочие — строки как есть."""
+    return [{"include": name.path} if isinstance(name, manifests.Include) else name for name in sorted(names)]
 
-    Новый манифест сравнивается с пустым; пропавший — ничего; манифест с тем же size, mtime и ctime не
-    перечитывается. Имя из любого манифеста того же реестра
+
+def _load_names(items):
+    """Имена из состояния JSON (_dump_names)."""
+    return frozenset(manifests.Include(item["include"]) if isinstance(item, dict) else item for item in items)
+
+
+def _valid_names(items):
+    """items — список имён формы _dump_names."""
+    return isinstance(items, list) and all(
+        isinstance(item, str) or isinstance(item, dict) and list(item) == ["include"]
+        and isinstance(item["include"], str) for item in items)
+
+
+def compare(entry, deadline):
+    """({путь: новые имена}, [пути, которые не проверить], причина, почему новые манифесты не проверены, или None)
+    после команды против снимка entry.
+
+    Новый манифест и манифест, не разобранный в снимке и без версии git, сравниваются с пустым (fresh_names);
+    пропавший — ничего; манифест с тем же size, mtime и ctime не перечитывается; не разобранный после команды — в
+    списке непроверенных. Имя из любого манифеста того же реестра
     (manifests.registry) в снимке, из ref до начала сессии (entry["known"], restored_names, с именами пакетов их
     манифестов), в git — из манифестов и файлов _LEGACY версии HEAD и имена пакетов её манифестов (_tree_names,
     читается, только если после old и версий файла что-то осталось) и имя пакета члена workspace корня после
     команды (_member; в снимке или в манифесте после команды) — не новое: перенос, копия, член workspace, возврат
-    работы автора. Unavailable — снимок другого режима."""
+    работы автора. Подключение манифеста из перечня после команды — не новое имя (_unchecked).
+
+    Режим сменился за команду (`git init`) или манифестов теперь не перечислить (больше MAX_MANIFESTS, вне git
+    файлов больше MAX_WALK_FILES) — сверяются только пути снимка, третий элемент — причина: новые манифесты не
+    проверены."""
     root = entry["root"]
-    mode, found = list_manifests(root, deadline)
-    if mode != entry["mode"]:
-        raise Unavailable("за команду корень проекта " +
-                          ("стал git-репозиторием" if mode == "git" else "перестал быть git-репозиторием"))
     before = entry["files"]
+    try:
+        mode, found = list_manifests(root, deadline)
+        lost = None if mode == entry["mode"] else ("за команду корень проекта " + (
+            "стал git-репозиторием" if mode == "git" else "перестал быть git-репозиторием"))
+    except Unavailable as e:
+        mode, found, lost = entry["mode"], [], str(e)
+    if lost is not None:
+        found = list(before)
     workspace = _workspace(root)
-    project = {registry: set(names) for registry, names in entry.get("known", {}).items()}
+    project = {registry: set(_load_names(names)) for registry, names in entry.get("known", {}).items()}
     for rel, (*_, known, own) in before.items():
         names = project.setdefault(manifests.registry(watched_kind(rel)), set())
-        names.update(known or ())
+        names.update(_load_names(known or ()))
         if own is not None and _member(workspace, rel):
             names.add(own)
     changed, unknown = [], []
@@ -573,7 +772,7 @@ def compare(entry, deadline):
             continue
         kind = watched_kind(rel)
         text = _text(path)
-        new = None if text is None else manifests.names(kind, text)
+        new = None if text is None else _rooted(manifests.names(kind, text), rel)
         if new is None:
             unknown.append(rel)
             continue
@@ -592,18 +791,14 @@ def compare(entry, deadline):
         if was is None:
             old = frozenset()
         else:
-            old = None if was[3] is None else frozenset(was[3])
+            old = None if was[3] is None else _load_names(was[3])
 
-        def head(path=path, kind=kind):
-            return head_names(path, kind, _remaining(deadline), root) if mode == "git" else None
-        try:
-            names = fresh_names(old, new, head, lambda kind=kind: project_of(kind))
-        except Unavailable:
-            unknown.append(rel)
-            continue
+        def head(path=path, kind=kind, rel=rel):
+            return _rooted(head_names(path, kind, _remaining(deadline), root), rel) if mode == "git" else None
+        names = _unchecked(fresh_names(old, new, head, lambda kind=kind: project_of(kind)), lambda: (root, found))
         if names:
             added[rel] = names
-    return added, unknown
+    return added, unknown, lost
 
 
 # Флаги со значением следующим словом: глобальные git до подкоманды и подкоманд, из чьих операндов берётся ref.
@@ -745,7 +940,7 @@ def _tree_names(root, tree, deadline):
             continue
         kind = source_kind(path)
         text = obj[1].decode("utf-8", "replace")
-        names = set(_known(kind, text) or ())
+        names = set(_rooted(_known(kind, text), path) or ())
         if kind not in _LEGACY:
             names.add(manifests.own_name(kind, text))
         names.discard(None)
@@ -859,9 +1054,9 @@ def _old_patch_names(patches, start, base, deadline):
 
 
 def restored_names(root, command, start, deadline, cwd=None):
-    """{реестр: имена с транзитивными и имена пакетов} манифестов и файлов _LEGACY ref, откуда command возвращает
-    файлы (command_refs), если ref создан до start — начала сессии (session_start), и слова изменённых строк
-    манифестов в файлах патчей `git apply` (command_patches), не менявшихся с start; относительный путь патча —
+    """{реестр: имена с транзитивными и имена пакетов (_dump_names)} манифестов и файлов _LEGACY ref, откуда command
+    возвращает файлы (command_refs), если ref создан до start — начала сессии (session_start), и слова изменённых
+    строк манифестов в файлах патчей `git apply` (command_patches), не менявшихся с start; относительный путь патча —
     от cwd, без него — от root. Это работа до сессии, после команды такие имена не новые. start None, ref
     моложе или не найден, патч изменён в сессии — имена не добавляются: сравнение блокирует, как без ref.
     Unavailable — имена ref не прочитаны: срок deadline вышел, манифестов в дереве больше MAX_MANIFESTS или git
@@ -883,7 +1078,7 @@ def restored_names(root, command, start, deadline, cwd=None):
                 known.setdefault(registry, set()).update(found)
     except TimeoutError:
         raise Unavailable("имена ref команды не прочитаны за срок") from None
-    return {registry: sorted(names) for registry, names in known.items()}
+    return {registry: _dump_names(names) for registry, names in known.items()}
 
 
 def _state_path(state_dir, session):
@@ -923,10 +1118,10 @@ def pop(session, tool_use_id):
             path.unlink(missing_ok=True)
     valid = (isinstance(entry, dict) and isinstance(entry.get("root"), str) and entry.get("mode") in ("git", "walk")
              and isinstance(entry.get("files"), dict)
-             and all(isinstance(v, list) and len(v) == 5 and (v[3] is None or isinstance(v[3], list))
+             and all(isinstance(v, list) and len(v) == 5 and (v[3] is None or _valid_names(v[3]))
                      and (v[4] is None or isinstance(v[4], str)) for v in entry["files"].values())
              and isinstance(entry.get("known", {}), dict)
-             and all(isinstance(v, list) for v in entry.get("known", {}).values()))
+             and all(_valid_names(v) for v in entry.get("known", {}).values()))
     return entry if valid else None
 
 

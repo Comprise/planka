@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import zlib
@@ -71,6 +72,30 @@ class WalkCaptureTest(unittest.TestCase):
         self.assertEqual(names, {"secrets", "bin"})
         self.assertEqual(exts, {"log"})
         self.assertEqual(sorted(walk_files(self.root)), [".gitignore", "ok.txt"])
+
+    def test_gitignore_symlink_not_read(self):
+        # Git ссылку .gitignore не читает: файлы остаются в снимке.
+        self.write("other/rules", "*.py\n")
+        self.write("a.py")
+        (self.root / ".gitignore").symlink_to(self.root / "other" / "rules")
+        self.assertEqual(snapshot.ignore_rules(self.root), (set(), set()))
+        self.assertIn("a.py", walk_files(self.root))
+
+    def test_gitignore_fifo_not_read(self):
+        # Чтение FIFO повесило бы хук: читает поток, чтобы тест падал, а не висел.
+        self.write("a.py")
+        os.mkfifo(self.root / ".gitignore")
+        result = []
+        reader = threading.Thread(target=lambda: result.append(snapshot.ignore_rules(self.root)), daemon=True)
+        reader.start()
+        reader.join(2)
+        hung = reader.is_alive()
+        if hung:
+            # Отпустить читателя, чтобы поток не остался висеть.
+            os.close(os.open(self.root / ".gitignore", os.O_WRONLY))
+            reader.join(2)
+        self.assertFalse(hung, "ignore_rules повис на FIFO")
+        self.assertEqual(result, [(set(), set())])
 
     def test_gitignore_multi_dot_ext(self):
         self.write(".gitignore", "*.min.js\n")
@@ -431,9 +456,67 @@ class ChangedSinceGitTest(unittest.TestCase):
         self.git("mv", "a.py", "c.py")
         self.assertEqual(snapshot.changed_since(self.root, snap), [("a.py", False), ("c.py", True)])
 
+    def test_rename_source_replaced_by_symlink_reported(self):
+        # Исходный путь переименования — обычный файл в HEAD: ссылка на его месте — исчезнувший файл.
+        snap = self.roundtrip()
+        self.git("mv", "a.py", "c.py")
+        os.symlink("c.py", self.root / "a.py")
+        self.assertEqual(snapshot.changed_since(self.root, snap), [("a.py", False), ("c.py", True)])
+
+    def test_rename_target_replaced_by_symlink_not_reported(self):
+        # Новый путь переименования в HEAD не было: ссылка на его месте — не файл кода; исходный путь исчез.
+        snap = self.roundtrip()
+        self.git("mv", "a.py", "c.py")
+        (self.root / "c.py").unlink()
+        os.symlink("b.py", self.root / "c.py")
+        self.assertEqual(snapshot.changed_since(self.root, snap), [("a.py", False)])
+
+    def test_conflict_added_by_both_replaced_by_symlink_reported(self):
+        # Конфликт «добавлено обеими сторонами»: в HEAD путь — обычный файл (сторона «ours»), базы слияния нет.
+        main = subprocess.run(["git", "branch", "--show-current"], cwd=self.root, capture_output=True, text=True,
+                              check=True).stdout.strip()
+        self.git("checkout", "-qb", "other")
+        self.write("n.py", "other\n"); self.git("add", "."); self.git("commit", "-qm", "o")
+        self.git("checkout", "-q", main)
+        self.write("n.py", "main\n"); self.git("add", "."); self.git("commit", "-qm", "m")
+        snap = self.roundtrip()
+        self.assertNotEqual(subprocess.run([*GIT_ENV, "merge", "other"], cwd=self.root, capture_output=True).returncode, 0)
+        self.assertEqual(snapshot._status(self.root, None)[3], {"n.py": "100644"})
+        (self.root / "n.py").unlink()
+        os.symlink("b.py", self.root / "n.py")
+        self.assertEqual(snapshot.changed_since(self.root, snap), [("n.py", False)])
+
     def test_symlink_not_reported(self):
         snap = self.roundtrip()
         os.symlink(self.root / "a.py", self.root / "link.py")
+        self.assertEqual(snapshot.changed_since(self.root, snap), [])
+
+    def test_tracked_file_replaced_by_symlink_reported(self):
+        # Чистый отслеживаемый обычный файл, заменённый ссылкой: файл исчез как обычный.
+        snap = self.roundtrip()
+        (self.root / "a.py").unlink()
+        os.symlink("b.py", self.root / "a.py")
+        self.assertEqual(snapshot.changed_since(self.root, snap), [("a.py", False)])
+
+    def test_tracked_file_replaced_by_symlink_and_committed_reported(self):
+        snap = self.roundtrip()
+        (self.root / "a.py").unlink()
+        os.symlink("b.py", self.root / "a.py")
+        self.git("add", "."); self.git("commit", "-qm", "link")
+        self.assertEqual(snapshot.changed_since(self.root, snap), [("a.py", False)])
+
+    def test_new_symlink_committed_not_reported(self):
+        snap = self.roundtrip()
+        os.symlink("a.py", self.root / "link.py")
+        self.git("add", "."); self.git("commit", "-qm", "link")
+        self.assertEqual(snapshot.changed_since(self.root, snap), [])
+
+    def test_tracked_symlink_repointed_not_reported(self):
+        os.symlink("a.py", self.root / "link.py")
+        self.git("add", "."); self.git("commit", "-qm", "link")
+        snap = self.roundtrip()
+        (self.root / "link.py").unlink()
+        os.symlink("b.py", self.root / "link.py")
         self.assertEqual(snapshot.changed_since(self.root, snap), [])
 
     def test_non_utf8_name(self):
@@ -705,7 +788,8 @@ class StoreLoadDiffTest(unittest.TestCase):
         self.assertEqual(got["root"], str(self.root))
         self.assertEqual(got["dirs"], dirs)
         self.assertEqual(files_of(got["dirs"]), {"a.py": (1, 2), "b/c.go": (3, 4), "b/d.go": (0, -5)})
-        self.assertEqual([p.name for p in self.state.iterdir()], ["sess_1.snap.json"])
+        # Временных файлов записи нет; .lock — файл state_lock, который берёт store.
+        self.assertEqual(sorted(p.name for p in self.state.iterdir()), [".lock", "sess_1.snap.json"])
 
     def test_store_past_deadline_writes_nothing(self):
         dirs = {"": self.block(("a.py", 1, 2))}
@@ -851,6 +935,19 @@ class SnapshotStateTest(unittest.TestCase):
         common.atomic_write_json(self.state / "s.snap.json", data)
         self.assertFalse(snapshot.carry_over(self.state, "s", "p-2", self.root))
         self.assertFalse(snapshot.carry_over(self.state, "none", "p-2", self.root))
+
+    def test_store_waits_for_state_lock(self):
+        # store пишет снимок под той же блокировкой, что mark_checked и carry_over: запись новой реплики ждёт, пока
+        # mark_checked держит блокировку между чтением и записью.
+        snapshot.store(self.state, "s", "p-1", self.root, self.snap)
+        writer = threading.Thread(target=snapshot.store, args=(self.state, "s", "p-2", self.root, self.snap))
+        with common.state_lock(self.state):
+            writer.start()
+            writer.join(0.5)
+            self.assertTrue(writer.is_alive())
+            self.assertEqual(snapshot.load(self.state, "s")["prompt_id"], "p-1")
+        writer.join(5)
+        self.assertEqual(snapshot.load(self.state, "s")["prompt_id"], "p-2")
 
     def test_failure_remembered_per_root(self):
         self.assertIsNone(snapshot.failure(self.state, "s", self.root))

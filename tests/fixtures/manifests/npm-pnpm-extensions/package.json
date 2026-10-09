@@ -1,0 +1,28 @@
+{
+  "//": "источник: формы pnpm.io, package.json pnpm 10 (pnpm.packageExtensions, pnpm.overrides; @pnpm/types PackageExtension)",
+  "name": "pnpm-app",
+  "dependencies": {
+    "react-redux": "^9.1.0",
+    "react": "^18.3.1"
+  },
+  "pnpm": {
+    "overrides": {
+      "foo": "^1.0.0"
+    },
+    "packageExtensions": {
+      "react-redux@1": {
+        "peerDependencies": {
+          "react-dom": "*"
+        }
+      },
+      "express@4": {
+        "dependencies": {
+          "cookie-parser": "^1.4.6"
+        },
+        "optionalDependencies": {
+          "fsevents": "^2.3.3"
+        }
+      }
+    }
+  }
+}

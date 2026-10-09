@@ -3,6 +3,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -178,9 +179,18 @@ def assert_not_logged(test, env, *texts):
             test.assertNotIn(text, dumped)
 
 
+def prompt_block(text, name):
+    """Блок name промпта судьи по его структуре: от «<name КОД>» до «</name КОД>» с тем же кодом; блока нет —
+    AssertionError."""
+    m = re.search(rf"\n<{name} ([0-9a-f]+)>\n(.*?)\n</{name} \1>\n", text, re.DOTALL)
+    if m is None:
+        raise AssertionError(f"в промпте нет блока <{name}> с кодом")
+    return m.group(2)
+
+
 def author_block(rec):
     """Блок <author> промпта судьи из записи заглушки PLANKA_STUB_RECORD."""
-    return rec.read_text(encoding="utf-8").split("\n<author>\n", 1)[1].split("\n</author>\n", 1)[0]
+    return prompt_block(rec.read_text(encoding="utf-8"), "author")
 
 
 def cpu_seconds(run):

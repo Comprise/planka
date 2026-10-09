@@ -102,6 +102,22 @@ class ModelWatchTest(unittest.TestCase):
         self.assertEqual(self.stored(".._x_y"), {"model": "claude-opus-5"})
         self.assertEqual(self.judge_model("../x/y"), "claude-opus-5")
 
+    def test_session_id_not_a_string_or_empty_writes_nothing(self):
+        # Без id сессии записи не найти: файл unknown.model.json был бы общим для всех таких сессий.
+        for bad in ("", 7, None, ["a"]):
+            r = self.start(model="claude-opus-5", session_id=bad)
+            self.assertEqual(r.stdout, "", bad)
+            r = self.switch("claude-opus-5", session_id=bad)
+            self.assertEqual(r.stdout, "", bad)
+            self.assertFalse((self.env.data / "state" / "unknown.model.json").exists(), bad)
+
+    def test_judge_ignores_stored_model_for_empty_or_bad_session_id(self):
+        state = self.env.data / "state"
+        state.mkdir()
+        (state / "unknown.model.json").write_text('{"model": "claude-opus-5"}', encoding="utf-8")
+        for bad in ("", 7, None):
+            self.assertEqual(self.judge_model(bad), "claude-test-model", bad)
+
     def test_bad_input_silent(self):
         for raw in ("", "не json", "[1]"):
             r = self.env.run("model_watch.py", raw)

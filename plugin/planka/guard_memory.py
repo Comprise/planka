@@ -35,8 +35,9 @@ MAX_IMPORT_FILE = 4 * 1024 * 1024
 # памяти; сверх предела остаток не разбирается, с предупреждением.
 MAX_IMPORT_FILES = 200
 MAX_IMPORT_BYTES = 16 * 1024 * 1024
-# Начало ограждённого блока кода Markdown: импорт в нём Claude Code не разбирает.
-FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
+# Начало ограждённого блока кода Markdown: импорт в нём Claude Code не разбирает. Блок из обратных кавычек
+# открывается, только если в остатке строки нет обратной кавычки: ```npm test``` — код в строке, не блок.
+FENCE = re.compile(r" {0,3}(`{3,}(?=[^`]*$)|~{3,})")
 # Серия обратных кавычек: код в строке идёт от серии до следующей серии той же длины.
 BACKTICKS = re.compile(r"`+")
 # Импорт: @ и путь до пробела, «\ » — пробел пути. Claude Code ищет @ в начале текста узла Markdown или после
@@ -59,12 +60,10 @@ def _forms(path):
 
 
 def managed_dir():
-    """Каталог managed-настроек Claude Code: macOS — /Library/Application Support/ClaudeCode, Windows —
-    C:\\Program Files\\ClaudeCode, иначе /etc/claude-code."""
+    """Каталог managed-настроек Claude Code: macOS — /Library/Application Support/ClaudeCode, иначе
+    /etc/claude-code. Windows нет: там run_hook хук не запускает."""
     if sys.platform == "darwin":
         return "/Library/Application Support/ClaudeCode"
-    if sys.platform == "win32":
-        return "C:\\Program Files\\ClaudeCode"
     return "/etc/claude-code"
 
 
@@ -83,10 +82,13 @@ def _settings_files(config, project):
 def _auto_memory_overrides(config, project):
     """Абсолютные значения autoMemoryDirectory из всех файлов _settings_files в кодировке файловой системы
     (common.input_path). Claude Code берёт одно по приоритету источников; здесь — все: файл без значения, с
-    ошибкой чтения, не с объектом JSON, значение не строкой, относительным путём (~ раскрывается при проверке),
-    с NUL или не кодируемое в файловую систему (одиночный суррогат) пропускается."""
+    ошибкой чтения, не обычный файл (FIFO), не с объектом JSON, значение не строкой, относительным путём
+    (~ раскрывается при проверке), с NUL или не кодируемое в файловую систему (одиночный суррогат) пропускается."""
     found = []
     for path in _settings_files(config, project):
+        # Не обычный файл (FIFO заблокировал бы хук) Claude Code как настройки не читает.
+        if not os.path.isfile(path):
+            continue
         try:
             with open(path, encoding="utf-8") as f:
                 value = json.load(f).get("autoMemoryDirectory")
@@ -215,17 +217,26 @@ def _strip_code(text):
 
 
 def _strip_html_comments(text):
-    """Текст без комментариев HTML <!-- … -->, каждый заменён пробелом. Незакрытый остаётся текстом, и за ним
-    закрытых нет: поиск закрытия от него дошёл до конца текста."""
+    """Текст без комментариев HTML <!-- … -->, каждый заменён пробелом. «<!-->» и «<!--->» — закрытые пустые
+    комментарии. Незакрытый остаётся текстом, и за ним закрытых нет: поиск закрытия от него дошёл до конца текста."""
     parts, pos = [], 0
     while True:
         start = text.find("<!--", pos)
-        end = text.find("-->", start + 4) if start >= 0 else -1
-        if end < 0:
+        if start < 0:
             parts.append(text[pos:])
             return " ".join(parts)
+        if text.startswith(">", start + 4):
+            after = start + 5
+        elif text.startswith("->", start + 4):
+            after = start + 6
+        else:
+            end = text.find("-->", start + 4)
+            if end < 0:
+                parts.append(text[pos:])
+                return " ".join(parts)
+            after = end + 3
         parts.append(text[pos:start])
-        pos = end + 3
+        pos = after
 
 
 def _strip_code_spans(text):
@@ -349,38 +360,18 @@ def _local_memory(form, projects, fold):
     return any(_inside(p, directory) or _inside(form, p) for p in projects)
 
 
-def _case_insensitive(path):
-    """Файловая система пути не различает регистр: путь или его предок находится и по имени с обращённым регистром,
-    и это тот же файл (os.path.samefile). Проверяется каждый уровень: том без учёта регистра монтируется и внутрь
-    чувствительного к нему."""
-    base = path
-    while True:
-        name = os.path.basename(base)
-        swapped = name.swapcase()
-        if swapped != name:
-            try:
-                if os.path.samefile(base, os.path.join(os.path.dirname(base), swapped)):
-                    return True
-            except (OSError, ValueError):
-                pass
-        parent = os.path.dirname(base)
-        if parent == base:
-            return False
-        base = parent
-
-
 def is_memory_path(path, project):
     """Абсолютный нормализованный путь — файл автопамяти, памяти субагента, CLAUDE.md или rules/ каталога
     настроек, CLAUDE.local.md проекта или файл, который память подключает импортом (_imported_files); project —
     каталог проекта сессии (_project_dir). path и project — строки в кодировке файловой системы (target_path,
     _project_dir приводят пути входа через common.input_path). Путь и места памяти сравниваются в обеих формах
     (_forms): запись через символьную ссылку в каталоге настроек и запись прямо в её цель — запись в память. На
-    файловой системе без учёта регистра (_case_insensitive) сравнение — без учёта регистра. CLAUDE.local.md и
+    файловой системе без учёта регистра (common.case_insensitive) сравнение — без учёта регистра. CLAUDE.local.md и
     импортированный файл, которые оказались файлом репозитория проекта (_repository_file), — не память, как
     проектный CLAUDE.md. В каталоге autoMemoryDirectory или cowork, который содержит проект project или равен ему,
     файл репозитория проекта — не память; в каталоге строго внутри проекта и вне проекта git не спрашивается,
     запись — память."""
-    fold = str.casefold if _case_insensitive(path) else str
+    fold = str.casefold if common.case_insensitive(path) else str
 
     def folded(paths):
         return {fold(p) for p in paths}

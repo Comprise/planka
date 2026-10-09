@@ -52,7 +52,11 @@ CORPUS = {
     "perl-mime-header/Header.pl": [1, 3, 12, 24, 26, 35, 52],
     "perl-module-load/Load.pl": [1, 8],
     "perl-proxysubs/ProxySubs.pl": [1],
+    "pygments-lisp/lisp.py": [1, 18],
     "python-shlex/shlex.py": [1, 2, *range(4, 10), 20, 59, 61, 63],
+    "wordpress-twentytwelve/custom-header.php": [1, *range(3, 10), 13, 18, 22, 28, 32, *range(44, 49), 70,
+        *range(84, 91)],
+    "wordpress-twentytwelve/header.php": [1, *range(3, 12), *range(13, 20), 21, 28, 29, 30, 31, 55, 60],
     "react-virtual/index.tsx": [1, *range(9, 14), *range(22, 44), *range(45, 55)],
     "ruby-rjit/insn_compiler.rb": [1, 4, 7, 21, 48, 52, 53],
     "sveltekit-sverdle/page.svelte": [1, 79],
@@ -147,6 +151,14 @@ class CommentLinesTest(unittest.TestCase):
         src = "cat <<EOF > s.md\n# Heading\nEOF\n# real\n"
         self.assertEqual(helpers.comment_lines(src, "sh"), ["# real"])
 
+    def test_shell_heredoc_inside_open_backtick_is_data(self):
+        # `…` не закрыта до конца строки: тело heredoc в ней — данные (depcheck.heredocs).
+        src = "x=`cat <<EOF\nbody # not a comment\nEOF\n`\n# real\n"
+        self.assertEqual(helpers.comment_lines(src, "sh"), ["# real"])
+        # Тело heredoc из `…` bash читает раньше тела heredoc строки: тело B, затем тело A.
+        src = "cat <<A; x=`cat <<B\nbodyB\nB\n`\nbodyA\nA\necho \"x=[$x]\"\n# real\n"
+        self.assertEqual(helpers.comment_lines(src, "sh"), ["# real"])
+
     def test_block_comments_lua_haskell(self):
         self.assertEqual(helpers.comment_lines("--[[ block\nline two\n]]\nx = 1 -- tail\n", "lua"),
                          ["--[[ block", "line two", "]]", "-- tail"])
@@ -180,13 +192,37 @@ class CommentLinesTest(unittest.TestCase):
         src = "<p>{ a // x</p>\n<p>{{ a /* c1 */ }} // y</p>\n<p :a=\"{b}\">{{ '}}' }} http://e.com</p>\n"
         self.assertEqual(comments._comments(src, "vue"), [(2, "/* c1 */ }} // y</p>")])
 
+    def test_vue_directive_and_svelte_attribute_code(self):
+        # Значение директивы Vue («v-», «:», «@», «#», «.») — выражение JavaScript до первой такой же кавычки, с
+        # раскрытыми сущностями HTML; атрибут Svelte в кавычках — текст с кодом «{…}». Прочие атрибуты — данные.
+        self.assertEqual(comments._comments('<p @click="a() // c">x</p>\n', "vue"), [(1, "// c")])
+        self.assertEqual(comments._comments('<p :x="[\n 1, // c1\n 2 /* c2 */]" title="a // b">\n', "vue"),
+                         [(2, "// c1"), (3, "/* c2 */]")])
+        src = '<p v-if="a &amp;&amp; \'//\' /* c */" .p=\'f("//")\' #s="{ a }">\n'
+        self.assertEqual(comments._comments(src, "vue"), [(1, "/* c */")])
+        self.assertEqual(comments._comments('<p :x="a &#47;&#47; c">\n', "vue"), [(1, "// c")])
+        # «#» — слот, «.» — привязка свойства: их значение — тоже выражение.
+        self.assertEqual(comments._comments('<p #s="{ a } /* c */">\n', "vue"), [(1, "/* c */")])
+        self.assertEqual(comments._comments('<p .p="a // c">\n', "vue"), [(1, "// c")])
+        self.assertEqual(comments._comments('<p title="a // b" href=\'//e.com\'>x</p>\n', "vue"), [])
+        src = '<p on:click="{() => {\n a() // c\n}}" title="{a} // b" class="x // y">\n'
+        self.assertEqual(comments._comments(src, "svelte"), [(2, "// c")])
+
+    def test_sfc_tag_opens_with_ascii_letter(self):
+        # Тег разметки компонента открывает «<» и буква ASCII (токенизатор HTML): атрибут-директива за именем тега
+        # не делает тег текстом; «<» перед пробелом, цифрой и не-ASCII буквой — текст.
+        self.assertEqual(helpers.comment_lines("<p :x=\"'{{'\">a // b</p>\n", "vue"), [])
+        self.assertEqual(helpers.comment_lines("<p>a < b, 1 <2 \"// x\" <ф \"// y\"</p>\n", "vue"), [])
+
     def test_sql_and_html(self):
         self.assertEqual(helpers.comment_lines("select 1 -- c\n", "sql"), ["-- c"])
         self.assertEqual(helpers.comment_lines("<a>\n<!-- hidden -->\n", "html"), ["<!-- hidden -->"])
 
     def test_slash_families(self):
         for ext in ("php", "groovy", "gradle", "proto", "sol", "zig"):
-            self.assertEqual(helpers.comment_lines("x = 1 // c\n", ext), ["// c"], ext)
+            # Код PHP — в блоке «<?php»: вне него HTML.
+            src = "<?php x = 1 // c\n" if ext == "php" else "x = 1 // c\n"
+            self.assertEqual(helpers.comment_lines(src, ext), ["// c"], ext)
 
     def test_language_variants(self):
         for ext in ("mjs", "cjs", "mts", "cts", "cxx", "hh", "hxx"):
@@ -371,7 +407,7 @@ class LanguageSyntaxTest(unittest.TestCase):
                  ("toml", "k = ['C:\\', '# x'] # c\n", ["# c"]), ("ps1", "$p = @('C:\\', '# x') # c\n", ["# c"]),
                  ("go", "s := []string{`C:\\`, `// x`} // c\n", ["// c"]),
                  ("go.mod", "replace a => `C:\\` `// x` // c\n", ["// c"]),
-                 ("php", "$s = 'it\\'s # x'; # c\n", ["# c"]),
+                 ("php", "<?php $s = 'it\\'s # x'; # c\n", ["# c"]),
                  # Escape в символьном литерале: «'\"'» не открывает строку.
                  ("c", "char q = '\\\"'; s = \"//x\"; // c\n", ["// c"]),
                  # «-» в имени heredoc Terraform.
@@ -415,9 +451,8 @@ class NestedAndDocTest(unittest.TestCase):
                  "hs": "{- a {- b -}\nstill -}\nx = 1\n",
                  "jl": "#= a #= b =#\nstill =#\nx = 1\n"}
         for ext, src in cases.items():
-            lines = helpers.comment_lines(src, ext)
-            self.assertEqual(len(lines), 2, ext)
-            self.assertTrue(lines[1].startswith("still"), ext)
+            first, second = src.split("\n")[:2]
+            self.assertEqual(comments._comments(src, ext), [(1, first), (2, second)], ext)
 
     def test_c_block_does_not_nest(self):
         self.check_lines("c", "/* a /* b */\nint x; // c\n", ["/* a /* b */", "// c"])
@@ -443,6 +478,37 @@ class NestedAndDocTest(unittest.TestCase):
         self.check_lines("pl", "=head1 NAME\n\nfoo\n=cut\n", ["=head1 NAME", "foo", "=cut"])
         # «= 5» и «=~» в начале строки — продолжение выражения.
         self.check_lines("pl", "my $x\n= 5; # c\n", ["# c"])
+
+    def test_php_template_html_outside_blocks(self):
+        # Вне «<?php … ?>», «<?= … ?>», «<? … ?>» — HTML: «#» и «//» в тексте — данные, «<!-- -->» — комментарий;
+        # «?>» кончает строчный комментарий; «<style>» и «<script>» — CSS и JavaScript, блоки PHP в них — код PHP.
+        cases = (("<style>#masthead { color: #fff; }</style>\n", []),
+                 ("<p>Order #12, see https://example.com</p>\n", []),
+                 ("<?php echo 1; // c ?> <p>#not</p>\n<?= $a /* d */ ?> // no\n",
+                  [(1, "// c ?> <p>#not</p>"), (2, "/* d */ ?> // no")]),
+                 ("<? if ($a): # c ?>x<? endif ?>\n<?xml version='1.0' ?><!-- e -->\n",
+                  [(1, "# c ?>x<? endif ?>"), (2, "<!-- e -->")]),
+                 ("<?php $s = '?>'; /* ?> */ ?>#x\n", [(1, "/* ?> */ ?>#x")]),
+                 ("<script>\nvar a = <?php echo $x; // p ?>; // j\n</script> // no\n"
+                  "<script type=\"text/html\">// t\n</script>\n", [(2, "// p ?>; // j"), (2, "// j")]),
+                 ('<style id="<?php echo $i ?>">a { b: #<?php echo $c ?>; } /* s */\n<?php // q\n?></style>#x\n',
+                  [(1, "/* s */"), (2, "// q")]),
+                 ("<script\n src='a>b'><?php\n// p\n?>/* j */</script>\n<script>\n// u\n",
+                  [(3, "// p"), (4, "/* j */"), (6, "// u")]))
+        for src, expected in cases:
+            self.assertEqual(comments._comments(src, "php"), expected, src)
+
+    def test_php_block_in_script_is_an_operand(self):
+        # Блок PHP в «<script>» и «<style>» выводит значение: для разбора JS и CSS он — имя: «/<?php ?>/g» —
+        # регулярка, «/<?php ?>* x *<?php ?>/» — не комментарий.
+        cases = (("<script>\nvar re = /<?php echo $pattern; ?>/g;\nvar x = 1; // c\n</script>\n", [(3, "// c")]),
+                 ("<script>\nvar w = <?= $a ?>/<?= $b ?>; // c\n</script>\n", [(2, "// c")]),
+                 ("<style>\na { b: c }\n/<?php ?>* not *<?php ?>/\n</style>\n", []),
+                 # Имени нет в тексте комментария; строка из одного блока PHP — не строка комментария JS.
+                 ("<script>\n/* a\n<?php echo 1 ?>\n b <?= $c ?>x */ // c\n</script>\n",
+                  [(2, "/* a"), (4, "b x */ // c")]))
+        for src, expected in cases:
+            self.assertEqual(comments._comments(src, "php"), expected, src)
 
     def test_php_heredoc(self):
         src = ("<?php\n$s = <<<EOT\n// not\n# not\nEOT;\n$t = <<<'NOW'\n/* not */\n  NOW;\n"
@@ -501,6 +567,74 @@ class ParserEdgeTest(unittest.TestCase):
     def test_hash_after_dollar_or_brace_is_code(self):
         self.assertEqual(helpers.comment_lines("my $n = $#a; # c\n", "pl"), ["# c"])
         self.assertEqual(helpers.comment_lines("t:\n\techo $${#PATH} # c\n", "makefile"), ["# c"])
+        # Вне рецепта «#» в вызове функции GNU make буквален: «{#» — код.
+        self.assertEqual(helpers.comment_lines("N := $(shell echo $${#A}) # c\n", "makefile"), ["# c"])
+
+    def test_shell_ansi_c_string_escapes_quote(self):
+        # «$'…'» bash — строка с escape обратной косой: «\'» её не закрывает; «'…'» — без escape.
+        for ext in ("sh", "bash", "zsh"):
+            self.assertEqual(helpers.comment_lines("echo $'a\\'b # x' # c\necho 'a\\' # d\n", ext), ["# c", "# d"],
+                             ext)
+
+    def test_nested_string_in_substitution(self):
+        # Строка внутри подстановки строки не закрывает внешнюю: стек подстановок до закрывающей кавычки.
+        cases = (("kt", 'val u = "${uri("https://x")}" // c\n', "// c"),
+                 ("kt", 'val u = """${"""//"""}""" // c\n', "// c"),
+                 ("gradle", 'url = "${uri("https://x")}" // c\n', "// c"),
+                 ("swift", 'let s = "\\(f("http://x"))" // c\n', "// c"),
+                 ("cs", 'var s = $"{F("http://x")}"; // c\n', "// c"),
+                 ("cs", 'var s = $@"{F(@"a"" // b")}"; // c\n', "// c"),
+                 ("dart", "var s = '${m['//']}'; // c\n", "// c"),
+                 ("ex", 's = "#{f("a # b")}" # c\n', "# c"),
+                 ("sh", 'r="$(echo "a # b")" # c\n', "# c"),
+                 ("sh", 'r="`echo "a # b"`" # c\n', "# c"),
+                 ("sh", 'r="${x:-"a # b"}" # c\n', "# c"),
+                 ("py", 'x = f"{d["//#"]}"  # c\n', "# c"),
+                 ("py", 'x = rf"\\{d["#"]}"  # c\n', "# c"),
+                 # Сырая f-строка: «\\"» и «\\\\» кавычку не закрывают (токенизатор Python), «\\{» открывает
+                 # подстановку. Форма — pygments 2.19, lexers/lisp.py.
+                 ("py", 'z = rf"a\\"#{y}"  # c\n', "# c"),
+                 ("py", "z = rf'[\\'#]{y}'  # c\n", "# c"),
+                 ("py", 'z = rf"\\\\" + "#"  # c\n', "# c"),
+                 # Обратная косая в коде подстановки shell берёт следующий знак: «\\"» — не строка.
+                 ("sh", 'q="${x/\\"/ # z}" # c\n', "# c"),
+                 ("sh", 't="${x//[\\"]/ # y}" # c\n', "# c"),
+                 ("sh", 'y="$(echo \\"a\\")" # c\n', "# c"),
+                 ("tf", 'x = "${f("#")}" # c\n', "# c"))
+        for ext, src, expected in cases:
+            self.assertEqual(helpers.comment_lines(src, ext), [expected], (ext, src))
+        # Без подстановки — обычная строка: «{{» f-строки и «$${» Terraform — текст, «"» без «$» C#, строка Scala
+        # без интерполятора, сырая строка Dart.
+        cases = (("py", 'x = f"{{" + "#" # c\n', "# c"), ("tf", 'x = "$${f("#")}" # c\n', '#")}" # c'),
+                 ("cs", 'var s = "{F("http://x")}"; // c\n', '//x")}"; // c'),
+                 ("scala", 'val u = "${uri("https://x")}" // c\n', '//x")}" // c'),
+                 ("dart", "var s = r'${m['//']}'; // c\n", "//']}'; // c"))
+        for ext, src, expected in cases:
+            self.assertEqual(helpers.comment_lines(src, ext), [expected], (ext, src))
+
+    def test_python_format_spec_is_text(self):
+        # «:» f-строки на нулевой глубине скобок кода подстановки открывает спецификацию формата — текст до «}»,
+        # в нём «{…}» — вложенная подстановка; «:» в «[…]», «(…)», «{…}» кода — не формат.
+        cases = (('a = f"{x:\'>10}"  # c\n', "# c"),
+                 ("a = f'{x:\"^10}' + \"#\"  # c\n", "# c"),
+                 ('a = f"{x:\'>{w}}" + \'#\'  # c\n', "# c"),
+                 ('a = f"{x!r:\'<{w:\'>3}}"  # c\n', "# c"),
+                 ('a = rf"{x:\'>10}"  # c\n', "# c"),
+                 ('a = f"{x[1:2]!r:>3} {d[\'#\']} {(lambda y: \'#\')(1)} {({1: \'#\'})}"  # c\n', "# c"),
+                 ('a = f"""{x:\'>10}"""  # c\n', "# c"))
+        for src, expected in cases:
+            self.assertEqual(helpers.comment_lines(src, "py"), [expected], src)
+
+    def test_hash_right_after_brace_is_comment(self):
+        # «{» — не префикс выражения: «#» сразу за ней открывает комментарий.
+        cases = {"py": "d = {# c\n 1: 2}\n", "rb": "[1].each {# c\n |x| x }\n", "pl": "my %h = (a => {# c\n});\n",
+                 "r": "f <- function() {# c\n}\n", "jl": "d = Dict{# c\n}\n", "ex": "m = %{# c\n}\n",
+                 "nix": "{# c\n}\n", "ps1": "if ($a) {# c\n}\n", "tf": "a = {# c\n}\n", "toml": "a = {# c\n}\n",
+                 "cmake": "if(A) {# c\n"}
+        for ext, src in cases.items():
+            self.assertEqual(helpers.comment_lines(src, ext), ["# c"], ext)
+        # Сразу после «${» — код: «${#x}» — переменная PowerShell.
+        self.assertEqual(helpers.comment_lines("$a = ${#x} # c\n", "ps1"), ["# c"])
 
     def test_escaped_hash_is_code(self):
         self.assertEqual(helpers.comment_lines("x := a\\#b # c\n", "makefile"), ["# c"])
@@ -1013,6 +1147,20 @@ class RubyPerlElixirLiteralTest(unittest.TestCase):
         for src, expected in cases:
             self.assertEqual(comments._comments(src, "pl"), expected, src)
 
+    def test_nested_substitution_code_within_budget(self):
+        # Вложенные вторые части s{…}{…}e разбираются кодом, пока повторный разбор укладывается в бюджет 4·len(text);
+        # глубже _MAX_CODE_DEPTH — не разбираются (предел рекурсии Python).
+        def nest(depth, pad=""):
+            return pad + "$s =~ s{a}{\n" * depth + "f() # d\n" + "}e;\n" * depth
+
+        self.assertEqual(comments._comments(nest(6), "pl"), [(7, "# d")])
+        pad = "# " + "x" * 200000 + "\n"
+        self.assertEqual(comments._comments(nest(60, pad), "pl"), [(1, pad.strip()), (62, "# d")])
+        self.assertEqual(comments._comments(nest(500, pad), "pl"), [(1, pad.strip())])
+        self.assertEqual(comments._comments(nest(500), "pl"), [])
+        # Глубина меньше _MAX_CODE_DEPTH, бюджет исчерпан: повторный разбор ~8,5·60² знаков больше 4·len(text).
+        self.assertEqual(comments._comments(nest(60), "pl"), [])
+
     def test_unclosed_literal_ends_with_line(self):
         # Незакрытая в строке регулярка прячет только остаток своей строки.
         self.assertEqual(comments._comments("x = split /a # b\n# c\n", "pl"), [(2, "# c")])
@@ -1064,6 +1212,18 @@ class MultilineStringTest(unittest.TestCase):
                  ("ps1", '$e = "a`"b # not" # c\n', [(1, "# c")]))
         for ext, src, expected in cases:
             self.assertEqual(comments._comments(src, ext), expected, (ext, src))
+
+    def test_php_strings_span_lines(self):
+        # Строки PHP «'…'», «"…"», «`…`» многострочны: «?>» и «<?php» внутри них — текст строки, а не граница блока
+        # PHP (лексер PHP 8: T_CONSTANT_ENCAPSED_STRING и T_ENCAPSED_AND_WHITESPACE берут перевод строки).
+        cases = (("<?php\nclass Feed {\n    function xml() {\n        $xml = '<?xml version=\"1.0\"?>\n"
+                  "<rss version=\"2.0\">';\n        // c1\n        return $xml; // c2\n    }\n}\n",
+                  [(6, "// c1"), (7, "// c2")]),
+                 ("<?php\n$tpl = '<div>\n<?php echo $x; ?>\n</div>'; // c1\n// c2\n", [(4, "// c1"), (5, "// c2")]),
+                 ('<?php\n$s = "\n?>\n// not\n"; // c\n', [(5, "// c")]),
+                 ("<?php\n$s = `ls\n?> # not\n`; # c\n", [(4, "# c")]))
+        for src, expected in cases:
+            self.assertEqual(comments._comments(src, "php"), expected, src)
 
     def test_unclosed_multiline_string_is_rolled_back(self):
         # Строка без закрытия до конца файла — однострочная: следующие строки — код.
@@ -1299,7 +1459,8 @@ class ExtractTest(unittest.TestCase):
         with mock.patch.object(comments.subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 1)):
             lines, _, unknown, late = comments.extract(self.root, ["a.py"], "HEAD", None, time.monotonic() + 30)
         self.assertEqual((lines, unknown, late), ([], [], ["a.py"]))
-        self.assertEqual(len(common._messages), 1)
+        self.assertEqual(common._messages,
+                         ["planka: строки комментариев не извлечены в срок, файлов кода без проверки: 1"])
 
     def test_empty_relpaths_no_git_calls(self):
         with mock.patch.object(comments, "_git", wraps=comments._git) as git:
@@ -1669,7 +1830,7 @@ class LinearParseTest(unittest.TestCase):
             (lambda k: "?#" * k, "rb", 3000), (lambda k: "remx " * k, "bat", 2500),
             (lambda k: " " * (5 * k) + "a ::" * k, "cmd", 1500), (lambda k: "x rem" * k, "vb", 2500),
             (lambda k: ' "a' * k, "vim", 20000), (lambda k: 'x"' * k + ' "', "vim", 3000),
-            (lambda k: "<<<A " * k, "php", 500), (lambda k: "@doc " * k, "ex", 2500),
+            (lambda k: "<?php " + "<<<A " * k, "php", 500), (lambda k: "@doc " * k, "ex", 2500),
             (lambda k: "{" * (5 * k) + "} <<B" * k, "pl", 200), (lambda k: "print " + "{$a->{b}}<<B " * k, "pl", 400),
             (lambda k: "#" * k + '"', "swift", 50000), (lambda k: 'r"' * k, "nim", 4000),
             # Регулярки, slashy-строки, теги JSX: незакрытые литералы, классы, имена тегов, вложенность.
@@ -1726,6 +1887,34 @@ class LinearParseTest(unittest.TestCase):
             (lambda k: "".join(" " * d + "- with:\n" + " " * d + "    script: |\n" + " " * d + "      # a\n"
                                for d in range(k)), "yml", 100)))
 
+    def test_many_closed_substitutions_on_one_line(self):
+        # Пуст ли хвост строки за первой частью s{…}{…} — без копии хвоста; квадратичность видна от десятков тысяч
+        # операторов в строке.
+        self.assertEqual(comments._comments("s{a}{b} " * 20000 + "# c\n", "pl"), [(1, "# c")])
+        self.assert_linear(((lambda k: "s{a}{b} " * k, "pl", 20000),))
+
+    def test_string_substitutions_are_linear(self):
+        # Подстановки строк: незакрытые, вложенные до глубины k, строки и символьные литералы в коде подстановки,
+        # спецификации формата Python, «\» в коде подстановки shell; «$'…'» shell.
+        self.assert_linear((
+            (lambda k: '"${' * k, "kt", 3000), (lambda k: '"${' * k + '}"' * k + " // c", "kt", 3000),
+            (lambda k: '"$(' * k, "sh", 3000), (lambda k: '"`' * k, "sh", 3000), (lambda k: "$'\\" * k, "sh", 3000),
+            (lambda k: 'f"{' * k, "py", 3000), (lambda k: 'f"{x:\'{(' * k, "py", 3000),
+            (lambda k: '"${\\' * k, "sh", 3000), (lambda k: '"\\(' * k, "swift", 3000),
+            (lambda k: '$"{' * k, "cs", 3000), (lambda k: '$@"{' * k, "cs", 3000),
+            (lambda k: "'${" * k + '"${' * k, "dart", 3000),
+            (lambda k: '"#{' * k, "ex", 3000), (lambda k: '"${' * k, "tf", 3000),
+            (lambda k: 'x = """${\n' * k, "kt", 2000), (lambda k: '"${"a" ' * k, "kt", 3000),
+            (lambda k: '"${\'"\'' * k, "kt", 3000), (lambda k: 'x = "${\\\n' * k, "gradle", 2000)))
+
+    def test_php_templates_are_linear(self):
+        # Блоки PHP в HTML, в теге и содержимом «<script>», «<style>»; «?>» после строчного комментария.
+        self.assert_linear((
+            (lambda k: "<?php ?>" * k, "php", 3000), (lambda k: "<script>a<?php ?>" + "b<?php ?>" * k, "php", 3000),
+            (lambda k: "<script " + "'" * k, "php", 3000), (lambda k: "<style " + "<?php ?>" * k, "php", 3000),
+            (lambda k: "<?php // a ?>" * k, "php", 3000), (lambda k: "<script>\n" + "a\n<?php\n?>\n" * k, "php", 1000),
+            (lambda k: "<?" * k + "\n<!--\n" * k, "php", 2000), (lambda k: "<script>" * k, "php", 3000)))
+
     def test_groovy_unclosed_quote_before_escaped_quotes(self):
         # За незакрытой «"» или «'» строки Groovy каждая следующая такая же кавычка экранирована: хвост строки не
         # просматривается заново.
@@ -1741,7 +1930,12 @@ class LinearParseTest(unittest.TestCase):
             (lambda k: "<style lang=scss>a{}</style><!-- c -->\n" * k, "vue", 500),
             (lambda k: "{" * k, "svelte", 5000), (lambda k: "{{" * k, "vue", 5000),
             (lambda k: "<a " * k, "svelte", 2000), (lambda k: "{/" * k, "svelte", 5000),
-            (lambda k: "<br>{a}\n" * k, "svelte", 2000)))
+            (lambda k: "<br>{a}\n" * k, "svelte", 2000),
+            # Значения директив Vue и строки атрибутов Svelte с кодом.
+            (lambda k: "<p " + ':a="x" ' * k + ">\n", "vue", 2000),
+            (lambda k: '<p :a="' + "f(\n" * k + '">\n', "vue", 2000),
+            (lambda k: "<p " + " " * (10 * k) + ':a="x" ' * k + ">\n", "vue", 1000),
+            (lambda k: '<p a="' + "{" * k + '">\n', "svelte", 2000), (lambda k: '<p a="{x}\n' * k, "svelte", 500)))
 
     def test_deadline_during_parse_files_without_check(self):
         common._reset()

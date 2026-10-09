@@ -32,13 +32,18 @@ class TooManyFiles(Exception):
 
 
 def ignore_rules(directory):
-    """Записи .gitignore каталога: имена без подстановочных знаков и расширения из «*.ext».
+    """Записи .gitignore каталога: имена без подстановочных знаков и расширения из «*.ext». Не обычный файл
+    (ссылка, FIFO) записей не даёт.
 
     Ведущий «/» не привязывает имя к каталогу: имя совпадает на любой глубине под каталогом файла.
     """
     names, exts = set(), set()
+    path = directory / ".gitignore"
     try:
-        lines = (directory / ".gitignore").read_text(encoding="utf-8", errors="replace").splitlines()
+        # Git читает только обычный файл, не ссылку; FIFO чтение повесило бы.
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return names, exts
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return names, exts
     for line in lines:
@@ -208,15 +213,18 @@ def _stat_one(root, rel):
     return [st.st_size, st.st_mtime_ns] if stat.S_ISREG(st.st_mode) else None
 
 
+# Режимы git обычного файла.
+_REGULAR_MODES = ("100644", "100755")
 # Число полей до пути в записях `git status --porcelain=v2`: обычная, переименование, конфликт.
 _V2_FIELDS = {b"1": 8, b"2": 9, b"u": 10}
 
 
 def _status(root, deadline):
-    """(HEAD или None без коммитов, пути с изменениями и неотслеживаемые, каталоги вложенных репозиториев)
-    по `git status` в root; None вне git.
+    """(HEAD или None без коммитов, пути с изменениями и неотслеживаемые, каталоги вложенных репозиториев,
+    {путь: режим в HEAD отслеживаемого пути}) по `git status` в root; None вне git.
 
-    Пути — от root. Подмодули пропускаются: их обходит _git_state. Переименование даёт оба пути.
+    Пути — от root. Подмодули пропускаются: их обходит _git_state. Переименование даёт оба пути, режим в HEAD —
+    у исходного.
     Неотслеживаемый каталог при --untracked-files=all git отдаёт одной записью «dir/» только для
     вложенного репозитория.
     """
@@ -224,7 +232,7 @@ def _status(root, deadline):
                "--untracked-files=all", "--ignore-submodules=all")
     if out is None:
         return None
-    head, paths, nested = None, [], []
+    head, paths, nested, modes = None, [], [], {}
     tokens = iter(out.split(b"\0"))
     for tok in tokens:
         kind = tok[:1]
@@ -244,9 +252,14 @@ def _status(root, deadline):
             if len(parts) <= _V2_FIELDS[kind]:
                 continue
             paths.append(os.fsdecode(parts[-1]))
+            # Режим в HEAD: у «1» — mH пути; у «2» — mH исходного пути (нового в HEAD нет); у «u» — m2, сторона
+            # «ours», это HEAD при merge, rebase, cherry-pick и stash (m1 — база слияния).
+            mode = parts[4 if kind == b"u" else 3].decode("ascii", "replace")
             if orig:
                 paths.append(os.fsdecode(orig))
-    return head, paths, nested
+            if kind != b"2" or orig:
+                modes[paths[-1]] = mode
+    return head, paths, nested, modes
 
 
 def _gitlinks(root, deadline):
@@ -257,7 +270,8 @@ def _gitlinks(root, deadline):
 
 
 def _git_state(root, deadline, prefix="", repos=None):
-    """{префикс репозитория от корня: {"head": HEAD или None, "dirty": [пути от корня]}} для root, его
+    """{префикс репозитория от корня: {"head": HEAD или None, "dirty": [пути от корня], "modes": {путь от
+    корня: режим отслеживаемого пути в HEAD}}} для root, его
     инициализированных подмодулей и вложенных репозиториев-не-подмодулей; None, если root вне git.
 
     Корень — префикс "". Подмодуль без своего `.git` не обходится: git в нём отвечает за родителя.
@@ -267,9 +281,9 @@ def _git_state(root, deadline, prefix="", repos=None):
     if st is None:
         return None
     repos = {} if repos is None else repos
-    head, dirty, nested = st
+    head, dirty, nested, modes = st
     pre = f"{prefix}/" if prefix else ""
-    entry = {"head": head, "dirty": [pre + p for p in dirty]}
+    entry = {"head": head, "dirty": [pre + p for p in dirty], "modes": {pre + p: m for p, m in modes.items()}}
     repos[prefix] = entry
     for sub in _gitlinks(root, deadline):
         if os.path.exists(os.path.join(root, sub, ".git")):
@@ -314,19 +328,32 @@ def _undetermined(reason):
 
 
 def _since_commit(repo_dir, base, deadline):
-    """Пути от repo_dir, отличные в рабочем дереве от коммита base, с удалёнными; без base — все
-    отслеживаемые; None — base недоступен."""
+    """{путь от repo_dir: режим пути в коммите base, "" — пути там не было}, для путей, отличных в рабочем дереве
+    от base, с удалёнными; без base — все отслеживаемые с режимом индекса; None — base недоступен."""
     if base is None:
-        return _git_ls(repo_dir, deadline, "-c")
-    out = _git(repo_dir, deadline, "--no-optional-locks", "diff", "--name-only", "-z", "--no-renames",
+        out = _git(repo_dir, deadline, "ls-files", "-s", "-z")
+        if out is None:
+            return None
+        return {os.fsdecode(e.partition(b"\t")[2]): e.split(b" ", 1)[0].decode("ascii", "replace")
+                for e in out.split(b"\0") if e}
+    out = _git(repo_dir, deadline, "--no-optional-locks", "diff", "--raw", "-z", "--no-renames",
                "--ignore-submodules=all", base, "--")
-    return None if out is None else [os.fsdecode(e) for e in out.split(b"\0") if e]
+    if out is None:
+        return None
+    # Запись `:<режим base> <режим дерева> <blob> <blob> <статус>`, следующая запись -z — путь.
+    tokens = iter(out.split(b"\0"))
+    names = {}
+    for tok in tokens:
+        if tok.startswith(b":"):
+            old = tok[1:].split(b" ", 1)[0].decode("ascii", "replace")
+            names[os.fsdecode(next(tokens, b""))] = "" if old.strip("0") == "" else old
+    return names
 
 
 def changed_since(root, snap, deadline=None):
     """[(путь от root, обычный ли это файл сейчас)] файлов, изменённых со снимка snap (snapshot.load),
-    по пути; None с предупреждением, если определить нельзя: сменился режим git/обход, пропал
-    репозиторий снимка, недоступен коммит HEAD снимка.
+    по пути; обычный файл git, заменённый ссылкой, — (путь, False); None с предупреждением, если определить нельзя:
+    сменился режим git/обход, пропал репозиторий снимка, недоступен коммит HEAD снимка.
     TimeoutError — не уложился в срок deadline (time.monotonic).
 
     В git изменённые — пути, отличные от HEAD снимка (коммиты и правки за реплику), грязные сейчас и
@@ -345,8 +372,11 @@ def changed_since(root, snap, deadline=None):
     if gone:
         return _undetermined(f"за реплику пропал репозиторий {gone[0]}")
     candidates = dict.fromkeys(start_dirty)
+    # Пути, которые в git были обычным файлом: режим 100644 или 100755 в HEAD сейчас или в HEAD снимка.
+    regular = set()
     for prefix, repo in repos.items():
         candidates.update(dict.fromkeys(repo["dirty"]))
+        regular.update(p for p, m in repo.get("modes", {}).items() if m in _REGULAR_MODES)
         if prefix in start_heads and repo["head"] == start_heads[prefix]:
             continue
         base = start_heads.get(prefix)
@@ -355,6 +385,7 @@ def changed_since(root, snap, deadline=None):
             return _undetermined(f"git не отдал изменения против снимка в репозитории {prefix or '.'}")
         pre = f"{prefix}/" if prefix else ""
         candidates.update(dict.fromkeys(pre + n for n in names))
+        regular.update(pre + n for n, m in names.items() if m in _REGULAR_MODES)
     changed = []
     for i, rel in enumerate(candidates):
         if i % STAT_CHECK_EVERY == 0:
@@ -363,8 +394,9 @@ def changed_since(root, snap, deadline=None):
         was = start_dirty.get(rel, False)
         if now == was:
             continue
-        # Ссылка или каталог на месте пути, который не был обычным файлом, — не файл кода.
-        if now is None and not was and os.path.lexists(os.path.join(root, rel)):
+        # Ссылка, подмодуль или каталог на месте пути, который не был обычным файлом (новый путь, ссылка и
+        # подмодуль в git), — не файл кода. Обычный файл git, заменённый ссылкой, — файл, которого больше нет.
+        if now is None and not was and rel not in regular and os.path.lexists(os.path.join(root, rel)):
             continue
         changed.append((rel, now is not None))
     return sorted(changed)
@@ -415,7 +447,9 @@ def store(state_dir, session_id, prompt_id, root, snap, deadline=None):
     data = {**snap, "format": FORMAT, "prompt_id": prompt_id, "root": str(root), "checked": False}
     if snap.get("mode") == "walk":
         data["dirs"] = _pack_dirs(snap["dirs"], deadline)
-    common.atomic_write_json(_snap_path(state_dir, session_id), data)
+    # Запись — под блокировкой, как чтение-правка-запись mark_checked и carry_over; упаковка — вне неё.
+    with common.state_lock(state_dir):
+        common.atomic_write_json(_snap_path(state_dir, session_id), data)
 
 
 def load(state_dir, session_id):

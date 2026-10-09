@@ -5,7 +5,10 @@
 нормализованы по PEP 503, Composer и crates.io — без регистра, crates.io — с `_` как `-`; npm, Go
 и RubyGems — как записаны. Пакет не из реестра по умолчанию (git, URL, другой реестр) — имя с источником
 `имя @ источник`, источник для всех пакетов (индекс, репозиторий) — `index <url>`: смена источника имени — новое
-имя, другая ссылка того же источника (коммит, тег, ветка) — нет.
+имя, другая ссылка того же источника (коммит, тег, ветка) — нет. Подключение файла, который ставится вместе с
+манифестом (`-r`, `-c`, `eval_gemfile`), — Include `include <путь>`, не равное строке с тем же текстом; строка
+requirements с переменной окружения `${…}` — сама строка, у её URL — без ссылки и фрагмента, где нет `${…}`, у
+архива — колесо `имя @ каталог`, другой архив — URL с именем файла.
 """
 import json
 import re
@@ -27,16 +30,23 @@ _KINDS = {
 }
 
 
-def kind(path):
+_FOLDED_KINDS = {name.casefold(): value for name, value in _KINDS.items()}
+
+
+def kind(path, fold=False):
     """Вид манифеста по имени файла или None.
 
     requirements — `requirements*.txt`, `requirements*.in` и `*.txt`, `*.in` в каталоге
-    `requirements/`; разделитель пути — `/` или `\\`. Регистр имени значим.
+    `requirements/`; разделитель пути — `/` или `\\`. Регистр имени значим; fold — без учёта регистра только
+    базового имени и только у имён _KINDS (файловая система без учёта регистра: `PACKAGE.JSON` — тот же
+    package.json); имена requirements и каталоги — как написаны.
     """
     parts = re.split(r"[\\/]", path)
     base = parts[-1]
     if base in _KINDS:
         return _KINDS[base]
+    if fold and base.casefold() in _FOLDED_KINDS:
+        return _FOLDED_KINDS[base.casefold()]
     if _REQUIREMENTS_NAME.match(base):
         return "requirements"
     if len(parts) > 1 and parts[-2] == "requirements" and _REQUIREMENTS_DIR_FILE.match(base):
@@ -69,11 +79,15 @@ _VCS_REF = re.compile(r"@[^/@]*\Z")
 _ARCHIVE = re.compile(r"[^/]*\.(?:whl|zip|tar|tgz|tbz2|txz|tar\.(?:gz|bz2|xz))\Z", re.IGNORECASE)
 
 
+# Схема VCS-URL pip: `git+…`, `hg+…`, `svn+…`, `bzr+…`.
+_VCS = re.compile(r"[A-Za-z]+\+")
+
+
 def _url_source(url):
     """URL пакета без фрагмента (`#egg=`, `#sha256=`); у VCS (`git+…`) — без ссылки `@…`, у архива — каталог
     без имени файла и запроса: версия пакета живёт в имени файла, как ссылка у VCS."""
     url = url.split("#", 1)[0].strip()
-    if re.match(r"[A-Za-z]+\+", url):
+    if _VCS.match(url):
         return _VCS_REF.sub("", url)
     path = url.split("?", 1)[0]
     if _URL.match(path) and _ARCHIVE.search(path) and path.count("/") > 2:
@@ -183,11 +197,14 @@ def _npm(text):
     if data is None:
         return None
     names = set()
-    for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
-        for name, spec in _table(data, section).items():
-            name = _npm_spec(name, spec)
-            if name is not None:
-                names.add(name)
+    # `pnpm.packageExtensions` дописывает зависимости в чужие пакеты (@pnpm/types, PackageExtension): они ставятся.
+    extensions = [ext for ext in _table(data, "pnpm", "packageExtensions").values() if isinstance(ext, dict)]
+    for table in [data, *extensions]:
+        for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+            for name, spec in _table(table, section).items():
+                name = _npm_spec(name, spec)
+                if name is not None:
+                    names.add(name)
     for table in (_table(data, "overrides"), _table(data, "resolutions"), _table(data, "pnpm", "overrides")):
         _npm_overrides(table, names)
     return frozenset(names)
@@ -205,11 +222,25 @@ def _composer(text):
         return None
     names = {name.lower() for section in ("require", "require-dev") for name in _table(data, section)
              if not _COMPOSER_PLATFORM.fullmatch(name)}
-    # Репозитории — источник для всех пакетов; `path` — каталог проекта.
+    # Репозитории — источник для всех пакетов; `path` — каталог проекта. Репозиторий `package` описывает пакет
+    # (одну версию или список) прямо в манифесте: его `dist.url` и `source.url` — источник этого пакета.
     repositories = data.get("repositories")
     for repo in repositories.values() if isinstance(repositories, dict) else _list(repositories):
-        if isinstance(repo, dict) and repo.get("type") != "path" and isinstance(repo.get("url"), str):
+        if not isinstance(repo, dict) or repo.get("type") == "path":
+            continue
+        if isinstance(repo.get("url"), str):
             names.add(_index(repo["url"]))
+        if repo.get("type") == "package":
+            package = repo.get("package")
+            for version in package if isinstance(package, list) else [package]:
+                if not isinstance(version, dict):
+                    continue
+                name = version.get("name")
+                for key in ("dist", "source"):
+                    url = _table(version, key).get("url")
+                    if isinstance(url, str):
+                        source = _url_source(url)
+                        names.add(_sourced(name.lower(), source) if isinstance(name, str) else _index(source))
     return frozenset(names)
 
 
@@ -265,14 +296,28 @@ def _pyproject(text):
         if isinstance(env, dict):
             specs += _list(env.get("dependencies")) + _list(env.get("extra-dependencies"))
     names = {_pep508_name(spec) for spec in specs} | (build - _BUILD_BACKENDS)
+    # Ограничения и замены uv (`override-dependencies`, `constraint-dependencies`) и замены pdm
+    # (`[tool.pdm.resolution.overrides]`) пакета не добавляют, но требование с URL меняет источник пакета графа.
+    for spec in _list(uv.get("override-dependencies")) + _list(uv.get("constraint-dependencies")):
+        name = _pep508_name(spec)
+        if name is not None and " @ " in name:
+            names.add(name)
+    for name, spec in _table(data, "tool", "pdm", "resolution", "overrides").items():
+        if isinstance(spec, str) and _URL.match(spec) and not spec.startswith("file:"):
+            names.add(_sourced(_pep503(name), _url_source(spec)))
     poetry = _table(data, "tool", "poetry")
     tables = [_table(poetry, "dependencies"), _table(poetry, "dev-dependencies")]
     tables += [_table(group, "dependencies") for group in _table(poetry, "group").values()]
     for table in tables:
         for name, spec in table.items():
-            if name.lower() != "python" and not (isinstance(spec, dict) and "path" in spec):
-                source = _table_source(spec)
-                names.add(_pep503(name) if source is None else _sourced(_pep503(name), source))
+            if name.lower() == "python":
+                continue
+            # Список таблиц — ограничения по маркерам (poetry, «Multiple constraints dependencies»): у каждой свой
+            # источник, `path` — местный.
+            for one in spec if isinstance(spec, list) else [spec]:
+                if not (isinstance(one, dict) and "path" in one):
+                    source = _table_source(one)
+                    names.add(_pep503(name) if source is None else _sourced(_pep503(name), source))
     # Ссылка проекта на свои extras (`app[cli]`) — не внешний пакет.
     for own in (project.get("name"), poetry.get("name")):
         if isinstance(own, str):
@@ -298,26 +343,44 @@ def _pyproject(text):
 
 _URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
 _EGG = re.compile(r"[#&]egg=([A-Za-z0-9][A-Za-z0-9._-]*)")
-# Комментарий файла требований: `#` в начале строки или после пробела.
-_REQ_COMMENT = re.compile(r"(?:^|\s)#.*")
-_EDITABLE = re.compile(r"(?:-e|--editable)(?:\s+|=)(.*)")
-# Индекс и каталог ссылок: `-i URL`, `-iURL`, `--index-url URL`, `--extra-index-url=URL`, `-f`, `--find-links`.
-_REQ_INDEX = re.compile(r"(?:-[if]\s*=?|--(?:extra-)?index-url(?:\s*=\s*|\s+)|--find-links(?:\s*=\s*|\s+))(\S+)")
+# Комментарий файла требований (pip, req_file.COMMENT_RE `(^|\s+)#.*$`): `#` в начале строки или после пробела;
+# строка, которая начинается с него после пробелов, — строка-комментарий. Без отката по пробелам: время линейно.
+_REQ_COMMENT = re.compile(r"(?<!\S)#")
+_REQ_COMMENT_LINE = re.compile(r"\s*#")
+# Переменная окружения, которую pip подставляет в строку требований (req_file.ENV_VAR_RE).
+_REQ_ENV = re.compile(r"\$\{[A-Z0-9_]+\}")
+
+
+class Include(str):
+    """Подключение другого файла манифестом (`-r`, `-c` requirements, `eval_gemfile` Gemfile): его содержимое
+    ставится, а этот разбор его не видит. Текст — `include <путь>`; равно только подключению того же пути, не строке
+    и не имени пакета с тем же текстом (`include @ git+…` — пакет)."""
+    __slots__ = ()
+    PREFIX = "include "
+
+    def __new__(cls, path):
+        return super().__new__(cls, cls.PREFIX + path)
+
+    @property
+    def path(self):
+        return self[len(self.PREFIX):]
+
+    def __eq__(self, other):
+        return isinstance(other, Include) and str.__eq__(self, other)
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash((Include, str(self)))
 
 
 def _requirement_name(line):
-    """Имя пакета строки требований без комментария или None.
+    """Имя пакета требования (строка без опций pip) или None.
 
     VCS- и прочий URL — имя из `#egg=` или из имени файла колеса `.whl` с источником (_sourced); иначе не
-    виден. Индекс и каталог ссылок по URL — `index <url>`. Локальный путь (`./x`, `/x`, `~/x`, `.`, архив с
-    разделителем пути) — не пакет. Прочие опции, `-r`, `-c` — None.
+    виден. Локальный путь (`./x`, `/x`, `~/x`, `.`, архив с разделителем пути) — не пакет.
     """
-    m = _EDITABLE.match(line)
-    if m:
-        line = m.group(1).strip()
-    elif line.startswith("-"):
-        m = _REQ_INDEX.match(line)
-        return _pypi_index(m.group(1)) if m else None
     if _URL.match(line):
         url = line.split()[0]
         egg = _EGG.search(url)
@@ -333,14 +396,193 @@ def _requirement_name(line):
     return _pep508_name(line)
 
 
+def _requirement_lines(text):
+    """Логические строки файла требований, как у pip (req_file.join_lines, ignore_comments): строка, оканчивающаяся
+    на `\\`, кроме строки-комментария, склеивается со следующей без разделителя, `\\` с её краёв снимаются; затем
+    снимается комментарий и пробелы по краям, пустые строки пропускаются."""
+    joined, parts = [], []
+    for line in text.splitlines():
+        comment = _REQ_COMMENT_LINE.match(line)
+        if line.endswith("\\") and not comment:
+            parts.append(line.strip("\\"))
+            continue
+        if comment:
+            line = " " + line
+        joined.append("".join(parts) + line)
+        parts = []
+    if parts:
+        joined.append("".join(parts))
+    for line in joined:
+        m = _REQ_COMMENT.search(line)
+        line = (line if m is None else line[:m.start()]).strip()
+        if line:
+            yield line
+
+
+class _OptionError(Exception):
+    pass
+
+
+# Слово строки опций, как у shlex.split (posix, whitespace_split, без комментариев): часть без кавычек, `\` с любым
+# знаком, строка в '…' и строка в "…" (`\` в ней снимается только перед `"` и `\`); пробелы shlex — ` \t\r\n`.
+# Незакрытая кавычка и `\` в конце не совпадают ни с чем: shlex отвергает такую строку. Части не пересекаются,
+# совпадение без отката: время линейно.
+_SHELL_PIECE = re.compile(r"""[^ \t\r\n'"\\]+|\\([\s\S])|'([^']*)'|"([^"\\]*(?:\\[\s\S][^"\\]*)*)"|([ \t\r\n]+)""")
+_SHELL_DQ_ESCAPE = re.compile(r"""\\([\s\S])""")
+
+
+def _shell_words(text):
+    """Слова text, как их даёт shlex.split; ValueError — незакрытая кавычка или `\\` в конце, как у shlex."""
+    words, word, quoted, pos = [], [], False, 0
+    while pos < len(text):
+        m = _SHELL_PIECE.match(text, pos)
+        if m is None:
+            raise ValueError("строка, которую shlex отвергает")
+        pos = m.end()
+        escaped, single, double, space = m.groups()
+        if space is not None:
+            if word or quoted:
+                words.append("".join(word))
+            word, quoted = [], False
+        elif escaped is not None:
+            word.append(escaped)
+        elif single is not None:
+            word.append(single)
+            quoted = True
+        elif double is not None:
+            word.append(_SHELL_DQ_ESCAPE.sub(lambda e: e.group(1) if e.group(1) in '"\\' else e.group(0), double))
+            quoted = True
+        else:
+            word.append(m.group())
+    if word or quoted:
+        words.append("".join(word))
+    return words
+
+
+# Опции строки файла требований pip (req_file.SUPPORTED_OPTIONS и SUPPORTED_OPTIONS_REQ, pip 26.2): имена опции —
+# первое длинное имя (у optparse — dest), значение — список значений (append) или True у флага.
+_OPTION_VALUES = [("-i", "--index-url", "--pypi-url"), ("--extra-index-url",), ("-c", "--constraint"),
+                  ("-r", "--requirement"), ("-e", "--editable"), ("-f", "--find-links"), ("--no-binary",),
+                  ("--only-binary",), ("--all-releases",), ("--only-final",), ("--trusted-host",), ("--use-feature",),
+                  ("--hash",), ("-C", "--config-settings")]
+_OPTION_FLAGS = ["--no-index", "--prefer-binary", "--require-hashes", "--no-require-hashes", "--pre"]
+# Имя опции → (dest, берёт ли значение).
+_OPTIONS = {name: (next(n for n in names if n.startswith("--")), True) for names in _OPTION_VALUES for name in names}
+_OPTIONS.update({name: (name, False) for name in _OPTION_FLAGS})
+
+
+def _long_option(opt):
+    """Длинная опция по имени или однозначному сокращению (optparse._match_abbrev); _OptionError — нет такой или
+    сокращение неоднозначно."""
+    if opt in _OPTIONS:
+        return opt
+    found = [name for name in _OPTIONS if name.startswith("--") and name.startswith(opt)]
+    if len(found) != 1:
+        raise _OptionError(opt)
+    return found[0]
+
+
+def _parse_options(args):
+    """{dest: [значения] или True} слов args, как их разбирает optparse pip (OptionParser._process_args): `--`
+    кончает опции; длинная — по имени или сокращению, значение — после `=` или следующим словом, у флага `=` —
+    ошибка; короткие склеиваются (`-e<значение>`), опция со значением берёт остаток слова или следующее слово;
+    прочие слова — позиционные, они не значат. Один проход по словам: время линейно. _OptionError — строка, которую
+    optparse отвергает."""
+    opts, i = {}, 0
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if arg == "--":
+            break
+        if arg.startswith("--"):
+            name, eq, value = arg.partition("=")
+            dest, takes = _OPTIONS[_long_option(name)]
+            if not takes:
+                if eq:
+                    raise _OptionError(name)
+                opts[dest] = True
+                continue
+            if not eq:
+                if i == len(args):
+                    raise _OptionError(name)
+                value = args[i]
+                i += 1
+            opts.setdefault(dest, []).append(value)
+        elif arg.startswith("-") and len(arg) > 1:
+            for k in range(1, len(arg)):
+                option = _OPTIONS.get("-" + arg[k])
+                if option is None:
+                    raise _OptionError(arg)
+                dest, takes = option
+                if not takes:
+                    opts[dest] = True
+                    continue
+                if k + 1 < len(arg):
+                    value = arg[k + 1:]
+                elif i < len(args):
+                    value = args[i]
+                    i += 1
+                else:
+                    raise _OptionError(arg)
+                opts.setdefault(dest, []).append(value)
+                break
+    return opts
+
+
+def _env_word(word):
+    """Слово строки с `${…}`: у слова-URL — без ссылки VCS `@…` и фрагмента `#…` (_url_source), если в снимаемой
+    части нет `${`; у архива — его пакет: колесо — `имя @ каталог`, как у _requirement_name, другой архив — URL с
+    именем файла, без запроса и фрагмента (имя пакета sdist из имени файла точно не выделить)."""
+    if not _URL.match(word):
+        return word
+    source = _url_source(word)
+    if not word.startswith(source) or "${" in word[len(source):]:
+        return word
+    path = word.split("#", 1)[0].split("?", 1)[0]
+    if path == source or _VCS.match(word):
+        return source
+    if path.endswith(".whl") and not path.startswith("file:"):
+        return _sourced(_pep503(path.rsplit("/", 1)[-1].split("-", 1)[0]), source)
+    return path
+
+
+def _env_line(line):
+    """Строка с переменной окружения `${…}` как имя: слова через пробел, каждое — _env_word. Другая ссылка того же
+    источника и другая версия того же колеса в том же каталоге — не новое имя."""
+    return " ".join(_env_word(word) for word in line.split(" "))
+
+
+def _requirement_line(line):
+    """Имена логической строки файла требований, как её читает pip (req_file.break_args_options, get_line_parser,
+    handle_line): до первого слова на `-` (слова — через пробел) — требование, остальное — опции: слова shlex
+    (_shell_words) и разбор optparse (_parse_options). Требование — его имя (_requirement_name); без него — первое
+    `-e`. Строка без требования: первое `-r`, иначе первое `-c` (файл ограничений тоже ставит пакеты своих `-r` и
+    меняет индекс), — Include; иначе индексы `-i`, `--extra-index-url` (без `--no-index`) и первый `-f` —
+    `index <url>` (_pypi_index). Строку с переменной окружения `${…}` pip подставляет при чтении: имя — сама строка
+    (_env_line). Опции, которые pip не разберёт, — пусто: pip отвергнет файл целиком."""
+    if _REQ_ENV.search(line):
+        return {_env_line(line)}
+    words = line.split(" ")
+    split = next((i for i, word in enumerate(words) if word.startswith("-")), len(words))
+    requirement = " ".join(words[:split])
+    try:
+        opts = _parse_options(_shell_words(" ".join(words[split:])))
+    except (ValueError, _OptionError):
+        return set()
+    requirement = requirement or opts.get("--editable", [""])[0]
+    if requirement:
+        return {_requirement_name(requirement)}
+    if "--requirement" in opts or "--constraint" in opts:
+        return {Include((opts.get("--requirement") or opts["--constraint"])[0])}
+    urls = [] if opts.get("--no-index") else opts.get("--index-url", [])[-1:] + opts.get("--extra-index-url", [])
+    return {_pypi_index(url) for url in urls + opts.get("--find-links", [])[:1]}
+
+
 def _requirements(text):
     """Имена файла требований. Заголовок генератора и аннотации `# via` проверку не снимают: их впишет и агент."""
     names = set()
-    # Строка, оканчивающаяся на `\`, продолжается следующей.
-    for line in re.sub(r"\\\r?\n", " ", text).splitlines():
-        line = _REQ_COMMENT.sub("", line).strip()
-        if line:
-            names.add(_requirement_name(line))
+    for line in _requirement_lines(text):
+        names.update(_requirement_line(line))
     names.discard(None)
     return frozenset(names)
 
@@ -395,8 +637,13 @@ _GO_COMMENT = re.compile(r"//.*")
 _GO_INDIRECT = re.compile(r"//\s*indirect\s*(?:;|$)")
 _GO_BLOCK_START = re.compile(r"([a-z]+)\s*\(\s*$")
 _GO_DIRECTIVE = re.compile(r"(require|replace|module)\s+(.*)")
-# Правая часть `replace` — каталог: `./`, `../`, абсолютный путь, в том числе Windows.
-_GO_LOCAL_PATH = re.compile(r"(?:\.{1,2}[\\/]|/|[A-Za-z]:[\\/]|\\)")
+
+
+def _go_directory(path):
+    """Правая часть `replace` — каталог (modfile.IsDirectoryPath): `.`, `..`, начало `./`, `.\\`, `../`, `..\\`, `/`,
+    `\\` или буква диска с `:`."""
+    return (path in (".", "..") or path.startswith(("./", ".\\", "../", "..\\", "/", "\\"))
+            or len(path) >= 2 and path[0].isascii() and path[0].isalpha() and path[1] == ":")
 
 
 def _go_path(token):
@@ -404,27 +651,35 @@ def _go_path(token):
 
 
 def _go_replace(spec):
-    """(модуль, заменённый каталогом, или None; модуль-замена из другого пути или None) директивы
-    `replace <модуль> [версия] => <путь или модуль> [версия]`."""
+    """((модуль, версия левой части или None), заменённый каталогом, или None; модуль-замена из другого пути или None)
+    директивы `replace <модуль> [версия] => <путь или модуль> [версия]`."""
     left, arrow, right = spec.partition("=>")
     old, new = left.split(), right.split()
     if not (arrow and old and new):
         return None, None
+    version = _go_path(old[1]) if len(old) > 1 else None
     old, new = _go_path(old[0]), _go_path(new[0])
-    if _GO_LOCAL_PATH.match(new):
-        return old, None
+    if _go_directory(new):
+        return (old, version), None
     return None, (new if new != old else None)
 
 
 def _gomod(text, indirect=False):
     """Пути модулей директив `require`; помеченные `// indirect` — только при indirect. Модуль,
-    заменённый каталогом (`replace x => ../x`), — местный, не входит; модуль-замена из другого пути
+    заменённый каталогом (`replace x => ../x`), — местный, не входит, если у замены нет версии или она — версия из
+    `require` этого модуля (замена `x v1 => ./x` другой версии не касается); модуль-замена из другого пути
     (`replace x => evil/x v1`) — входит.
 
     Незакрытый блок читается до конца файла.
     """
-    names, replaced = set(), []
+    names, replaced, versions = set(), [], {}
     block = None
+
+    def require(spec):
+        words = spec.split()
+        path = _go_path(words[0])
+        versions.setdefault(path, set()).update(_go_path(w) for w in words[1:2])
+        return path
     for line in text.splitlines():
         skip = not indirect and _GO_INDIRECT.search(line)
         line = _GO_COMMENT.sub("", line).strip()
@@ -433,8 +688,10 @@ def _gomod(text, indirect=False):
         if block is not None:
             if line.startswith(")"):
                 block = None
-            elif block == "require" and not skip:
-                names.add(_go_path(line.split(None, 1)[0]))
+            elif block == "require":
+                path = require(line)
+                if not skip:
+                    names.add(path)
             elif block == "replace":
                 replaced.append(_go_replace(line))
             continue
@@ -443,11 +700,14 @@ def _gomod(text, indirect=False):
             block = m.group(1)
             continue
         m = _GO_DIRECTIVE.match(line)
-        if m and m.group(1) == "require" and not skip:
-            names.add(_go_path(m.group(2).split(None, 1)[0]))
+        if m and m.group(1) == "require" and m.group(2).split():
+            path = require(m.group(2))
+            if not skip:
+                names.add(path)
         elif m and m.group(1) == "replace":
             replaced.append(_go_replace(m.group(2)))
-    local = {old for old, _ in replaced}
+    local = {old for (old, version), _ in filter(lambda r: r[0], replaced)
+             if version is None or version in versions.get(old, ())}
     names = (names - local) | {new for _, new in replaced}
     names.discard("")
     names.discard(None)
@@ -462,12 +722,19 @@ def _gomod_module(text):
     return None
 
 
-# `gem 'имя'` и `gem("имя")` с буквальным именем; интерполяция и переменные не совпадают.
-_GEM = re.compile(r"""\s*gem\s*(?:\(\s*)?(['"])([A-Za-z0-9._-]+)\1""")
-# Местный гем: опция `path:` или `:path =>` в строке `gem`.
-_GEM_PATH = re.compile(r"(?:\bpath:|:path\s*=>)")
-# Источник гема опцией: `git:`, `github:`, `source:` или `:git =>` и т.п. с буквальной строкой.
-_GEM_SOURCE = re.compile(r"""(?:\b(git|github|source):|:(git|github|source)\s*=>)\s*(['"])([^'"]*)\3""")
+# `gem 'имя'`, `gem("имя")`, `(gem "имя")` с буквальным именем; `plugin` — гем плагина Bundler, его ставит
+# Bundler::Plugin::DSL как `gem`. Интерполяция и переменные не совпадают.
+_GEM = re.compile(r"""\s*(?:\(\s*)*(?:gem|plugin)\s*(?:\(\s*)?(['"])([A-Za-z0-9._-]+)\1""")
+# Подключение файла: `eval_gemfile "путь"` с буквальным путём.
+_GEM_EVAL = re.compile(r"""\s*(?:\(\s*)*eval_gemfile\s*(?:\(\s*)?(['"])([^'"]*)\1""")
+# Местный гем: опция `path` в строке `gem` — `path:`, `:path =>`, `"path" =>` (Bundler::Dsl.normalize_hash
+# приводит ключи к строкам).
+_GEM_PATH = re.compile(r"""(?:\bpath:|:path\s*=>|(['"])path\1\s*=>)""")
+# Источник гема опцией с буквальной строкой: `git`, `source` и встроенные git_source Bundler (`github`, `gist`,
+# `bitbucket`, `gitlab`; Bundler::Dsl.add_git_sources) ключом `git:`, `:git =>` или `"git" =>`.
+_GEM_SOURCE_KEYS = "git|github|gist|bitbucket|gitlab|source"
+_GEM_SOURCE = re.compile(rf"""(?:\b({_GEM_SOURCE_KEYS}):|:({_GEM_SOURCE_KEYS})\s*=>|(['"])({_GEM_SOURCE_KEYS})\3\s*=>)"""
+                         r"""\s*(['"])([^'"]*)\5""")
 # Блок `path|git|github|source "значение" do … end`: гемы в нём — из каталога или источника. Значение — до первой
 # своей кавычки.
 _GEM_BLOCK = re.compile(
@@ -504,12 +771,13 @@ def _ruby_statements(line):
 
 
 def _gem_source(kind, value):
-    """Источник гема по виду опции или блока (`git`, `github`, `source`) и значению."""
+    """Источник гема по виду опции или блока (`git`, `source`, git_source `github`, `gist`, `bitbucket`, `gitlab`) и
+    значению."""
     if kind == "git":
         return "git+" + _url_source(value)
-    if kind == "github":
-        return "github:" + value
-    return value.rstrip("/")
+    if kind == "source":
+        return value.rstrip("/")
+    return f"{kind}:{value}"
 
 
 # Метка местного блока `path … do` в стеке источников _gemfile.
@@ -517,8 +785,9 @@ _GEM_LOCAL = object()
 
 
 def _gemfile(text):
-    """Гемы операторов `gem` с буквальным именем, кроме местных: с `path:` и внутри блока `path … do` без своей
-    опции источника; гем с опцией или в блоке `git`, `github`, `source` — имя с источником, опция важнее блока;
+    """Гемы операторов `gem` и `plugin` с буквальным именем, кроме местных: с опцией `path` и внутри блока
+    `path … do` без своей опции источника; гем с опцией (_GEM_SOURCE) или в блоке `git`, `github`, `source` — имя с
+    источником, опция важнее блока; `eval_gemfile "путь"` — Include;
     `source "url"` без блока, кроме RubyGems, — `index <url>` на любой глубине, в том числе внутри `path … do`: в
     Bundler он глобален. Операторы одной строки, в том числе `source`, разделяет `;`. Источник гема — ближайший
     блок источника на любой глубине (стек блоков): вложенный `path` внутри `source … do` — местный. Вложенность
@@ -548,12 +817,16 @@ def _gemfile(text):
                 if m.group(2).rstrip("/") not in _RUBYGEMS:
                     names.add(_index(m.group(2)))
                 continue
+            m = _GEM_EVAL.match(statement)
+            if m:
+                names.add(Include(m.group(2)))
+                continue
             m = _GEM.match(statement)
             if not m or _GEM_PATH.search(statement, m.end()):
                 continue
             option = _GEM_SOURCE.search(statement, m.end())
             if option:
-                source = _gem_source(option.group(1) or option.group(2), option.group(4))
+                source = _gem_source(option.group(1) or option.group(2) or option.group(4), option.group(6))
             elif block is _GEM_LOCAL:
                 continue
             else:

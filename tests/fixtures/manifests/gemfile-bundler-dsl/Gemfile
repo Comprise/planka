@@ -1,0 +1,15 @@
+# источник: формы man gemfile(5) Bundler 2.6 и Bundler::Dsl 2.6.9 (git_source github, gist, bitbucket, gitlab; ключ строкой; plugin; eval_gemfile)
+source "https://rubygems.org"
+
+plugin "bundler-graph"
+
+gem "rails", "~> 7.1"
+gem "rack", github: "rack/rack"
+gem "nokogiri", :git => "https://github.com/sparklemotion/nokogiri.git", :branch => "main"
+gem "redis", "git" => "https://github.com/redis/redis-rb.git"
+gem "the_gist", gist: "4815162342"
+gem "bb_gem", bitbucket: "mybitbucketuser/bb_gem"
+gem "gl_gem", gitlab: "mygroup/gl_gem"
+gem "my_engine", "path" => "engines/my_engine"
+
+eval_gemfile "Gemfile.local" if File.exist?("Gemfile.local")

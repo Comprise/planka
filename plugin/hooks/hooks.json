@@ -29,7 +29,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "^(AskUserQuestion|ExitPlanMode|Bash|Write|Edit|MultiEdit)$",
+        "matcher": "^(AskUserQuestion|ExitPlanMode|Bash|Write|Edit|MultiEdit)$|^mcp__",
         "hooks": [
           {
             "type": "command",
@@ -75,6 +75,16 @@
             "timeout": 30
           }
         ]
+      },
+      {
+        "matcher": "^mcp__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/planka/judge_tool.py\"",
+            "timeout": 30
+          }
+        ]
       }
     ],
     "PostToolUseFailure": [
@@ -86,6 +96,16 @@
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/planka/debug_watch.py\"",
             "timeout": 10
           },
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/planka/judge_tool.py\"",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "^mcp__",
+        "hooks": [
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/planka/judge_tool.py\"",

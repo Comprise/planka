@@ -70,13 +70,10 @@
 ## `plugin/planka/`
 
 Код хуков: точки входа `remind.py` (`UserPromptSubmit`, хук на каждую часть ядра, номер части — аргументом),
-`judge_tool.py` (`PreToolUse`, а на `Bash` ещё `PostToolUse` и
-`PostToolUseFailure` — проверка манифестов), `guard_memory.py`, `judge_stop.py`, `debug_watch.py`, `model_watch.py`
-(`SessionStart`, `PostModelSwitch` — модель сессии для судьи); остальное —
-их модули, среди них `manifests.py` (разбор манифестов) и `manifest_watch.py` (правка манифеста, в том числе через
-ссылку, члены workspace корня, снимок и
-сравнение после команды, стороны конфликта в индексе, имена `setup.py`, `setup.cfg`, `Pipfile` как известные,
-имена ref до начала сессии, откуда команда git возвращает файлы, и патчей `git apply`, не менявшихся с начала сессии).
+`judge_tool.py` (`PreToolUse`, а на `Bash` и MCP-инструментах `mcp__*` ещё `PostToolUse` и `PostToolUseFailure` —
+проверка манифестов), `guard_memory.py`, `judge_stop.py`, `debug_watch.py`, `model_watch.py` (`SessionStart`,
+`PostModelSwitch` — модель сессии для судьи); остальное — их модули, среди них `manifests.py` (разбор манифестов) и
+`manifest_watch.py` (проверка манифестов после правки и команды; роли — `context/architecture.md`, «Компоненты»).
 
 Инварианты:
 
@@ -91,7 +88,8 @@
 - Отказ запоминается через `common.emit` до записи журнала: сбой записи не отменяет отказ.
 - Запись файлов состояния — атомарная, через `common.atomic_write_json` (временный файл и
   `os.replace`); чтение и запись счётчиков, предупреждений, неудач команд, снимков манифестов, неудач снимка
-  дерева, запись модели сессии, перепривязка и отметка снимка дерева — под `common.state_lock`.
+  дерева, запись модели сессии, начала сессии и снимка дерева, перепривязка и отметка снимка дерева — под
+  `common.state_lock`.
 - Хук с судьёй проверяет лимит отказов до вызова судьи (`common.deny_budget_left`); ошибка судьи
   — пропуск с `common.skip_message`, в журнал — `Verdict.error` без текста модели.
 - JSON наружу — через `common.dumps`: имя файла не в UTF-8 не роняет запись.
@@ -107,13 +105,13 @@
 
 - Модуль начинается с заголовка и строки условия «Читайте, мой дорогой друг, …».
 - Текст модуля — на «вы», с «пожалуйста» в просьбах (`PoliteFormTest` в `tests/test_contract.py`).
-- Имя файла — контракт с кодом: переименование — правка вызовов `common.rubric` и
-  `common.rule_texts` в `judge_tool.py`, `judge_stop.py`, `guard_memory.py`, `debug_watch.py`
-  (`MODULE`), ссылок `judge_tool.DEP_REASON`, `MANIFEST_REASON`, `COMMAND_REASON`, `MODULES` в
-  `tests/test_contract.py`, индекса в `plugin/philosophy.md` и `README.md`, ссылок `{RULES}/<имя>.md` в ядре и
-  модулях, `remind.NO_DOCS_LINE`, `debug_watch.LINE` (их и ссылки в коде сверяет
-  `test_module_references_exist`) и ключей `tests/helpers.RULES`. Имена из вызовов тест выводит
-  из кода сам (`test_names_taken_by_code_exist`); `dependencies` код называет только текстом причин отказа.
+- Имя файла — контракт с кодом: переименование — правка вызовов `common.rubric` и `common.rule_texts` в `judge_tool.py`,
+  `judge_stop.py`, `guard_memory.py`, `debug_watch.py` (`MODULE`), ссылок `judge_tool.DEP_REASON`, `DEP_DOUBT_REASON`,
+  `MANIFEST_REASON`, `COMMAND_REASON`, `MCP_REASON`, `MODULES` в `tests/test_contract.py`, индекса в
+  `plugin/philosophy.md` и `README.md`, ссылок `{RULES}/<имя>.md` в ядре и модулях, `remind.NO_DOCS_LINE`,
+  `debug_watch.LINE` (их и ссылки в коде сверяет `test_module_references_exist`) и ключей `tests/helpers.RULES`. Имена
+  из вызовов тест выводит из кода сам (`test_names_taken_by_code_exist`); `dependencies` код называет только текстом
+  причин отказа.
 - Метки `{RULES}`, `{COMMENT_LANG}`, `{DOC_LANG}` подставляются при чтении; других меток нет.
 
 Читать перед правкой: `context/architecture.md`, «Контракт кода с текстами правил».

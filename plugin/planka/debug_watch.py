@@ -86,12 +86,63 @@ def _skip_heredocs(command, i, pending):
     return i
 
 
+def _paren_pairs(command):
+    """Закрывающая «)» каждой «(» вне кавычек, комментариев и тел heredoc: {индекс «(»: индекс «)»}. «<<» внутри
+    «$[…]» и внутри открытой «((» — сдвиг, не heredoc, даже если «((» окажется двумя «(» подоболочек: так её
+    содержимое читает bash, проверяя арифметику (parse_arith_cmd). Один проход, время линейно."""
+    # stack — открытые «(»: (индекс, начинает ли она «((»); arith — сколько из них начинают «((».
+    pairs, stack, pending = {}, [], []
+    arith = 0
+    # Глубина «[» внутри «$[…]», считая саму «$[»; 0 — вне «$[…]».
+    brackets = 0
+    quote, boundary, i, n = None, True, 0, len(command)
+    while i < n:
+        c = command[i]
+        if quote is None and c == "#" and boundary:
+            end = command.find("\n", i)
+            i = n if end < 0 else end
+            continue
+        if quote is None and c == "\n" and pending:
+            i = _skip_heredocs(command, i + 1, pending)
+            pending = []
+            boundary = True
+            continue
+        step = 2 if c == "\\" and quote != "'" else 1
+        boundary = quote is None and (c.isspace() or c in "&()<>;|")
+        if quote is None:
+            if c == "<" and not command.startswith("<<<", i) and not command.startswith("<<<", i - 1) \
+                    and not arith and not brackets:
+                m = HEREDOC.match(command, i)
+                if m:
+                    word = next(g for g in m.groups()[1:] if g is not None)
+                    pending.append((word, m.group(1) == "-"))
+            if c == "(":
+                opens = command.startswith("((", i)
+                stack.append((i, opens))
+                arith += opens
+            elif c == ")" and stack:
+                j, opens = stack.pop()
+                arith -= opens
+                pairs[j] = i
+            elif brackets and c in "[]":
+                brackets += 1 if c == "[" else -1
+            elif command.startswith("$[", i):
+                brackets, step = brackets + 1, 2
+            elif c in "'\"":
+                quote = c
+        elif c == quote:
+            quote = None
+        i += step
+    return pairs
+
+
 def _segments(command):
     """Непустые команды строки с разделителем перед каждой: [(разделитель, текст)]. Разделители вне кавычек —
     «|», «|&», «||», «&&», «;» и перевод строки; у первой команды разделитель "". Одиночный «&» и скобки не
-    разделяют; внутри «[[ … ]]» разделителей нет; тела heredoc отбрасываются, а «<<» внутри «$((…))» и
-    «((…))» — сдвиг, не heredoc. Комментарий от «#» в начале слова (после пробела, «;», «&», «|», скобки,
-    «<», «>» или в начале строки) до конца строки отбрасывается."""
+    разделяют; внутри «[[ … ]]», «$((…))», «((…))» и «$[…]» разделителей нет («((» без закрытия «))» — две «(»
+    подоболочек); тела heredoc отбрасываются, а «<<» внутри арифметики — сдвиг, не heredoc. Комментарий от «#»
+    в начале слова (после пробела, «;», «&», «|», скобки, «<», «>» или в начале строки) до конца строки
+    отбрасывается."""
     segments = [["", []]]
     i, n = 0, len(command)
     quote = None
@@ -101,8 +152,14 @@ def _segments(command):
     pending = []
     # Последний « ]]»: «[[ » открывает проверку, только если закрытие стоит дальше (один поиск, не на каждый «[[ »).
     last_close = command.rfind(" ]]")
-    # Глубина скобок внутри арифметики «$((…))» и «((…))»; 0 — вне её.
+    # Глубина скобок внутри арифметики «$((…))», «((…))» и «$[…]»; 0 — вне её.
     arith = 0
+    # Открытые «[» внутри «$[…]»: «$» — сама «$[…]», её «]» закрывает арифметику; «[» — индекс внутри неё. Вне
+    # «$[…]» «[» и «]» — обычные символы.
+    brackets = []
+    # «((» в начале команды — арифметика, только если «)», закрывающая вторую «(», стоит перед «)» первой (bash,
+    # parse_arith_cmd); иначе это подоболочка в подоболочке: «((cd a && make); false)».
+    pairs = _paren_pairs(command) if "((" in command else {}
     while i < n:
         c = command[i]
         step = 1
@@ -115,7 +172,7 @@ def _segments(command):
             in_test = True
         elif quote is None and in_test and boundary and command.startswith("]]", i):
             in_test = False
-        if quote is None and not in_test and (c in "|;\n" or command.startswith("&&", i)):
+        if quote is None and not in_test and not arith and (c in "|;\n" or command.startswith("&&", i)):
             step = 2 if command[i:i + 2] in ("||", "&&", "|&") else 1
             segments.append([command[i:i + step], []])
             boundary = True
@@ -127,9 +184,18 @@ def _segments(command):
             if quote is None:
                 if arith and c in "()":
                     arith += 1 if c == "(" else -1
+                elif brackets and c in "[]":
+                    if c == "[":
+                        brackets.append("[")
+                    elif brackets.pop() == "$":
+                        arith -= 1
+                elif command.startswith("$[", i):
+                    arith, step = arith + 1, 2
+                    brackets.append("$")
                 elif command.startswith("$((", i):
                     arith, step = arith + 2, 3
-                elif boundary and command.startswith("((", i):
+                elif boundary and command.startswith("((", i) and i + 1 in pairs \
+                        and pairs.get(i) == pairs[i + 1] + 1:
                     arith, step = arith + 2, 2
             boundary = quote is None and (c.isspace() or c in "&()<>")
             m = HEREDOC.match(command, i) if quote is None and c == "<" and not in_test and not arith and \
@@ -156,6 +222,8 @@ def _head_words(text):
     cut = len(text) > len(head)
     lexer = shlex.shlex(head, posix=True)
     lexer.whitespace_split = True
+    # «#» внутри слова («VAR=a#b») — не комментарий: слова после него нужны.
+    lexer.commenters = ""
     words = []
     try:
         words.extend(lexer)

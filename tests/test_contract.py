@@ -19,7 +19,7 @@ import remind  # noqa: E402
 PLUGIN = REPO / "plugin"
 # Обратное направление: разделы и модули, которые код обязан брать (имена выводит из кода _code_names);
 # «Границы» называют guard_memory и тексты отказа judge_tool (DEP_REASON, DEP_DOUBT_REASON, MANIFEST_REASON,
-# COMMAND_REASON), dependencies — те же тексты judge_tool.
+# COMMAND_REASON, MCP_REASON), dependencies — те же тексты judge_tool.
 SECTIONS = ("Решения", "Планы", "Границы")
 MODULES = ("planning", "subagents", "verification", "docs", "comments", "dependencies",
            "refactoring", "design-patterns", "heuristics", "debugging", "memory")
@@ -47,11 +47,11 @@ def _callee(func):
     return func.id if isinstance(func, ast.Name) else None
 
 
-def _assigned(tree):
+def _assigned(tree, nodes=None):
     """{имя: [выражения]}: всё, что в файле присваивают имени (=, +=, аннотированное) или кладут в него
-    (append, extend)."""
+    (append, extend); nodes — узлы, которые смотреть вместо всех узлов tree."""
     values = {}
-    for node in ast.walk(tree):
+    for node in ast.walk(tree) if nodes is None else nodes:
         if isinstance(node, ast.Assign):
             targets, value = node.targets, node.value
         elif isinstance(node, (ast.AugAssign, ast.AnnAssign)) and node.value is not None:
@@ -67,16 +67,60 @@ def _assigned(tree):
     return values
 
 
-def _resolve(expr, values, seen=frozenset()):
-    """Строки, которые выражение даёт значением: литералы, элементы кортежей и списков, ветви условного
-    выражения, слагаемые, tuple(...)/list(...), распаковка и всё, что присваивают именам, — рекурсивно.
-    Условие ветвления и аргументы прочих вызовов значением не считаются."""
+_FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
+class _Scopes:
+    """Присваивания _assigned по областям видимости: модуль и каждая функция без тел вложенных в неё. Имя ищется
+    в своей функции, затем в объемлющих, затем в модуле; параметр функции значения из кода не получает."""
+
+    def __init__(self, tree):
+        self.values, self.params, self.parent, self.scope_of = {}, {}, {}, {}
+        self._fill(tree, None)
+
+    def _fill(self, scope, outer):
+        self.parent[id(scope)] = outer
+        args = getattr(scope, "args", None)
+        names = set()
+        if args is not None:
+            names = {a.arg for a in args.posonlyargs + args.args + args.kwonlyargs}
+            names |= {a.arg for a in (args.vararg, args.kwarg) if a}
+        self.params[id(scope)] = names
+        own = []
+        stack = list(ast.iter_child_nodes(scope))
+        while stack:
+            node = stack.pop()
+            own.append(node)
+            self.scope_of[id(node)] = scope
+            if isinstance(node, _FUNCTIONS):
+                self._fill(node, scope)
+            else:
+                stack.extend(ast.iter_child_nodes(node))
+        self.values[id(scope)] = _assigned(scope, own)
+
+    def lookup(self, name, scope):
+        """(область, [выражения]) имени из scope; пустой список — параметр или имя без присваивания."""
+        while scope is not None:
+            if name in self.params[id(scope)]:
+                return scope, []
+            if name in self.values[id(scope)]:
+                return scope, self.values[id(scope)][name]
+            scope = self.parent[id(scope)]
+        return None, []
+
+
+def _resolve(expr, scopes, scope, seen=frozenset()):
+    """Строки, которые выражение в области scope даёт значением: литералы, элементы кортежей и списков, ветви
+    условного выражения, слагаемые, tuple(...)/list(...), распаковка и всё, что присваивают именам в их области
+    (_Scopes), — рекурсивно. Условие ветвления и аргументы прочих вызовов значением не считаются."""
     if isinstance(expr, ast.Constant):
         return {expr.value} if isinstance(expr.value, str) else set()
     if isinstance(expr, ast.Name):
+        owner, exprs = scopes.lookup(expr.id, scope)
+        key = (id(owner), expr.id)
         found = set()
-        for value in () if expr.id in seen else values.get(expr.id, ()):
-            found |= _resolve(value, values, seen | {expr.id})
+        for value in () if key in seen else exprs:
+            found |= _resolve(value, scopes, owner, seen | {key})
         return found
     if isinstance(expr, (ast.Tuple, ast.List, ast.Set)):
         parts = expr.elts
@@ -92,7 +136,7 @@ def _resolve(expr, values, seen=frozenset()):
         parts = []
     found = set()
     for part in parts:
-        found |= _resolve(part, values, seen)
+        found |= _resolve(part, scopes, scope, seen)
     return found
 
 
@@ -113,17 +157,18 @@ def _code_names(sources=None):
     """(разделы, модули, нераспознанные), которые код берёт по имени в вызовах TAKERS.
 
     sources — [(имя файла, текст)], по умолчанию plugin/planka/*.py. Имя из аргумента — литерал или значение
-    имени, которому его присваивают в том же файле (константа, список с append, +=), в позиционном,
-    распакованном (*) или ключевом аргументе; вызов — common.rubric или rubric после from common import.
-    Нераспознанные — «файл:строка» аргументов без единой строки; исключение — параметр функции из TAKERS,
-    переданный дальше как есть (common.rubric зовёт philosophy_sections и rule_texts)."""
+    имени, которому его присваивают в той же функции, объемлющей или в модуле (константа, список с append, +=;
+    _Scopes), в позиционном, распакованном (*) или ключевом аргументе; вызов — common.rubric или rubric после
+    from common import. Нераспознанные — «файл:строка» аргументов без единой строки, в том числе параметр
+    функции; исключение — параметр функции из TAKERS, переданный дальше как есть (common.rubric зовёт
+    philosophy_sections и rule_texts)."""
     if sources is None:
         sources = [(p.name, p.read_text(encoding="utf-8")) for p in sorted(PLANKA_DIR.glob("*.py"))]
     found = {"sections": set(), "modules": set()}
     unresolved = []
     for name, text in sources:
         tree = ast.parse(text)
-        values = _assigned(tree)
+        scopes = _Scopes(tree)
         forwarded = {}
         for fn in ast.walk(tree):
             if isinstance(fn, ast.FunctionDef) and fn.name in TAKERS:
@@ -136,7 +181,7 @@ def _code_names(sources=None):
             for kind, expr in _arguments(node):
                 if isinstance(expr, ast.Name) and expr.id in forwarded.get(id(node), ()):
                     continue
-                strings = _resolve(expr, values) if kind else set()
+                strings = _resolve(expr, scopes, scopes.scope_of[id(node)]) if kind else set()
                 if not strings:
                     unresolved.append(f"{name}:{expr.lineno}")
                 elif kind:
@@ -148,8 +193,8 @@ def _code_names(sources=None):
 INFORMAL = re.compile(r"(?<![\w-])(?:ты|тебя|тебе|тобой|твой|твоя|твоё|твои|твоих|твоим|твоей|твоего|твою|"
                       r"[а-яё]+(?:ешь|ёшь|ишь)(?:ся)?)(?![\w-])", re.IGNORECASE)
 INFORMAL_EXCEPT = {"лишь"}
-# Повелительное ед. числа из текстов для модели версии 0.6.5 (ядро, модули, промпты судьи, причины отказа): ловит
-# эти формы в любом месте предложения, в том числе там, где их не видит IMPERATIVE_PLACE.
+# Повелительное ед. числа глаголов, которыми пишут указания тексты для модели (ядро, модули, промпты судьи, причины
+# отказа): ловит эти формы в любом месте предложения, в том числе там, где их не видит IMPERATIVE_PLACE.
 SINGULAR_IMPERATIVES = (
     "бери", "включай", "возрази", "выбери", "выбирай", "выводи", "выдели", "выдумывай", "выполняй", "говори",
     "гоняй", "давай", "делай", "делегируй", "держи", "держись", "добавляй", "добавь", "закрепляй", "заменяй",
@@ -179,16 +224,16 @@ IMPERATIVE_PLACE = re.compile(
 # прилагательные и местоимения -ый/-ий/-ой/-ей, инфинитив -ть/-ться/-чь/-сти/-зти/-йти/-дти, мн. ч. повелительного
 # -тесь, прошедшее -ось/-ась, существительные -ии, -тель, -ки, творительный мн. ч. -ами/-ями/-ыми.
 NOT_IMPERATIVE = re.compile(r"(?:[ыиое]й|ть|ться|чь|[сзйд]ти|тесь|[оа]сь|ии|тель|ки|[аяы]ми)$", re.IGNORECASE)
-# Не глаголы, которые в текстах версии 0.6.5 стоят на месте указания (IMPERATIVE_PLACE) и не отсекаются
+# Не глаголы, которые в текстах для модели стоят на месте указания (IMPERATIVE_PLACE) и не отсекаются
 # NOT_IMPERATIVE: служебные слова и существительные. Новое такое слово в тексте — сюда.
 IMPERATIVE_EXCEPT = {
     "весь", "внутри", "если", "или", "ни", "они", "при", "ради", "три",
     "дубли", "задачи", "запись", "ключи", "конфиги", "логи", "локаль", "модули", "модуль", "перечень",
-    "пути", "разборщики", "стиль", "флаги", "хэши", "цель",
+    "пути", "разборщики", "стиль", "теги", "флаги", "хэши", "цель",
     "разошлись",
 }
-# Просьба во мн. ч. повелительного (-йте, -ьте, -ите и возвратные): предложение с ней в тексте хука несёт
-# «пожалуйста». -ите совпадает и с настоящим временем («вы видите»): в текстах хуков его нет.
+# Просьба во мн. ч. повелительного (-йте, -ьте, -ите и возвратные): предложение с ней в тексте хука, ядре и модуле
+# несёт «пожалуйста». -ите совпадает и с настоящим временем («вы видите»): в этих текстах его нет.
 PLURAL_IMPERATIVE = re.compile(r"(?<![\w-])[а-яё]+(?:[йь]те|ите)(?:сь)?(?![\w-])", re.IGNORECASE)
 # Функции common, которые отдают текст модели; обращение к ней добавляют они сами.
 EMITTERS = {"deny_output", "block_output", "context_output"}
@@ -407,7 +452,7 @@ class ContractTest(unittest.TestCase):
         # Сборщик находит каждое имя ручных списков: пустое множество — сбой разбора.
         self.assertGreaterEqual(sections, set(SECTIONS))
         # dependencies код называет только в текстах judge_tool DEP_REASON, DEP_DOUBT_REASON, MANIFEST_REASON,
-        # COMMAND_REASON, не вызовом.
+        # COMMAND_REASON, MCP_REASON, не вызовом.
         self.assertGreaterEqual(modules, set(MODULES) - {"dependencies"})
         headings = set(re.findall(r"^## (.+)$", self.core, re.MULTILINE))
         for name in sorted(sections):
@@ -486,8 +531,8 @@ class PoliteFormTest(unittest.TestCase):
         import judge_tool
         texts = set().union(*_hook_texts().values())
         known = (judge_tool.DEP_REASON, judge_tool.DEP_DOUBT_REASON, judge_tool.MANIFEST_REASON,
-                 judge_tool.COMMAND_REASON, remind.NO_DOCS_LINE, remind.CONTINUATION, debug_watch.LINE,
-                 depcheck._WHY_FLAG, depcheck._WHY_NAME)
+                 judge_tool.COMMAND_REASON, judge_tool.MCP_REASON, judge_tool.FILES_HINT, remind.NO_DOCS_LINE,
+                 remind.CONTINUATION, debug_watch.LINE, depcheck._WHY_FLAG, depcheck._WHY_NAME)
         for text in known:
             self.assertIn(text, texts)
 
@@ -543,6 +588,12 @@ class PoliteFormTest(unittest.TestCase):
 
     def test_hook_requests_say_please(self):
         found = [f"{name}: {s}" for name, strings in sorted(_hook_texts().items()) for text in sorted(strings)
+                 for s in _sentences_without_please(text)]
+        if found:
+            self.fail("просьба без «пожалуйста»:\n" + "\n".join(found))
+
+    def test_rule_requests_say_please(self):
+        found = [f"{name}: {' '.join(s.split())}" for name, text in sorted(_rule_texts().items())
                  for s in _sentences_without_please(text)]
         if found:
             self.fail("просьба без «пожалуйста»:\n" + "\n".join(found))
@@ -606,6 +657,13 @@ class CodeNamesTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(self.names(text)[2], ["x.py:1"])
 
+    def test_names_resolved_in_own_scope(self):
+        # Параметр функции — не одноимённая переменная другой функции; имя функции без присваивания в ней — имя
+        # модуля.
+        text = ('def f():\n    mods = ("a",)\ndef g(mods):\n    common.rule_texts(*mods)\n'
+                'def h():\n    common.rule_texts(*mods)\nmods = ("b",)')
+        self.assertEqual(self.names(text), (set(), {"b"}, ["x.py:4"]))
+
     def test_forwarded_parameter_is_not_reported(self):
         text = 'def rubric(sections, modules):\n    philosophy_sections(*sections)\n    rule_texts(*modules)'
         self.assertEqual(self.names(text), (set(), set(), []))
@@ -627,6 +685,25 @@ class RulesMatchJudgeTest(unittest.TestCase):
         rule = self.flat(self.rules["comments"])
         self.assertIn("Директивы языка и инструментов", rule)
         self.assertIn("не комментарии: правила модуля к ним не применяются", rule)
+
+    def test_correct_option_first_checked(self):
+        # Правило — plugin/philosophy.md, «Решения» 4: самый правильный вариант есть в списке и идёт первым.
+        decisions = self.flat(common.philosophy_sections("Решения"))
+        self.assertIn("самый правильный вариант обязан быть в списке, даже если он самый трудный и крупный, и идёт "
+                      "первым", decisions)
+        self.assertIn("есть ли он в списке и идёт ли он первым?", prompts._CHOICE_CHECKS)
+
+    def test_fact_question_rule_matches_planning(self):
+        # Ядро и plugin/rules/planning.md говорят одно: факт ищется, вопрос — только о нескольких кандидатах.
+        specs = self.flat(common.philosophy_sections("Спецификации"))
+        self.assertIn("спрашивается, только если после поиска осталось несколько кандидатов", specs)
+        self.assertIn("спрашивается то, где после поиска осталось несколько кандидатов", self.flat(
+            self.rules["planning"]))
+
+    def test_positive_statement_rule_names_its_form(self):
+        # Правило запрещает начинать с отрицания; форма «X, а не Y» в ядре — утверждение с контрастом.
+        behaviour = self.flat(common.philosophy_sections("Поведение"))
+        self.assertIn("без «не X, а Y» — отрицания в начале; «X, а не Y» — утверждение", behaviour)
 
     def test_recommendation_premises_checked(self):
         # Правило — plugin/philosophy.md, «Решения» 4; судья Stop его проверяет (видит шаги реплики), судьям вопроса
@@ -657,6 +734,33 @@ class RulesMatchJudgeTest(unittest.TestCase):
                       "context/deferred/", prompts._DOCS_CHECKS)
         self.assertIn("Изолированный каталог без роутера получает его той же правкой; не сделано — запись в "
                       "`context/deferred/`", self.flat(self.rules["docs"]))
+
+
+def _readme_missing(readme, name, values):
+    """Значения values, которых нет в блоках README (BLOCK_START), где упомянута константа name."""
+    blocks = [b for b in BLOCK_START.split(readme) if name in b]
+    return sorted(v for v in values
+                  if not any(re.search(r"(?<![\w.-])" + re.escape(v) + r"(?![\w-])", b) for b in blocks))
+
+
+class ReadmeCopiesTest(unittest.TestCase):
+    """README перечисляет значения списков кода, которые названы рядом: копию сверяет тест."""
+
+    def test_lists_named_in_readme_complete(self):
+        import manifests
+        import snapshot
+        readme = (REPO / "README.md").read_text(encoding="utf-8")
+        lists = {"snapshot.IGNORED_DIRS": snapshot.IGNORED_DIRS,
+                 "manifest_watch.FOREIGN_DIRS": set(manifest_watch.FOREIGN_DIRS) - set(snapshot.IGNORED_DIRS),
+                 "manifests._BUILD_BACKENDS": manifests._BUILD_BACKENDS, "CODE_NAMES": common.CODE_NAMES}
+        for name, values in lists.items():
+            with self.subTest(name=name):
+                self.assertEqual(_readme_missing(readme, name, values), [])
+
+    def test_readme_missing_found(self):
+        readme = "Каталоги `snapshot.IGNORED_DIRS` (`.git`, `build`).\n\nИ `dist` в другом блоке."
+        self.assertEqual(_readme_missing(readme, "snapshot.IGNORED_DIRS", {".git", "build", "dist", "git"}),
+                         ["dist", "git"])
 
 
 class TimeoutsTest(unittest.TestCase):
@@ -693,12 +797,28 @@ class TimeoutsTest(unittest.TestCase):
 
     def test_bash_manifest_snapshot_fits(self):
         # Снимок манифестов перед командой Bash: корень проекта git rev-parse, затем срок снимка; правка
-        # манифеста файловым инструментом — корень проекта, git cat-file версий из HEAD с ним и обход манифестов
-        # проекта (judge_tool._project_names) с тем же корнем.
+        # манифеста файловым инструментом — корень проекта, перечень манифестов (manifest_watch.listing,
+        # HEAD_TIMEOUT), git cat-file версий из HEAD и обход манифестов проекта (judge_tool._project_names) первого
+        # манифеста. Второй и следующий манифест одного файла начинается, только если и он уложится в
+        # judge_tool.LINKED_BUDGET от started: started снят до корня и перечня, срок покрывает и их.
+        import judge_tool
         for timeout in self.timeouts[("PreToolUse", "judge_tool")]:
             self.assertLess(common.GIT_ROOT_TIMEOUT + manifest_watch.SNAPSHOT_BUDGET, timeout)
-            self.assertLess(manifest_watch.HEAD_TIMEOUT + common.GIT_ROOT_TIMEOUT + manifest_watch.SNAPSHOT_BUDGET,
-                            timeout)
+            self.assertLess(2 * manifest_watch.HEAD_TIMEOUT + common.GIT_ROOT_TIMEOUT
+                            + manifest_watch.SNAPSHOT_BUDGET, timeout)
+            self.assertLess(judge_tool.LINKED_BUDGET, timeout)
+
+    def test_linked_budget_counts_from_hook_work(self):
+        # LINKED_BUDGET покрывает корень проекта и перечень, только если started снят до manifest_watch.listing и
+        # edit_targets в judge_tool.judge_manifest_edit.
+        tree = ast.parse((PLANKA_DIR / "judge_tool.py").read_text(encoding="utf-8"))
+        func = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "judge_manifest_edit")
+        started = min(n.lineno for n in ast.walk(func) if isinstance(n, ast.Assign)
+                      and any(isinstance(t, ast.Name) and t.id == "started" for t in n.targets))
+        calls = [n.lineno for n in ast.walk(func) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                 and n.func.attr in ("listing", "edit_targets")]
+        self.assertTrue(calls)
+        self.assertLess(started, min(calls))
 
     def test_post_tool_use_fits(self):
         for event in ("PostToolUse", "PostToolUseFailure"):
@@ -729,3 +849,15 @@ class TimeoutsTest(unittest.TestCase):
         for event in ("PostToolUse", "PostToolUseFailure"):
             self.assertIn((event, "debug_watch"), self.timeouts)
             self.assertIn((event, "judge_tool"), self.timeouts)
+
+
+class SourceWarningsTest(unittest.TestCase):
+    """Модули хуков компилируются без предупреждений: SyntaxWarning (escape вроде «\\`» в строке) Python пишет в
+    stderr при первой компиляции, а хук stderr не пишет. Компилируется текст, а не импорт: __pycache__ не прячет."""
+
+    def test_modules_compile_without_warnings(self):
+        import warnings
+        for path in sorted(PLANKA_DIR.glob("*.py")):
+            with self.subTest(path.name), warnings.catch_warnings():
+                warnings.simplefilter("error")
+                compile(path.read_text(encoding="utf-8"), str(path), "exec")
