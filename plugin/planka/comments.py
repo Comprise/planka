@@ -1645,36 +1645,50 @@ def _comments(text, ext, deadline=None):
     return _reparse(text, syn, deadline)
 
 
-# Расширения файлов, чьи комментарии даёт разбор bash (shparse); zsh разбирает прежний движок.
+# Расширения файлов, чьи комментарии даёт разбор bash (shparse); zsh разбирает общий движок _SYNTAX.
 _TREE_SHELL = frozenset(("sh", "bash"))
+
+# Сколько раз остаток скрипта за фатальной синтаксической ошибкой разбирается заново (_shell_comments): каждый
+# повторный разбор держит свою копию остатка, число разборов ограничено, и работа линейна по длине текста.
+_SHELL_RECOVERIES = 64
 
 
 def _shell_comments(text, deadline=None):
     """Комментарии скрипта bash по разбору shparse: [(номер строки с 1, строка комментария)], как у _parse; None —
-    разбор не годится и комментарии даёт прежний движок: bash прекращает чтение на фатальной синтаксической
-    ошибке, и комментарии после неё выпали бы из вывода (отказ судьи без них дороже лишней строки), либо shparse
-    упал. Перевод строки «\\r\\n» снимается, как у _parse (файл с CRLF), BOM в начале — тоже; «#!» первой строки —
-    не комментарий. Срок deadline проверяется до и после разбора (shparse линеен по длине текста)."""
+    shparse упал (исключение). bash прекращает чтение на фатальной синтаксической ошибке, но комментарии после неё
+    остаются в выводе (отказ судьи без них дороже лишней строки): остаток разбирается заново со следующей строки
+    после ошибки, не больше _SHELL_RECOVERIES раз, и комментарии берутся со всех кусков. Перевод строки «\\r\\n»
+    снимается, как у _parse (файл с CRLF), BOM в начале — тоже; «#!» первой строки — не комментарий. Срок deadline
+    проверяется до и после каждого разбора."""
     if deadline is not None and time.monotonic() >= deadline:
         raise TimeoutError
     if text.startswith("\ufeff"):
         text = text[1:]
     text = text.replace("\r\n", "\n")
-    try:
-        script = shparse.parse(text)
-    except Exception:  # noqa: BLE001
-        return None
-    if script.error is not None and script.error.fatal:
-        return None
-    out, line, at = [], 1, 0
-    for start, end in script.comments:
-        if start == 0 and text.startswith("#!"):
-            continue
-        line += text.count("\n", at, start)
-        at = start
-        out.append((line, text[start:end].strip()))
-    if deadline is not None and time.monotonic() >= deadline:
-        raise TimeoutError
+    out = []
+    chunk, first = text, 0
+    for _ in range(_SHELL_RECOVERIES + 1):
+        try:
+            script = shparse.parse(chunk)
+        except Exception:  # noqa: BLE001
+            return None
+        line, at = 1 + first, 0
+        for start, end in script.comments:
+            if first == 0 and start == 0 and text.startswith("#!"):
+                continue
+            line += chunk.count("\n", at, start)
+            at = start
+            out.append((line, chunk[start:end].strip()))
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError
+        error = script.error
+        if error is None or not error.fatal:
+            break
+        eol = chunk.find("\n", error.pos)
+        if eol < 0:
+            break
+        first += chunk.count("\n", 0, eol + 1)
+        chunk = chunk[eol + 1:]
     return out
 
 

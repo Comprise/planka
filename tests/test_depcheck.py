@@ -8,12 +8,23 @@ PLANKA_DIR = pathlib.Path(__file__).resolve().parent.parent / "plugin" / "planka
 sys.path.insert(0, str(PLANKA_DIR))
 import depcheck  # noqa: E402
 import pkgmanagers  # noqa: E402
+import shparse  # noqa: E402
 from tests.helpers import assert_linear  # noqa: E402
 
 # Корпус команд Bash: source — transcript (команды из транскриптов Claude Code автора в этом проекте, санитизированы:
 # без секретов, адресов, хостов и чужих проектов, домашний каталог — /home/user) или edge (образец края разбора);
 # expect — add (dependency_add), doubt (dependency_doubt) или pass.
 CORPUS = pathlib.Path(__file__).parent / "fixtures" / "bash-commands.jsonl"
+
+
+def _commands(text):
+    """Тексты простых команд дерева shparse по порядку текста, в том числе в телах подстановок."""
+    return [text[c.start:c.end] for c in shparse.simple_commands(shparse.parse(text))]
+
+
+def _subs(text):
+    """Подстановки дерева shparse по порядку обхода: (вид, ошибка разбора тела)."""
+    return [(n.kind, n.body.error) for n in shparse.walk(shparse.parse(text)) if type(n) is shparse.Sub]
 
 
 class DependencyAddTest(unittest.TestCase):
@@ -1194,14 +1205,14 @@ class HeredocInQuotedSubstitutionTest(unittest.TestCase):
                 self.assertEqual(depcheck.dependency_add(cmd), "npm install y")
 
     def test_heredoc_to_shell_inside_quote_runs_body(self):
-        # Тело heredoc оболочки внутри `"$(…)"` исполняется, как и вне кавычек.
+        # Тело heredoc оболочки внутри `"$(…)"` исполняется, как и вне кавычек: сегмент — команда тела.
         for cmd in [
             'x="$(bash <<EOF\nnpm install x\nEOF\n)"',
             'echo "$(sh <<EOF\nnpm install x\nEOF\n)"',
             'echo "$(echo a | bash <<EOF\nnpm install x\nEOF\n)"',
         ]:
             with self.subTest(cmd):
-                self.assertEqual(depcheck.dependency_add(cmd), cmd)
+                self.assertEqual(depcheck.dependency_add(cmd), "npm install x")
 
     def test_heredoc_to_cat_inside_quote_is_data(self):
         self.assertIsNone(depcheck.dependency_add("git commit -m \"$(cat <<'EOF'\nnpm install x\nEOF\n)\""))
@@ -1373,11 +1384,12 @@ class NestedQuotesInSubstitutionTest(unittest.TestCase):
 
     def test_commands_inside_and_after_detected(self):
         for cmd, segment in [
-            ('echo "$(echo "a"; npm install x)"', 'echo "$(echo "a"; npm install x)"'),
+            # Команда в подстановке — свой сегмент.
+            ('echo "$(echo "a"; npm install x)"', "npm install x"),
             ('echo "$(echo "a")" && npm install x', "npm install x"),
             ("git commit -m \"$(\ncat <<'EOF'\nmsg)\nEOF\n)\"\nnpm install x", "npm install x"),
-            ('x="$(\nbash <<EOF\nnpm install x\nEOF\n)"', 'x="$(\nbash <<EOF\nnpm install x\nEOF\n)"'),
-            ('echo "$(echo "$(npm install x)")"', 'echo "$(echo "$(npm install x)")"'),
+            ('x="$(\nbash <<EOF\nnpm install x\nEOF\n)"', "npm install x"),
+            ('echo "$(echo "$(npm install x)")"', "npm install x"),
             ('A="$(echo "a b")" npm install x', 'A="$(echo "a b")" npm install x'),
         ]:
             with self.subTest(cmd):
@@ -1434,7 +1446,8 @@ class SubstitutionBoundsTest(unittest.TestCase):
                     # Арифметика на две строки не прячет подстановку за ней.
                     "echo \"$((1<<x\n))\" \"$(npm install x)\""]:
             with self.subTest(cmd):
-                self.assertEqual(depcheck.dependency_add(cmd), cmd)
+                # Команда в подстановке — свой сегмент.
+                self.assertEqual(depcheck.dependency_add(cmd), "npm install x")
 
     def test_quoted_substitution_is_text(self):
         for cmd in ["echo '\"$(npm install x)\"'", "echo $'a\\'\"$(npm install x)\"'"]:
@@ -1482,10 +1495,20 @@ class LauncherTest(unittest.TestCase):
     def test_detected(self):
         for cmd in ["NPM.CMD install x", "Pip.Exe install requests", "corepack pnpm add x", "corepack yarn@4.1.0 add x",
                     "npx pnpm add x", "npx -y yarn add x", "npx pnpm@9 add x", "npx -- pnpm add x",
-                    "bunx pnpm add x", "/usr/bin/time -f %e npm i x", "time -o t.txt npm i x",
-                    "time --format=%e npm i x", "Rscript.exe -e 'install.packages(\"x\")'"]:
+                    "bunx pnpm add x", "/usr/bin/time -f %e npm i x", "/usr/bin/time -o t.txt npm i x",
+                    "/usr/bin/time --format=%e npm i x",
+                    "Rscript.exe -e 'install.packages(\"x\")'"]:
             with self.subTest(cmd):
                 self.assertEqual(depcheck.dependency_add(cmd), cmd)
+
+    def test_time_keyword_flags(self):
+        # `time` в начале команды — ключевое слово bash: флаг у него один, `-p`; другое слово с `-` — имя команды
+        # (bash 5.3: `time -o t.txt touch P1`, `time --format=%e touch P2` файлов не создают).
+        for cmd in ["time -o t.txt npm i x", "time --format=%e npm i x"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+        # Сегмент — команда за ключевым словом.
+        self.assertEqual(depcheck.dependency_add("time -p npm i x"), "npm i x")
 
     def test_not_adds(self):
         for cmd in ["corepack enable", "corepack pnpm install", "npx -p pnpm pnpm install", "npx -y cowsay hi",
@@ -1655,10 +1678,11 @@ class BacktickInDoubleQuotesTest(unittest.TestCase):
     def test_commands_inside_and_after_detected(self):
         for cmd, segment in [
             ('echo "a `echo \'it"s\'` c"; npm install x', "npm install x"),
-            ('echo "`echo "b"; npm install x`"', 'echo "`echo "b"; npm install x`"'),
+            # Команда в подстановке — свой сегмент.
+            ('echo "`echo "b"; npm install x`"', "npm install x"),
             ('echo "a `echo\n"b"` c"; npm install x', "npm install x"),
             ('npm install --tag "`date "+%Y %m"`" left-pad', 'npm install --tag "`date "+%Y %m"`" left-pad'),
-            ('echo "`echo a\\`b\\` ; npm install q` x"', 'echo "`echo a\\`b\\` ; npm install q` x"'),
+            ('echo "`echo a\\`b\\` ; npm install q` x"', "npm install q"),
         ]:
             with self.subTest(cmd):
                 self.assertEqual(depcheck.dependency_add(cmd), segment)
@@ -1738,7 +1762,7 @@ class DoubtTest(unittest.TestCase):
         ("eval " * 5 + "npx -y pnpm@9 add x", "eval " * 5 + "npx -y pnpm@9 add x", depcheck._WHY_DEPTH),
         ("eval " * 12 + "npm install x", "eval " * 12 + "npm install x", depcheck._WHY_DEPTH),
         (_nest("npm install x", 6), _nest("npm install x", 6), depcheck._WHY_DEPTH),
-        (_nest('echo "$(npm install x)"', 4), _nest('echo "$(npm install x)"', 4), depcheck._WHY_DEPTH),
+        (_nest('echo "$(npm install x)"', 5), _nest('echo "$(npm install x)"', 5), depcheck._WHY_DEPTH),
         ("npx " * 12 + "npm install x", "npx " * 12 + "npm install x", depcheck._WHY_DEPTH),
         ("python -m " * 12 + "pip install x", "python -m " * 12 + "pip install x", depcheck._WHY_DEPTH),
         ("uv run " * 12 + "pip install x", "uv run " * 12 + "pip install x", depcheck._WHY_DEPTH),
@@ -1754,6 +1778,11 @@ class DoubtTest(unittest.TestCase):
                 self.assertIsNotNone(found)
                 self.assertEqual(found[0], segment)
                 self.assertEqual(found[1], why)
+
+    def test_substitution_not_level(self):
+        # Подстановка — не уровень вложенности: её тело — команды того же дерева; уровни — строки `bash -c`.
+        cmd = _nest('echo "$(npm install x)"', 4)
+        self.assertEqual(depcheck.dependency_add(cmd), cmd)
 
     def test_not_doubt(self):
         for cmd in [
@@ -2236,9 +2265,9 @@ class CorpusTest(unittest.TestCase):
         with CORPUS.open(encoding="utf-8") as f:
             rows = [json.loads(line) for line in f if line.strip()]
         self.assertGreater(sum(r["source"] == "transcript" for r in rows), 1000)
-        for row in rows:
+        for number, row in enumerate(rows, 1):
             command = row["command"]
-            with self.subTest(command[:80]):
+            with self.subTest(line=number, command=command[:80]):
                 added = depcheck.dependency_add(command)
                 got = "add" if added is not None else "doubt" if depcheck.dependency_doubt(command) else "pass"
                 self.assertEqual(got, row["expect"])
@@ -2459,11 +2488,18 @@ class BraceExpansionTest(unittest.TestCase):
 
     def test_over_budget_any_command_doubt(self):
         # Слова за пределом раскрытия не видны у любой команды: сомнение, обход — маркер.
-        for cmd in ["for i in {1..10000}; do echo $i; done", "echo {a,b}{c,d}" * 2000, "touch f{1..5000}.txt"]:
+        for cmd in ["echo {a,b}{c,d}" * 2000, "touch f{1..5000}.txt"]:
             with self.subTest(cmd[:30]):
                 self.assertIsNone(depcheck.dependency_add(cmd))
                 self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_BRACES)
                 self.assertIsNone(depcheck.dependency_doubt("PLANKA_DEP_OK=1 " + cmd))
+
+    def test_loop_words_not_command(self):
+        # Слова `for … in` — не команда: их раскрытие ничего не запускает (bash 5.3: `for i in {1..3}; do :; done;
+        # touch P1` создаёт P1).
+        cmd = "for i in {1..10000}; do echo $i; done"
+        self.assertIsNone(depcheck.dependency_add(cmd))
+        self.assertIsNone(depcheck.dependency_doubt(cmd))
 
 
 class FunctionDefinitionTest(unittest.TestCase):
@@ -2602,7 +2638,7 @@ class ComputedScriptDoubtTest(unittest.TestCase):
              'sh -c ":; $CMD"', 'eval "\\"$CMD\\""', 'echo ":; $X" | bash', "bash -c 'cd x && $RUN'",
              # Вход `cat` — не только файлы.
              "curl u | cat - | bash", "cat <(curl u) | bash"]
-    NOT_DOUBT = ['bash -c "echo $X"', "sh -c 'make'", "eval 'a=1'", "curl u | bash script.sh", "cat f | sh -c 'wc'",
+    NOT_DOUBT = ["sh -c 'make'", "eval 'a=1'", "curl u | bash script.sh", "cat f | sh -c 'wc'",
                  "curl u | PLANKA_DEP_OK=1 bash", "PLANKA_DEP_OK=1 eval \"$X\"", "echo 'make' | bash",
                  "curl u | cat", "diff <(cat a) b", "bash <<< 'make'", 'PLANKA_DEP_OK=1 bash -c "$X"',
                  # `-n` и `-o noexec`: оболочка строку только разбирает.
@@ -2632,6 +2668,118 @@ class ComputedScriptDoubtTest(unittest.TestCase):
         for cmd in self.NOT_DOUBT:
             with self.subTest(cmd):
                 self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+
+class OuterExpansionScriptTest(unittest.TestCase):
+    """Строку `sh -c`, `eval`, here-string оболочки внешняя оболочка сначала раскрывает: значение внешней подстановки
+    становится текстом скрипта, и внутренняя оболочка разбирает его заново (bash 5.3: `t='a $(touch P1)'; bash -c
+    "x=( $t )"` создаёт P1, `D='.; touch P2'; bash -c "cd $D && true"` — P2). Внешняя подстановка вне `'…'` в слове
+    скрипта — сомнение. Литеральная строка (`bash -c 'echo $t'`: `$t` раскрывает внутренняя оболочка, текстом, без
+    разбора) разбирается как текст скрипта, без сомнения."""
+
+    DOUBT = [
+        "t='a $(npm i evil)'; bash -c \"x=( $t )\"", "t='a $(npm i evil)'; eval \"x=( $t )\"",
+        'bash -c "echo $t"', 'sh -c "echo $t"', 'bash <<< "echo $t"', 'bash -s <<< "echo $t"',
+        # Известный ложный отказ (README, «Известные ограничения»): значение `$D` команд не несёт; обход —
+        # `PLANKA_DEP_OK=1 bash -c …`.
+        'bash -c "cd $D && make"',
+        'bash -c "echo ${t}"', 'bash -c "echo $(cat f)"', 'bash -c "echo `cat f`"', "eval echo $t", "eval -- echo $t",
+        'bash -c "cat <(echo $t)"', "bash -c ': '\"$X\"", 'bash -c "make ${t:-all}"',
+        # Обёртки и формы `-c`: строка — то же слово (или его часть).
+        'sudo bash -c "make $X"', 'fish --command="make $X"', 'su -c "make $X" user',
+        'su -lc"make $X" user', 'watch "make $X"', 'flock /tmp/l -c "make $X"',
+    ]
+    NOT_DOUBT = [
+        "bash -c 'echo $t'", "bash -c $'echo $t'", "bash -c \"echo \"'$t'", "bash <<< 'echo $t'", "eval 'echo $t'",
+        # Арифметика и `$$`, `$?`, `$#`, `$!` раскрываются в число (или пусто): команд в тексте не прибавляют
+        # (bash 5.3: `bash -c "echo $((n+1)) $(( $n * 2 )) $$ $? $# $!"` печатает числа).
+        'bash -c "echo $((n+1)) $(( $n * 2 )) $[n+1] $$ $? $# $!"', 'bash -c "kill ${$}"',
+        # `<(…)` в "…" — текст: процесс-подстановку видит внутренняя оболочка.
+        'bash -c "cat <(echo hi)"',
+        # Маркер снимает сомнение.
+        'PLANKA_DEP_OK=1 bash -c "cd $D && make"',
+    ]
+
+    def test_doubt(self):
+        for cmd in self.DOUBT:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_COMPUTED)
+
+    def test_not_doubt(self):
+        for cmd in self.NOT_DOUBT:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    # Тот же класс: значение внешнего раскрытия — текст, который исполняет оболочка: вход оболочки из `echo`/`printf`
+    # (bash 5.3: `t='touch Q1'; echo "$t" | bash` создаёт Q1), тело heredoc оболочки с терминатором без кавычек
+    # (`t='touch Q4'; bash <<E` ⏎ `$t` ⏎ `E` — Q4), строки запускателей (`x='$(touch Q8)'; find . -exec sh -c "echo
+    # $x" \;` — Q8, `trap "echo $x" EXIT` — Q10, `git -c alias.z="!echo $x" z` — Q11), шаблон имён без кавычек в
+    # слове строки (`touch 'touch Q13'; bash -c *` — Q13).
+    DOUBT_FED = [
+        'echo "$t" | bash', "printf '%s' \"$t\" | sh", 'bash <(echo "$t")', 'echo "cd $D && make" | bash',
+        "bash <<E\n$t\nE", "cat <<E | bash\n$t\nE", "bash -s <<E\n$t\nE", "bash <<E\necho $(cat f)\nE",
+        # ssh без удалённой команды отдаёт тело удалённой оболочке (_heredoc_runs). Известный ложный отказ (README,
+        # «Известные ограничения»): значение `$D` команд не несёт; обход — `PLANKA_DEP_OK=1 ssh …`.
+        "ssh host <<EOF\ncd $D && make\nEOF",
+        'find . -exec sh -c "echo $x" \\;', 'echo a | xargs sh -c "echo $x"', 'echo a | xargs -I{} sh -c "echo {} $x"',
+        # Известный ложный отказ (README): `trap "rm -rf $tmp" EXIT` — значение вставлено в строку ловушки.
+        'trap "rm -rf $tmp" EXIT', 'git -c alias.z="!echo $x" z', 'ssh host "make $X"', 'ssh host make "$X"',
+        'git submodule foreach "make $X"', 'git rebase -x "make $X" main', 'git rebase --exec="make $X" main',
+        'nix-shell --run "make $X"', 'cmd /c "make $X"', 'pwsh -Command "make $X"',
+        # Строка — слова-аргументы (argv), но в них `sh -c` с раскрытием.
+        'nix develop -c sh -c "make $X"', 'mise exec -- sh -c "make $X"', 'git bisect run sh -c "make $X"',
+        'git submodule foreach sh -c "make $X"',
+        "bash -c *", "eval echo *", "eval ls *.txt", "sh -c [ab]x", "bash -c x?",
+    ]
+    # Не тот класс: тело heredoc в кавычках или с `\$`, числа, вход не оболочки, слова-аргументы без строки оболочки
+    # (`find . -exec echo $x \;` не создаёт Q12, `git -c alias.z='!echo' z "$x"` — Q20: аргументы псевдонима —
+    # "$@"), строка в одинарных кавычках (`trap 'echo $x' EXIT` — Q16 нет), here-string без шаблона имён
+    # (`bash <<< *` — `*` раскрывает внутренняя оболочка словом), тильда — путь домашнего каталога, `\*` и `'*'` —
+    # литералы.
+    NOT_DOUBT_FED = [
+        "bash <<'E'\necho $t\nE", "bash <<E\n\\$t\nE", "bash <<E\necho $((1+2)) $$\nE", "cat <<E | grep x\n$t\nE",
+        'echo "$t" | grep x', "echo \"make $$\" | bash", 'PLANKA_DEP_OK=1 bash <<E\n$t\nE',
+        "find . -exec echo $x \\;", "find . -exec bash -c 'make \"$0\"' \"$x\" \\;", "trap 'echo $x' EXIT",
+        "git -c alias.z='!echo' z \"$x\"", "ssh host 'make $X'", 'git bisect run make "$X"',
+        "bash <<< *", "bash -c ~/x", "bash -c ~", "bash -c \\*", "bash -c '*'", "eval [ -f x ]", 'bash -c "*"',
+        # Маркер у оболочки или запускателя покрывает строку и тело heredoc.
+        "PLANKA_DEP_OK=1 ssh host <<EOF\ncd $D && make\nEOF", 'PLANKA_DEP_OK=1 trap "rm -rf $tmp" EXIT',
+        "cat <<E | PLANKA_DEP_OK=1 bash\n$t\nE",
+    ]
+
+    def test_fed_doubt(self):
+        for cmd in self.DOUBT_FED:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_COMPUTED)
+
+    def test_fed_not_doubt(self):
+        for cmd in self.NOT_DOUBT_FED:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_fed_literal_detected(self):
+        for cmd in ["echo 'npm i x' | bash", "bash <<E\nnpm i x\nE", "find . -exec sh -c 'npm i x' \\;",
+                    "trap 'npm i x' EXIT", "git -c alias.z='!npm i x' z", "ssh host 'npm i x'",
+                    "nix develop -c sh -c 'npm i x'", "bash <<E\nnpm i $x\nE"]:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
+
+    def test_marker_covers_heredoc(self):
+        # Тело heredoc оболочки — её строка команд, как строка `-c` и вход по конвейеру: маркер её покрывает.
+        for cmd in ["PLANKA_DEP_OK=1 bash <<E\nnpm i x\nE", "cat <<'E' | PLANKA_DEP_OK=1 bash\nnpm i x\nE"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+        self.assertIsNotNone(depcheck.dependency_add("PLANKA_DEP_OK=1 cat <<'E' | bash\nnpm i x\nE"))
+
+    def test_literal_still_detected(self):
+        for cmd in ["bash -c 'npm i x'", "eval 'npm i x'", "bash <<< 'npm i x'", 'bash -c "npm i x"']:
+            with self.subTest(cmd):
+                self.assertIsNotNone(depcheck.dependency_add(cmd))
 
 
 class HeredocCatPipeTest(unittest.TestCase):
@@ -2764,8 +2912,8 @@ class ArithmeticSubstitutionTest(unittest.TestCase):
 
     def test_subshell_fallback_quotes(self):
         # Тело `$(` после отката — команда: `'…'` в нём прячет подстановку, как в bash.
-        self.assertEqual(depcheck._quoted_substitutions("echo \"$((echo '$(npm i x)') )\""),
-                         ["(echo '$(npm i x)') "])
+        self.assertEqual(_commands("echo \"$((echo '$(npm i x)') )\""),
+                         ["echo \"$((echo '$(npm i x)') )\"", "echo '$(npm i x)'"])
         self.assertIsNone(depcheck.dependency_add("echo \"$((echo '$(npm i x)') )\""))
 
     def test_subshell_fallback_heredoc(self):
@@ -2952,8 +3100,10 @@ class BacktickOutsideQuotesTest(unittest.TestCase):
             with self.subTest(cmd):
                 self.assertEqual(depcheck.dependency_add(cmd), "npm i x")
         self.assertEqual(depcheck.dependency_add("x=`'` npm i x"), "x=`'` npm i x")
-        # Пустая подстановка на месте имени команды: bash исполняет слова за ней.
-        self.assertEqual(depcheck.dependency_doubt("`'` npm i x")[1], depcheck._WHY_LAUNCHER)
+        # Пустая подстановка на месте имени команды: bash исполняет слова за ней (`` `'` touch P1 `` создаёт P1);
+        # имя команды — вывод подстановки.
+        self.assertIsNone(depcheck.dependency_add("`'` npm i x"))
+        self.assertEqual(depcheck.dependency_doubt("`'` npm i x")[1], depcheck._WHY_NAME)
 
     def test_body_detected(self):
         for cmd in ["echo `npm i x`", "echo `echo 'a;b'; npm i x`", "echo `echo a\nnpm i x`",
@@ -3011,14 +3161,23 @@ class ArithmeticQuotesTest(unittest.TestCase):
     def test_quotes_bound_substitution(self):
         # Подстановка в `'…'` арифметики кончается не дальше кавычки, и когда за кавычкой на строке есть ещё текст
         # и перевод строки.
-        self.assertEqual(depcheck._quoted_substitutions("echo \"$(( '$(echo ' )) $(npm i x)\""),
-                         ["echo ", "npm i x"])
-        self.assertEqual(depcheck._quoted_substitutions("echo \"$(( '$(echo ' + '1) $(npm i x)' ))\"\n"),
-                         ["echo ", "npm i x"])
-        # Тело `` `…` `` в `'…'` арифметики — без экранирования обратной кавычки (bash 5.3).
-        self.assertEqual(depcheck._quoted_substitutions("echo $[ '`echo \\`b\\``' ]"), ["echo `b`"])
+        # Тело `$(echo ' )) …` не закрыто: ошибка разбора остаётся в нём, следующая подстановка — команда.
+        cmd = "echo \"$(( '$(echo ' )) $(npm i x)\""
+        self.assertEqual(_commands(cmd), [cmd, "npm i x"])
+        self.assertEqual(depcheck.dependency_add(cmd), "npm i x")
+        # Кавычка в теле подстановки — кавычка команды: тело идёт за `'` арифметики до `)` (bash 5.3:
+        # `echo "$(( '$(touch P1 ' + '1) $(touch P2)' ))"` создаёт файлы P1, ` + 1` и P2).
+        cmd = "echo \"$(( '$(echo ' + '1) $(npm i x)' ))\"\n"
+        self.assertEqual(_commands(cmd), [cmd.strip(), "echo ' + '1", "npm i x"])
+        self.assertEqual(depcheck.dependency_add(cmd), "npm i x")
+        # Тело `` `…` `` в `'…'` арифметики — без экранирования обратной кавычки (bash 5.3): `echo` с подстановкой
+        # `b`.
+        cmd = "echo $[ '`echo \\`b\\``' ]"
+        self.assertEqual(_commands(cmd), [cmd, "echo \\`b\\`", "b"])
+        self.assertEqual(_subs(cmd), [("`", None), ("`", None)])
         # Подстановка сразу за закрывающей кавычкой — снова в арифметике.
-        self.assertEqual(depcheck._quoted_substitutions("echo \"$(( '1'$(npm i x) ))\""), ["npm i x"])
+        cmd = "echo \"$(( '1'$(npm i x) ))\""
+        self.assertEqual(_commands(cmd), [cmd, "npm i x"])
 
     def test_linear(self):
         for make in [lambda n: 'echo "$(( ' + "'$(\"' " * n + '))"', lambda n: 'echo "$(( ' + '"$(( ' * n,
@@ -3050,8 +3209,11 @@ class BacktickEscapesTest(unittest.TestCase):
                 self.assertIsNone(depcheck.dependency_doubt(cmd))
 
     def test_body(self):
-        self.assertEqual(depcheck._quoted_substitutions("echo `a \\\\ \\` \\$ \\\" \\x`"), ['a \\ ` $ \\" \\x'])
-        self.assertEqual(depcheck._quoted_substitutions("echo \"`a \\\\ \\` \\$ \\\" \\x`\""), ['a \\ ` $ " \\x'])
+        # Тело — `a \ ` $ \" \x` (в "…" — `a \ ` $ " \x`): `\\` — `\`, `\`` — обратная кавычка, она открывает
+        # подстановку без конца — ошибка разбора тела на ней (позиция `\`` в тексте).
+        self.assertEqual(_commands("echo `a \\\\ \\` \\$ \\\" \\x`"), ["echo `a \\\\ \\` \\$ \\\" \\x`"])
+        self.assertEqual(_subs("echo `a \\\\ \\` \\$ \\\" \\x`"), [("`", shparse.SyntaxIssue(12, True))])
+        self.assertEqual(_subs("echo \"`a \\\\ \\` \\$ \\\" \\x`\""), [("`", shparse.SyntaxIssue(13, True))])
 
 
 class ComputedSubcommandTest(unittest.TestCase):
@@ -3117,10 +3279,15 @@ class ArithmeticOutsideQuotesTest(unittest.TestCase):
                 self.assertIsNone(depcheck.dependency_doubt(cmd))
 
     def test_bodies(self):
-        self.assertEqual(depcheck._quoted_substitutions("echo ${a['$(b)']:-'$(c)'} ${x:'`d`'}"), ["b", "d"])
-        self.assertEqual(depcheck._quoted_substitutions("a['$(b)'] c['$(d)']=1"), ["d"])
-        # Индекс не закрыт до конца текста: не присваивание.
-        self.assertEqual(depcheck._quoted_substitutions("a['$(b)' c"), [])
+        cmd = "echo ${a['$(b)']:-'$(c)'} ${x:'`d`'}"
+        self.assertEqual(_commands(cmd), [cmd, "b", "d"])
+        # `c[…]=1` за именем команды — слово, не присваивание: индекс не вычисляется (bash 5.3:
+        # `a['$(touch P1)'] c['$(touch P2)']=1` файлов не создаёт).
+        cmd = "a['$(b)'] c['$(d)']=1"
+        self.assertEqual(_commands(cmd), [cmd])
+        # Индекс не закрыт до конца текста: синтаксическая ошибка, команд нет.
+        self.assertEqual(_commands("a['$(b)' c"), [])
+        self.assertTrue(shparse.parse("a['$(b)' c").error.fatal)
 
     def test_linear(self):
         for make in [lambda n: "echo " + "$(( '$(a)' )) " * n, lambda n: "echo " + "(( " * n,
@@ -3160,8 +3327,9 @@ class ParameterExpansionSpaceTest(unittest.TestCase):
                 self.assertIsNone(depcheck.dependency_doubt(cmd))
 
     def test_words(self):
+        # Раскрытие в слове — его текст в команде: `\}` не закрывает `${…}`.
         self.assertEqual([w for w, _ in depcheck._split("a ${x:- b}c ${y:-\\}} d", braces=True)],
-                         ["a", "${x:- b}c", "${y:-}}", "d"])
+                         ["a", "${x:- b}c", "${y:-\\}}", "d"])
         self.assertEqual([w for w, _ in depcheck._split("a ${x:- b}c d")], ["a", "${x:- b}c", "d"])
 
     def test_linear(self):
@@ -3199,9 +3367,14 @@ class SubscriptWordQuotesTest(unittest.TestCase):
                 self.assertIsNone(depcheck.dependency_doubt(cmd))
 
     def test_bodies(self):
-        self.assertEqual(depcheck._quoted_substitutions('[ "$(b)" = \'$(c)\' ]'), ["b"])
-        self.assertEqual(depcheck._quoted_substitutions("a['$(b)' \"$(c)\" `d`]"), ["c", "d"])
-        self.assertEqual(depcheck._quoted_substitutions("a['$(b)' \"$(c)\""), ["c"])
+        cmd = '[ "$(b)" = \'$(c)\' ]'
+        self.assertEqual(_commands(cmd), [cmd, "b"])
+        cmd = "a['$(b)' \"$(c)\" `d`]"
+        self.assertEqual(_commands(cmd), [cmd, "c", "d"])
+        # Индекс не закрыт до конца текста: синтаксическая ошибка, ничего не исполняется (bash 5.3:
+        # `a['$(touch P1)' "$(touch P2)"` файлов не создаёт).
+        self.assertEqual(_commands("a['$(b)' \"$(c)\""), [])
+        self.assertTrue(shparse.parse("a['$(b)' \"$(c)\"").error.fatal)
 
     def test_linear(self):
         for make in [lambda n: '"$(b)" ' * n + "a['$(c)'] " * n, lambda n: "a[" + "'$(b)' \"$(c)\" " * n,
@@ -3291,8 +3464,12 @@ class FunctionSubstitutionTest(unittest.TestCase):
                 self.assertIsNone(depcheck.dependency_doubt(cmd))
 
     def test_bodies(self):
-        self.assertEqual(depcheck._quoted_substitutions('echo "${ a; }" ${| b; } x'), [" a; ", " b; "])
-        self.assertEqual(depcheck._quoted_substitutions('echo "${ { a; }; }"'), [" { a; }; "])
+        cmd = 'echo "${ a; }" ${| b; } x'
+        self.assertEqual(_commands(cmd), [cmd, "a", "b"])
+        self.assertEqual(_subs(cmd), [("${ ", None), ("${|", None)])
+        cmd = 'echo "${ { a; }; }"'
+        self.assertEqual(_commands(cmd), [cmd, "a"])
+        self.assertTrue(any(type(n) is shparse.Group for n in shparse.walk(shparse.parse(cmd))))
         self.assertEqual([w for w, _ in depcheck._split("x=${ a b; } c", braces=True)], ["x=${ a b; }", "c"])
         self.assertEqual(depcheck.heredocs('echo "${ cat <<E'), [("E", False)])
 
@@ -3497,6 +3674,101 @@ class HeredocLineJoinTest(unittest.TestCase):
                      lambda n: "cat <<E\n" + "\\" * n + "\nE\n", lambda n: "cat <<E\n" + "$(a #\\\n" * n + "E\n"]:
             small, large = make(2000), make(8000)
             with self.subTest(small[:20]):
+                assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
+                assert_linear(self, lambda: depcheck.dependency_doubt(small),
+                              lambda: depcheck.dependency_doubt(large))
+
+
+class NameOutputTest(unittest.TestCase):
+    """Имя команды — вывод подстановки: bash исполняет вывод командой."""
+
+    def test_doubt(self):
+        for cmd in ["x=${ $(cat <<E\nnpm i x\nE\n); }", "$(cat <<E\nnpm i x\nE\n)", "$(echo npm) i x",
+                    "${ printf 'npm i x'; }", "`echo npm i x`", "\"$(echo pip)\" install requests",
+                    "sudo $(printf 'npm i') x", "$(cat <<E) i x\nnpm\nE"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_NAME)
+
+    def test_no_install(self):
+        # Вывод подстановки без менеджера и глагола установки: не сомнение.
+        for cmd in ['"$(git rev-parse --show-toplevel)/bin/x" install', "$(npm bin)/eslint .",
+                    "$(dirname \"$0\")/run.sh a b", "echo $(echo npm i x)"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_marker(self):
+        self.assertIsNone(depcheck.dependency_doubt("PLANKA_DEP_OK=1 $(echo npm) i x"))
+
+    def test_long_text_doubt(self):
+        # Текст имени длиннее _WORDS_LIMIT не разбирается: сомнение.
+        cmd = "$(echo " + "a " * depcheck._WORDS_LIMIT + ") x"
+        self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_NAME)
+
+
+class GrammarFormsTest(unittest.TestCase):
+    """Формы, которые разбор читает как bash (проверено прогоном bash с `touch` в песочнице bashdiff)."""
+
+    def test_add(self):
+        for cmd, segment in [
+            # `eval --`: строка — слова за `--`.
+            ("eval -- 'for i in a; do npm i x; done'", "eval -- 'for i in a; do npm i x; done'"),
+            # Вывод команды в `>(…)` — вход оболочки.
+            ("echo 'npm i x' > >(bash)", "echo 'npm i x' > >(bash)"),
+            # Тело heredoc `cat` в процесс-подстановке — вход оболочки.
+            ("bash <(cat <<E\nnpm i x\nE\n)", "cat <<E"),
+            # `#` за `;` — комментарий: кавычка в нём строку не продолжает.
+            ("true;#\" \nnpm i x", "npm i x"),
+            # Тело heredoc в конвейере с оболочкой.
+            ("cat <<E | tee /dev/null | bash\nnpm i x\nE", "npm i x"),
+            ("npm i x", "npm i x"),
+            ("echo \"$(npm i x)\"", "npm i x"),
+            ("f() { npm i x; }", "npm i x"),
+        ]:
+            with self.subTest(cmd):
+                self.assertEqual(depcheck.dependency_add(cmd), segment)
+
+    def test_syntax_error_recovery(self):
+        # После фатальной ошибки — остаток со следующей строки и начало строки с ошибкой до неё.
+        self.assertEqual(depcheck.dependency_add(")\nnpm i x"), "npm i x")
+        self.assertEqual(depcheck.dependency_add("npm i x && )"), "npm i x")
+        self.assertEqual(depcheck.dependency_add("npm i x |)"), "npm i x")
+        # Остаток строки за ошибкой bash не исполняет (`( ); touch P1` — P1 нет).
+        self.assertIsNone(depcheck.dependency_add("( ); npm i x"))
+
+    def test_pass(self):
+        for cmd in ["echo 'npm i x'", "cat <<E\nnpm i x\nE", "PLANKA_DEP_OK=1 npm i x", "x=( $t )",
+                    "# npm i x", "echo $(( \"$(echo 1)\" + 1 ))"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_not_str(self):
+        self.assertIsNone(depcheck.dependency_add(None))
+        self.assertIsNone(depcheck.dependency_doubt(b"npm i x"))
+
+
+class GrammarLinearTest(unittest.TestCase):
+    """Разбор над деревом линеен по длине команды."""
+
+    def test_linear(self):
+        forms = {
+            "nested": lambda n: "$(" * n + "npm i x" + ")" * n,
+            "nested name": lambda n: "echo " + "$(" * n + "echo" + ")" * n + " i x",
+            "quoted name": lambda n: "echo " + '"$(' * n + "echo" + ')"' * n,
+            "funsub": lambda n: "${ " * n + "echo x; }" * n,
+            "heredocs": lambda n: "cat <<E\nx\nE\n" * n,
+            "shell heredoc": lambda n: "bash <<E\n" + "echo x\n" * n + "E\n",
+            "pipes": lambda n: "echo a | " * n + "bash",
+            "procsubs": lambda n: "cat " + "<(echo a) " * n,
+            "errors": lambda n: "x; )\n" * n,
+            "escaped globs": lambda n: "eval " + "\\" * n + "*" + " \\*" * n,
+            "expanding words": lambda n: "find . -exec sh -c \"$x\" " + '"$y" ' * n + "\\;",
+        }
+        for name, form in forms.items():
+            small, large = form(250), form(1000)
+            with self.subTest(name):
                 assert_linear(self, lambda: depcheck.dependency_add(small), lambda: depcheck.dependency_add(large))
                 assert_linear(self, lambda: depcheck.dependency_doubt(small),
                               lambda: depcheck.dependency_doubt(large))

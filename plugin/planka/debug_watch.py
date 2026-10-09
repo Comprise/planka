@@ -50,8 +50,6 @@ PASS_THROUGH = frozenset({"echo", "printf", "true", ":"})
 # Участки в кавычках и экранированные символы: перенаправление ищется вне них.
 UNQUOTED = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"|\\.", re.DOTALL)
 EXIT_LINE = re.compile(r"Exit code (\d+)")
-# Открытие heredoc: «<<» или «<<-», терминатор — слово, возможно в кавычках (here-string «<<<» не подходит).
-HEREDOC = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]*)'|\"([^\"\n]*)\"|\\?([A-Za-z0-9_.-]+))")
 
 LINE = "Команда `{command}` упала {ordinal} раз подряд — дальше, пожалуйста, по модулю {rules}/debugging.md."
 
@@ -75,148 +73,6 @@ def exit_code(error):
     return int(m.group(1)) if m else None
 
 
-def _skip_heredocs(command, i, pending):
-    """Индекс после тел heredoc, открытых строкой: i — первый символ после перевода строки. Тело и строка
-    терминатора пропускаются для каждого heredoc по порядку; терминатора нет — до конца строки команды."""
-    for terminator, strip_tabs in pending:
-        while i < len(command):
-            end = command.find("\n", i)
-            line = command[i:] if end < 0 else command[i:end]
-            i = len(command) if end < 0 else end + 1
-            if (line.lstrip("\t") if strip_tabs else line) == terminator:
-                break
-    return i
-
-
-def _paren_pairs(command):
-    """Закрывающая «)» каждой «(» вне кавычек, комментариев и тел heredoc: {индекс «(»: индекс «)»}. «<<» внутри
-    «$[…]» и внутри открытой «((» — сдвиг, не heredoc, даже если «((» окажется двумя «(» подоболочек: так её
-    содержимое читает bash, проверяя арифметику (parse_arith_cmd). Один проход, время линейно."""
-    # stack — открытые «(»: (индекс, начинает ли она «((»); arith — сколько из них начинают «((».
-    pairs, stack, pending = {}, [], []
-    arith = 0
-    # Глубина «[» внутри «$[…]», считая саму «$[»; 0 — вне «$[…]».
-    brackets = 0
-    quote, boundary, i, n = None, True, 0, len(command)
-    while i < n:
-        c = command[i]
-        if quote is None and c == "#" and boundary:
-            end = command.find("\n", i)
-            i = n if end < 0 else end
-            continue
-        if quote is None and c == "\n" and pending:
-            i = _skip_heredocs(command, i + 1, pending)
-            pending = []
-            boundary = True
-            continue
-        step = 2 if c == "\\" and quote != "'" else 1
-        boundary = quote is None and (c.isspace() or c in "&()<>;|")
-        if quote is None:
-            if c == "<" and not command.startswith("<<<", i) and not command.startswith("<<<", i - 1) \
-                    and not arith and not brackets:
-                m = HEREDOC.match(command, i)
-                if m:
-                    word = next(g for g in m.groups()[1:] if g is not None)
-                    pending.append((word, m.group(1) == "-"))
-            if c == "(":
-                opens = command.startswith("((", i)
-                stack.append((i, opens))
-                arith += opens
-            elif c == ")" and stack:
-                j, opens = stack.pop()
-                arith -= opens
-                pairs[j] = i
-            elif brackets and c in "[]":
-                brackets += 1 if c == "[" else -1
-            elif command.startswith("$[", i):
-                brackets, step = brackets + 1, 2
-            elif c in "'\"":
-                quote = c
-        elif c == quote:
-            quote = None
-        i += step
-    return pairs
-
-
-def _segments(command):
-    """Непустые команды строки с разделителем перед каждой: [(разделитель, текст)]. Разделители вне кавычек —
-    «|», «|&», «||», «&&», «;» и перевод строки; у первой команды разделитель "". Одиночный «&» и скобки не
-    разделяют; внутри «[[ … ]]», «$((…))», «((…))» и «$[…]» разделителей нет («((» без закрытия «))» — две «(»
-    подоболочек); тела heredoc отбрасываются, а «<<» внутри арифметики — сдвиг, не heredoc. Комментарий от «#»
-    в начале слова (после пробела, «;», «&», «|», скобки, «<», «>» или в начале строки) до конца строки
-    отбрасывается."""
-    segments = [["", []]]
-    i, n = 0, len(command)
-    quote = None
-    # Предыдущий символ — незаэкранированный разрыв слова вне кавычек: после него «#» начинает комментарий.
-    boundary = True
-    in_test = False
-    pending = []
-    # Последний « ]]»: «[[ » открывает проверку, только если закрытие стоит дальше (один поиск, не на каждый «[[ »).
-    last_close = command.rfind(" ]]")
-    # Глубина скобок внутри арифметики «$((…))», «((…))» и «$[…]»; 0 — вне её.
-    arith = 0
-    # Открытые «[» внутри «$[…]»: «$» — сама «$[…]», её «]» закрывает арифметику; «[» — индекс внутри неё. Вне
-    # «$[…]» «[» и «]» — обычные символы.
-    brackets = []
-    # «((» в начале команды — арифметика, только если «)», закрывающая вторую «(», стоит перед «)» первой (bash,
-    # parse_arith_cmd); иначе это подоболочка в подоболочке: «((cd a && make); false)».
-    pairs = _paren_pairs(command) if "((" in command else {}
-    while i < n:
-        c = command[i]
-        step = 1
-        if quote is None and c == "#" and boundary:
-            end = command.find("\n", i)
-            i = n if end < 0 else end
-            continue
-        if quote is None and boundary and not in_test and re.match(r"\[\[\s", command[i:i + 3]) \
-                and last_close >= i:
-            in_test = True
-        elif quote is None and in_test and boundary and command.startswith("]]", i):
-            in_test = False
-        if quote is None and not in_test and not arith and (c in "|;\n" or command.startswith("&&", i)):
-            step = 2 if command[i:i + 2] in ("||", "&&", "|&") else 1
-            segments.append([command[i:i + step], []])
-            boundary = True
-            if c == "\n" and pending:
-                i = _skip_heredocs(command, i + 1, pending)
-                pending = []
-                continue
-        else:
-            if quote is None:
-                if arith and c in "()":
-                    arith += 1 if c == "(" else -1
-                elif brackets and c in "[]":
-                    if c == "[":
-                        brackets.append("[")
-                    elif brackets.pop() == "$":
-                        arith -= 1
-                elif command.startswith("$[", i):
-                    arith, step = arith + 1, 2
-                    brackets.append("$")
-                elif command.startswith("$((", i):
-                    arith, step = arith + 2, 3
-                elif boundary and command.startswith("((", i) and i + 1 in pairs \
-                        and pairs.get(i) == pairs[i + 1] + 1:
-                    arith, step = arith + 2, 2
-            boundary = quote is None and (c.isspace() or c in "&()<>")
-            m = HEREDOC.match(command, i) if quote is None and c == "<" and not in_test and not arith and \
-                not command.startswith("<<<", i) and not command.startswith("<<<", i - 1) else None
-            if m:
-                word = next(g for g in m.groups()[1:] if g is not None)
-                pending.append((word, m.group(1) == "-"))
-            if c == "\\" and quote != "'":
-                step = 2
-            elif quote is None and c in "'\"":
-                quote = c
-            elif c == quote:
-                quote = None
-            segments[-1][1].append(command[i:i + step])
-        i += step
-    texts = [(sep, "".join(chars)) for sep, chars in segments]
-    return [(sep, text) for sep, text in texts if text.strip()]
-
-
 # Операторы, разделяющие команды строки: «|», «|&», «||», «&&», «;», перевод строки; «\\» с переводом строки —
 # продолжение строки, не разделитель. Одиночный «&» и скобки не разделяют.
 _SEPARATOR = re.compile(r"\\\n|\|[|&]?|&&|;|\n")
@@ -225,10 +81,10 @@ _SEPARATOR = re.compile(r"\\\n|\|[|&]?|&&|;|\n")
 _NO_SPLIT = (shparse.Word, shparse.Redir, shparse.ArithCmd, shparse.Arith, shparse.Cond)
 
 
-def _tree_skip_heredocs(command, script, nodes=None):
+def _skip_heredocs(command, script, nodes=None):
     """Диапазоны (начало, конец) тел heredoc вместе со строкой терминатора и её переводом строки; терминатора нет —
     до конца текста; терминатор со знаком конца подстановки в остатке строки («E)») — до знака. Тела берутся из
-    дерева script (shparse.parse(command)), а не из порядка открытий. Heredoc, тело которого bash не читал (в
+    дерева script (shparse.parse(command)). Heredoc, тело которого bash не читал (в
     теле `` `…` `` оно в самой строке подстановки), диапазона не даёт. nodes — уже обойдённые узлы script."""
     n = len(command)
     out = []
@@ -270,13 +126,13 @@ def _covered(ranges, starts, i):
     return ranges[k][1] if k >= 0 and i < ranges[k][1] else None
 
 
-def _tree_paren_pairs(command, script=None):
+def _paren_pairs(command, script=None):
     """Закрывающая «)» каждой «(» вне кавычек, комментариев и тел heredoc: {индекс «(»: индекс «)»}. Кавычки,
     комментарии и heredoc берутся из дерева (shparse.parse), скобки считаются по тексту; «\\» вне кавычек
     экранирует следующий символ."""
     script = shparse.parse(command) if script is None else script
     nodes = list(shparse.walk(script))
-    cuts = list(_comment_ranges(nodes)) + _tree_skip_heredocs(command, script, nodes)
+    cuts = list(_comment_ranges(nodes)) + _skip_heredocs(command, script, nodes)
     cuts += [(node.start, node.end) for node in nodes if type(node) in (shparse.SQ, shparse.DQ, shparse.AnsiC)]
     cuts = _merge(cuts)
     starts = [start for start, _ in cuts]
@@ -303,15 +159,15 @@ def _comment_ranges(nodes):
             yield from node.comments
 
 
-def _tree_segments(command, script=None):
-    """То же, что _segments, по дереву shparse: непустые команды строки с разделителем перед каждой. Разделитель —
+def _segments(command, script=None):
+    """Непустые команды строки с разделителем перед каждой: [(разделитель, текст)], по дереву shparse. Разделитель —
     оператор между командами (_SEPARATOR) вне слов, перенаправлений, «((…))», «[[ … ]]», комментариев и тел
     heredoc; внутри подстановки, группы слов и скобок массива разделителей нет; комментарии и тела heredoc из
     текста команд убраны. После синтаксической ошибки bash не исполняет остаток: от начала команды с ошибкой он
     одна команда без разделителей. script — готовый shparse.parse(command)."""
     script = shparse.parse(command) if script is None else script
     nodes = list(shparse.walk(script))
-    cuts = _merge(list(_comment_ranges(nodes)) + _tree_skip_heredocs(command, script, nodes))
+    cuts = _merge(list(_comment_ranges(nodes)) + _skip_heredocs(command, script, nodes))
     cut_starts = [start for start, _ in cuts]
     fixed = _merge([(node.start, node.end) for node in nodes if isinstance(node, _NO_SPLIT)]
                    + [(item[0][0].start, item[0][-1].end) for node in nodes if type(node) is shparse.Case

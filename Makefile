@@ -33,4 +33,4 @@ check: test test-hostile validate
 # расхождений — BASHDIFF_OUT, по умолчанию новый временный. В check не входит: нужен bwrap, прогон долгий.
 BASHDIFF_OUT ?= $(shell mktemp -d)
 bashdiff:
-	python3 tests/tools/bashdiff.py --target detector --engine old --seed 1 --count 20000 --out $(BASHDIFF_OUT)
+	python3 tests/tools/bashdiff.py --target detector --seed 1 --count 20000 --out $(BASHDIFF_OUT)

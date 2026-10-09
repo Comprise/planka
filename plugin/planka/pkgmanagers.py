@@ -180,6 +180,49 @@ def _basename(word):
     return _WIN_EXT.sub("", name).lower()
 
 
+def _part_of(word, text):
+    """Часть text слова word с атрибутами слова: у слова depcheck — признак внешнего раскрытия (строка `su -c"…"`,
+    `--command=…` несёт раскрытие своего слова)."""
+    if type(word) is str:
+        return text
+    out = type(word)(text)
+    out.__dict__.update(word.__dict__)
+    return out
+
+
+def _joined(words, text):
+    """Строка text, склеенная из слов words: с признаком внешнего раскрытия depcheck (expands), если он есть у
+    какого-то из них (строку разбирает оболочка: `ssh host "…"`, `cmd /c …`)."""
+    for word in words:
+        if getattr(word, "expands", False):
+            return _part_of(word, text)
+    return text
+
+
+def _replaced(word, old, new):
+    """Слово word с заменой old на new (`{}` у `find -exec`) и в его записи для повторного разбора (shell)."""
+    out = _part_of(word, word.replace(old, new))
+    if getattr(word, "shell", None):
+        out.shell = word.shell.replace(old, new)
+    return out
+
+
+def _shell_join(words):
+    """Строка команды из слов-аргументов words для повторного разбора: слово с внешним раскрытием depcheck — его
+    записью shell (раскрытия остаются раскрытиями), без записи — в кавычках с заглушкой `$_` за ними (раскрытие
+    видно, значение неизвестно); прочие — в кавычках shlex."""
+    out = []
+    for word in words:
+        shell = getattr(word, "shell", None)
+        if shell:
+            out.append(shell)
+        elif getattr(word, "expands", False):
+            out.append(shlex.quote(word) + '"$_"')
+        else:
+            out.append(shlex.quote(word))
+    return " ".join(out)
+
+
 def _c_wrapper(words, value_flags):
     """Слова words после `su`/`runuser` — как их разбирает getopt с перестановкой: флаги и их значения (value_flags)
     стоят где угодно до `--`, склейка коротких флагов забирает значением остаток слова (`-lc'…'`). С
@@ -197,6 +240,7 @@ def _c_wrapper(words, value_flags):
             break
         if word.startswith("--"):
             flag, eq, value = word.partition("=")
+            value = _part_of(word, value)
             if flag in value_flags and not eq:
                 value = words.popleft()[0] if words else None
         elif word.startswith("-") and len(word) > 1:
@@ -204,7 +248,7 @@ def _c_wrapper(words, value_flags):
             for j in range(1, len(word)):
                 if "-" + word[j] in value_flags:
                     flag = "-" + word[j]
-                    value = word[j + 1:] or (words.popleft()[0] if words else None)
+                    value = _part_of(word, word[j + 1:]) or (words.popleft()[0] if words else None)
                     break
         else:
             rest.append((word, lead))
@@ -1016,12 +1060,13 @@ def _dry_value_flags(name):
 
 def _inline_script(words):
     """Строка, которую команда исполняет как команду: `sh -c '…'`, `fish --command '…'`, `eval …`; None, если такой
-    нет или оболочка её только разбирает (_noexec)."""
+    нет или оболочка её только разбирает (_noexec). Встроенная eval принимает `--` концом флагов (bash 5.3,
+    no_options): строка — слова за ним."""
     if not words:
         return None
     name = _basename(words[0])
     if name == "eval":
-        return " ".join(words[1:])
+        return " ".join(words[2:] if words[1:2] == ["--"] else words[1:])
     if name not in _C_SHELLS:
         return None
     args = words[1:]
@@ -1033,7 +1078,7 @@ def _inline_script(words):
         if a == "--command" or a.startswith("--command="):
             # `fish --command '…'`, `fish --command=…`.
             if "=" in a:
-                return None if noexec else a.partition("=")[2]
+                return None if noexec else _part_of(a, a.partition("=")[2])
             has_c = True
         elif a.startswith("--"):
             if a in _SHELL_VALUE_FLAGS:
@@ -1155,7 +1200,7 @@ def _git_runs(args):
                 key, _, value = args[i + 1].partition("=")
                 section, _, alias = key.partition(".")
                 if section.lower() == "alias" and value.startswith("!"):
-                    aliases[alias.lower()] = value[1:]
+                    aliases[alias.lower()] = _part_of(args[i + 1], value[1:])
             i += 2
         else:
             i += 1
@@ -1163,15 +1208,18 @@ def _git_runs(args):
         return []
     sub, rest = args[i], args[i + 1:]
     if sub.lower() in aliases:
-        return [" ".join([aliases[sub.lower()], shlex.join(rest)]).strip()]
+        # Строка псевдонима — строка оболочки, слова за ним — её аргументы "$@" (git 2.x: `git -c alias.z='!echo' z
+        # "$x"` печатает значение $x, не исполняя его).
+        alias = aliases[sub.lower()]
+        return [_part_of(alias, " ".join([alias, _shell_join(rest)]).strip())]
     if sub == "submodule":
         rest = _after_flags(rest, _NO_VALUE_FLAGS)
         if rest[:1] != ["foreach"]:
             return []
         rest = _after_flags(rest[1:], _NO_VALUE_FLAGS)
-        return rest if len(rest) == 1 else [shlex.join(rest)] if rest else []
+        return rest if len(rest) == 1 else [_shell_join(rest)] if rest else []
     if sub == "bisect":
-        return [shlex.join(rest[1:])] if rest[:1] == ["run"] and rest[1:] else []
+        return [_shell_join(rest[1:])] if rest[:1] == ["run"] and rest[1:] else []
     if sub != "rebase":
         return []
     out = []
@@ -1181,11 +1229,11 @@ def _git_runs(args):
             break
         name, eq, value = a.partition("=")
         if name in _GIT_REBASE_EXEC:
-            out.append(value if eq else following)
+            out.append(_part_of(a, value) if eq else following)
         elif a.startswith("-") and not a.startswith("--"):
             for j in range(1, len(a)):
                 if a[j] == "x":
-                    out.append(a[j + 1:] or following)
+                    out.append(_part_of(a, a[j + 1:]) or following)
                     break
                 if a[j] in _GIT_REBASE_VALUE_LETTERS:
                     break
@@ -1193,8 +1241,8 @@ def _git_runs(args):
 
 
 def _expanded(word):
-    """Слово — подстановка или переменная целиком или частью (`$X`, `${V:-add}`, `` `…` ``, заглушка `$` _parse на
-    месте `$(…)`): его слова известны только при исполнении. None — слова нет."""
+    """Слово — подстановка или переменная целиком или частью (`$X`, `${V:-add}`, `` `…` ``, заглушка `$_`
+    depcheck на месте длинного раскрытия): его слова известны только при исполнении. None — слова нет."""
     return word is not None and ("$" in word or "`" in word)
 
 
@@ -1218,7 +1266,7 @@ def _asks_help(name, args):
 
 
 def _expanded_install(words):
-    """Имя команды — подстановка или переменная (`$M`, `$(which npm)`, заглушка `$` _parse, `` `which npm` ``), за
+    """Имя команды — подстановка или переменная (`$M`, `$(which npm)`, заглушка `$_` depcheck, `` `which npm` ``), за
     ним глагол установки и слово-не-флаг."""
     return (len(words) > 2 and _expanded(words[0]) and words[1] in _INSTALL_VERBS
             and _has(words[2:], _EXPANDED_VALUE_FLAGS))

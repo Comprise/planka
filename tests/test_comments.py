@@ -1,5 +1,6 @@
 import codecs
 import errno
+import json
 import os
 import pathlib
 import shutil
@@ -152,7 +153,7 @@ class CommentLinesTest(unittest.TestCase):
         self.assertEqual(helpers.comment_lines(src, "sh"), ["# real"])
 
     def test_shell_heredoc_inside_open_backtick_is_data(self):
-        # `…` не закрыта до конца строки: тело heredoc в ней — данные (depcheck.heredocs).
+        # `…` не закрыта до конца строки: тело heredoc в ней — данные (shparse.heredocs).
         src = "x=`cat <<EOF\nbody # not a comment\nEOF\n`\n# real\n"
         self.assertEqual(helpers.comment_lines(src, "sh"), ["# real"])
         # Тело heredoc из `…` bash читает раньше тела heredoc строки: тело B, затем тело A.
@@ -1978,58 +1979,96 @@ class LinearParseTest(unittest.TestCase):
         self.assertLess(len(seen), 200)
 
 
+# Ожидаемые комментарии sh и bash записаны в tests/fixtures/comments-shell-results.json: вход -> [[номер строки,
+# комментарий]]; у входа "multiline-quote" записан результат bash (test_multiline_quote_is_data).
+SHELL_RESULTS = pathlib.Path(__file__).resolve().parent / "fixtures" / "comments-shell-results.json"
+
+
+def recorded(key):
+    return [tuple(e) for e in json.loads(SHELL_RESULTS.read_text(encoding="utf-8"))[key]]
+
+
 class ShellTreeTest(unittest.TestCase):
-    """Комментарии sh и bash по разбору shparse (comments._shell_comments) рядом с прежним движком _SYNTAX."""
+    """Комментарии sh и bash по разбору shparse (comments._shell_comments) равны записанным результатам (SHELL_RESULTS)."""
 
-    @staticmethod
-    def old(text, ext):
-        # Прежний путь: _reparse по _SYNTAX, heredoc строк — прежний depcheck.heredocs.
-        import depcheck
-        import shparse
-        with mock.patch.object(shparse, "heredocs", depcheck.heredocs):
-            return comments._reparse(text, comments._SYNTAX[ext], None)
-
-    def test_shell_fixtures_equal_old_path(self):
+    def test_shell_fixtures_equal_recorded(self):
         for rel in ("fzf-tmux/fzf-tmux.sh", "openssh-findssl/findssl.sh"):
             with self.subTest(rel):
                 text = (FIXTURES / rel).read_text(encoding="utf-8")
-                self.assertEqual(comments._shell_comments(text), self.old(text, "sh"))
-                self.assertEqual(comments._comments(text, "bash"), self.old(text, "bash"))
+                self.assertEqual(comments._shell_comments(text), recorded(rel + ":sh"))
+                self.assertEqual(comments._comments(text, "bash"), recorded(rel + ":bash"))
 
-    def test_yaml_fixtures_equal_old_path(self):
+    def test_yaml_fixtures_equal_recorded(self):
         for rel in ("esp-idf-gitlab/pre_check.yml", "grpc-gateway-ci/ci.yml", "mldsa-hol-light/hol_light.yml"):
             with self.subTest(rel):
                 text = (FIXTURES / rel).read_text(encoding="utf-8")
-                with mock.patch.object(comments, "_shell_comments", return_value=None):
-                    expected = comments._comments(text, "yml")
-                self.assertEqual(comments._comments(text, "yml"), expected)
+                self.assertEqual(comments._comments(text, "yml"), recorded(rel))
 
     def test_yaml_script_uses_tree(self):
         src = "steps:\n  - run: |\n      echo a # c1\n      echo 'x\n      # data\n      y'\n      # c2\n"
         self.assertEqual(comments._comments(src, "yml"), [(3, "# c1"), (7, "# c2")])
 
     def test_multiline_quote_is_data(self):
-        # Расхождение с прежним путём: тело строки в одинарных кавычках на нескольких строках — данные
-        # (awk-программа в git-completion.bash, jq-программа в dracut), прежний движок брал её «#» за комментарий.
+        # Тело строки в одинарных кавычках на нескольких строках — данные (awk-программа в git-completion.bash,
+        # jq-программа в dracut): bash передаёт строку целиком, `printf '[%s]' '\n  # not a comment\n  { print }\n' f
+        # # real` печатает «#»-строку внутри аргумента, а «# real» отбрасывает.
         src = "awk '\n  # not a comment\n  { print }\n' f # real\n"
-        self.assertEqual(comments._comments(src, "sh"), [(4, "# real")])
-        self.assertEqual(self.old(src, "sh"), [(2, "# not a comment"), (4, "# real")])
+        self.assertEqual(comments._comments(src, "sh"), recorded("multiline-quote"))
+        self.assertEqual(recorded("multiline-quote"), [(4, "# real")])
 
     def test_shebang_bom_crlf_and_line_numbers(self):
-        src = "﻿#!/bin/sh\r\n# one\r\necho a # two\r\ncat <<E\r\n# body\r\nE\r\n# three\r\n"
+        src = "\ufeff#!/bin/sh\r\n# one\r\necho a # two\r\ncat <<E\r\n# body\r\nE\r\n# three\r\n"
         for ext in ("sh", "bash"):
             self.assertEqual(comments._comments(src, ext), [(2, "# one"), (3, "# two"), (7, "# three")])
-            self.assertEqual(comments._comments(src, ext), self.old(src, ext))
+            self.assertEqual(comments._comments(src, ext), recorded("crlf"))
 
     def test_shebang_only_on_first_line(self):
         self.assertEqual(comments._comments("#!/bin/sh\n#!second\n", "sh"), [(2, "#!second")])
 
-    def test_fatal_error_falls_back_to_old_path(self):
+    def test_fatal_error_keeps_comments_after_it(self):
         # bash прекращает чтение на фатальной ошибке; комментарии после неё не должны выпасть из вывода.
         src = "# a\nif then\n# b\necho x # c\n"
-        self.assertIsNone(comments._shell_comments(src))
-        self.assertEqual(comments._comments(src, "sh"), self.old(src, "sh"))
+        self.assertEqual(comments._shell_comments(src), recorded("fatal"))
+        self.assertEqual(comments._comments(src, "sh"), recorded("fatal"))
         self.assertEqual([n for n, _ in comments._comments(src, "sh")], [1, 3, 4])
+
+    def test_several_fatal_errors_in_a_row(self):
+        src = "# a\nif then\n# b\nfi fi\n# c\necho ) # d\n# e\n"
+        for ext in ("sh", "bash"):
+            self.assertEqual(comments._comments(src, ext), [(1, "# a"), (3, "# b"), (5, "# c"), (7, "# e")])
+            # Комментарий в строке с ошибкой за самой ошибкой («# d») разбор со следующей строки не видит.
+
+    def test_fatal_error_on_last_line(self):
+        for src, want in (("# a\nif then", [(1, "# a")]), ("# a\nif then\n", [(1, "# a")]),
+                          ("# a\necho # b\nfi", [(1, "# a"), (2, "# b")])):
+            with self.subTest(src):
+                self.assertEqual(comments._comments(src, "sh"), want)
+
+    def test_heredoc_after_fatal_error(self):
+        src = "if then\n# b\ncat <<E\n# body\nE\n# c\n"
+        found = comments._comments(src, "sh")
+        # Heredoc после ошибки: его тело — данные.
+        self.assertEqual(found, [(2, "# b"), (6, "# c")])
+
+    def test_crlf_line_numbers_after_fatal_error(self):
+        src = "# a\r\nif then\r\n# b\r\necho x # c\r\n"
+        self.assertEqual(comments._comments(src, "sh"), recorded("fatal"))
+
+    def test_shebang_before_fatal_error(self):
+        self.assertEqual(comments._comments("#!/bin/sh\nif then\n#!x\n", "sh"), [(3, "#!x")])
+
+    def test_many_fatal_errors_linear(self):
+        def make(n):
+            return "if then\n# c\n" * n
+
+        for ext in ("sh", "bash"):
+            helpers.assert_linear(self, lambda: comments._comments(make(8000), ext, time.monotonic() + 60),
+                                  lambda: comments._comments(make(32000), ext, time.monotonic() + 60))
+
+    def test_recoveries_bounded(self):
+        with mock.patch.object(comments.shparse, "parse", wraps=comments.shparse.parse) as parse:
+            comments._comments("if then\n# c\n" * 1000, "sh")
+        self.assertLessEqual(parse.call_count, comments._SHELL_RECOVERIES + 1)
 
     def test_shparse_failure_falls_back(self):
         with mock.patch.object(comments.shparse, "parse", side_effect=RuntimeError):

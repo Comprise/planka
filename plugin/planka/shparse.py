@@ -731,32 +731,161 @@ def _valid_ident(s):
     return bool(s) and s[0] in _NAME_START and all(c in _NAME_CHAR for c in s)
 
 
-def _skip_subscript(s, i):
-    """Конец `[…]` с позиции `[` (skipsubscript, упрощённо: вложенные скобки, кавычки, `\\`): индекс `]` или len."""
-    depth = 0
+_PARAMEXPNEST_MAX = 32
+
+
+def _backquote_end(s, i):
+    """string_extract с "`": позиция закрывающей `` ` `` с позиции после открывающей (`\\` экранирует) или len."""
     n = len(s)
     while i < n:
         c = s[i]
         if c == "\\":
             i += 2
             continue
-        if c == "'":
-            j = s.find("'", i + 1)
-            i = n if j < 0 else j + 1
+        if c == "`":
+            return i
+        i += 1
+    return n
+
+
+def _skip_subscript(s, i):
+    """skipsubscript (subst.c, skip_matched_pair с флагами 0): индекс `]`, закрывающей `[` на позиции i, или len.
+    Как в bash, индекс не кончают `]` во вложенных `[…]`, '…', "…" (skip_double_quoted), `` `…` ``, `$(…)`
+    (extract_delimited_string: скобки, кавычки, комментарий) и `${…}` (extract_dollar_brace_string: свои `[…]` в
+    имени параметра, dolbrace_state). Текст — _flat: подстановка `$(…)`, `${ …; }`, `<(…)` в нём — заглушка `$( )`;
+    xparse_dolparen, которым bash находит конец подстановки в "…" и `${…}`, на заглушке совпадает со счётом скобок.
+    Расхождение: `$(…)` и `<(…)` прямо в индексе bash просматривает по напечатанному тексту символами (`)` метки
+    `case`, `]` в `<(…)`), здесь — заглушкой. Незакрытая конструкция на любом уровне — len (CHECK_STRING_OVERRUN).
+    Стек кадров вместо рекурсии: [вид, счётчик, …]; кадр, закрытый на позиции k, возвращает разбор к k + 1."""
+    n = len(s)
+    stack = [["[", 1]]
+    i += 1
+    while i < n:
+        f = stack[-1]
+        kind = f[0]
+        c = s[i]
+        nxt = s[i + 1:i + 2]
+        if kind == "(" and f[2]:
+            # Комментарий в extract_delimited_string (SX_COMMAND) — до перевода строки.
+            if c == "\n":
+                f[2] = False
+            i += 1
+            continue
+        if kind == "(" and c == "#" and s[i - 1] in " \t\n":
+            f[2] = True
+            i += 1
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        if c == "`":
+            j = _backquote_end(s, i + 1)
+            if j >= n:
+                return n
+            i = j + 1
+            continue
+        if kind == "[":
+            if c == "[":
+                f[1] += 1
+            elif c == "]":
+                f[1] -= 1
+                if f[1] == 0:
+                    stack.pop()
+                    if not stack:
+                        return i
+                    # Вложенный `[…]` в имени `${…}`: `]` — символ, dolbrace_state с ним не меняется (PARAM).
+            elif c == "'":
+                j = s.find("'", i + 1)
+                if j < 0:
+                    return n
+                i = j
+            elif c == '"':
+                stack.append(['"'])
+            elif c == "$" and nxt == "(":
+                stack.append(["(", 1, False])
+                i += 1
+            elif c == "$" and nxt == "{":
+                stack.append(["{", 1, _DB_PARAM, [_DB_PARAM] * _PARAMEXPNEST_MAX, i + 2])
+                i += 1
+            i += 1
+            continue
+        if kind == '"':
+            if c == '"':
+                stack.pop()
+            elif c == "$" and nxt == "(":
+                # extract_command_subst: `$((` — extract_delimited_string, иначе xparse_dolparen (на заглушке — то же).
+                stack.append(["(", 1, False])
+                i += 1
+            elif c == "$" and nxt == "{":
+                # Функциональная подстановка `${ …; }` в _flat — заглушка; `${` — extract_dollar_brace_string.
+                stack.append(["{", 1, _DB_PARAM, [_DB_PARAM] * _PARAMEXPNEST_MAX, i + 2])
+                i += 1
+            i += 1
+            continue
+        if kind == "(":
+            if c == "$" and nxt == "(":
+                # extract_command_subst: тот же счёт скобок, что у этого кадра.
+                f[1] += 1
+                i += 2
+                continue
+            if c == "$" and nxt == "{" and s[i + 2:i + 3] in _FUNSUB:
+                # extract_function_subst (xparse_dolparen до `}`): счёт `${…}` — приближение.
+                stack.append(["{", 1, _DB_PARAM, [_DB_PARAM] * _PARAMEXPNEST_MAX, i + 2])
+                i += 2
+                continue
+            if c == "(":
+                f[1] += 1
+            elif c == ")":
+                f[1] -= 1
+                if f[1] == 0:
+                    stack.pop()
+            elif c == "'":
+                j = s.find("'", i + 1)
+                if j < 0:
+                    return n
+                i = j
+            elif c == '"':
+                stack.append(['"'])
+            i += 1
+            continue
+        # kind == "{": extract_dollar_brace_string; f = ["{", nesting, dolbrace_state, dbstate, начало после `${`].
+        if c == "$" and nxt == "{":
+            if f[1] < _PARAMEXPNEST_MAX:
+                f[3][f[1]] = f[2]
+            f[1] += 1
+            i += 2
+            if f[2] in (_DB_QUOTE, _DB_WORD):
+                f[2] = _DB_PARAM
+            continue
+        if c == "}":
+            f[1] -= 1
+            if f[1] == 0:
+                stack.pop()
+            else:
+                f[2] = f[3][f[1]] if f[1] < _PARAMEXPNEST_MAX else f[3][0]
+            i += 1
+            continue
+        if c == "$" and nxt == "(" or c in "<>" and nxt == "(":
+            # extract_command_subst, extract_process_subst: xparse_dolparen, на заглушке — счёт скобок.
+            stack.append(["(", 1, False])
+            i += 2
             continue
         if c == '"':
-            i += 1
-            while i < n and s[i] != '"':
-                i += 2 if s[i] == "\\" else 1
+            stack.append(['"'])
             i += 1
             continue
-        if c == "[":
-            depth += 1
-        elif c == "]":
-            depth -= 1
-            if depth == 0:
-                return i
+        if c == "'":
+            j = s.find("'", i + 1)
+            if j < 0:
+                return n
+            i = j + 1
+            continue
+        if c == "[" and f[2] == _DB_PARAM:
+            stack.append(["[", 1])
+            i += 1
+            continue
         i += 1
+        f[2] = _dolbrace_state(f[2], c, i - f[4])
     return n
 
 
@@ -2247,9 +2376,10 @@ class _R:
                 wasdol = False
         # Итог по виду конструкции.
         end_pos = close_pos if close_pos is not None else self.cpos
-        for idx, qstart in quotes:
+        for idx, qstart in quotes[:1]:
             # Подстановка, не закрытая в '…' арифметики, при раскрытии продолжается за кавычкой: раскрывается
-            # текст от кавычки (она — простой символ) до конца выражения, как его хранит bash.
+            # текст от кавычки (она — простой символ) до конца выражения, как его хранит bash; раскрывается только
+            # текст от первой такой кавычки.
             anchors = []
             text = _render(raw[idx:], anchors)
             sub = _R(text, [(0, qstart)], self.comments, shared=self.shared, tail=False, limit=P(end_pos),

@@ -1,0 +1,334 @@
+{
+"crlf": [
+[
+2,
+"# one"
+],
+[
+3,
+"# two"
+],
+[
+7,
+"# three"
+]
+],
+"esp-idf-gitlab/pre_check.yml": [
+[
+1,
+"# источник: esp-idf release/v6.0 (71722673), .gitlab/ci/pre_check.yml, строки 1–55"
+],
+[
+3,
+"# Don't run this for feature/bugfix branches, so that it is possible to modify"
+],
+[
+4,
+"# esp_idf_version.h in a branch before tagging the next version."
+],
+[
+10,
+"# need a full clone to get the latest tag"
+],
+[
+11,
+"# the --shallow-since=$(git log -1 --format=%as $LATEST_GIT_TAG) option is not accurate"
+],
+[
+22,
+"# use ast-grep to describe customized lint rules"
+],
+[
+34,
+"# Check if Wi-Fi library header files match between IDF and the version used when compiling the libraries"
+],
+[
+44,
+"# Check if Coexistence library header files match between IDF and the version used when compiling the libraries"
+],
+[
+54,
+"# Check if Wi-Fi, PHY, BT blobs contain references to specific symbols"
+]
+],
+"fatal": [
+[
+1,
+"# a"
+],
+[
+3,
+"# b"
+],
+[
+4,
+"# c"
+]
+],
+"fzf-tmux/fzf-tmux.sh:bash": [
+[
+1,
+"# источник: fzf 0.74.4, bin/fzf-tmux, строки 141–196"
+],
+[
+7,
+"# * --height option is not allowed"
+],
+[
+8,
+"# * CTRL-Z is also disabled"
+],
+[
+9,
+"# * fzf-tmux script is not compatible with --tmux option in fzf 0.53.0 or later"
+],
+[
+12,
+"# Handle zoomed tmux pane without popup options by moving it to a temp window"
+],
+[
+22,
+"# Clean up named pipes on exit"
+],
+[
+37,
+"# Restore tmux window options"
+],
+[
+42,
+"# Remove temp window if we were zoomed without popup options"
+]
+],
+"fzf-tmux/fzf-tmux.sh:sh": [
+[
+1,
+"# источник: fzf 0.74.4, bin/fzf-tmux, строки 141–196"
+],
+[
+7,
+"# * --height option is not allowed"
+],
+[
+8,
+"# * CTRL-Z is also disabled"
+],
+[
+9,
+"# * fzf-tmux script is not compatible with --tmux option in fzf 0.53.0 or later"
+],
+[
+12,
+"# Handle zoomed tmux pane without popup options by moving it to a temp window"
+],
+[
+22,
+"# Clean up named pipes on exit"
+],
+[
+37,
+"# Restore tmux window options"
+],
+[
+42,
+"# Remove temp window if we were zoomed without popup options"
+]
+],
+"grpc-gateway-ci/ci.yml": [
+[
+1,
+"# источник: grpc-gateway v2.30.0, .github/workflows/ci.yml, строки 60–100 (run: с индикатором «|» на следующей строке, heredoc)"
+],
+[
+6,
+"# v7.0.1"
+],
+[
+7,
+"# v6.1.0"
+],
+[
+14,
+"# v6.1.0"
+],
+[
+21,
+"# Required with newer versions of Git"
+],
+[
+22,
+"# https://github.com/actions/checkout/issues/766"
+],
+[
+26,
+"# put .bazelrc in $HOME so that it's read before project's .bazelrc"
+]
+],
+"mldsa-hol-light/hol_light.yml": [
+[
+1,
+"# источник: mldsa-native в esp-idf release/v6.0 (71722673), .github/workflows/hol_light.yml, строки 55–75 (script: | под with:)"
+],
+[
+2,
+"# v5.0.0"
+],
+[
+10,
+"# Load base infrastructure and specs to validate HOL-Light environment"
+],
+[
+11,
+"# When we have smaller/faster proofs, we can run them here instead:"
+],
+[
+12,
+"# make -C proofs/hol_light/x86_64 mldsa/mldsa_ntt.o"
+],
+[
+13,
+"# echo 'needs \"proofs/mldsa_ntt.ml\";;' | hol.sh"
+],
+[
+21,
+"# Dependencies on {name}.{S,ml} are implicit"
+]
+],
+"multiline-quote": [
+[
+4,
+"# real"
+]
+],
+"openssh-findssl/findssl.sh:bash": [
+[
+1,
+"# источник: OpenSSH 10.6p1, contrib/findssl.sh, строки 59–107"
+],
+[
+2,
+"#"
+],
+[
+3,
+"# Adjust these to suit your compiler."
+],
+[
+4,
+"# You may also need to set the *LIB*PATH environment variables if"
+],
+[
+5,
+"# DEFAULT_LIBPATH is not correct for your system."
+],
+[
+6,
+"#"
+],
+[
+10,
+"#"
+],
+[
+11,
+"# Cleanup on interrupt"
+],
+[
+12,
+"#"
+],
+[
+15,
+"#"
+],
+[
+16,
+"# Set up conftest C source"
+],
+[
+17,
+"#"
+],
+[
+24,
+"#"
+],
+[
+25,
+"# Set default library paths if not already set"
+],
+[
+26,
+"#"
+],
+[
+33,
+"# not all platforms have a 'which' command"
+]
+],
+"openssh-findssl/findssl.sh:sh": [
+[
+1,
+"# источник: OpenSSH 10.6p1, contrib/findssl.sh, строки 59–107"
+],
+[
+2,
+"#"
+],
+[
+3,
+"# Adjust these to suit your compiler."
+],
+[
+4,
+"# You may also need to set the *LIB*PATH environment variables if"
+],
+[
+5,
+"# DEFAULT_LIBPATH is not correct for your system."
+],
+[
+6,
+"#"
+],
+[
+10,
+"#"
+],
+[
+11,
+"# Cleanup on interrupt"
+],
+[
+12,
+"#"
+],
+[
+15,
+"#"
+],
+[
+16,
+"# Set up conftest C source"
+],
+[
+17,
+"#"
+],
+[
+24,
+"#"
+],
+[
+25,
+"# Set default library paths if not already set"
+],
+[
+26,
+"#"
+],
+[
+33,
+"# not all platforms have a 'which' command"
+]
+]
+}

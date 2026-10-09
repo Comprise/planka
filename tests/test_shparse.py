@@ -410,6 +410,28 @@ class ExpansionClassesTest(unittest.TestCase):
         self.assertEqual(shparse.parse("echo ''").commands[0].words[1].literal(), "")
 
 
+class SubscriptAssignmentTest(unittest.TestCase):
+    """Конец индекса `имя[…]=` ищет skipsubscript (skip_matched_pair): `]` в `${…}`, `` `…` `` и вложенных `[…]`
+    индекс не кончает. Проверено прогоном bash 5.3 с `touch`."""
+
+    def test_bracket_inside_expansion(self):
+        for text in ["a[${x:-]}]=1 npm i x", "a[`echo ]`]=1 npm i x", "a[${x:-${y:-]}}]=1 npm i x",
+                     "a[${x[${y:-]}]}]=1 npm i x", "a[${x//]/y}]=1 npm i x", "a[${x:-`echo ]`}]=1 npm i x",
+                     "a[${x:-a[]]}]=1 npm i x", "a[${x:-]}]+=1 npm i x", "a[${x:-]}]=(1) npm i x",
+                     "x=1 a[${x:-]}]=1 npm i x", "a[$((1 # ]\n))]=1 npm i x"]:
+            with self.subTest(text):
+                simple = shparse.simple_commands(shparse.parse(text))[0]
+                self.assertEqual([w.literal() for w in simple.words], ["npm", "i", "x"])
+                self.assertEqual(len(simple.assigns), 2 if text.startswith("x=1") else 1)
+
+    def test_not_assignment(self):
+        # Индекс кончается первой `]` вне `${…}`: за ней не `=` — слово не присваивание, а имя команды.
+        for text in ["a[${x:-}]]=1 npm i x", "a[${x:-]}]x=1 npm i x"]:
+            with self.subTest(text):
+                simple = shparse.simple_commands(shparse.parse(text))[0]
+                self.assertEqual((len(simple.assigns), len(simple.words)), (0, 4))
+
+
 class ArrayBackslashReexpandTest(unittest.TestCase):
     """`\\` в слове скобок массива внутри подстановки: parse_compound_assignment снимает PST_NOEXPAND, и read_token_word
     экранирует следующий символ, только если разделитель (current_delimiter) пуст или `"` перед `\\`, `` ` ``, `$`,
@@ -834,6 +856,9 @@ class LinearityTest(unittest.TestCase):
         "sq_arith": lambda n: "echo $(( " + "'$(a)' + " * n + "1 ))",
         "regex_parens": lambda n: "[[ a =~ " + "(" * n + "a" + ")" * n + " ]]",
         "unclosed": lambda n: "echo " + "$(" * n,
+        "subscript_param": lambda n: "a[" + "${x:-" * n + "]" + "}" * n + "]=1 b",
+        "subscript_nest": lambda n: "a[" + "${x[" * n + "]" + "]}" * n + "]=1 b",
+        "subscript_dq": lambda n: "a[" + '"${x:-' * n + "]" + '}"' * n + "]=1 b",
     }
     HEREDOCS = {
         "many": lambda n: "cat <<E\nx\nE\n" * n,
@@ -857,7 +882,8 @@ class LinearityTest(unittest.TestCase):
 
     # Виды, где у разбора есть вложенность по входу (стек генераторов растёт с глубиной).
     DEEP = ["comsub", "comsub_dq", "param", "funsub", "procsub", "group", "if", "case", "function", "arith_nest",
-            "dparen_subshell", "cond_parens", "cond_bang", "bang", "unclosed", "in_comsub", "subshell_in_funsub"]
+            "dparen_subshell", "cond_parens", "cond_bang", "bang", "unclosed", "in_comsub", "subshell_in_funsub",
+            "subscript_param", "subscript_nest", "subscript_dq"]
 
     @staticmethod
     def walk_all(text):

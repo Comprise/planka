@@ -10,15 +10,17 @@ make check          # test, test-hostile и validate
 make bashdiff       # фаззер детектора против bash 5.3 в песочнице bwrap (в check не входит)
 ```
 
-`make bashdiff` (`tests/tools/bashdiff.py`) — дифференциальный фаззер: генератор форм с маркерами `touch P<n>` (единственный
-источник форм; корпуса и транскрипты фаззер не читает и не исполняет), исполнение — обёрткой инструмента Bash Claude
-Code (`eval` после `shopt -u extglob`) внутри `bwrap` (корень только для чтения, сеть выключена; без `bwrap` или при
-провале пробы песочницы — выход с кодом 2). Режимы: `--target detector --engine old|new` (маркер исполнен, а детектор
-молчит, — потеря, код 1), `--target parser` (исполненные маркеры против `shparse.simple_commands`: имя `touch` с
-подстановками перед ним, аргумент — литерал `P<n>` с подстановками после; маркер, исполненный как вывод подстановки
-в слове команды, — вид `output`, не потеря), `--compare`. Фаззер и любой разбор форм генератора — под
-`prlimit --as=2000000000` и не больше `--jobs 4`: формы, на которых разбор растёт нелинейно, иначе съедают память
-машины. `tests/tools/` без `__init__.py`: unittest его не собирает. Разбор shell — `tests/test_shparse.py`.
+`make bashdiff` (`tests/tools/bashdiff.py`) — дифференциальный фаззер: генератор форм с маркерами `touch P<n>`
+(единственный источник форм; корпуса и транскрипты фаззер не читает и не исполняет), исполнение — обёрткой инструмента
+Bash Claude Code (`eval` после `shopt -u extglob`) внутри `bwrap` (корень только для чтения, сеть выключена; без `bwrap`
+или при провале пробы песочницы — выход с кодом 2). Режимы: `--target detector` (
+`dependency_add`, `dependency_doubt` с `npm i evil` на месте маркеров: маркер исполнен, а детектор молчит, — потеря, код
+1), `--target parser` (исполненные маркеры против `shparse.simple_commands`: имя `touch` с подстановками перед ним,
+аргумент — литерал `P<n>` с подстановками после; маркер, исполненный как вывод подстановки в слове команды, — вид
+`output`, не потеря).
+Фаззер и любой разбор форм генератора — под `prlimit --as=2000000000` и не больше `--jobs 4`: формы, на которых разбор
+растёт нелинейно, иначе съедают память машины. `tests/tools/` без `__init__.py`: unittest его не собирает. Разбор shell
+— `tests/test_shparse.py`.
 
 CI нет; цели — в `Makefile`. Проверяются два разных свойства:
 
@@ -83,6 +85,14 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
     выброшены — печатается номер и вид шаблона, не значение) с записанным вердиктом `add`/`doubt` версии, на которой
     корпус собран; `test_bash_corpus` сверяет с ним `dependency_add`, затем `dependency_doubt` каждой строки. Строка
     меняет вердикт только по согласию автора;
+  - `debug-watch-results.json` — записанный разбор `debug_watch` команд `bash-commands.jsonl` и
+    `bash-transcripts.jsonl`: `sha256[:12]` команды → `sha256[:12]` от `_segments`, `_paren_pairs` и `code1_is_answer`;
+    `CorpusResultsTest` в `tests/test_debug_watch.py` сверяет с ним каждую команду, `PLANKA_RECORD_RESULTS=1`
+    перезаписывает файл — после проверки каждого изменения по bash; классы форм, сверенных с bash, — комментарием
+    перед `ParenPairsTest`;
+  - `comments-shell-results.json` — записанные комментарии sh и bash (`comments._shell_comments`) образцов
+    `comments/` и форм `ShellTreeTest` в `tests/test_comments.py`: вход → `[[номер строки, комментарий]]`; у входа
+    `multiline-quote` — результат bash;
   - `manifests/<образец>/<манифест>` — настоящие `package.json`, `composer.json`, `pyproject.toml`, `requirements*.txt`,
     `Cargo.toml`, `go.mod`, `Gemfile` (источник — комментарием, в JSON — ключом `"//"`); `test_manifests` (`CorpusTest`)
     сверяет имена каждого с `CORPUS` (ожидание есть у каждого файла корпуса: файлом корпуса считается файл, который git
@@ -185,10 +195,15 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
 - Гонка счётчика неудач команд — `StateLockRaceTest` в `tests/test_debug_watch.py`: `PARALLEL` хуков подпроцессом через
   обёртку `WRAPPER`, рандеву перед первым `common.data_dir` (до `state_lock`) и задержка `SLOW` после
   `common.read_json`; без блокировки записи затирают друг друга.
-- Путь над деревом `shparse` (`debug_watch._tree_segments`, `_tree_paren_pairs`) — `TreeSegmentsTest` (те же проверки, что
-  у `SegmentsTest`, плюс свои), `TreeParenPairsTest` и `TreeCorpusTest` (корпуса `bash-commands`, `bash-transcripts`: равенство
-  старому пути, кроме перечисленных расхождений, и итога `code1_is_answer`).
-- Разделители команд `debug_watch._segments` — `SegmentsTest` в `tests/test_debug_watch.py`: арифметика без разделителей
+- Детектор зависимостей над деревом `shparse` — `tests/test_depcheck.py`: формы, которые разбор читает как bash
+  (`GrammarFormsTest`; проверка остатка после фатальной ошибки — `test_syntax_error_recovery`), внешнее раскрытие в
+  строке оболочки (`OuterExpansionScriptTest`: сомнение и его исключения, вход оболочки, маркер у оболочки покрывает
+  тело heredoc — `test_marker_covers_heredoc`), имя команды — вывод подстановки (`NameOutputTest`); вердикты корпусов —
+  `CorpusTest` и `tests/test_bash_corpus.py`. Разбор shell сам по себе — `tests/test_shparse.py`.
+- Разделители команд `debug_watch._segments` (по дереву `shparse`) — `SegmentsTest` в `tests/test_debug_watch.py`:
+  разделитель в подстановке, образце `case`, скобках массива и перенаправлении `>|` команды не делит
+  (`test_operators_outside_words_only`), строка с фатальной синтаксической ошибкой — одна команда
+  (`test_syntax_error_line_is_one_command`); арифметика без разделителей
   и `<<` в ней — сдвиг; `((` без закрытия `))` — подоболочка в подоболочке, её разделители делят команды
   (`test_nested_subshell_is_not_arithmetic`); тело heredoc с апострофом не прячет пары скобок `((…))` после терминатора
   (`test_heredoc_body_quote_does_not_hide_arithmetic_pairs`); не прячут и не сдвигают пары скобок ни тело heredoc рядом
@@ -204,6 +219,7 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
   (setup.py с шестью уровнями имён по 4 и 16 ссылок), `LinearParseTest` (комментарии),
   `FilterTest.test_list_items_linear_in_blank_lines`, `BacktickInDoubleQuotesTest.test_linear` в
   `tests/test_depcheck.py` (подстановка `` `…` `` в `"…"`: закрытая, незакрытая до конца команды, на многих строках),
+  `GrammarLinearTest.test_linear` там же (формы грамматики над деревом),
   `BacktickOutsideQuotesTest.test_linear` там же (`` `…` `` вне кавычек и в `$(…)`), `ArithmeticQuotesTest.test_linear`
   там же (кавычки в арифметике `$((…))` и `$[…]`), `DoubtTest.test_linear` там же (формы сомнения детектора),
   `ArithmeticOutsideQuotesTest.test_linear` там же (арифметика, индексы и смещения вне кавычек),
@@ -214,7 +230,9 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
   `RobustnessTest.test_adversarial_input_is_linear` (`tests/test_planparse.py`: каждый враждебный пункт и строка при
   множителе 1 и 4), `SegmentsTest.test_unclosed_test_brackets_linear` (`tests/test_debug_watch.py`),
   `SegmentsTest.test_shift_after_open_parens_linear` там же (`<` после тысяч открытых `(`),
-  `Code1IsAnswerTest.test_long_word_linear` там же (слово длиннее `_HEAD_LIMIT`), `UserAndWatchWrappersTest.test_linear`
+  `Code1IsAnswerTest.test_long_word_linear` там же (слово длиннее `_HEAD_LIMIT`),
+  `ShellTreeTest.test_many_fatal_errors_linear` в `tests/test_comments.py` (повторный разбор после каждой фатальной
+  ошибки), `UserAndWatchWrappersTest.test_linear`
   в `tests/test_depcheck.py` (цепочки `su`/`runuser`/`watch`), `GemfileTest.test_linear_on_long_line` в
   `tests/test_manifests.py` (строки Gemfile из кавычек и пробелов), `ImportParseTest.test_strip_code_linear` в
   `tests/test_guard_memory.py` (незакрытые `<!--`, серии обратных кавычек);

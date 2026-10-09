@@ -430,7 +430,7 @@ class SegmentsTest(unittest.TestCase):
                          [("", "echo $((1<<2))"), ("\n", "grep x f")])
 
     def test_heredoc_body_quote_does_not_hide_arithmetic_pairs(self):
-        # Апостроф в теле heredoc не открывает кавычку для _paren_pairs: «((…))» после терминатора — арифметика.
+        # Апостроф в теле heredoc не открывает кавычку при подсчёте скобок: «((…))» после терминатора — арифметика.
         self.assertEqual(debug_watch._segments("cat <<EOF\ndon't\nEOF\n(( x = 1 << 2 )); make test\nmake lint"),
                          [("", "cat <<EOF"), ("\n", "(( x = 1 << 2 ))"), (";", " make test"), ("\n", "make lint")])
         self.assertEqual(debug_watch._segments("cat <<EOF\ndon't\nEOF\n((x>0 && y>0)) && make test"),
@@ -468,7 +468,7 @@ class SegmentsTest(unittest.TestCase):
         self.assertEqual(debug_watch._segments("echo $[ (1+2)<<3 ]\nls"), [("", "echo $[ (1+2)<<3 ]"), ("\n", "ls")])
 
     def test_shift_does_not_hide_later_arithmetic_pairs(self):
-        # «<<» внутри «((…))» и «$[…]» — сдвиг и для _paren_pairs: строки после него — не тело heredoc, «((…))» за
+        # «<<» внутри «((…))» и «$[…]» — сдвиг и для подсчёта скобок: строки после него — не тело heredoc, «((…))» за
         # ними — арифметика.
         for first in ("(( n = x << 2 ))", "echo $[1<<2]", "echo $[a[1]<<2]", "echo $[$[1]<<2]"):
             with self.subTest(first=first):
@@ -487,7 +487,7 @@ class SegmentsTest(unittest.TestCase):
                          [("", "cat <<< 'x'"), ("\n", "((x>0 && y>0)) "), ("&&", " make test")])
 
     def test_tab_stripped_heredoc_does_not_hide_arithmetic_pairs(self):
-        # Терминатор «<<-» с табуляцией в начале закрывает тело и для _paren_pairs: апостроф тела не кавычка.
+        # Терминатор «<<-» с табуляцией в начале закрывает тело и для подсчёта скобок: апостроф тела не кавычка.
         self.assertEqual(debug_watch._segments("cat <<-EOF\n\tdon't\n\tEOF\n((x>0 && y>0)) && make test"),
                          [("", "cat <<-EOF"), ("\n", "((x>0 && y>0)) "), ("&&", " make test")])
 
@@ -498,108 +498,6 @@ class SegmentsTest(unittest.TestCase):
     def test_unclosed_test_brackets_linear(self):
         small, large = ("[[ " * n for n in (25000, 100000))
         assert_linear(self, lambda: debug_watch._segments(small), lambda: debug_watch._segments(large))
-
-
-# Команды корпусов разбора shell: tests/fixtures/bash-commands.jsonl и bash-transcripts.jsonl (поле command).
-COMMAND_CORPORA = ("bash-commands.jsonl", "bash-transcripts.jsonl")
-
-
-def command_corpus():
-    out = []
-    for name in COMMAND_CORPORA:
-        with (pathlib.Path(__file__).parent / "fixtures" / name).open(encoding="utf-8") as f:
-            out += [json.loads(line)["command"] for line in f if line.strip()]
-    return out
-
-
-def digest(command):
-    return hashlib.sha256(command.encode("utf-8", "surrogatepass")).hexdigest()[:12]
-
-
-def merged(old, new):
-    """Каждый сегмент new — склейка подряд идущих сегментов old с их разделителями (old резал там, где не надо)."""
-    i = 0
-    for sep, text in new:
-        if i >= len(old) or old[i][0] != sep:
-            return False
-        acc = old[i][1]
-        i += 1
-        while acc != text and i < len(old) and len(acc) < len(text):
-            acc += old[i][0] + old[i][1]
-            i += 1
-        if acc != text:
-            return False
-    return i == len(old)
-
-
-# Расхождения нового пути (_tree_segments, _tree_paren_pairs) со старым на корпусах: sha256[:12] команды -> класс.
-# Во всех классах старый путь расходится с bash, новый — нет (прогон bash через bwrap, `touch` вместо действия):
-# A  разделитель в теле подстановки «$(…)», «<(…)», «${ …; }» и «|» образца case не делит команды строки (`diff
-#    <(echo a; true) /dev/null` — код 1, то есть код команды diff); такие расхождения не перечислены, их
-#    проверяет merged;
-# B  `\'` в строке `$'…'` не закрывает кавычку, старый путь закрывает (`echo $'it\'s' ; touch P` — P создан);
-# C  кавычка в теле обратных кавычек (`echo `'` && touch P` — P создан);
-# D  «#» в `${x:- #}` и после `\r` (`echo a$'\r'#$(touch P)` — P создан) — не комментарий;
-# E  `<<` в `${x:-a<<b}` — не heredoc (строка после него исполнена);
-# F1 `E\` с переводом строки склеивает строку тела и терминатор: тело идёт до конца (команда после него не
-#    исполнена); F2 heredoc в обратных кавычках тела не читает (следующие строки — команды); F3 `E)` в `$(…)` —
-#    терминатор, остаток строки — команды; F4 `E\` с переводом строки и `)` — терминатор со знаком конца;
-# G  ошибка скобок массива `x=(<<E` отбрасывает свою строку: heredoc не открыт, следующие строки — команды;
-# H  кавычка внутри `$(…)` внутри `"…"` вложена, а не закрывает внешнюю;
-# J  `$(…)` в `'…'` арифметики `$[ ]`, `(( ))`, `${a[…]}`, `${x:…}` исполняется: скобки настоящие.
-SEGMENT_DIVERGENCES = {
-    "3ba22c454b15": "E",
-    "7cbf7141bf9a": "D",
-    "b8fffb7b7377": "C",
-    "7263cd63b2f3": "C",
-    "0a5b0664eab0": "C",
-    "5c56bfdb6244": "F2",
-    "65f24ef53e59": "F3",
-    "a526ae76b48e": "G",
-    "af58d8ea15a3": "G",
-    "05064a790319": "G",
-    "e5d66d03c75f": "G",
-    "d8b06d46659d": "D",
-    "497fbe20b271": "F4",
-    "92ca5a2b7214": "F4",
-    "4e48ab885551": "F1",
-    "85d33c5b5d1f": "B",
-    "e81a3234f5bd": "B",
-    "2e9d3fd48eda": "B",
-    "7b747bd280df": "B",
-    "50579176d785": "B",
-    "3fcc096a61fa": "B",
-    "0001a4375eaf": "H",
-    "bea1f90d8c65": "H",
-    "e73106dd4a8d": "H",
-}
-PAIR_DIVERGENCES = {
-    "b567623e9f0e": "J",
-    "79503e9d830b": "J",
-    "9514bfe1766e": "J",
-    "21337c20ea51": "J",
-    "206f14085980": "J",
-    "65f24ef53e59": "F3",
-    "d8b06d46659d": "D",
-    "92ca5a2b7214": "F4",
-    "85d33c5b5d1f": "B",
-    "e81a3234f5bd": "B",
-    "7b747bd280df": "B",
-    "50579176d785": "B",
-    "454f28d6dd25": "H",
-}
-# Единственные расхождения итога code1_is_answer при подмене _segments на _tree_segments: настоящая последняя команда
-# строки — grep (после `$'…\'…'`) и diff (`diff <(cd …; cat …) файл`).
-VERDICT_DIVERGENCES = {"e81a3234f5bd": (False, True), "f2ac86f780de": (False, True)}
-
-
-class TreeSegmentsTest(SegmentsTest):
-    """Те же проверки, что у SegmentsTest, над деревом shparse."""
-
-    def setUp(self):
-        patcher = mock.patch.object(debug_watch, "_segments", debug_watch._tree_segments)
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
     def test_operators_outside_words_only(self):
         # Разделитель внутри слова, перенаправления «>|», образца case, подстановки и скобок массива не делит.
@@ -634,66 +532,94 @@ class TreeSegmentsTest(SegmentsTest):
         for command in ("", "\x00", "\ud800", "$(", "((", "<<", "'", "a\\", "`"):
             with self.subTest(command=command):
                 debug_watch._segments(command)
-                debug_watch._tree_paren_pairs(command)
+                debug_watch._paren_pairs(command)
 
 
-class TreeParenPairsTest(unittest.TestCase):
+# Команды корпусов разбора shell: tests/fixtures/bash-commands.jsonl и bash-transcripts.jsonl (поле command).
+COMMAND_CORPORA = ("bash-commands.jsonl", "bash-transcripts.jsonl")
+
+
+def command_corpus():
+    out = []
+    for name in COMMAND_CORPORA:
+        with (pathlib.Path(__file__).parent / "fixtures" / name).open(encoding="utf-8") as f:
+            out += [json.loads(line)["command"] for line in f if line.strip()]
+    return out
+
+
+def digest(command):
+    return hashlib.sha256(command.encode("utf-8", "surrogatepass")).hexdigest()[:12]
+
+
+# Результаты разбора корпусов записаны в tests/fixtures/debug-watch-results.json: sha256[:12] команды -> sha256[:12] от
+# (_segments, _paren_pairs, code1_is_answer). Запись сверена с bash (прогон через bwrap, `touch` вместо действия)
+# там, где она отличалась от прежнего посимвольного разборщика. Классы отличий (прежний разборщик расходился с bash,
+# нынешний — нет):
+# A  разделитель в теле подстановки «$(…)», «<(…)», «${ …; }» и «|» образца case не делит команды строки (`diff
+#    <(echo a; true) /dev/null` — код 1, то есть код команды diff);
+# B  `\'` в строке `$'…'` не закрывает кавычку, прежний разборщик закрывал (`echo $'it\'s' ; touch P` — P создан);
+# C  кавычка в теле обратных кавычек (`echo `'` && touch P` — P создан);
+# D  «#» в `${x:- #}` и после `\r` (`echo a$'\r'#$(touch P)` — P создан) — не комментарий;
+# E  `<<` в `${x:-a<<b}` — не heredoc (строка после него исполнена);
+# F1 `E\` с переводом строки склеивает строку тела и терминатор: тело идёт до конца (команда после него не
+#    исполнена); F2 heredoc в обратных кавычках тела не читает (следующие строки — команды); F3 `E)` в `$(…)` —
+#    терминатор, остаток строки — команды; F4 `E\` с переводом строки и `)` — терминатор со знаком конца;
+# G  ошибка скобок массива `x=(<<E` отбрасывает свою строку: heredoc не открыт, следующие строки — команды;
+# H  кавычка внутри `$(…)` внутри `"…"` вложена, а не закрывает внешнюю;
+# J  `$(…)` в `'…'` арифметики `$[ ]`, `(( ))`, `${a[…]}`, `${x:…}` исполняется: скобки настоящие.
+
+
+class ParenPairsTest(unittest.TestCase):
     def test_pairs(self):
-        self.assertEqual(debug_watch._tree_paren_pairs("(a (b)) c"), {3: 5, 0: 6})
-        self.assertEqual(debug_watch._tree_paren_pairs("echo '(' \\( \"(\" # (\n(x)"), {20: 22})
-        self.assertEqual(debug_watch._tree_paren_pairs("cat <<E\n(\nE\n(x)"), {12: 14})
-        self.assertEqual(debug_watch._tree_paren_pairs("((cd a && make); false)"), {1: 14, 0: 22})
-        self.assertEqual(debug_watch._tree_paren_pairs("echo $'(' ("), {})
+        self.assertEqual(debug_watch._paren_pairs("(a (b)) c"), {3: 5, 0: 6})
+        self.assertEqual(debug_watch._paren_pairs("echo '(' \\( \"(\" # (\n(x)"), {20: 22})
+        self.assertEqual(debug_watch._paren_pairs("cat <<E\n(\nE\n(x)"), {12: 14})
+        self.assertEqual(debug_watch._paren_pairs("((cd a && make); false)"), {1: 14, 0: 22})
+        self.assertEqual(debug_watch._paren_pairs("echo $'(' ("), {})
 
     def test_skip_heredocs(self):
         for command, cut in (("cat <<E\nx\nE\nls", (8, 12)), ("cat <<-E\n\tx\n\tE\nls", (9, 15)),
                              ("cat <<E\nx", (8, 9)), ("echo $(cat <<E\nx\nE); ls", (15, 18)),
                              ("echo `cat <<E`\nls\nE", None)):
             with self.subTest(command=command):
-                got = debug_watch._tree_skip_heredocs(command, debug_watch.shparse.parse(command))
+                got = debug_watch._skip_heredocs(command, debug_watch.shparse.parse(command))
                 self.assertEqual(got, [cut] if cut else [])
 
 
-class TreeCorpusTest(unittest.TestCase):
-    """Новый путь на корпусах команд равен старому, кроме перечисленных классов расхождений."""
+RESULTS = pathlib.Path(__file__).parent / "fixtures" / "debug-watch-results.json"
 
-    @classmethod
-    def setUpClass(cls):
-        cls.commands = command_corpus()
 
-    def test_segments_and_pairs(self):
-        seen_segments, seen_pairs = set(), set()
-        for command in self.commands:
-            script = debug_watch.shparse.parse(command)
-            old, new = debug_watch._segments(command), debug_watch._tree_segments(command, script)
-            if old != new:
-                key = digest(command)
-                if key in SEGMENT_DIVERGENCES:
-                    seen_segments.add(key)
-                else:
-                    with self.subTest(command=command):
-                        self.assertTrue(merged(old, new), f"новый путь расходится со старым: {old!r} {new!r}")
-            old, new = debug_watch._paren_pairs(command), debug_watch._tree_paren_pairs(command, script)
-            if old != new:
-                key = digest(command)
-                with self.subTest(command=command):
-                    self.assertIn(key, PAIR_DIVERGENCES)
-                seen_pairs.add(key)
-        # Перечисленное расхождение, которого нет, — устаревшая запись.
-        self.assertEqual(seen_segments, set(SEGMENT_DIVERGENCES))
-        self.assertEqual(seen_pairs, set(PAIR_DIVERGENCES))
+def result_digest(command):
+    """Свёртка всего, что debug_watch выводит из команды: разделители, пары скобок, ответ code1_is_answer."""
+    script = debug_watch.shparse.parse(command)
+    got = (debug_watch._segments(command, script), sorted(debug_watch._paren_pairs(command, script).items()),
+           debug_watch.code1_is_answer(command))
+    return hashlib.sha256(repr(got).encode("utf-8", "surrogatepass")).hexdigest()[:12]
 
-    def test_verdicts(self):
-        diffs = {}
-        for command in self.commands:
-            if debug_watch._segments(command) == debug_watch._tree_segments(command):
-                continue
-            old = debug_watch.code1_is_answer(command)
-            with mock.patch.object(debug_watch, "_segments", debug_watch._tree_segments):
-                new = debug_watch.code1_is_answer(command)
-            if old != new:
-                diffs[digest(command)] = (old, new)
-        self.assertEqual(diffs, VERDICT_DIVERGENCES)
+
+class CorpusResultsTest(unittest.TestCase):
+    """Разбор команд корпусов равен записанному. Запись обновляется так: PLANKA_RECORD_RESULTS=1 запускает тест
+    и перезаписывает файл — после проверки каждого изменения вердикта по bash."""
+
+    def test_recorded_results(self):
+        commands = sorted(set(command_corpus()))
+        got = {digest(command): result_digest(command) for command in commands}
+        if os.environ.get("PLANKA_RECORD_RESULTS") == "1":
+            RESULTS.write_text(json.dumps(got, indent=0, sort_keys=True) + "\n", encoding="utf-8")
+        recorded = json.loads(RESULTS.read_text(encoding="utf-8"))
+        for command in commands:
+            key = digest(command)
+            with self.subTest(command=command):
+                self.assertEqual(got[key], recorded.get(key), "результат разбора расходится с записанным")
+        self.assertEqual(set(recorded) - set(got), set(), "в записи остались команды, которых нет в корпусах")
+
+    def test_real_last_command_is_answer(self):
+        # Настоящая последняя команда строки — grep (после `$'…\'…'`) и diff (`diff <(cd …; cat …) файл`).
+        for key in ("e81a3234f5bd", "f2ac86f780de"):
+            commands = [c for c in command_corpus() if digest(c) == key]
+            self.assertTrue(commands)
+            with self.subTest(key=key):
+                self.assertTrue(debug_watch.code1_is_answer(commands[0]))
 
 
 class Code1IsAnswerTest(unittest.TestCase):

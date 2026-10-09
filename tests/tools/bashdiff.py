@@ -13,12 +13,11 @@
 пропускает запись наружу или сеть, фаззер выходит с кодом 2 и ничего не исполняет.
 
 Режимы:
-- `--target detector --engine old|new` — маркер исполнен, а детектор на той же форме с `npm i evil` вместо маркеров
+- `--target detector` — маркер исполнен, а детектор на той же форме с `npm i evil` вместо маркеров
   молчит — потеря; не исполнен ни один, а детектор отказал — строгость (счётчик).
 - `--target parser` — множество исполненных маркеров против имён `touch P<n>` среди `shparse.simple_commands`;
   исполненный маркер, которого в дереве нет, но текст которого стоит в подстановке в слове команды, — вид `output`
   (имя или аргумент команды — вывод подстановки; семантика исполнения), не потеря.
-- `--compare old new` — расхождения вердиктов двух движков детектора на одних формах (bash не нужен).
 
 Расхождения — JSON-строками в файл внутри `--out`; итог — в stdout; код выхода 1 при потере или ошибке разбора."""
 
@@ -630,17 +629,12 @@ def check_sandbox(out):
 # Проверяемые движки
 
 
-def load_engine(name):
-    """(add, doubt) детектора: old — публичные функции, new — путь над деревом shparse."""
+def load_engine():
+    """(add, doubt) детектора."""
     if PLANKA not in sys.path:
         sys.path.insert(0, PLANKA)
     import depcheck
-    if name == "old":
-        return depcheck.dependency_add, depcheck.dependency_doubt
-    add, doubt = getattr(depcheck, "_tree_add", None), getattr(depcheck, "_tree_doubt", None)
-    if add is None or doubt is None:
-        raise ImportError("в depcheck нет _tree_add/_tree_doubt (появятся в волне 2, задача 5)")
-    return add, doubt
+    return depcheck.dependency_add, depcheck.dependency_doubt
 
 
 def load_parser():
@@ -711,11 +705,9 @@ def init_worker(config):
     CONFIG.update(config)
     target = config["target"]
     if target == "detector":
-        CONFIG["engine"] = load_engine(config["engine_name"])
-    elif target == "parser":
-        CONFIG["shparse"] = load_parser()
+        CONFIG["engine"] = load_engine()
     else:
-        CONFIG["engines"] = [load_engine(name) for name in config["compare"]]
+        CONFIG["shparse"] = load_parser()
 
 
 def run_case(index):
@@ -724,12 +716,11 @@ def run_case(index):
     record = {"seed": cfg["seed"], "index": index, "depth": cfg["depth"], "form": form, "markers": count,
               "classes": sorted(tags)}
     kinds = []
-    if cfg["target"] in ("detector", "parser"):
-        made, timeout = run_sandboxed(cfg["bwrap"], cfg["cases"], claude_wrapper(form))
-        executed = sorted((m for m in made if MARKER_FILE.fullmatch(m)), key=lambda m: int(m[1:]))
-        record["executed"] = executed
-        if timeout:
-            kinds.append("timeout")
+    made, timeout = run_sandboxed(cfg["bwrap"], cfg["cases"], claude_wrapper(form))
+    executed = sorted((m for m in made if MARKER_FILE.fullmatch(m)), key=lambda m: int(m[1:]))
+    record["executed"] = executed
+    if timeout:
+        kinds.append("timeout")
     started = time.monotonic()
     try:
         if cfg["target"] == "detector":
@@ -739,7 +730,7 @@ def run_case(index):
                 kinds.append("loss")
             elif not executed and denied:
                 kinds.append("strict")
-        elif cfg["target"] == "parser":
+        else:
             parsed = parsed_markers(cfg["shparse"], form)
             record["parsed"] = sorted(parsed, key=lambda m: int(m[1:]))
             lost = set(executed) - parsed
@@ -751,11 +742,6 @@ def run_case(index):
                 kinds.append("loss")
             if parsed - set(executed):
                 kinds.append("strict")
-        else:
-            verdicts = [verdict(engine, form) for engine in cfg["engines"]]
-            record["verdicts"] = verdicts
-            if verdicts[0] != verdicts[1]:
-                kinds.append("differ")
     except Exception as error:  # сбой разбора — находка, а не конец прогона
         record["error"] = f"{type(error).__name__}: {error}"
         kinds.append("error")
@@ -770,8 +756,6 @@ def run_case(index):
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--target", choices=["detector", "parser"])
-    parser.add_argument("--engine", choices=["old", "new"], default="old")
-    parser.add_argument("--compare", nargs=2, choices=["old", "new"], metavar=("A", "B"))
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--count", type=int, default=2000)
     parser.add_argument("--start", type=int, default=0, help="номер первой формы")
@@ -781,8 +765,8 @@ def parse_args(argv):
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
     args = parser.parse_args(argv)
     if args.show is None:
-        if bool(args.target) == bool(args.compare):
-            parser.error("нужен ровно один режим: --target или --compare")
+        if not args.target:
+            parser.error("нужен --target")
         if not args.out:
             parser.error("нужен --out")
     return args
@@ -797,22 +781,19 @@ def main(argv):
         return 0
     os.makedirs(args.out, exist_ok=True)
     out = os.path.abspath(args.out)
-    config = {"seed": args.seed, "target": args.target or "compare", "engine_name": args.engine,
-              "compare": args.compare, "depth": args.depth}
+    config = {"seed": args.seed, "target": args.target, "depth": args.depth}
     try:
         init_worker(dict(config))  # проверка импорта до песочницы и пула
     except ImportError as error:
         print(f"bashdiff: модуль не загружен: {error}")
         return 2
-    if args.target:
-        bwrap, reason = check_sandbox(out)
-        if reason:
-            print(f"bashdiff: {reason}")
-            return 2
-        config["bwrap"] = bwrap
-        config["cases"] = out
-    label = f"{args.target}-{args.engine}" if args.target == "detector" else (
-        args.target or "compare-" + "-".join(args.compare))
+    bwrap, reason = check_sandbox(out)
+    if reason:
+        print(f"bashdiff: {reason}")
+        return 2
+    config["bwrap"] = bwrap
+    config["cases"] = out
+    label = args.target
     report = os.path.join(out, f"bashdiff-{label}-s{args.seed}-d{args.depth}.jsonl")
     totals = collections.Counter()
     classes = collections.Counter()
@@ -832,10 +813,9 @@ def main(argv):
     rate = totals["forms"] / elapsed if elapsed else 0.0
     print(f"режим: {label}, зерно {args.seed}, глубина {args.depth}, формы {args.start}..{args.start + args.count - 1}")
     print(f"форм: {totals['forms']}, потерь: {totals['loss']}, строгостей: {totals['strict']}, "
-          f"расхождений движков: {totals['differ']}, ошибок: {totals['error']}, медленных: {totals['slow']}, "
+          f"ошибок: {totals['error']}, медленных: {totals['slow']}, "
           f"таймаутов: {totals['timeout']}, форм в секунду: {rate:.1f}")
-    if args.target:
-        print(f"форм с исполненным маркером: {totals['executed']}")
+    print(f"форм с исполненным маркером: {totals['executed']}")
     if args.target == "parser":
         print(f"вывод подстановки исполнен командой (output, не потеря): {totals['output']}")
     print("классы: " + ", ".join(f"{name} {n}" for name, n in sorted(classes.items())))

@@ -74,8 +74,9 @@
 проверка манифестов), `guard_memory.py`, `judge_stop.py`, `debug_watch.py`, `model_watch.py` (`SessionStart`,
 `PostModelSwitch` — модель сессии для судьи); остальное — их модули, среди них `manifests.py` (разбор манифестов) и
 `manifest_watch.py` (проверка манифестов после правки и команды; роли — `context/architecture.md`, «Компоненты»),
-`depcheck.py` (разбор команды Bash для детектора зависимостей), `pkgmanagers.py` (семантика менеджеров над словами) и
-`shparse.py` (разбор shell по грамматике bash 5.3).
+`depcheck.py` (вопросы детектора зависимостей над деревом `shparse`), `pkgmanagers.py` (семантика менеджеров пакетов над
+списками слов; текст команды не разбирает) и `shparse.py` (разбор shell по грамматике bash 5.3; его дерево читают
+`depcheck`, `debug_watch` и `comments` для sh и bash).
 
 Инварианты:
 
