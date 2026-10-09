@@ -185,6 +185,9 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
 - Гонка счётчика неудач команд — `StateLockRaceTest` в `tests/test_debug_watch.py`: `PARALLEL` хуков подпроцессом через
   обёртку `WRAPPER`, рандеву перед первым `common.data_dir` (до `state_lock`) и задержка `SLOW` после
   `common.read_json`; без блокировки записи затирают друг друга.
+- Путь над деревом `shparse` (`debug_watch._tree_segments`, `_tree_paren_pairs`) — `TreeSegmentsTest` (те же проверки, что
+  у `SegmentsTest`, плюс свои), `TreeParenPairsTest` и `TreeCorpusTest` (корпуса `bash-commands`, `bash-transcripts`: равенство
+  старому пути, кроме перечисленных расхождений, и итога `code1_is_answer`).
 - Разделители команд `debug_watch._segments` — `SegmentsTest` в `tests/test_debug_watch.py`: арифметика без разделителей
   и `<<` в ней — сдвиг; `((` без закрытия `))` — подоболочка в подоболочке, её разделители делят команды
   (`test_nested_subshell_is_not_arithmetic`); тело heredoc с апострофом не прячет пары скобок `((…))` после терминатора

@@ -1976,3 +1976,74 @@ class LinearParseTest(unittest.TestCase):
         # Разбор остановился на сроке, а не дошёл до конца строки: проверок срока на несколько порядков
         # меньше позиций.
         self.assertLess(len(seen), 200)
+
+
+class ShellTreeTest(unittest.TestCase):
+    """Комментарии sh и bash по разбору shparse (comments._shell_comments) рядом с прежним движком _SYNTAX."""
+
+    @staticmethod
+    def old(text, ext):
+        # Прежний путь: _reparse по _SYNTAX, heredoc строк — прежний depcheck.heredocs.
+        import depcheck
+        import shparse
+        with mock.patch.object(shparse, "heredocs", depcheck.heredocs):
+            return comments._reparse(text, comments._SYNTAX[ext], None)
+
+    def test_shell_fixtures_equal_old_path(self):
+        for rel in ("fzf-tmux/fzf-tmux.sh", "openssh-findssl/findssl.sh"):
+            with self.subTest(rel):
+                text = (FIXTURES / rel).read_text(encoding="utf-8")
+                self.assertEqual(comments._shell_comments(text), self.old(text, "sh"))
+                self.assertEqual(comments._comments(text, "bash"), self.old(text, "bash"))
+
+    def test_yaml_fixtures_equal_old_path(self):
+        for rel in ("esp-idf-gitlab/pre_check.yml", "grpc-gateway-ci/ci.yml", "mldsa-hol-light/hol_light.yml"):
+            with self.subTest(rel):
+                text = (FIXTURES / rel).read_text(encoding="utf-8")
+                with mock.patch.object(comments, "_shell_comments", return_value=None):
+                    expected = comments._comments(text, "yml")
+                self.assertEqual(comments._comments(text, "yml"), expected)
+
+    def test_yaml_script_uses_tree(self):
+        src = "steps:\n  - run: |\n      echo a # c1\n      echo 'x\n      # data\n      y'\n      # c2\n"
+        self.assertEqual(comments._comments(src, "yml"), [(3, "# c1"), (7, "# c2")])
+
+    def test_multiline_quote_is_data(self):
+        # Расхождение с прежним путём: тело строки в одинарных кавычках на нескольких строках — данные
+        # (awk-программа в git-completion.bash, jq-программа в dracut), прежний движок брал её «#» за комментарий.
+        src = "awk '\n  # not a comment\n  { print }\n' f # real\n"
+        self.assertEqual(comments._comments(src, "sh"), [(4, "# real")])
+        self.assertEqual(self.old(src, "sh"), [(2, "# not a comment"), (4, "# real")])
+
+    def test_shebang_bom_crlf_and_line_numbers(self):
+        src = "﻿#!/bin/sh\r\n# one\r\necho a # two\r\ncat <<E\r\n# body\r\nE\r\n# three\r\n"
+        for ext in ("sh", "bash"):
+            self.assertEqual(comments._comments(src, ext), [(2, "# one"), (3, "# two"), (7, "# three")])
+            self.assertEqual(comments._comments(src, ext), self.old(src, ext))
+
+    def test_shebang_only_on_first_line(self):
+        self.assertEqual(comments._comments("#!/bin/sh\n#!second\n", "sh"), [(2, "#!second")])
+
+    def test_fatal_error_falls_back_to_old_path(self):
+        # bash прекращает чтение на фатальной ошибке; комментарии после неё не должны выпасть из вывода.
+        src = "# a\nif then\n# b\necho x # c\n"
+        self.assertIsNone(comments._shell_comments(src))
+        self.assertEqual(comments._comments(src, "sh"), self.old(src, "sh"))
+        self.assertEqual([n for n, _ in comments._comments(src, "sh")], [1, 3, 4])
+
+    def test_shparse_failure_falls_back(self):
+        with mock.patch.object(comments.shparse, "parse", side_effect=RuntimeError):
+            self.assertIsNone(comments._shell_comments("# a\n"))
+            self.assertEqual(comments._comments("# a\n", "sh"), [(1, "# a")])
+
+    def test_zsh_stays_on_old_engine(self):
+        with mock.patch.object(comments, "_shell_comments", side_effect=AssertionError):
+            self.assertEqual(comments._comments("echo a # c\n", "zsh"), [(1, "# c")])
+
+    def test_make_recipe_stays_on_old_engine(self):
+        with mock.patch.object(comments, "_shell_comments", side_effect=AssertionError):
+            self.assertEqual(comments._comments("all:\n\t@echo hi # c\n", "makefile"), [(2, "# c")])
+
+    def test_deadline(self):
+        with self.assertRaises(TimeoutError):
+            comments._shell_comments("# a\n", deadline=time.monotonic() - 1)

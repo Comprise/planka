@@ -8,7 +8,7 @@ import subprocess
 import time
 
 import common
-import depcheck
+import shparse
 
 MAX_LINES = 300
 MAX_BYTES = 16_384
@@ -1511,7 +1511,10 @@ def _yaml_script(lines, ext, deadline):
     отступа строк: [(номер строки, комментарий)]."""
     body = [raw for _, raw in lines]
     indent = min((len(r) - len(r.lstrip(" ")) for r in body if r.strip()), default=0)
-    found = _parse("\n".join(r[indent:] for r in body), _SYNTAX[ext], deadline, frozenset())[0]
+    script = "\n".join(r[indent:] for r in body)
+    found = _shell_comments(script, deadline) if ext == "sh" else None
+    if found is None:
+        found = _parse(script, _SYNTAX[ext], deadline, frozenset())[0]
     return [(lines[k - 1][0], c) for k, c in found]
 
 
@@ -1633,9 +1636,46 @@ def _comments(text, ext, deadline=None):
     syn = _SYNTAX.get(ext.lower())
     if syn is None:
         return []
+    if ext.lower() in _TREE_SHELL:
+        found = _shell_comments(text, deadline)
+        if found is not None:
+            return found
     if syn.sfc:
         return _sfc(text, syn, deadline)
     return _reparse(text, syn, deadline)
+
+
+# Расширения файлов, чьи комментарии даёт разбор bash (shparse); zsh разбирает прежний движок.
+_TREE_SHELL = frozenset(("sh", "bash"))
+
+
+def _shell_comments(text, deadline=None):
+    """Комментарии скрипта bash по разбору shparse: [(номер строки с 1, строка комментария)], как у _parse; None —
+    разбор не годится и комментарии даёт прежний движок: bash прекращает чтение на фатальной синтаксической
+    ошибке, и комментарии после неё выпали бы из вывода (отказ судьи без них дороже лишней строки), либо shparse
+    упал. Перевод строки «\\r\\n» снимается, как у _parse (файл с CRLF), BOM в начале — тоже; «#!» первой строки —
+    не комментарий. Срок deadline проверяется до и после разбора (shparse линеен по длине текста)."""
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    text = text.replace("\r\n", "\n")
+    try:
+        script = shparse.parse(text)
+    except Exception:  # noqa: BLE001
+        return None
+    if script.error is not None and script.error.fatal:
+        return None
+    out, line, at = [], 1, 0
+    for start, end in script.comments:
+        if start == 0 and text.startswith("#!"):
+            continue
+        line += text.count("\n", at, start)
+        at = start
+        out.append((line, text[start:end].strip()))
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError
+    return out
 
 
 def _reparse(text, syn, deadline):
@@ -1907,7 +1947,7 @@ def _parse(text, syn, deadline, banned, level=0, budget=None):
             if j:
                 stmt = _statement_end(raw, j)
         if syn.heredoc == "shell":
-            pending = [(term, "tabs" if tabs else "exact", None) for term, tabs in depcheck.heredocs(raw)]
+            pending = [(term, "tabs" if tabs else "exact", None) for term, tabs in shparse.heredocs(raw)]
     if scalar is not None and scalar[1]:
         _yaml_done(scalar, waiting, out, deadline)
     if syn.block_scalar:

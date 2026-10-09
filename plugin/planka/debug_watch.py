@@ -1,10 +1,12 @@
 """PostToolUse и PostToolUseFailure на Bash: повторная неудача той же команды подмешивает модуль debugging."""
+import bisect
 import hashlib
 import os
 import re
 import shlex
 
 import common
+import shparse
 
 MODULE = "debugging"
 # Неудача с этого номера подряд подмешивает модуль.
@@ -213,6 +215,151 @@ def _segments(command):
         i += step
     texts = [(sep, "".join(chars)) for sep, chars in segments]
     return [(sep, text) for sep, text in texts if text.strip()]
+
+
+# Операторы, разделяющие команды строки: «|», «|&», «||», «&&», «;», перевод строки; «\\» с переводом строки —
+# продолжение строки, не разделитель. Одиночный «&» и скобки не разделяют.
+_SEPARATOR = re.compile(r"\\\n|\|[|&]?|&&|;|\n")
+# Узлы, внутри которых разделителей нет: слова (кавычки, подстановки, скобки массива), перенаправления
+# («>|» — не конвейер), «((…))», «[[ … ]]».
+_NO_SPLIT = (shparse.Word, shparse.Redir, shparse.ArithCmd, shparse.Arith, shparse.Cond)
+
+
+def _tree_skip_heredocs(command, script, nodes=None):
+    """Диапазоны (начало, конец) тел heredoc вместе со строкой терминатора и её переводом строки; терминатора нет —
+    до конца текста; терминатор со знаком конца подстановки в остатке строки («E)») — до знака. Тела берутся из
+    дерева script (shparse.parse(command)), а не из порядка открытий. Heredoc, тело которого bash не читал (в
+    теле `` `…` `` оно в самой строке подстановки), диапазона не даёт. nodes — уже обойдённые узлы script."""
+    n = len(command)
+    out = []
+    for node in shparse.walk(script) if nodes is None else nodes:
+        if type(node) is not shparse.Heredoc or node.body_start == node.end:
+            continue
+        i = node.body_end
+        if i >= n:
+            out.append((node.body_start, n))
+            continue
+        if node.strip_tabs:
+            while i < n and command[i] == "\t":
+                i += 1
+        if command.startswith(node.term, i):
+            i += len(node.term)
+            if i < n and command[i] != "\n":
+                out.append((node.body_start, i))
+                continue
+        end = command.find("\n", i)
+        out.append((node.body_start, n if end < 0 else end + 1))
+    return out
+
+
+def _merge(ranges):
+    """Отсортированные непересекающиеся диапазоны: пересекающиеся и смежные склеены."""
+    out = []
+    for start, end in sorted(ranges):
+        if out and start <= out[-1][1]:
+            if end > out[-1][1]:
+                out[-1] = (out[-1][0], end)
+        else:
+            out.append((start, end))
+    return out
+
+
+def _covered(ranges, starts, i):
+    """Конец диапазона из ranges (starts — их начала), накрывающего позицию i; не накрыта — None."""
+    k = bisect.bisect_right(starts, i) - 1
+    return ranges[k][1] if k >= 0 and i < ranges[k][1] else None
+
+
+def _tree_paren_pairs(command, script=None):
+    """Закрывающая «)» каждой «(» вне кавычек, комментариев и тел heredoc: {индекс «(»: индекс «)»}. Кавычки,
+    комментарии и heredoc берутся из дерева (shparse.parse), скобки считаются по тексту; «\\» вне кавычек
+    экранирует следующий символ."""
+    script = shparse.parse(command) if script is None else script
+    nodes = list(shparse.walk(script))
+    cuts = list(_comment_ranges(nodes)) + _tree_skip_heredocs(command, script, nodes)
+    cuts += [(node.start, node.end) for node in nodes if type(node) in (shparse.SQ, shparse.DQ, shparse.AnsiC)]
+    cuts = _merge(cuts)
+    starts = [start for start, _ in cuts]
+    pairs, stack = {}, []
+    skip_to = 0
+    for m in re.finditer(r"[()\\]", command):
+        i = m.start()
+        if i < skip_to or _covered(cuts, starts, i) is not None:
+            continue
+        c = m.group()
+        if c == "\\":
+            skip_to = i + 2
+        elif c == "(":
+            stack.append(i)
+        elif stack:
+            pairs[stack.pop()] = i
+    return pairs
+
+
+def _comment_ranges(nodes):
+    """Диапазоны комментариев всех разборов среди узлов дерева (тело подстановки хранит свои)."""
+    for node in nodes:
+        if type(node) is shparse.Script:
+            yield from node.comments
+
+
+def _tree_segments(command, script=None):
+    """То же, что _segments, по дереву shparse: непустые команды строки с разделителем перед каждой. Разделитель —
+    оператор между командами (_SEPARATOR) вне слов, перенаправлений, «((…))», «[[ … ]]», комментариев и тел
+    heredoc; внутри подстановки, группы слов и скобок массива разделителей нет; комментарии и тела heredoc из
+    текста команд убраны. После синтаксической ошибки bash не исполняет остаток: от начала команды с ошибкой он
+    одна команда без разделителей. script — готовый shparse.parse(command)."""
+    script = shparse.parse(command) if script is None else script
+    nodes = list(shparse.walk(script))
+    cuts = _merge(list(_comment_ranges(nodes)) + _tree_skip_heredocs(command, script, nodes))
+    cut_starts = [start for start, _ in cuts]
+    fixed = _merge([(node.start, node.end) for node in nodes if isinstance(node, _NO_SPLIT)]
+                   + [(item[0][0].start, item[0][-1].end) for node in nodes if type(node) is shparse.Case
+                      for item in node.items if item[0]]
+                   + [(a, b - 1 if command[b - 1:b] == "\n" else b) for a, b in script.dropped or ()] + cuts)
+    fixed_starts = [start for start, _ in fixed]
+    # Фатальная ошибка: bash не исполняет ни команды с ошибкой (всю строку верхнего уровня, где она), ни остаток;
+    # границы ищутся только до конца последней прочитанной команды и за пробелами после неё.
+    fatal = None
+    if script.error is not None and script.error.fatal:
+        fatal = script.commands[-1].end if script.commands else 0
+    # Границы команд: (начало оператора, конец, сам оператор).
+    bounds = []
+    for m in _SEPARATOR.finditer(command):
+        if fatal is not None and m.start() >= fatal and command[max(fatal, bounds[-1][1] if bounds else 0):
+                                                               m.start()].strip():
+            break
+        if m.group()[0] == "\\" or _covered(fixed, fixed_starts, m.start()) is not None:
+            continue
+        bounds.append((m.start(), m.end(), m.group()))
+    bounds.append((len(command), len(command), None))
+    segments = []
+    sep, begin = "", 0
+    for start, end, op in bounds:
+        text = _without(command, begin, start, cuts, cut_starts)
+        if text.strip():
+            segments.append((sep, text))
+        if op is None:
+            break
+        sep, begin = op, end
+    return segments
+
+
+def _without(command, start, end, cuts, starts):
+    """command[start:end] без диапазонов cuts (starts — их начала)."""
+    out = []
+    i = start
+    k = max(bisect.bisect_right(starts, start) - 1, 0)
+    while k < len(cuts) and cuts[k][0] < end:
+        a, b = cuts[k]
+        if b > i:
+            if a > i:
+                out.append(command[i:a])
+            i = max(i, b)
+        k += 1
+    if i < end:
+        out.append(command[i:end])
+    return "".join(out)
 
 
 def _head_words(text):
