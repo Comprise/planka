@@ -29,7 +29,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "^(AskUserQuestion|ExitPlanMode|Bash|Write|Edit|MultiEdit)$|^mcp__",
+        "matcher": "^(AskUserQuestion|ExitPlanMode|Agent|Bash|Write|Edit|MultiEdit)$|^mcp__",
         "hooks": [
           {
             "type": "command",

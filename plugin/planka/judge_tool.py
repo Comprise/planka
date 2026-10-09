@@ -1,6 +1,6 @@
-"""PreToolUse: судья вопросов автору (AskUserQuestion), планов (ExitPlanMode), детерминированная проверка
-команд Bash и правок манифестов (Write, Edit, MultiEdit). PostToolUse и PostToolUseFailure на Bash: новые
-имена зависимостей в манифестах после команды."""
+"""PreToolUse: судья вопросов автору (AskUserQuestion), планов (ExitPlanMode), яруса модели субагента (Agent),
+детерминированная проверка команд Bash и правок манифестов (Write, Edit, MultiEdit). PostToolUse и
+PostToolUseFailure на Bash: новые имена зависимостей в манифестах после команды."""
 import functools
 import os
 import time
@@ -124,6 +124,44 @@ def judge_plan(data):
         common.log_event("plan", session, verdict="skipped", error="нет раздела рубрики")
         return
     _judge_and_emit("plan", data, transcript, prompts.plan_prompt(rubric, plan, _author(transcript)), plan)
+
+
+SUBAGENT_HOOK = "subagent"
+SUBAGENT_TOOL = "Agent"
+# Форк наследует модель родителя: model у него инструмент игнорирует.
+FORK_TYPE = "fork"
+MODEL_REASON = ("planka: у запуска субагента не назван ярус: ярус родителя не наследуется молча. Пожалуйста, "
+                "передайте параметр model с моделью яруса по классу задачи — лёгкого, стандартного или фронтира; "
+                "прочитайте {rules}/subagents.md. Имя модели, пожалуйста, берите из самого инструмента, а не из "
+                "памяти. Субагента, у которого модель задана в определении, пожалуйста, запускайте с этой моделью "
+                "в model явно.")
+
+
+def judge_subagent(data):
+    """Ярус модели субагента. Форк — пропуск; модель не названа (нет поля, None, пустая строка) — отказ без судьи,
+    в лимите отказов; модель не строка — пропуск (вход отклонит инструмент); иначе судья по модулю subagents."""
+    session = data.get("session_id", "")
+    tool_input = data.get("tool_input")
+    if not isinstance(tool_input, dict) or tool_input.get("subagent_type") == FORK_TYPE:
+        return
+    model = tool_input.get("model")
+    content = prompts.render_subagent(tool_input)
+    if model is None or isinstance(model, str) and not model.strip():
+        reason = MODEL_REASON.format(rules=common.rules_dir())
+        _deny(SUBAGENT_HOOK, data, reason, "deny-model", content)
+        return
+    if not isinstance(model, str):
+        return
+    rubric = common.rule_texts("subagents")
+    if rubric is None:
+        # Предупреждение уже выдал rule_texts.
+        common.log_event(SUBAGENT_HOOK, session, verdict="skipped", error="нет модуля рубрики")
+        return
+    if _budget_spent(SUBAGENT_HOOK, data, content):
+        return
+    transcript = common.read_transcript(data.get("transcript_path"))
+    _judge_and_emit(SUBAGENT_HOOK, data, transcript, prompts.subagent_prompt(rubric, content, _author(transcript)),
+                    content)
 
 
 DEP_REASON = ("planka: новая зависимость — вопрос автору (ядро, «Границы»): пожалуйста, назовите пакет, зачем он "
@@ -406,6 +444,8 @@ def main():
         judge_question(data)
     elif tool == "ExitPlanMode":
         judge_plan(data)
+    elif tool == SUBAGENT_TOOL:
+        judge_subagent(data)
     elif tool == "Bash":
         judge_bash(data)
     elif tool in EDIT_TOOLS:

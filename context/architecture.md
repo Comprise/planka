@@ -13,15 +13,15 @@ planka — плагин Claude Code уровня пользователя: ше�
 
 | Файл | Роль |
 | --- | --- |
-| `hooks/hooks.json` | регистрация хуков: `SessionStart` и `PostModelSwitch` → `model_watch.py`; `UserPromptSubmit` → `remind.py 1` и `remind.py 2` (по хуку на часть ядра); `PreToolUse` на `^(AskUserQuestion\|ExitPlanMode\|Bash\|Write\|Edit\|MultiEdit)$\|^mcp__` → `judge_tool.py`; `PreToolUse` на файловые инструменты записи и MCP-инструменты с `memor` или `remember` в имени в любом регистре (регулярное выражение — в `hooks/hooks.json`) → `guard_memory.py`; `Stop` → `judge_stop.py`; `PostToolUse` и `PostToolUseFailure` на `Bash` → `debug_watch.py` и `judge_tool.py`, на `^mcp__` → `judge_tool.py` |
+| `hooks/hooks.json` | регистрация хуков: `SessionStart` и `PostModelSwitch` → `model_watch.py`; `UserPromptSubmit` → `remind.py 1` и `remind.py 2` (по хуку на часть ядра); `PreToolUse` на `^(AskUserQuestion\|ExitPlanMode\|Agent\|Bash\|Write\|Edit\|MultiEdit)$\|^mcp__` → `judge_tool.py`; `PreToolUse` на файловые инструменты записи и MCP-инструменты с `memor` или `remember` в имени в любом регистре (регулярное выражение — в `hooks/hooks.json`) → `guard_memory.py`; `Stop` → `judge_stop.py`; `PostToolUse` и `PostToolUseFailure` на `Bash` → `debug_watch.py` и `judge_tool.py`, на `^mcp__` → `judge_tool.py` |
 | `planka/remind.py` | часть ядра с номером из аргумента (`part_number`) как `additionalContext`: деление по разделам (`split_core`, `core_parts`, `PARTS`, предел `CONTEXT_LIMIT`); в части 1 — снимок дерева (`take_snapshot`) и строка `NO_DOCS_LINE` об отсутствии `CLAUDE.md` (`remind_project`) |
-| `planka/judge_tool.py` | судья вопроса (`judge_question`), плана (`judge_plan`), отказ на добавление пакета и на команду установки под сомнением (`judge_bash`, причины `DEP_REASON`, `DEP_DOUBT_REASON`) и снимок манифестов перед командой и вызовом MCP-инструмента (`snapshot_manifests`); отказ правке манифеста (`judge_manifest_edit`, `MANIFEST_REASON`); после команды `Bash` и вызова `mcp__*` — блок на новые имена в манифестах (`check_command_manifests`, `COMMAND_REASON`, `MCP_REASON`) |
+| `planka/judge_tool.py` | судья вопроса (`judge_question`), плана (`judge_plan`), яруса модели субагента (`judge_subagent`: форк `FORK_TYPE` — пропуск, нет `model` — отказ `MODEL_REASON` без судьи), отказ на добавление пакета и на команду установки под сомнением (`judge_bash`, причины `DEP_REASON`, `DEP_DOUBT_REASON`) и снимок манифестов перед командой и вызовом MCP-инструмента (`snapshot_manifests`); отказ правке манифеста (`judge_manifest_edit`, `MANIFEST_REASON`); после команды `Bash` и вызова `mcp__*` — блок на новые имена в манифестах (`check_command_manifests`, `COMMAND_REASON`, `MCP_REASON`) |
 | `planka/guard_memory.py` | судья записи в постоянную память: цель — `is_memory_path` (в том числе `CLAUDE.local.md` — `_local_memory`, импорты `@путь` — `_imported_files`), `is_memory_mcp`; содержимое — `render_content` |
 | `planka/judge_stop.py` | фильтры «варианты» (`looks_like_options`), «готово» (`claims_done`) по последнему сообщению, «документация» (`docs_check`) по изменениям со снимка; один вызов судьи на шаги реплики (`turn_messages`, `prompts.Step`, до `prompts.MAX_TURN_CHARS`); отметка снимка проверенным после Stop без блока (`release_snapshot`, в `finally` `main`) |
 | `planka/debug_watch.py` | счётчик неудач подряд одной команды `Bash` (`update`; хранятся последние `MAX_COUNTS` счётчиков и `MAX_SHOWN` отметок показа); с `REPEAT_THRESHOLD`-й неудачи — модуль `debugging.md` контекстом; команда-ответ с кодом 1 (`code1_is_answer`, сегменты строки — по дереву `shparse`) |
 | `planka/model_watch.py` | модель сессии из `model` входа `SessionStart` и `to_model` входа `PostModelSwitch` в состояние (`store`); агенту ничего не выводит |
 | `planka/common.py` | барьер, чтение входа, тексты правил и рубрика, транскрипт (`read_transcript`), модель и запуск судьи (`judge_model`, `stored_session_model`, `usable_model`, `run_judge`), лимит отказов, журнал, корень проекта (`project_root`) и окружение git о нём (`git_env`), классы путей, формат ответа (`run_hook`) |
-| `planka/prompts.py` | обращение к модели `ADDRESS`, системный промпт, схема ответа `JUDGE_SCHEMA`, вопросы судье по видам проверки, сборка содержимого; шаг реплики `Step` и его текст для судьи (`render_step`, `turn_content`, код меток `step_tag`); код тегов блоков данных (`_fresh_code`) |
+| `planka/prompts.py` | обращение к модели `ADDRESS`, системный промпт, схема ответа `JUDGE_SCHEMA`, вопросы судье по видам проверки, сборка содержимого (вход `Agent` — `render_subagent`, задание до `MAX_SUBAGENT_TASK`); шаг реплики `Step` и его текст для судьи (`render_step`, `turn_content`, код меток `step_tag`); код тегов блоков данных (`_fresh_code`) |
 | `planka/planparse.py` | разбор плана на волны и задачи, владение файлами (`shared_files`) |
 | `planka/manifests.py` | разбор манифестов: вид по имени (`kind`), имена внешних зависимостей с источником не по умолчанию (`names`), они же с транзитивными `go.mod` (`known_names`), имя пакета манифеста (`own_name`), шаблоны членов workspace корня (`workspace_members`) |
 | `planka/manifest_watch.py` | манифесты, которые правит файловый инструмент, в том числе через ссылку и жёсткие ссылки (`edit_targets`; перечень манифестов проекта один на правку — `listing`), текст манифеста после правки (`edit_texts`, `check_edit`), новые имена (`fresh_names`, `edit_names`), имена версии HEAD и сторон конфликта (`head_names`), других манифестов проекта и манифестов и файлов `setup.py`, `setup.cfg`, `Pipfile` его версии HEAD (`project_names`, `_tree_names`, `source_kind`), снимок манифестов проекта и сравнение после команды (`take`, `compare`, `store`, `pop`), имена ref до начала сессии, откуда команда git возвращает файлы, и патчей `git apply`, не менявшихся с начала сессии (`command_refs`, `command_patches`, `restored_names`; начало сессии — `mark_start`, `session_start`), члены workspace корня (`_workspace`, `_member`) |
@@ -50,7 +50,8 @@ planka — плагин Claude Code уровня пользователя: ше�
   (`prompts.without_premises` по строке `prompts.PREMISES_ITEM`). Отвергнуто: исключение словами в вопросах — судья
   плана всё равно требовал источник опоры; проверка опор у судьи вопроса — выбор по предпочтению получал отказ.
 - Модули берутся по имени файла (`common.rule_texts`, `common.rubric`): `planning`, `subagents`,
-  `refactoring`, `design-patterns`, `heuristics` — план (`judge_tool.judge_plan`); `verification` — фильтр «готово»;
+  `refactoring`, `design-patterns`, `heuristics` — план (`judge_tool.judge_plan`); `subagents` — ярус модели субагента
+  (`judge_tool.judge_subagent`), его же называет причина `judge_tool.MODEL_REASON`; `verification` — фильтр «готово»;
   `docs`, `comments` — фильтр «документация» (`judge_stop.judge`; судья видит сообщения, список файлов и
   строки комментариев, а не код, поэтому `design-patterns` и `refactoring` — только в рубрике плана);
   `memory` — запись в память (`guard_memory.main`); `debugging` — `debug_watch.MODULE`.
@@ -59,8 +60,8 @@ planka — плагин Claude Code уровня пользователя: ше�
 - Метки `{RULES}`, `{COMMENT_LANG}`, `{DOC_LANG}` заменяет `common.substitute` при каждом чтении: путь к `rules/`
   плагина и значения настроек; незаданный язык — `DEFAULT_LANG` (`ru`). Ссылка на модуль из ядра и модулей пишется как
   `{RULES}/<имя>.md`, строка `remind.NO_DOCS_LINE` — так же; `debug_watch.LINE`, `judge_tool.DEP_REASON`,
-  `DEP_DOUBT_REASON`, `MANIFEST_REASON`, `COMMAND_REASON` и `MCP_REASON` подставляют `common.rules_dir()`: агент
-  получает абсолютный путь к правилам плагина, а `rules/` проекта с ним не путается.
+  `DEP_DOUBT_REASON`, `MANIFEST_REASON`, `COMMAND_REASON`, `MCP_REASON` и `MODEL_REASON` подставляют
+  `common.rules_dir()`: агент получает абсолютный путь к правилам плагина, а `rules/` проекта с ним не путается.
 - Имена, которые код берёт, `tests/test_contract.py` выводит из кода сам (`_code_names`, через `ast`): аргументы вызовов
   `rubric`, `philosophy_sections`, `rule_texts` (через `common.` или после `from common import`) — позиционные,
   распакованные и ключевые; литерал или всё, что присваивают имени из аргумента в той же функции, объемлющей или в
@@ -208,26 +209,27 @@ planka — плагин Claude Code уровня пользователя: ше�
 — корпус `tests/fixtures/transcript-shapes.jsonl`. Нет файла, путь с нулевым байтом или ошибка чтения — пустой
 `Transcript`. Хук читает транскрипт один раз и передаёт его в `judge_model`.
 
-Проверяемое содержимое идёт судье блоком `<content КОД>…</content КОД>` (`prompts._wrap`). Судьи вопроса, плана и `Stop`
-получают перед ним блок `<author КОД>…</author КОД>` — `prompts.author_context(author_turn, author_answers,
-earlier_turns)`: прежние реплики автора от старых к новым (все вместе с разделителями — до `prompts.MAX_AUTHOR_FIELD`,
-самые старые отбрасываются с пометкой их числа), реплика автора текущего хода и его ответы на `AskUserQuestion` после
-неё (каждое поле — до `prompts.MAX_AUTHOR_FIELD`, 8000 символов); передают его `judge_tool._author` и
-`judge_stop.judge`. Пояснение `prompts._AUTHOR_NOTE`: явная просьба автора побеждает рубрику, просьба из прежней реплики
-— тоже, если более поздняя реплика её не отменила; проверяется только `<content>`, `<author>` — тоже данные. Зачем: без
-реплики автора судья не отличает решение агента от решения, которое автор принял сам, и отклоняет сделанное по его явной
-просьбе, в том числе по просьбе, сделанной несколько ходов назад; судья записи в память те же поля получает внутри
-`<content>` (`guard_memory.render_content`), потому что согласие автора там и есть проверяемое. Блок `<author>`
-отдельный, а не часть `<content>`: журнал хранит длину и SHA-256 только проверяемого содержимого, текст автора в
-`judge.log` не попадает ни целиком, ни в хэше. Код тегов обоих блоков общий — `prompts._fresh_code` по данным обоих
-блоков (как код шагов выше): его нет в данных, правило называет судье `prompts._data_note`. Данные идут как есть:
-похожий закрывающий тег (`</content>` без кода, `</content>` с невидимым знаком внутри, `＜/content＞`, другой регистр)
-блок не закрывает; `content_sha256` в `judge.log` считается по самому содержимому. Вопросы по видам:
-`prompts.question_prompt`, `prompts.plan_prompt`, `prompts.memory_prompt`, `prompts.stop_prompt` (вопросы совпавших
-фильтров в порядке options, done, docs; сообщения реплики склеивает `prompts.turn_content` с пояснением
-`prompts.turn_label`, не больше `prompts.MAX_TURN_CHARS` символов: ранние шаги сверх предела опущены с пометкой их
-числа), блок хука фильтра «документация» — `prompts.render_docs_content`, его ставит `turn_content` за меткой
-`DOCS_MARK`.
+Проверяемое содержимое идёт судье блоком `<content КОД>…</content КОД>` (`prompts._wrap`). Судьи вопроса, плана, яруса
+субагента и `Stop` получают перед ним блок `<author КОД>…</author КОД>` — `prompts.author_context(author_turn,
+author_answers, earlier_turns)`: прежние реплики автора от старых к новым (все вместе с разделителями — до
+`prompts.MAX_AUTHOR_FIELD`, самые старые отбрасываются с пометкой их числа), реплика автора текущего хода и его ответы
+на `AskUserQuestion` после неё (каждое поле — до `prompts.MAX_AUTHOR_FIELD`, 8000 символов); передают его
+`judge_tool._author` и `judge_stop.judge`. Пояснение `prompts._AUTHOR_NOTE`: явная просьба автора побеждает рубрику,
+просьба из прежней реплики — тоже, если более поздняя реплика её не отменила; проверяется только `<content>`, `<author>`
+— тоже данные. Зачем: без реплики автора судья не отличает решение агента от решения, которое автор принял сам, и
+отклоняет сделанное по его явной просьбе, в том числе по просьбе, сделанной несколько ходов назад; судья записи в память
+те же поля получает внутри `<content>` (`guard_memory.render_content`), потому что согласие автора там и есть
+проверяемое. Блок `<author>` отдельный, а не часть `<content>`: журнал хранит длину и SHA-256 только проверяемого
+содержимого, текст автора в `judge.log` не попадает ни целиком, ни в хэше. Код тегов обоих блоков общий —
+`prompts._fresh_code` по данным обоих блоков (как код шагов выше): его нет в данных, правило называет судье
+`prompts._data_note`. Данные идут как есть: похожий закрывающий тег (`</content>` без кода, `</content>` с невидимым
+знаком внутри, `＜/content＞`, другой регистр) блок не закрывает; `content_sha256` в `judge.log` считается по самому
+содержимому. Вопросы по видам: `prompts.question_prompt`, `prompts.plan_prompt`, `prompts.subagent_prompt` (класс
+задачи, ярус модели по имени внутри линейки провайдера, соответствие; сомнение — соответствие рубрике),
+`prompts.memory_prompt`, `prompts.stop_prompt` (вопросы совпавших фильтров в порядке options, done, docs; сообщения
+реплики склеивает `prompts.turn_content` с пояснением `prompts.turn_label`, не больше `prompts.MAX_TURN_CHARS` символов:
+ранние шаги сверх предела опущены с пометкой их числа), блок хука фильтра «документация» —
+`prompts.render_docs_content`, его ставит `turn_content` за меткой `DOCS_MARK`.
 
 Судья — группа процессов (`start_new_session`) со сторожем `common._WATCHDOG` (`python3 -I -c`) во главе
 (`common._start_judge`): сторож запускает `claude` потомком и раз в `WATCHDOG_POLL` (0,5 с) сверяет своего родителя с
@@ -287,14 +289,30 @@ cat-file --batch` изменённых манифестов, и дерево HEA
 
 ## Лимит отказов
 
-`MAX_DENIES` = 2 на ключ `<prompt_id>:<hook>`, хук — `question`, `plan`, `memory`, `stop`. До вызова
+`MAX_DENIES` = 2 на ключ `<prompt_id>:<hook>`, хук — `question`, `plan`, `subagent`, `memory`, `stop`. До вызова
 судьи `common.deny_budget_left` проверяет счётчик, не меняя его (сбой чтения — проверка идёт); лимит
 исчерпан — пропуск с предупреждением и записью `budget`. При отказе `common.deny_budget_exhausted`
 увеличивает счётчик; если к этому моменту он уже на пределе (параллельный вызов), отказ заменяется
 пропуском. Сбой записи счётчика — исключение, `run_hook` выдаёт «внутреннюю ошибку» без отказа: без
-счётчика нечем остановить цикл отказов. Отказ `judge_bash`, отказ правке манифеста
+счётчика нечем остановить цикл отказов. Детерминированный отказ запуску субагента без `model` (`deny-model`) в
+лимите, как отказ плана по файлам: в среде, где `Agent` без параметра `model`, иначе цикл отказов. Отказ `judge_bash`,
+отказ правке манифеста
 (`judge_manifest_edit`) и блок после команды (`check_command_manifests`) лимитом не ограничены: проверка
 детерминированная, без модели (`ManifestEditTest.test_not_limited_by_budget`).
+
+## Ярус субагента
+
+`judge_tool.judge_subagent` на `PreToolUse` инструмента `Agent` (`SUBAGENT_TOOL`). Документация хуков называет `model`
+входа `Agent` необязательным алиасом, а `resolvedModel` `PostToolUse` — отдельным от него; прямо о том, что хук получает
+`model` только заданным явно, она не говорит. В транскриптах вызовы без ключа `model` есть (`claude-code-guide`).
+Поэтому нет поля, `null` или пустая строка — отказ `MODEL_REASON` без судьи, в лимите отказов (хук `subagent`, вердикт
+`deny-model`); модель не строка — пропуск: вход отклонит сам инструмент. Форк (`subagent_type == FORK_TYPE`) наследует
+модель родителя, `model` у него игнорируется — пропуск без журнала. С моделью — судья: рубрика — модуль `subagents`
+(`common.rule_texts`; нет модуля — пропуск `skipped`), содержимое — `prompts.render_subagent` (модель, усилие, тип,
+описание, задание до `prompts.MAX_SUBAGENT_TASK`), блок `<author>` — `judge_tool._author`. Ярус по имени модели судья
+определяет сам (`prompts._SUBAGENT_CHECKS`): в коде имён моделей нет, правило провайдеро-нейтрально. Сомнение судьи —
+соответствие рубрике: ложный отказ останавливает работу. Прежнее имя инструмента `Task` в транскриптах Claude Code
+2.1.293–2.1.295 не встречается, matcher его не включает.
 
 ## Разбор плана
 

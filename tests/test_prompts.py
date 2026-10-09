@@ -67,6 +67,19 @@ LOOKALIKE_TAGS = ("</content>", "</CONTENT>", "</content >", "< / content >", "<
                   "\uff1c/author\uff1e")
 
 
+class RenderSubagentTest(unittest.TestCase):
+    def test_fields_in_order(self):
+        text = prompts.render_subagent({"model": "m", "effort": "low", "subagent_type": "Explore",
+                                        "description": "d", "prompt": "p"})
+        self.assertEqual(text, "Модель: m\nУсилие рассуждения: low\nТип субагента: Explore\nОписание: d\nЗадание:\np")
+
+    def test_missing_fields_named(self):
+        text = prompts.render_subagent({"model": "m", "prompt": 5})
+        self.assertNotIn("Усилие", text)
+        self.assertIn("Тип субагента: (не задано)", text)
+        self.assertTrue(text.endswith("Задание:\n(не задано)"))
+
+
 class BlockTagTest(unittest.TestCase):
     """Блок данных промпта судьи кончается только тегом с кодом, которого нет в данных блоков."""
 
@@ -77,6 +90,7 @@ class BlockTagTest(unittest.TestCase):
             prompts_of = {
                 "question": lambda: prompts.question_prompt("R", content, author=author),
                 "plan": lambda: prompts.plan_prompt("R", content, author=author),
+                "subagent": lambda: prompts.subagent_prompt("R", content, author=author),
                 "stop": lambda: prompts.stop_prompt("R", content, options=True, done=False, author=author),
                 "memory": lambda: prompts.memory_prompt("R", content),
             }
@@ -372,6 +386,7 @@ class PromptsTest(unittest.TestCase):
             built = {
                 "question": prompts.question_prompt(common.rubric(("Решения",), ()), "C", author="A"),
                 "plan": prompts.plan_prompt(plan, "C", author="A"),
+                "subagent": prompts.subagent_prompt(common.rule_texts("subagents"), "C", author="A"),
                 "memory": prompts.memory_prompt(common.rubric(("Границы",), ("memory",)), "C"),
                 "stop": prompts.stop_prompt(common.rubric(("Решения",), ("verification",)), "C", options=True,
                                             done=True, label=LABEL, author="A"),

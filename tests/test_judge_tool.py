@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -9,7 +10,7 @@ import unittest
 from unittest import mock
 
 from tests.helpers import (PHILOSOPHY, RULES, Env, PLANKA_DIR, assert_not_logged, author_block, fill_budget, messages,
-                           output, run_in_process)
+                           output, prompt_block, run_in_process)
 
 sys.path.insert(0, str(PLANKA_DIR))
 import common  # noqa: E402
@@ -192,6 +193,138 @@ class QuestionTest(unittest.TestCase):
         r = self.env.run("judge_tool.py", self.env.hook_input("PreToolUse", tool_name="Read", tool_input={}))
         self.assertEqual(r.stdout, "")
         self.assertEqual(self.env.log_lines(), [])
+
+
+SUBAGENT_INPUT = {"description": "Найти вызывающих", "prompt": "Найдите всех вызывающих run_hook, верните path:line.",
+                  "subagent_type": "Explore", "model": "haiku"}
+
+
+class SubagentTest(unittest.TestCase):
+    def setUp(self):
+        self.env = Env()
+        self.rec = self.env.data / "rec.txt"
+
+    def tearDown(self):
+        self.env.close()
+
+    def spawn(self, tool_input=None, **extra):
+        return self.env.run("judge_tool.py", self.env.hook_input(
+            "PreToolUse", tool_name="Agent", tool_input=SUBAGENT_INPUT if tool_input is None else tool_input,
+            tool_use_id="t1"), PLANKA_STUB_RECORD=str(self.rec), **extra)
+
+    def test_fork_passes_without_judge(self):
+        for model in ({}, {"model": "haiku"}):
+            with self.subTest(model=model):
+                r = self.spawn({"prompt": "продолжите", "subagent_type": "fork", **model}, PLANKA_STUB="deny")
+                self.assertEqual(r.stdout, "", r.stderr)
+                self.assertFalse(self.rec.exists())
+        self.assertEqual(self.env.log_lines(), [])
+
+    def test_missing_model_denied_without_judge(self):
+        base = {k: v for k, v in SUBAGENT_INPUT.items() if k != "model"}
+        for i, extra in enumerate(({}, {"model": ""}, {"model": "  "}, {"model": None})):
+            with self.subTest(extra=extra):
+                r = self.env.run("judge_tool.py", self.env.hook_input(
+                    "PreToolUse", tool_name="Agent", tool_input={**base, **extra}, prompt_id=f"p-{i}"),
+                    PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(self.rec))
+                out = output(r)["hookSpecificOutput"]
+                self.assertEqual(out["permissionDecision"], "deny")
+                reason = out["permissionDecisionReason"]
+                self.assertTrue(reason.startswith("planka: Мой дорогой друг, "), reason)
+                self.assertIn("model", reason)
+                self.assertIn(f"{self.env.root / 'rules'}/subagents.md", reason)
+                self.assertFalse(self.rec.exists())
+                last = self.env.log_lines()[-1]
+                self.assertEqual((last["hook"], last["verdict"]), ("subagent", "deny-model"))
+        assert_not_logged(self, self.env, "run_hook", "Найти вызывающих")
+
+    def test_missing_model_limited_by_budget(self):
+        tool_input = {k: v for k, v in SUBAGENT_INPUT.items() if k != "model"}
+        for _ in range(2):
+            self.assertEqual(output(self.spawn(tool_input))["hookSpecificOutput"]["permissionDecision"], "deny")
+        r = self.spawn(tool_input)
+        self.assertIsNone(output(r))
+        self.assertEqual(messages(r), ["planka: лимит отказов, пропущено без проверки"])
+        self.assertEqual(self.env.log_lines()[-1]["verdict"], "budget")
+
+    def test_non_string_model_passes_silently(self):
+        # Вход не по схеме инструмента отклонит сам инструмент.
+        r = self.spawn({**SUBAGENT_INPUT, "model": 5}, PLANKA_STUB="deny")
+        self.assertEqual(r.stdout, "")
+        self.assertFalse(self.rec.exists())
+
+    def test_ok_passes(self):
+        r = self.spawn(PLANKA_STUB="ok")
+        self.assertEqual(r.stdout, "", r.stderr)
+        last = self.env.log_lines()[-1]
+        self.assertEqual((last["hook"], last["verdict"]), ("subagent", "ok"))
+        self.assertEqual(last["content_len"], len(prompts.render_subagent(SUBAGENT_INPUT)))
+
+    def test_deny_names_class_and_tier(self):
+        r = self.spawn(PLANKA_STUB="deny", PLANKA_STUB_REASON="задача — компромисс дизайна, нужен фронтир")
+        out = output(r)["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("нужен фронтир", out["permissionDecisionReason"])
+        self.assertTrue(out["permissionDecisionReason"].startswith("planka: "))
+        last = self.env.log_lines()[-1]
+        self.assertEqual((last["hook"], last["verdict"]), ("subagent", "deny"))
+
+    def test_judge_failure_passes_with_one_warning(self):
+        r = self.spawn(PLANKA_STUB="notlogged")
+        self.assertIsNone(output(r))
+        self.assertEqual(messages(r), ["planka: судья пропущен: ошибка судьи: Not logged in · Please run /login"])
+        last = self.env.log_lines()[-1]
+        self.assertEqual((last["verdict"], last["error"]), ("skipped", "ошибка судьи"))
+
+    def test_budget_checked_before_judge(self):
+        for _ in range(2):
+            self.assertEqual(output(self.spawn(PLANKA_STUB="deny"))["hookSpecificOutput"]["permissionDecision"],
+                             "deny")
+        self.rec.unlink()
+        r = self.spawn(PLANKA_STUB="deny")
+        self.assertIsNone(output(r))
+        self.assertEqual(messages(r), ["planka: лимит отказов, пропущено без проверки"])
+        self.assertFalse(self.rec.exists())
+        self.assertEqual(self.env.log_lines()[-1]["verdict"], "budget")
+
+    def test_judge_gets_model_task_rubric_and_author(self):
+        self.env.transcript.write_text("".join(json.dumps(e) + "\n" for e in author_entries()), encoding="utf-8")
+        r = self.spawn({**SUBAGENT_INPUT, "effort": "low"}, PLANKA_STUB="ok")
+        self.assertEqual(r.stdout, "", r.stderr)
+        text = self.rec.read_text(encoding="utf-8")
+        content = prompt_block(text, "content")
+        for needle in ("Модель: haiku", "Усилие рассуждения: low", "Тип субагента: Explore",
+                       "Описание: Найти вызывающих", SUBAGENT_INPUT["prompt"]):
+            self.assertIn(needle, content)
+        self.assertIn("# Субагенты", text)
+        self.assertNotIn("## Решения", text)
+        self.assertIn(AUTHOR_TURN, author_block(self.rec))
+        self.assertNotIn(AUTHOR_TURN, content)
+        assert_not_logged(self, self.env, AUTHOR_TURN, "run_hook", "haiku")
+
+    def test_long_task_clipped(self):
+        long_task = "а" * (prompts.MAX_SUBAGENT_TASK + 500)
+        self.spawn({**SUBAGENT_INPUT, "prompt": long_task}, PLANKA_STUB="ok")
+        content = prompt_block(self.rec.read_text(encoding="utf-8"), "content")
+        self.assertIn("а" * prompts.MAX_SUBAGENT_TASK + "\n… обрезано", content)
+        self.assertNotIn("а" * (prompts.MAX_SUBAGENT_TASK + 1), content)
+
+    def test_missing_module_skips_with_warning(self):
+        (self.env.root / "rules" / "subagents.md").unlink()
+        r = self.spawn(PLANKA_STUB="deny")
+        self.assertIsNone(output(r))
+        self.assertEqual(messages(r), [f"planka: нет модуля правил {self.env.root / 'rules' / 'subagents.md'}"])
+        last = self.env.log_lines()[-1]
+        self.assertEqual((last["hook"], last["verdict"]), ("subagent", "skipped"))
+        self.assertFalse(self.rec.exists())
+
+    def test_hook_matcher_passes_agent(self):
+        hooks = json.loads((PLANKA_DIR.parent / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+        matcher = next(h["matcher"] for h in hooks["hooks"]["PreToolUse"]
+                       if "judge_tool.py" in h["hooks"][0]["command"])
+        self.assertRegex("Agent", matcher)
+        for tool in ("Agents", "SubAgent", "AgentX"):
+            self.assertIsNone(re.search(matcher, tool), tool)
 
 
 class InputGuardTest(unittest.TestCase):

@@ -55,7 +55,7 @@
 
 | Документ | О чём |
 | --- | --- |
-| `context/architecture.md` | компоненты, контракт с правилами, ответ хука, судья, сроки, лимит отказов, разбор плана, память, неудачи команд, детектор зависимостей, манифесты, состояние, снимок, комментарии, платформы |
+| `context/architecture.md` | компоненты, контракт с правилами, ответ хука, судья, сроки, лимит отказов, ярус субагента, разбор плана, память, неудачи команд, детектор зависимостей, манифесты, состояние, снимок, комментарии, платформы |
 | `context/development.md` | запуск, точки входа, правила кода, новый хук, документация, git |
 | `context/testing.md` | цели `make`, устройство тестов, изоляция окружения, заглушка судьи |
 | `context/deferred/INDEX.md` | отложенное |
@@ -70,13 +70,13 @@
 ## `plugin/planka/`
 
 Код хуков: точки входа `remind.py` (`UserPromptSubmit`, хук на каждую часть ядра, номер части — аргументом),
-`judge_tool.py` (`PreToolUse`, а на `Bash` и MCP-инструментах `mcp__*` ещё `PostToolUse` и `PostToolUseFailure` —
-проверка манифестов), `guard_memory.py`, `judge_stop.py`, `debug_watch.py`, `model_watch.py` (`SessionStart`,
-`PostModelSwitch` — модель сессии для судьи); остальное — их модули, среди них `manifests.py` (разбор манифестов) и
-`manifest_watch.py` (проверка манифестов после правки и команды; роли — `context/architecture.md`, «Компоненты»),
-`depcheck.py` (вопросы детектора зависимостей над деревом `shparse`), `pkgmanagers.py` (семантика менеджеров пакетов над
-списками слов; текст команды не разбирает) и `shparse.py` (разбор shell по грамматике bash 5.3; его дерево читают
-`depcheck`, `debug_watch` и `comments` для sh и bash).
+`judge_tool.py` (`PreToolUse`, в том числе `Agent` — ярус модели субагента, а на `Bash` и MCP-инструментах `mcp__*` ещё
+`PostToolUse` и `PostToolUseFailure` — проверка манифестов), `guard_memory.py`, `judge_stop.py`, `debug_watch.py`,
+`model_watch.py` (`SessionStart`, `PostModelSwitch` — модель сессии для судьи); остальное — их модули, среди них
+`manifests.py` (разбор манифестов) и `manifest_watch.py` (проверка манифестов после правки и команды; роли —
+`context/architecture.md`, «Компоненты»), `depcheck.py` (вопросы детектора зависимостей над деревом `shparse`),
+`pkgmanagers.py` (семантика менеджеров пакетов над списками слов; текст команды не разбирает) и `shparse.py` (разбор
+shell по грамматике bash 5.3; его дерево читают `depcheck`, `debug_watch` и `comments` для sh и bash).
 
 Инварианты:
 

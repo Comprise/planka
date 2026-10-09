@@ -228,8 +228,8 @@ NOT_IMPERATIVE = re.compile(r"(?:[ыиое]й|ть|ться|чь|[сзйд]ти|
 # NOT_IMPERATIVE: служебные слова и существительные. Новое такое слово в тексте — сюда.
 IMPERATIVE_EXCEPT = {
     "весь", "внутри", "если", "или", "ни", "они", "при", "ради", "три",
-    "дубли", "задачи", "запись", "ключи", "конфиги", "логи", "локаль", "модули", "модуль", "перечень",
-    "пути", "разборщики", "стиль", "теги", "флаги", "хэши", "цель",
+    "дубли", "задачи", "запись", "ключи", "конфиги", "логи", "локаль", "модели", "модель", "модули", "модуль",
+    "перечень", "пути", "разборщики", "стиль", "теги", "флаги", "хэши", "цель",
     "разошлись",
 }
 # Просьба во мн. ч. повелительного (-йте, -ьте, -ите и возвратные): предложение с ней в тексте хука, ядре и модуле
@@ -531,8 +531,8 @@ class PoliteFormTest(unittest.TestCase):
         import judge_tool
         texts = set().union(*_hook_texts().values())
         known = (judge_tool.DEP_REASON, judge_tool.DEP_DOUBT_REASON, judge_tool.MANIFEST_REASON,
-                 judge_tool.COMMAND_REASON, judge_tool.MCP_REASON, judge_tool.FILES_HINT, remind.NO_DOCS_LINE,
-                 remind.CONTINUATION, debug_watch.LINE, depcheck._WHY_FLAG, depcheck._WHY_NAME)
+                 judge_tool.COMMAND_REASON, judge_tool.MCP_REASON, judge_tool.FILES_HINT, judge_tool.MODEL_REASON,
+                 remind.NO_DOCS_LINE, remind.CONTINUATION, debug_watch.LINE, depcheck._WHY_FLAG, depcheck._WHY_NAME)
         for text in known:
             self.assertIn(text, texts)
 
@@ -545,7 +545,7 @@ class PoliteFormTest(unittest.TestCase):
                         and node.value.id == "prompts" and node.attr.lower().endswith("_prompt")):
                     used.add(node.attr)
         self.assertGreaterEqual(used, {"SYSTEM_PROMPT", "question_prompt", "plan_prompt", "memory_prompt",
-                                       "stop_prompt"})
+                                       "stop_prompt", "subagent_prompt"})
         for name in sorted(used):
             value = getattr(prompts, name)
             if callable(value):
