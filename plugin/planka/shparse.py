@@ -18,9 +18,15 @@
   (shell_eof_token, parse_comsub); синтаксическая ошибка в нём — ошибка всей команды. Тело `` `…` ``, `$((…) …)`,
   подстановки в теле heredoc с терминатором без кавычек и в `'…'` арифметики bash разбирает при раскрытии
   (command_substitute, xparse_dolparen) — здесь отдельным разбором той же строки; их ошибка остаётся в их теле.
+- `$(…)` bash хранит напечатанной (print_comsub) и при раскрытии слова разбирает заново без стека разделителей.
+  Расходится с чтением только `\\` в словах скобок массива внутри подстановки: при чтении разделитель — `(`, `{`
+  подстановки или `"` вокруг неё, и `\\` не экранирует (read_token_word); при раскрытии — экранирует. Такое слово
+  раскрывается заново по своему тексту (`_reexpand_word`); его границу задаёт чтение.
 - Рекурсии Python по глубине входа нет: разбор написан генераторами, вложенный вызов — `yield генератор`, стек
-  вызовов ведёт `_run`. Разбор, `walk` и `simple_commands` линейны по длине текста; исключение — цепочки heredoc в
-  подстановке в теле heredoc: строки тела внутреннего heredoc перечитываются на каждом уровне, как в bash.
+  вызовов ведёт `_run`. Разбор, `walk` и `simple_commands` линейны по длине текста; исключения, как в bash, —
+  цепочки heredoc в подстановке в теле heredoc (строки тела внутреннего heredoc перечитываются на каждом уровне) и
+  вложенные подстановки, чьи слова скобок массива с `\\` при чтении и при раскрытии делятся по-разному (`\\'`
+  открывает кавычку только при чтении): каждый уровень раскрытия читает весь вложенный текст заново.
 
 Синтаксическая ошибка (`Script.error`): `fatal=True` — bash прекращает чтение (команды до неё исполнены, её команда и
 следующие — нет); `fatal=False` — ошибка скобок присваивания массива (parse_compound_assignment): bash отбрасывает
@@ -854,6 +860,9 @@ class _R:
         self.shared = shared if shared is not None else {}
         self.paren_memo = {}
         self.paren_next = {}
+        # Скобки арифметики за `<`, `>`, прочитанные parse_matched_pair этого разбора или разбора той же строки, из
+        # которого он создан (view): `(` → (`)`, текст между ними, qc, scanning) — см. pmp.
+        self.paren_tpl = {}
         # Группы `(…)` образца `=~` и extglob: `(` → (`)`, разделитель) — пары, которые нашёл parse_matched_pair
         # группы (без переходов ввода внутри); group_views — такие пары разборов, читавших тот же текст раньше
         # (словарь, сдвиг позиций). Вложенная группа в подстановке в группе не перечитывается на каждом уровне.
@@ -869,6 +878,11 @@ class _R:
         self.scanning = False
         self.scan_failed = False
         self.quote_memo = None
+        # `\\` в слове скобок массива внутри подстановки, не экранировавший следующий символ (разделитель — `(`,
+        # `{` или `"`), который экранирует разбор при раскрытии (разделителей нет): read_token_word.
+        self.esc_split = False
+        # В текущем слове есть подстановка с таким `\\`: слово раскрывается заново по его тексту (read_token_word).
+        self.reexpand = False
 
     def view(self, start):
         """Новый разбор той же строки с позиции start (без копии текста): bash разбирает её ещё раз при раскрытии."""
@@ -876,6 +890,9 @@ class _R:
         sub.s, sub.n0, sub.n, sub.limit = self.s, self.n0, self.n, self.limit
         sub.pieces, sub.piece_starts = self.pieces, self.piece_starts
         sub.frontier = start
+        # Пары скобок, которые нашёл parse_matched_pair этой строки: `((` в теле `<(((…) …)` — подоболочка без
+        # нового прохода (arith_cmd), `<((` — без нового parse_matched_pair (parse_comsub).
+        sub.paren_tpl, sub.paren_memo, sub.paren_next = self.paren_tpl, self.paren_memo, self.paren_next
         return sub
 
     # -- позиции
@@ -1430,6 +1447,7 @@ class _R:
         sub_quotes = []
         if parts is None:
             parts = _Parts()
+        outer, self.reexpand = self.reexpand, False
         all_digit = c in _DIGITS
         dollar_present = quoted = pass_next = compound = False
         P = self.P
@@ -1459,10 +1477,13 @@ class _R:
                 self.ungetc(peek)
                 if cd is None or cd == "`" or (cd == '"' and peek in _DQ_ESC):
                     pass_next = True
-                elif peek == ")" and cd == '"' and (self.state & _COMPASSIGN) and self.eof_tok == ")":
-                    # Поведение bash 5.3 (прогон): в скобках массива в `$(…)` внутри "…" `\)` — экранированная
-                    # скобка (`b="$(a=( \)) touch P)"` исполняет `touch P`), а `\(`, `\;` — нет.
-                    pass_next = True
+                elif peek is not None and (peek in _BREAK or peek in _QUOTE or peek in "$\\"):
+                    # Сюда доходят только слова скобок массива в подстановке (parse_compound_assignment снимает
+                    # PST_NOEXPAND, разделитель — `(`, `{` подстановки или `"` вокруг неё): `\\` не экранирует. При
+                    # раскрытии bash разбирает напечатанный текст подстановки заново без разделителей
+                    # (xparse_dolparen), и там этот `\\` экранирует: `x=$(a=(\\'y) ; touch P ; b=(\\'))` исполняет
+                    # `touch P`. Перед прочими символами `\\` меняет только значение слова, не границы.
+                    self.esc_split = True
                 quoted = True
                 tok.append(c)
                 if not pass_next:
@@ -1476,6 +1497,7 @@ class _R:
                 parts.char(c, P(self.cpos))
                 all_digit = dollar_present = False
                 end_char = None
+                self.reexpand = outer
                 return self._got_token(tok, parts, start, all_digit, dollar_present, quoted, compound, end_char,
                                        self.pos)
             if c in _QUOTE:
@@ -1642,6 +1664,9 @@ class _R:
             if c == "$":
                 dollar_present = True
             c = self.getc(self._cd() != "'" and not pass_next)
+        if self.reexpand and not whole:
+            parts = yield self._reexpand_word(tok, start, self.pos if c is not None else self.n0)
+        self.reexpand = outer
         if whole:
             return parts.done()
         if sub_quotes:
@@ -1660,6 +1685,24 @@ class _R:
                                 parts.part(node)
         return self._got_token(tok, parts, start, all_digit, dollar_present, quoted, compound, end_char,
                                self.pos if c is not None else self.n0)
+
+    def _reexpand_word(self, tok, start, end):
+        """Части слова, как его раскрывает bash, когда разбор подстановки в нём при раскрытии расходится с разбором
+        при чтении (esc_split): текст слова — подстановки напечатанными (print_comsub) — разбирается заново без
+        разделителей (expand_word_internal, string_extract_double_quoted → xparse_dolparen). Конец такой подстановки
+        при раскрытии бывает дальше или ближе, чем при чтении: `"$(a=(\\)) ; touch P)"` исполняет `touch P`."""
+        anchors = []
+        text = _render(tok, anchors)
+        key = ("reexpand_word", self.P(start), text)
+        done = self.shared.get(key)
+        if done is None:
+            sub = _R(text, [(0, self.P(start))], self.comments, shared=self.shared, tail=False,
+                     limit=self.PE(end), foreign=_seeds(anchors))
+            done = yield sub.scan_word()
+            self.shared[key] = done
+        parts = _Parts()
+        parts.extend(done)
+        return parts
 
     def group_word(self, cd, gpos, wpos):
         """Группа `(…)` образца `=~` или шаблона extglob с позиции gpos: parse_matched_pair находит её конец без
@@ -1937,6 +1980,13 @@ class _R:
         # Скобки арифметики: открытые на этом уровне и последняя закрытая (её пара и следующий символ — для
         # повторного чтения `((…) …)`, arith_cmd).
         parens = [] if open_ == "(" and (flags & _P_ARITH) else None
+        # По скобке parens: начало её текста в raw, число переходов ввода, стоит ли она за `<`, `>`. Текст такой
+        # скобки (она может начать `<((…) …)`, которую разбор при раскрытии прочтёт сам) сворачивается в один кусок
+        # raw и запоминается (paren_tpl): parse_matched_pair этой подстановки (тот же qc, только P_ARITH) возьмёт
+        # конец и текст готовыми, без нового прохода. Прочие скобки не сворачиваются: кусок на каждой вложенной
+        # скобке хранил бы свой текст (_flat) — память по квадрату глубины.
+        pidx = [] if parens is not None else None
+        precord = parens is not None and flags == _P_ARITH
         grec = self.group_rec
         gstack = [] if grec is not None and grec[0] == opos and open_ == "(" and not flags else None
         closed = None
@@ -1991,6 +2041,7 @@ class _R:
                 count += 1
                 if parens is not None:
                     parens.append(cp)
+                    pidx.append((len(raw) + 1, len(self.jumps), gtlt))
                 if gstack is not None:
                     gstack.append((cp, len(self.jumps)))
             if gstack is not None and ch == close and count > 0 and gstack:
@@ -2008,6 +2059,15 @@ class _R:
             if parens is not None and ch == ")" and parens:
                 closed = parens.pop()
                 self.paren_memo[closed] = cp
+                i, pjumps, after_gtlt = pidx.pop()
+                j = len(raw) - 1
+                if after_gtlt and (not quotes or quotes[-1][0] < i) and (not procs or procs[-1][1] < i):
+                    # Свёрнутый кусок печатается и сравнивается так же, как символы по одному, но внешние
+                    # скобки уже не перебирают его символы.
+                    piece = _Tpl(raw[i:j])
+                    raw[i:j] = [piece]
+                    if precord and pjumps == len(self.jumps):
+                        self.paren_tpl[closed] = (cp, piece, qc, scanning)
             if sq:
                 if (flags & _P_ALLOWESC) and ch == "\\":
                     passnext = True
@@ -2104,6 +2164,7 @@ class _R:
                             count -= 1
                             if parens and parens[-1] == cp:
                                 parens.pop()
+                                pidx.pop()
                     elif (flags & _P_ARITH) and wasdol and ch == "{":
                         npeek = self.getc(True)
                         self.ungetc(npeek)
@@ -2325,7 +2386,14 @@ class _R:
 
     def parse_comsub(self, qc, open_, close, flags, dpos):
         """Подстановка с позиции dpos (`$`, `<`, `>`): `$(…)`, `$((…))`, `${ …; }`, `${| …; }`, `<(…)`, `>(…)` —
-        Sub или Arith; тело разбирается тем же разбором со знаком конца close (parse_comsub)."""
+        Sub или Arith; тело разбирается тем же разбором со знаком конца close (parse_comsub). Подстановка, которую
+        разбор при раскрытии прочтёт иначе (esc_split в её теле), отмечает слово вокруг (reexpand)."""
+        node = yield self._parse_comsub(qc, open_, close, flags, dpos)
+        if self.shared.get(("reexpand", id(node))) is node:
+            self.reexpand = True
+        return node
+
+    def _parse_comsub(self, qc, open_, close, flags, dpos):
         P = self.P
         ctx = self._sub_ctx(open_)
         memo = self.sub_memo.get(dpos)
@@ -2350,16 +2418,20 @@ class _R:
                 self.tpl_out = tpl
                 return node
             origin = tpl[0]
-            alt = origin.alts.get(ctx) if origin.alts else None
-            if alt is not None and self.skip_to(dpos + alt[1]):
-                self._memo(dpos, alt[0], alt[2], ctx)
-                self.tpl_out = alt[2]
-                return alt[0]
-            # Подстановку разбирать заново (иная обстановка): готовыми остаются внешние подстановки в её тексте.
+            # Разбор в этой обстановке годится, только если текст с dpos тот же: печать (print_comsub) и исходный
+            # текст расходятся пробелами, и длина из другого текста сдвинула бы чтение.
+            for alt_node, alt_text, alt_tpl in (origin.alts or {}).get(ctx, ()):
+                if self.s.startswith(alt_text, dpos) and self.skip_to(dpos + len(alt_text)):
+                    self._memo(dpos, alt_node, alt_tpl, ctx)
+                    self.tpl_out = alt_tpl
+                    return alt_node
+            # Подстановку разбирать заново (иная обстановка): готовыми остаются внешние подстановки в её тексте —
+            # если он здесь в печатном виде (позиции записей — позиции печати).
             anchors = []
-            _render(list(origin), anchors)
-            for key, entry in _seeds(anchors, dpos + 1).items():
-                self.foreign.setdefault(key, entry)
+            printed = _render(list(origin), anchors)
+            if self.s.startswith(printed, dpos + 1):
+                for key, entry in _seeds(anchors, dpos + 1).items():
+                    self.foreign.setdefault(key, entry)
             self.foreign_keys = None
         kind_char = self.s[dpos]
         if open_ == "(":
@@ -2368,8 +2440,15 @@ class _R:
             self.ungetc(peek)
             if peek == "(":
                 k0 = len(self.jumps)
-                inner, close_pos = yield self.pmp(qc, "(", ")", _P_ARITH, ppos - 1)
-                content = _Tpl(self.tpl_out[:-1])
+                hit = self.paren_tpl.get(ppos - 1) if kind_char in "<>" else None
+                if hit is not None and hit[2:] == (qc, self.scanning) and self.skip_to(hit[0]):
+                    # Конец и текст уже нашёл parse_matched_pair внешней `<((…) …)` (или `$((`, `((`), которая
+                    # читала эту строку: тело всё равно разбирается при раскрытии, части арифметики не нужны.
+                    self.getc(qc != "'")
+                    close_pos, content, inner = hit[0], hit[1], []
+                else:
+                    inner, close_pos = yield self.pmp(qc, "(", ")", _P_ARITH, ppos - 1)
+                    content = _Tpl(self.tpl_out[:-1])
                 k1 = len(self.jumps)
                 node = yield self._arith_or_comsub(kind_char, dpos, ppos, close_pos, inner, k0, k1, content)
                 self.tpl_out = self._memo(dpos, node, ["(", content, ")"], ctx, origin)
@@ -2395,6 +2474,7 @@ class _R:
         self.current = "\n"
         self.push_history("DOLPAREN" if open_ == "(" else "DOLBRACE")
         ncomments = len(self.comments)
+        split, self.esc_split = self.esc_split, False
         t = yield self.yylex()
         body, t = yield self.compound_list(t, True)
         if t.kind != close:
@@ -2402,12 +2482,15 @@ class _R:
         if self.pending:
             yield self.gather()
         self._restore(saved)
+        split, self.esc_split = self.esc_split, split
         if open_ == "(":
             kind = kind_char + "("
         else:
             kind = "${|" if spec == "|" else "${ "
         script = self._script(body, None, P(dpos), t.end, ncomments)
         node = _node(Sub, P(dpos), t.end, kind=kind, body=script)
+        if split:
+            self.shared[("reexpand", id(node))] = node
         self.tpl_out = self._memo(dpos, node, [("sub", node)], ctx, origin)
         return node
 
@@ -2473,7 +2556,7 @@ class _R:
             # обстановке возьмёт результат готовым.
             if origin.alts is None:
                 origin.alts = {}
-            origin.alts.setdefault(ctx, (node, self.pos - dpos, tpl))
+            origin.alts.setdefault(ctx, []).append((node, self.s[dpos:self.pos], tpl))
         if dpos not in self.sub_memo:
             self.memo_keys = None
         self.sub_memo[dpos] = (node, self.pos, tpl, ctx, clean)
@@ -2485,20 +2568,20 @@ class _R:
         процесс-подстановку при раскрытии находит разбор (extract_process_subst → xparse_dolparen), и её конец —
         конец разбора с `)`, а не счёт скобок: в `${x/<((…) …)/y}` он бывает дальше конца, найденного при чтении."""
         P = self.P
+        if kind_char in "<>":
+            sub = self.view(ppos)
+            script = yield sub.toplevel(")")
+            return _node(Sub, P(dpos), _close_end(self, close_pos), kind=kind_char + "(", body=script)
         # Текст после `$(`, как его хранит bash: вложенные подстановки — напечатанными (print_comsub).
         anchors = []
         read = _render([content], anchors)
-        if kind_char == "$" and read[:1] == "(" and read[-1:] == ")":
+        if read[:1] == "(" and read[-1:] == ")":
             skel = _skel([content])
             arith = skel[:1] == "(" and skel[-1:] == ")" and _chk_arithsub(skel[1:-1])
         else:
             arith = False
         if arith:
             return _node(Arith, P(dpos), _close_end(self, close_pos), parts=_strip_parens(inner))
-        if kind_char in "<>":
-            sub = self.view(ppos)
-            script = yield sub.toplevel(")")
-            return _node(Sub, P(dpos), _close_end(self, close_pos), kind=kind_char + "(", body=script)
         # bash разбирает при раскрытии этот текст; позиции его узлов — в пределах подстановки.
         sub = _R(read, [(0, P(ppos))], self.comments, shared=self.shared, limit=P(close_pos),
                  foreign=_seeds(anchors))
@@ -3185,7 +3268,7 @@ class _Tpl(list):
         # Подстановка, разобранная parse_comsub (её текст — этот кусок): (узел, обстановка разбора). Повторный
         # разбор напечатанного текста берёт узел готовым (_render с anchors, _R.foreign).
         self.seed = None
-        # Разборы того же текста в иной обстановке: обстановка → (узел, длина, куски текста).
+        # Разборы того же текста в иной обстановке: обстановка → [(узел, прочитанный текст, куски текста)].
         self.alts = None
         # Текст '…' в арифметике: записи sub_memo разбора, раскрывшего его (arith_quote), в позициях текста.
         self.memo = None

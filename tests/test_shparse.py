@@ -394,7 +394,8 @@ class ExpansionClassesTest(unittest.TestCase):
         self.assertTrue(runs("$(( (npm i x) )\n\nesac)"))
 
     def test_printed_text_reparsed(self):
-        # Класс 2: в скобках массива в `$(…)` внутри "…" `\\)` — экранированная скобка, `\\(` — нет.
+        # Класс 2: `\\` в скобках массива в `$(…)` внутри "…" при чтении не экранирует, при раскрытии — экранирует
+        # (ArrayBackslashReexpandTest); `\\(` ошибка уже при чтении.
         self.assertTrue(runs('b="$(true\n a5=( \\)) npm i x)"'))
         self.assertTrue(runs('a1=("$(a5=( \\)) npm i x)")'))
         self.assertFalse(runs('x="$(a=(x \\( y); npm i x)"'))
@@ -407,6 +408,65 @@ class ExpansionClassesTest(unittest.TestCase):
         word = shparse.parse("touch P1''\"\"").commands[0].words[1]
         self.assertEqual(([type(p).__name__ for p in word.parts], word.literal()), (["Lit"], "P1"))
         self.assertEqual(shparse.parse("echo ''").commands[0].words[1].literal(), "")
+
+
+class ArrayBackslashReexpandTest(unittest.TestCase):
+    """`\\` в слове скобок массива внутри подстановки: parse_compound_assignment снимает PST_NOEXPAND, и read_token_word
+    экранирует следующий символ, только если разделитель (current_delimiter) пуст или `"` перед `\\`, `` ` ``, `$`,
+    `"`. При чтении разделитель — `(` подстановки или `"` вокруг неё: `\\)` — символ `\\` и конец скобок. bash хранит
+    подстановку напечатанной (print_comsub) и при раскрытии разбирает её текст с остатком слова заново без
+    разделителей (xparse_dolparen): там `\\` экранирует, и конец подстановки, а с ним команды, бывают другими.
+    Проверено прогоном bash 5.3 с `touch`."""
+
+    def test_reexpanded_substitution_runs_hidden_command(self):
+        # При чтении `\\'` открывает '…' до `\\'` в `b=(…)`; при раскрытии обе `'` экранированы.
+        self.assertTrue(runs("x=$(a=(\\'y) ; npm i x ; b=(\\')); echo"))
+        self.assertTrue(runs('x="$(a=(\\\'y) ; npm i x ; b=(\\\'))"; echo'))
+        self.assertTrue(runs("echo ${x:-$(a=(\\'y) ; npm i x ; b=(\\'))}"))
+        # Конец подстановки при раскрытии дальше, чем при чтении: остаток "…" — её тело.
+        self.assertTrue(runs('echo "$(a=(\\)) ; npm i x)$(true)"'))
+
+    def test_reexpanded_substitution_error_hides_read_commands(self):
+        # При раскрытии `\\)` экранирована, `&&` в скобках — ошибка: подстановка не исполняется.
+        self.assertFalse(runs('echo "$( a6=(a=b\\) && npm i x)"'))
+        self.assertFalse(runs('x="$(a=(\\)\'<<E\'\nnpm i x)\n{ :; })"; echo'))
+
+    def test_read_reading_keeps_word_end(self):
+        # Слово кончается там, где его кончает разбор при чтении: `"…"` после `\\)` — внешняя кавычка.
+        self.assertTrue(runs('v=$(: "$(a=(\\)) ; true)" | npm i x)'))
+        # Процесс-подстановка в той же команде исполняется до ошибки раскрытия "…".
+        self.assertTrue(runs(': \\\n[")" \\\n<(npm i x)"$[ $( a6=(a=b\\) && touch P2) 1 ]"'))
+
+    # Формы генератора фаззера: (зерно, глубина, номер) → маркеры, которые исполнил bash.
+    FUZZ = {
+        (11, 3, 11823): ("v1+=$( touch P1)$( : && [[ -z \"$(! time a2=(\\)'<<E'\ntouch P2)\n{ })\" ]])",
+                         {"P1"}),
+        (1, 3, 16359): ("test 1 && cat >/dev/null <<-'END1' ; cat >/dev/null <<< '<<E'$( cat <<< \"\n$(a2+=($'a\\n' a"
+                        "#b \\)) ; case \"a\" in\na)|(b) touch P5\n;&\nesac)\"$ | { touch P6 ;})\n\t'touch P1\n\ttouc"
+                        "h P2\n\tEND1;\n\tEND1",
+                        {"P6"}),
+        (5, 2, 7424): ("{ false; } || v1+=${HOME#<({ false; } || function f3() { : && touch P1\n}\nf3)}; false || tru"
+                       "e;#}`\n( v4=$xa\\ b touch P10) | : \\\n[\")\" \\\n<(! false && for ((i=0; i<1; i++)); do touc"
+                       "h P12; touch P13; done)\"`(( x = $(touch P15) 1 ))`$[ $([ -n a ] && printf '%s\\n' $'`' \"<<E"
+                       "\" >/dev/null & printf '%s\\n' $(( - 0 (1) $( touch P18 \\\n; : && touch P19) 1 )) $( touch P"
+                       "21 |& true)) $( a6=(a=b\\) && touch P22)) 1 ]\\\"\"",
+                       {"P1", "P10", "P12"}),
+        # Разбор при раскрытии брал готовым разбор той же подстановки из исходного текста (длина другая, чем у
+        # печати): чтение сдвигалось, `"}"` открывал кавычку до конца.
+        (2, 3, 7715): ("printf '%s\\n' $(( (1) - 0 $( if touch P3\nthen [[ a == a ]] && true #'; ( printf '%s\\n' \\'"
+                       " )\nfi |& touch P4\nread -r x <<< ${u1-\"a b\"<((( $(test 1 && touch P5;touch P7) 1 ))|printf"
+                       " '%s\\n' ${HOME:+$(: & ! touch P8)\"}\"})a} |& a3=(\\# `test 1 && touch P14`)) 1 )) $'\\'touc"
+                       "h P16'",
+                       {"P3", "P4", "P5", "P8", "P14"}),
+    }
+
+    def test_fuzz_forms(self):
+        # Ни один исполненный маркер не потерян (лишние — строгость: ошибка раскрытия `$[ … ]` прерывает команду).
+        for key, (text, executed) in self.FUZZ.items():
+            with self.subTest(key):
+                found = {c[1] for c in cmds(text) if c[:1] == ["touch"] and len(c) > 1}
+                self.assertEqual(executed - found, set())
+        self.assertNotIn(["touch", "P2"], cmds(self.FUZZ[11, 3, 11823][0]))
 
 
 class PrintedTextTest(unittest.TestCase):
@@ -424,7 +484,9 @@ class PrintedTextTest(unittest.TestCase):
                          "x='a'\\''b' $(echo 'c'\\''d' \"$'e'\")")
         self.assertEqual(self.printed("echo $(( (1) + $( echo 2 ) )) ${x:-$( echo y)} ${ echo a; }"),
                          "echo $(( (1) + $(echo 2) )) ${x:-$(echo y)} ${ echo a; }")
-        self.assertEqual(self.printed('echo "$( touch P6; a3=(\\)) )"'), 'echo "$(touch P6;a3=(\\)))"')
+        # `\\` в скобках массива в подстановке не экранирует `)`: она кончает скобки, следующая — подстановку
+        # (declare -f bash 5.3: `echo "$(touch P6; a3=(\\)) )"`).
+        self.assertEqual(self.printed('echo "$( touch P6; a3=(\\)) )"'), 'echo "$(touch P6;a3=(\\)) )"')
 
     def test_commands_and_heredocs(self):
         # Тело heredoc — за разделителем после строки команды; `for` без `in` — `in "$@"`.
@@ -885,6 +947,13 @@ class ReparseLinearityTest(unittest.TestCase):
         "arith_param": lambda s, i: "$(( ${x:-$((true) " + s + ")} ))",
         "param_procsub_dq": lambda s, i: '"${x:-<(echo ' + s + ')}"',
         "arith_cond": lambda s, i: "$(( $([[ -z " + s + " ]]) ))",
+        # `<((…) …)`: текст после `<(` читает parse_matched_pair, тело — разбор при раскрытии; конец вложенной
+        # такой же подстановки уже нашёл parse_matched_pair внешней.
+        "procsub_arith": lambda s, i: "<((echo " + s + ") )",
+        "outsub_arith": lambda s, i: ">((true) " + s + ")",
+        "procsub_arith_param": lambda s, i: "${x:-<((echo " + s + ") )}",
+        # `((` в теле `<(((…) …)`: пару скобок и символ за ней уже нашёл parse_matched_pair внешней — подоболочка.
+        "procsub_dparen": lambda s, i: "<(((echo " + s + ") ) )",
     }
 
     @staticmethod
@@ -913,6 +982,8 @@ class ReparseLinearityTest(unittest.TestCase):
             "arith_heredoc": lambda s, i: f"$((true) ; cat <<E{i}\n$(touch P{i})" + s + f"\nE{i}\n)",
             "heredoc_arith": lambda s, i: f"$(cat <<E{i}\n$((touch P{i}) ; " + s + f")\nE{i}\n)",
             "arith_quote": lambda s, i: f"$(( '$(touch P{i}; echo " + s + ")' ))",
+            "procsub_arith": lambda s, i: f"<((touch P{i}) ; echo " + s + ")",
+            "procsub_dparen": lambda s, i: f"<(((touch P{i}) ; echo " + s + ") )",
         }
         for name, wrap in forms.items():
             with self.subTest(name), deadline(self, 60):
