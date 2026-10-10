@@ -241,16 +241,16 @@ def _manifest_skip(session, msg, **fields):
     common.log_event(MANIFEST_HOOK, session, verdict="skipped", error=msg, **fields)
 
 
-def _project_names(root, kind):
+def _project_names(root, kind, listed):
     """Имена манифестов реестра вида kind и пакетов самого проекта под корнем проекта root() и в его версии HEAD,
-    файлов manifest_watch._LEGACY в версии HEAD (manifest_watch.project_names) в пределах SNAPSHOT_BUDGET; root()
-    None — пусто."""
+    файлов manifest_watch._LEGACY в версии HEAD (manifest_watch.project_names) в пределах SNAPSHOT_BUDGET; перечень
+    манифестов и дерево HEAD — из listed (manifest_watch.listing), общего с правкой. root() None — пусто."""
     root = root()
     if root is None:
         return frozenset()
     deadline = time.monotonic() + manifest_watch.SNAPSHOT_BUDGET
     try:
-        return manifest_watch.project_names(root, kind, deadline)
+        return manifest_watch.project_names(root, kind, deadline, listed)
     except manifest_watch.Unavailable as e:
         raise manifest_watch.Unavailable(f"не сравнён с другими манифестами проекта ({e})") from None
 
@@ -290,7 +290,7 @@ def judge_manifest_edit(data):
             continue
         try:
             names = manifest_watch.check_edit(tool, tool_input, path, kind,
-                                              lambda kind=kind: _project_names(root, kind), root, listed)
+                                              lambda kind=kind: _project_names(root, kind, listed), root, listed)
         except manifest_watch.Unavailable as e:
             _manifest_skip(session, f"манифест {path} {e}: новые зависимости не проверены", tool=tool)
             continue

@@ -1,9 +1,7 @@
 """PostToolUse и PostToolUseFailure на Bash: повторная неудача той же команды подмешивает модуль debugging."""
-import bisect
 import hashlib
 import os
 import re
-import shlex
 
 import common
 import shparse
@@ -15,8 +13,6 @@ MAX_SHOWN_COMMAND = 200
 # В файле состояния хранятся последние MAX_COUNTS ключей счётчика и последние MAX_SHOWN отметок показа.
 MAX_COUNTS = 500
 MAX_SHOWN = 100
-# Имя команды, обёртки и подкоманда git разбираются только по началу сегмента, до _HEAD_LIMIT символов.
-_HEAD_LIMIT = 4096
 
 # Код выхода 1 этих команд — ответ «не найдено», «ложно» или «различаются», не сбой; код 2 и выше — сбой.
 CODE1_ANSWERS = frozenset({"grep", "egrep", "fgrep", "zgrep", "rg", "test", "[", "[[", "diff", "cmp",
@@ -43,12 +39,8 @@ WRAPPERS = {
 }
 GIT_ARG_OPTIONS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
-# Присваивание одной подстановки без скобок внутри: код выхода — код команды подстановки.
-SUBSTITUTION_ASSIGNMENT = re.compile(r"\s*[A-Za-z_][A-Za-z0-9_]*=(\"?)\$\(([^()]*)\)\1\s*")
 # Команды, которые после «&&» не возвращают 1 сами: код 1 цепочки — код команды перед ними.
 PASS_THROUGH = frozenset({"echo", "printf", "true", ":"})
-# Участки в кавычках и экранированные символы: перенаправление ищется вне них.
-UNQUOTED = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"|\\.", re.DOTALL)
 EXIT_LINE = re.compile(r"Exit code (\d+)")
 
 LINE = "Команда `{command}` упала {ordinal} раз подряд — дальше, пожалуйста, по модулю {rules}/debugging.md."
@@ -73,200 +65,77 @@ def exit_code(error):
     return int(m.group(1)) if m else None
 
 
-# Операторы, разделяющие команды строки: «|», «|&», «||», «&&», «;», перевод строки; «\\» с переводом строки —
-# продолжение строки, не разделитель. Одиночный «&» и скобки не разделяют.
-_SEPARATOR = re.compile(r"\\\n|\|[|&]?|&&|;|\n")
-# Узлы, внутри которых разделителей нет: слова (кавычки, подстановки, скобки массива), перенаправления
-# («>|» — не конвейер), «((…))», «[[ … ]]».
-_NO_SPLIT = (shparse.Word, shparse.Redir, shparse.ArithCmd, shparse.Arith, shparse.Cond)
-
-
-def _skip_heredocs(command, script, nodes=None):
-    """Диапазоны (начало, конец) тел heredoc вместе со строкой терминатора и её переводом строки; терминатора нет —
-    до конца текста; терминатор со знаком конца подстановки в остатке строки («E)») — до знака. Тела берутся из
-    дерева script (shparse.parse(command)). Heredoc, тело которого bash не читал (в
-    теле `` `…` `` оно в самой строке подстановки), диапазона не даёт. nodes — уже обойдённые узлы script."""
-    n = len(command)
-    out = []
-    for node in shparse.walk(script) if nodes is None else nodes:
-        if type(node) is not shparse.Heredoc or node.body_start == node.end:
-            continue
-        i = node.body_end
-        if i >= n:
-            out.append((node.body_start, n))
-            continue
-        if node.strip_tabs:
-            while i < n and command[i] == "\t":
-                i += 1
-        if command.startswith(node.term, i):
-            i += len(node.term)
-            if i < n and command[i] != "\n":
-                out.append((node.body_start, i))
-                continue
-        end = command.find("\n", i)
-        out.append((node.body_start, n if end < 0 else end + 1))
-    return out
-
-
-def _merge(ranges):
-    """Отсортированные непересекающиеся диапазоны: пересекающиеся и смежные склеены."""
-    out = []
-    for start, end in sorted(ranges):
-        if out and start <= out[-1][1]:
-            if end > out[-1][1]:
-                out[-1] = (out[-1][0], end)
-        else:
-            out.append((start, end))
-    return out
-
-
-def _covered(ranges, starts, i):
-    """Конец диапазона из ranges (starts — их начала), накрывающего позицию i; не накрыта — None."""
-    k = bisect.bisect_right(starts, i) - 1
-    return ranges[k][1] if k >= 0 and i < ranges[k][1] else None
-
-
-def _paren_pairs(command, script=None):
-    """Закрывающая «)» каждой «(» вне кавычек, комментариев и тел heredoc: {индекс «(»: индекс «)»}. Кавычки,
-    комментарии и heredoc берутся из дерева (shparse.parse), скобки считаются по тексту; «\\» вне кавычек
-    экранирует следующий символ."""
-    script = shparse.parse(command) if script is None else script
-    nodes = list(shparse.walk(script))
-    cuts = list(_comment_ranges(nodes)) + _skip_heredocs(command, script, nodes)
-    cuts += [(node.start, node.end) for node in nodes if type(node) in (shparse.SQ, shparse.DQ, shparse.AnsiC)]
-    cuts = _merge(cuts)
-    starts = [start for start, _ in cuts]
-    pairs, stack = {}, []
-    skip_to = 0
-    for m in re.finditer(r"[()\\]", command):
-        i = m.start()
-        if i < skip_to or _covered(cuts, starts, i) is not None:
-            continue
-        c = m.group()
-        if c == "\\":
-            skip_to = i + 2
-        elif c == "(":
-            stack.append(i)
-        elif stack:
-            pairs[stack.pop()] = i
-    return pairs
-
-
-def _comment_ranges(nodes):
-    """Диапазоны комментариев всех разборов среди узлов дерева (тело подстановки хранит свои)."""
-    for node in nodes:
-        if type(node) is shparse.Script:
-            yield from node.comments
-
-
-def _segments(command, script=None):
-    """Непустые команды строки с разделителем перед каждой: [(разделитель, текст)], по дереву shparse. Разделитель —
-    оператор между командами (_SEPARATOR) вне слов, перенаправлений, «((…))», «[[ … ]]», комментариев и тел
-    heredoc; внутри подстановки, группы слов и скобок массива разделителей нет; комментарии и тела heredoc из
-    текста команд убраны. После синтаксической ошибки bash не исполняет остаток: от начала команды с ошибкой он
-    одна команда без разделителей. script — готовый shparse.parse(command). Разбор без дерева (вложенность глубже
-    предела shparse, сбой разбора) — команд нет, с предупреждением: код 1 такой строки считается неудачей."""
-    script = shparse.parse(command) if script is None else script
-    kind = script.error.kind if script.error is not None else None
-    if kind is not None:
-        why = "вложенность глубже предела разбора" if kind == shparse.DEPTH else "сбой разбора"
-        common.warn(f"команда не разобрана ({why}): её код выхода 1 считается неудачей")
-        return []
-    nodes = list(shparse.walk(script))
-    cuts = _merge(list(_comment_ranges(nodes)) + _skip_heredocs(command, script, nodes))
-    cut_starts = [start for start, _ in cuts]
-    fixed = _merge([(node.start, node.end) for node in nodes if isinstance(node, _NO_SPLIT)]
-                   + [(item[0][0].start, item[0][-1].end) for node in nodes if type(node) is shparse.Case
-                      for item in node.items if item[0]]
-                   + [(a, b - 1 if command[b - 1:b] == "\n" else b) for a, b in script.dropped or ()] + cuts)
-    fixed_starts = [start for start, _ in fixed]
-    # Фатальная ошибка: bash не исполняет ни команды с ошибкой (всю строку верхнего уровня, где она), ни остаток;
-    # границы ищутся только до конца последней прочитанной команды и за пробелами после неё.
-    fatal = None
-    if script.error is not None and script.error.fatal:
-        fatal = script.commands[-1].end if script.commands else 0
-    # Границы команд: (начало оператора, конец, сам оператор).
-    bounds = []
-    for m in _SEPARATOR.finditer(command):
-        if fatal is not None and m.start() >= fatal and command[max(fatal, bounds[-1][1] if bounds else 0):
-                                                               m.start()].strip():
-            break
-        if m.group()[0] == "\\" or _covered(fixed, fixed_starts, m.start()) is not None:
-            continue
-        bounds.append((m.start(), m.end(), m.group()))
-    bounds.append((len(command), len(command), None))
-    segments = []
-    sep, begin = "", 0
-    for start, end, op in bounds:
-        text = _without(command, begin, start, cuts, cut_starts)
-        if text.strip():
-            segments.append((sep, text))
-        if op is None:
-            break
-        sep, begin = op, end
-    return segments
-
-
-def _without(command, start, end, cuts, starts):
-    """command[start:end] без диапазонов cuts (starts — их начала)."""
-    out = []
-    i = start
-    k = max(bisect.bisect_right(starts, start) - 1, 0)
-    while k < len(cuts) and cuts[k][0] < end:
-        a, b = cuts[k]
-        if b > i:
-            if a > i:
-                out.append(command[i:a])
-            i = max(i, b)
-        k += 1
-    if i < end:
-        out.append(command[i:end])
-    return "".join(out)
-
-
-def _head_words(text):
-    """Слова начала text (до _HEAD_LIMIT символов) по правилам shlex; None — не разбирается. Слово, которое
-    обрезал предел, отбрасывается; кавычка, не закрытая в пределах, у обрезанной строки не ошибка."""
-    head = text[:_HEAD_LIMIT]
-    cut = len(text) > len(head)
-    lexer = shlex.shlex(head, posix=True)
-    lexer.whitespace_split = True
-    # «#» внутри слова («VAR=a#b») — не комментарий: слова после него нужны.
-    lexer.commenters = ""
-    words = []
-    try:
-        words.extend(lexer)
-    except ValueError:
-        # Недочитанное слово в кавычках shlex не отдаёт — отбрасывать нечего.
-        return words if cut else None
-    if cut and words and not head[-1].isspace():
-        words.pop()
-    return words
-
-
-def _passes_code(text):
-    """Команда не возвращает 1 сама: первое слово из PASS_THROUGH и вне кавычек и экранирования нет
-    «<» и «>» (перенаправление может не открыться и дать 1; «echo "a > b"» — не перенаправление)."""
-    if re.search(r"[<>]", UNQUOTED.sub("", text)):
+def _passes_code(node):
+    """Команда не возвращает 1 сама: простая команда без присваиваний и перенаправлений (перенаправление может не
+    открыться и дать 1) с именем из PASS_THROUGH."""
+    if type(node) is not shparse.Simple or node.assigns or node.redirs or not node.words:
         return False
-    words = _head_words(text)
-    return bool(words) and words[0] in PASS_THROUGH
+    return node.words[0].literal() in PASS_THROUGH
 
 
-def _last_pipeline_command(command):
-    """Текст команды, чей код выхода — код строки, если цепочку не оборвала неудача раньше и не включён
-    pipefail: последняя команда (_segments); стоящая после «&&» команда из PASS_THROUGH код не меняет —
-    тогда команда перед ней. Нет команд — ""."""
-    segments = _segments(command)
-    while len(segments) > 1 and segments[-1][0] == "&&" and _passes_code(segments[-1][1]):
-        segments.pop()
-    return segments[-1][1] if segments else ""
+def _last_substitution(assigns):
+    """Последняя подстановка «$(…)» или «`…`» присваиваний — её код bash отдаёт командой без имени; None — подстановки
+    нет или последней может оказаться другая: подстановка внутри «${…}» или арифметики (исполняется не всегда),
+    «${ …; }», «<(…)»."""
+    last = None
+    stack = [iter(word.parts) for word in reversed(assigns)]
+    while stack:
+        part = next(stack[-1], None)
+        if part is None:
+            stack.pop()
+            continue
+        kind = type(part)
+        if kind is shparse.DQ:
+            stack.append(iter(part.parts))
+        elif kind is shparse.Sub:
+            last = part if part.kind in ("$(", "`") else None
+        elif kind is shparse.Param or kind is shparse.Arith:
+            if any(type(node) is shparse.Sub for node in shparse.walk(part)):
+                last = None
+    return last
+
+
+def _deciding(script):
+    """Узел, чей код выхода — код строки, если цепочку не оборвала неудача раньше и не включён pipefail: последняя
+    команда последней полной команды, списка, «&&»/«||», конвейера, тела «( … )» и «{ …; }»; стоящая после «&&»
+    команда из PASS_THROUGH код не меняет — берётся команда перед ней; у команды из одних присваиваний — последняя
+    команда подстановки (_last_substitution). Конвейер с «!» — сам конвейер. None — кода 1 у строки нет или он не
+    от одной команды: синтаксическая ошибка (bash отдаёт 2), последняя команда в фоне «&» (код 0), строка пуста."""
+    node = script
+    while True:
+        kind = type(node)
+        if kind is shparse.Script:
+            if node.error is not None and node.error.fatal or not node.commands:
+                return None
+            node = node.commands[-1]
+        elif kind is shparse.Sequence:
+            if len(node.seps) == len(node.items) and node.seps[-1] == "&":
+                return None
+            node = node.items[-1]
+        elif kind is shparse.AndOr:
+            k = len(node.items) - 1
+            while k > 0 and node.ops[k - 1] == "&&" and _passes_code(node.items[k]):
+                k -= 1
+            node = node.items[k]
+        elif kind is shparse.Pipeline:
+            if node.bang:
+                return node
+            node = node.commands[-1]
+        elif kind is shparse.Subshell or kind is shparse.Group:
+            node = node.body
+        elif kind is shparse.Simple and not node.words and not node.redirs and node.assigns:
+            sub = _last_substitution(node.assigns)
+            if sub is None:
+                return node
+            node = sub.body
+        else:
+            return node
 
 
 def _skip_options(words, i, with_arg):
     """Индекс первого слова после опций с i: «--» завершает опции, опция из with_arg без «=» берёт
-    следующее слово."""
-    while i < len(words) and words[i].startswith("-") and words[i] != "-":
+    следующее слово. words — значения слов, None у слова с раскрытием."""
+    while i < len(words) and words[i] is not None and words[i].startswith("-") and words[i] != "-":
         if words[i] == "--":
             return i + 1
         if words[i] in with_arg:
@@ -275,27 +144,28 @@ def _skip_options(words, i, with_arg):
     return i
 
 
-def code1_is_answer(command):
-    """Код выхода 1 команды — штатный ответ, а не сбой: последняя команда строки после присваиваний и
-    обёрток WRAPPERS — из CODE1_ANSWERS, git с подкомандой и флагом из GIT_CODE1_ANSWERS, «command -v»,
-    «command -V» или отрицание «!»; присваивание x=$(…) — по команде подстановки. Неразборная строка —
-    False."""
-    last = _last_pipeline_command(command)
-    substitution = SUBSTITUTION_ASSIGNMENT.fullmatch(last)
-    if substitution:
-        return code1_is_answer(substitution.group(2))
-    words = _head_words(last)
-    if words is None:
-        return False
+def _is_assignment(word, value):
+    """Слово вида «имя=…» (аргумент env и sudo): по значению value (word.literal()) или, у слова с раскрытием, по
+    его первому тексту."""
+    if value is None:
+        value = word.parts[0].text if word.parts and type(word.parts[0]) is shparse.Lit else ""
+    return ASSIGNMENT.match(value) is not None
+
+
+def _simple_answers(node):
+    """Код 1 простой команды — ответ: после обёрток WRAPPERS и их аргументов «имя=…» — из CODE1_ANSWERS, git с
+    подкомандой и флагом из GIT_CODE1_ANSWERS, «command -v» или «command -V». Слово с раскрытием на месте имени,
+    опции или подкоманды — не ответ."""
+    words = [word.literal() for word in node.words]
     i = 0
     while i < len(words):
-        word = words[i]
-        if ASSIGNMENT.match(word):
+        # Присваивания перед именем — в node.assigns; «имя=…» после обёртки — её аргумент.
+        if i > 0 and _is_assignment(node.words[i], words[i]):
             i += 1
             continue
-        if word == "!":
-            return True
-        name = os.path.basename(word)
+        if words[i] is None:
+            return False
+        name = os.path.basename(words[i])
         if name == "command" and i + 1 < len(words) and words[i + 1] in ("-v", "-V"):
             return True
         if name not in WRAPPERS:
@@ -303,7 +173,7 @@ def code1_is_answer(command):
         i = _skip_options(words, i + 1, WRAPPERS[name])
         if name == "timeout":
             i += 1
-    if i >= len(words):
+    if i >= len(words) or words[i] is None:
         return False
     name = os.path.basename(words[i])
     if name in CODE1_ANSWERS:
@@ -315,6 +185,24 @@ def code1_is_answer(command):
         return False
     flags = GIT_CODE1_ANSWERS[words[i]]
     return flags is None or any(w in flags for w in words[i + 1:])
+
+
+def code1_is_answer(command, script=None):
+    """Код выхода 1 команды — штатный ответ, а не сбой: команда, решающая код строки (_deciding по дереву
+    shparse), — «[[ … ]]», конвейер с «!» или простая команда-ответ (_simple_answers). script — готовый
+    shparse.parse(command). Разбор без дерева (вложенность глубже предела shparse, сбой разбора) — False, с
+    предупреждением."""
+    script = shparse.parse(command) if script is None else script
+    kind = script.error.kind if script.error is not None else None
+    if kind is not None:
+        why = "вложенность глубже предела разбора" if kind == shparse.DEPTH else "сбой разбора"
+        common.warn(f"команда не разобрана ({why}): её код выхода 1 считается неудачей")
+        return False
+    node = _deciding(script)
+    kind = type(node)
+    if kind is shparse.Pipeline or kind is shparse.Cond:
+        return True
+    return kind is shparse.Simple and bool(node.words) and _simple_answers(node)
 
 
 def _ordinal(n):

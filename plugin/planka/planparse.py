@@ -40,7 +40,10 @@ _READ_NOTE = re.compile(
     r"reference(?:\s+only)?|context(?:\s+only)?|imports?\s+only|import|"
     r"(?:do\s+not|don['’]t)\s+(?:modify|edit|touch|change))"
     r"(?:[\s*_]*(?:$|[,;:.])|[\s*_]*\s[—–-])", re.IGNORECASE)
-_FENCE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+# Info-строка забора из обратных кавычек не содержит обратной кавычки: «```make test```» — код в строке.
+_FENCE = re.compile(r"^\s*(`{3,}(?=[^`]*$)|~{3,})(.*)$")
+# Пометка в скобках перед запятой в перечне без кавычек; пометка в конце перечня — _trailing_note.
+_MID_NOTE = re.compile(r"\(([^()]*)\)(?=\s*,)")
 # Пункт целиком из путей: `…` или слова с `.` или `/` через пробелы, запятые и пометки в скобках; `…` с
 # пробелом путём не станет в _paths. _is_whole_path разбирает пункт за время, линейное по его длине.
 _PATH_WORD = re.compile(r"[^`\s,;()]+")
@@ -152,15 +155,28 @@ def _split(fragment):
     first = text.split()[0].lower().strip(".,;:*_") if text else ""
     if first in _NO_FILES:
         return [], ""
+    # Пометка чтения в середине перечня снимает путь перед ней, остальные пометки — только сами пометки.
+    chunks, pos = [], 0
+    for m in _MID_NOTE.finditer(text):
+        chunks.append(text[pos:m.start()])
+        if check_read and _READ_NOTE.match(m.group(1)):
+            chunks.append("\0")
+        pos = m.end()
+    chunks.append(text[pos:])
+    text = "".join(chunks)
     parts = [p.strip() for p in text.split(",")]
+    dropped = [p.endswith("\0") for p in parts]
+    parts = [p.rstrip("\0").rstrip() for p in parts]
     # Хвост перечня «etc.» — не путь.
     if len(parts) > 1 and parts[-1].lower().rstrip(".") == "etc":
         parts.pop()
+        dropped.pop()
     if not all(p and not any(c.isspace() for c in p) for p in parts):
         return [], ""
     if read_last:
         parts.pop()
-    return [_lines_suffix_stripped(p) for p in parts], ""
+        dropped.pop()
+    return [_lines_suffix_stripped(p) for p, drop in zip(parts, dropped) if not drop], ""
 
 
 def _paths(fragment):

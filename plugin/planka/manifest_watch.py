@@ -4,17 +4,21 @@
 манифестов проекта перед ней (state/<session>.manifests.json по tool_use_id) и сравнение после.
 Новым не считается имя из текста до правки вместе с транзитивными, из версии манифеста в HEAD, в
 источнике незавершённых merge, cherry-pick, rebase, revert и в сторонах конфликта индекса, из другого манифеста
-того же реестра в проекте и в HEAD, из файла _LEGACY в HEAD, имя пакета самого проекта — манифеста в HEAD или
-члена workspace корня (монорепозиторий) — и, после команды, имя из манифестов ref, откуда команда git возвращает
-файлы (stash, ветка, коммит), если ref создан до начала сессии, и из изменённых строк манифестов в файле патча
-`git apply`, не менявшемся с начала сессии. Подключение файла (manifests.Include) — путь цели от корня проекта
-(_rooted) в каждом источнике имён; не новое имя, если файл — манифест из перечня проекта, который проверяется сам
-(_unchecked).
+того же реестра в проекте и в HEAD, из файла _LEGACY в HEAD, имя пакета самого проекта — манифеста в HEAD
+(кроме npm и PyPI) или члена workspace (монорепозиторий, корень — _workspace_root): у npm — только зависимость,
+которую npm связывает с каталогом члена (manifests.NpmWorkspace), у uv — только в pyproject.toml workspace с
+источником `workspace = true` (_uv_inherited и manifests.names), — и, после команды, имя из манифестов ref, откуда
+команда git возвращает файлы (stash, ветка, коммит), если ref создан до начала сессии, и из изменённых строк
+манифестов в файле патча `git apply`, не менявшемся с начала сессии. Подключение файла (manifests.Include) — путь
+цели от корня проекта (_rooted) в каждом источнике имён; не новое имя, если файл — манифест из перечня проекта того
+вида, которым его читает менеджер, и проверяется сам (_unchecked).
 """
 import ast
 import configparser
+import functools
 import os
 import pathlib
+import posixpath
 import re
 import stat
 import subprocess
@@ -32,7 +36,7 @@ import snapshot
 # common.GIT_ROOT_TIMEOUT корня проекта (tests/test_contract.py, TimeoutsTest).
 SNAPSHOT_BUDGET = 5
 CHECK_BUDGET = 5
-# Срок `git cat-file` версий из _REPO_REFS и _INDEX_STAGES при правке файловым инструментом, секунды.
+# Срок вызовов git версий из _REPO_REFS и _INDEX_STAGES (head_names) при правке файловым инструментом, секунды.
 HEAD_TIMEOUT = 5
 # Пределы: больший манифест не разбирается, больше манифестов или файлов обхода вне git — снимка нет.
 MAX_MANIFEST_BYTES = 1_048_576
@@ -75,24 +79,43 @@ def _relative(path, root):
 
 
 def listing(root):
-    """Перечень манифестов проекта для жёстких ссылок и подключений: функция () → (корень root(), [путь от корня])
-    или None — проект неизвестен. list_manifests зовётся при первом вызове в срок HEAD_TIMEOUT и один раз за хук:
-    результат и ошибка (Unavailable, TimeoutError) запоминаются."""
-    memo = []
+    """Перечень манифестов проекта для жёстких ссылок, подключений и project_names на хук (_Listing)."""
+    return _Listing(root)
 
-    def listed():
-        if not memo:
+
+class _Listing:
+    """Перечень манифестов проекта на хук: вызов () → (корень root(), [путь от корня]) или None — проект неизвестен.
+    list_manifests зовётся при первом вызове в срок HEAD_TIMEOUT и один раз за хук: результат, режим (mode, "git" или
+    "walk") и ошибка (Unavailable, TimeoutError) запоминаются. versions() — один _VersionNpm корня на хук или None —
+    проект неизвестен: дерево HEAD читается один раз для head_names и project_names."""
+    __slots__ = ("root", "memo", "mode", "shared")
+
+    def __init__(self, root):
+        self.root, self.memo, self.mode, self.shared = root, None, None, None
+
+    def __call__(self):
+        if self.memo is None:
             try:
-                base = root()
-                memo.append((None if base is None else (base, list_manifests(base, time.monotonic() + HEAD_TIMEOUT)[1]),
-                             None))
+                base = self.root()
+                if base is None:
+                    self.memo = (None, None)
+                else:
+                    self.mode, found = list_manifests(base, time.monotonic() + HEAD_TIMEOUT)
+                    self.memo = ((base, found), None)
             except (Unavailable, TimeoutError) as e:
-                memo.append((None, e))
-        result, error = memo[0]
+                self.memo = (None, e)
+        result, error = self.memo
         if error is not None:
             raise error
         return result
-    return listed
+
+    def versions(self):
+        base = self.root()
+        if base is None:
+            return None
+        if self.shared is None:
+            self.shared = _VersionNpm(base)
+        return self.shared
 
 
 def edit_targets(path, root, listed=None):
@@ -303,18 +326,20 @@ def _pipfile(text):
 _LEGACY_PARSERS = {"setup.py": _setup_py, "setup.cfg": _setup_cfg, "Pipfile": _pipfile}
 
 
-def _known(kind, text):
-    """Имена с транзитивными (manifests.known_names) манифеста или файла _LEGACY вида kind; None — не разобран."""
+def _known(kind, text, workspace=None):
+    """Имена с транзитивными (manifests.known_names) манифеста или файла _LEGACY вида kind; None — не разобран.
+    workspace — manifests.NpmWorkspace package.json или None."""
     if kind not in _LEGACY:
-        return manifests.known_names(kind, text)
+        return manifests.known_names(kind, text, workspace)
     lines = _LEGACY_PARSERS[kind](text)
     # Строки требований разбирает разбор файла требований: имя PEP 508, нормализация PEP 503.
     return None if lines is None else manifests.known_names("requirements", "\n".join(lines))
 
 
-def _read(path):
-    """Текст файла в UTF-8 с заменой, переводы строк как есть; None — нет файла; Unavailable — не обычный файл,
-    больше MAX_MANIFEST_BYTES или не прочитан. Файл открывается с O_NONBLOCK: FIFO не вешает хук."""
+def _read(path, kind=None):
+    """Текст файла, декодированный, как его читает менеджер вида kind (manifests.decode; None — UTF-8 с заменой),
+    переводы строк как есть; None — нет файла; Unavailable — не обычный файл, больше MAX_MANIFEST_BYTES или не
+    прочитан. Файл открывается с O_NONBLOCK: FIFO не вешает хук."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except FileNotFoundError:
@@ -330,7 +355,7 @@ def _read(path):
         raise Unavailable(f"не прочитан: {e!r}") from None
     if len(data) > MAX_MANIFEST_BYTES:
         raise Unavailable(f"больше {MAX_MANIFEST_BYTES} байт")
-    return data.decode("utf-8", "replace")
+    return manifests.decode(kind, data)
 
 
 def _replace(text, old, new, replace_all):
@@ -341,13 +366,14 @@ def _replace(text, old, new, replace_all):
     return text.replace(old, new) if replace_all else text.replace(old, new, 1)
 
 
-def edit_texts(tool, tool_input, path):
-    """(текст до или None — файла нет, текст после) правки файловым инструментом; None — правку не
-    вычислить или инструмент сам откажет. Unavailable — файл не прочитан.
+def edit_texts(tool, tool_input, path, kind=None):
+    """(текст до или None — файла нет, текст после) правки файловым инструментом файла path вида kind (_read);
+    None — правку не вычислить или инструмент сам откажет. Unavailable — файл не прочитан.
 
     Edit и MultiEdit, как Claude Code, сопоставляют old_string с текстом файла, где CRLF приведены к LF;
-    текст после — с переводами строк LF."""
-    current = _read(path)
+    текст после — с переводами строк LF. У текста с другим прочтением (manifests.Decoded.other) правка, которая не
+    ложится на первое, вычисляется по второму: какую кодировку видит инструмент, хук не знает."""
+    current = _read(path, kind)
     if tool == "Write":
         content = tool_input.get("content")
         return (current, content) if isinstance(content, str) else None
@@ -359,6 +385,16 @@ def edit_texts(tool, tool_input, path):
             return None
     else:
         return None
+    other = getattr(current, "other", None)
+    for view in [current] if other is None else [current, other]:
+        after = _apply_edits(view, edits)
+        if after is not None:
+            return current, after
+    return None
+
+
+def _apply_edits(current, edits):
+    """Текст current после замен edits, как у Edit и MultiEdit; None — инструмент откажет или правку не вычислить."""
     text = None if current is None else current.replace("\r\n", "\n")
     for edit in edits:
         if not isinstance(edit, dict):
@@ -375,7 +411,7 @@ def edit_texts(tool, tool_input, path):
         text = _replace(text, old, new, edit.get("replace_all") is True)
         if text is None:
             return None
-    return current, text
+    return text
 
 
 def _git(cwd, timeout, *args, root, input=None):
@@ -401,6 +437,7 @@ _REPO_REFS = ("HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REBASE_HEAD", "REVERT_H
 # `git stash pop|apply`, `git merge --squash`, `git cherry-pick -n`, которые ref в _REPO_REFS не оставляют;
 # держатся до `git add` или `git rm` файла.
 _INDEX_STAGES = (":1:", ":2:", ":3:")
+_VERSIONS = _REPO_REFS + _INDEX_STAGES
 
 
 def _objects(out):
@@ -422,11 +459,6 @@ def _objects(out):
     return objects
 
 
-def _blobs(out):
-    """Содержимое блобов вывода `git cat-file --batch`; отсутствующие и не блобы пропущены."""
-    return [data for kind, data in filter(None, _objects(out)) if kind == b"blob"]
-
-
 def _inside(path, root):
     """Каталог path — root или под ним, символические ссылки разрешены."""
     path, root = os.path.realpath(path), os.path.realpath(root)
@@ -437,12 +469,16 @@ def _inside(path, root):
         return False
 
 
-def head_names(path, kind, timeout, root=None):
+def head_names(path, kind, timeout, root=None, versions=None):
     """Имена манифеста path вместе с транзитивными (manifests.known_names) в версиях _REPO_REFS и сторонах
     конфликта _INDEX_STAGES его репозитория, объединённые; None — нет репозитория, файла ни в одной версии или
-    ни одна не разобрана. `cat-file --batch` отдаёт байты блобов без textconv и фильтров одним вызовом git.
+    ни одна не разобрана. `cat-file --batch` отдаёт байты блобов без textconv и фильтров одним вызовом git;
+    package.json каждой версии разбирается с npm workspace той же версии (_VersionNpm). timeout — срок всех вызовов
+    git вместе, секунды.
     root — корень проекта (common.project_root) или None; файл под root ищет репозиторий не выше root (_git),
-    файл вне root и при None — свой репозиторий без ограничения."""
+    файл вне root и при None — свой репозиторий без ограничения и без npm workspace. versions — _VersionNpm корня
+    root, общий для манифестов одной правки или сравнения; None — свой."""
+    deadline = time.monotonic() + timeout
     name = os.path.basename(path)
     cwd = os.path.dirname(path) or "."
     if root is not None and not _inside(cwd, root):
@@ -450,16 +486,169 @@ def head_names(path, kind, timeout, root=None):
     if "\n" in name or "\r" in name:
         # Ввод --batch построчный: имя с переводом строки или возвратом каретки — только версия HEAD отдельным
         # вызовом.
-        out = _git(cwd, timeout, "cat-file", "blob", f"HEAD:./{name}", root=root)
-        blobs = [] if out is None else [out]
+        out = _git(cwd, _remaining(deadline), "cat-file", "blob", f"HEAD:./{name}", root=root)
+        blobs = [] if out is None else [("HEAD", out)]
     else:
-        out = _git(cwd, timeout, "cat-file", "--batch", root=root,
+        out = _git(cwd, _remaining(deadline), "cat-file", "--batch", root=root,
                    input=os.fsencode("".join(f"{ref}:./{name}\n" for ref in _REPO_REFS)
                                      + "".join(f"{stage}./{name}\n" for stage in _INDEX_STAGES)))
-        blobs = [] if out is None else _blobs(out)
-    found = [manifests.known_names(kind, b.decode("utf-8", "replace")) for b in blobs if len(b) <= MAX_MANIFEST_BYTES]
+        blobs = [] if out is None else [(version, obj[1]) for version, obj in zip(_VERSIONS, _objects(out))
+                                         if obj is not None and obj[0] == b"blob"]
+    texts = {version: manifests.decode(kind, data) for version, data in blobs if len(data) <= MAX_MANIFEST_BYTES}
+    npm = {}
+    if kind == "package.json" and root is not None and texts:
+        if versions is None:
+            versions = _VersionNpm(root)
+        npm = versions.of(_project_rel(path, root), texts, deadline)
+    found = [manifests.known_names(kind, text, npm.get(version)) for version, text in texts.items()]
     found = [names for names in found if names is not None]
     return frozenset().union(*found) if found else None
+
+
+def _spec(version, path):
+    """Объект `cat-file` файла path от каталога вызова в версии version: ref — `ref:./path`, сторона индекса —
+    `:N:./path`."""
+    return f"{version}./{path}" if version.startswith(":") else f"{version}:./{path}"
+
+
+def _package_text(obj):
+    """Текст package.json объекта _objects; None — не блоб, нет объекта или больше MAX_MANIFEST_BYTES."""
+    if obj is None or obj[0] != b"blob" or len(obj[1]) > MAX_MANIFEST_BYTES:
+        return None
+    return manifests.decode("package.json", obj[1])
+
+
+class _VersionNpm:
+    """npm workspace версий _VERSIONS проекта root для разбора package.json в head_names и деревья ref с блобами для
+    _tree_names; один на правку (_Listing.versions) или сравнение (compare), чтобы дерево версии читалось один раз, а
+    не на каждый изменённый package.json и не второй раз для имён проекта. Дерево версии для npm (_tree) читается,
+    только если в этой версии у самого package.json или у package.json его каталога-предка есть `workspaces`; тексты
+    предков запоминаются. Пути — от root: `git -C root` с путями `./` в cat-file и ls-files без --full-tree; ls-tree
+    (entries) — с --full-tree: git ищет репозиторий не выше root (_git), так что пути от вершины дерева — пути от
+    root."""
+    __slots__ = ("root", "ancestors", "trees", "index", "blobs", "listed")
+
+    def __init__(self, root):
+        # ancestors — {(версия, каталог): текст package.json или None}; trees — {версия: _Npm или None};
+        # index — {путь: {стадия: SHA}} `ls-files -s`; blobs — {SHA: байты блоба или None}; listed — {ref: {путь:
+        # SHA блоба} или None}.
+        self.root, self.ancestors, self.trees, self.index, self.blobs, self.listed = root, {}, {}, None, {}, {}
+
+    def of(self, rel, texts, deadline):
+        """{версия: manifests.NpmWorkspace} package.json rel (путь от root) с текстами версий texts {версия: текст}.
+        Версии нет в ответе (разбор без workspace), если ни у файла, ни у package.json предков в ней нет
+        `workspaces`, её дерево не прочитано или package.json в нём больше MAX_MANIFESTS."""
+        rel = rel.replace(os.sep, "/")
+        directories = _ancestors(rel)
+        wanted = [(version, directory) for version in texts if version not in self.trees
+                  for directory in directories if (version, directory) not in self.ancestors]
+        if wanted:
+            self._read_ancestors(wanted, deadline)
+        out = {}
+        for version, text in texts.items():
+            if version not in self.trees:
+                own = [text, *(self.ancestors[(version, directory)] for directory in directories)]
+                if not any(manifests.workspace_members("package.json", t) for t in own if t is not None):
+                    continue
+                self.trees[version] = self._tree(version, deadline)
+            npm = self.trees[version]
+            workspace = None if npm is None else npm.of("package.json", rel)
+            if workspace is not None:
+                out[version] = workspace
+        return out
+
+    def _read_ancestors(self, wanted, deadline):
+        """Тексты package.json каталогов wanted [(версия, каталог)] одним `cat-file --batch`; у стороны конфликта
+        индекса файл без этой стороны — его стадия 0. Каталог с переводом строки не ложится в построчный ввод — его
+        package.json как нет."""
+        specs, fed = [], []
+        for version, directory in wanted:
+            if "\n" in directory or "\r" in directory:
+                self.ancestors[(version, directory)] = None
+                continue
+            path = posixpath.join(directory, "package.json")
+            specs.append(_spec(version, path))
+            if version in _INDEX_STAGES:
+                specs.append(_spec(":0:", path))
+            fed.append((version, directory))
+        out = _git(self.root, _remaining(deadline), "cat-file", "--batch", root=self.root,
+                   input=os.fsencode("".join(f"{spec}\n" for spec in specs))) if specs else None
+        objects = [] if out is None else _objects(out)
+        if len(objects) != len(specs):
+            objects = [None] * len(specs)
+        objects = iter(objects)
+        for version, directory in fed:
+            obj = next(objects)
+            if version in _INDEX_STAGES:
+                zero = next(objects)
+                obj = zero if obj is None else obj
+            self.ancestors[(version, directory)] = _package_text(obj)
+
+    def _tree(self, version, deadline):
+        """_Npm дерева версии (_tree_npm): package.json из `ls-tree -r` ref или, у стороны конфликта, из
+        `ls-files -s` (запись стороны, иначе стадия 0); None — дерево не прочитано, package.json нет или их больше
+        MAX_MANIFESTS."""
+        if version in _INDEX_STAGES:
+            if self.index is None:
+                self.index = _index_entries(_git(self.root, _remaining(deadline), "ls-files", "-s", "-z",
+                                                 root=self.root))
+            entries = {path: stages.get(version[1], stages.get("0")) for path, stages in self.index.items()}
+        else:
+            entries = self.entries(version, deadline) or {}
+        entries = {path: sha for path, sha in entries.items() if sha and watched_kind(path) == "package.json"}
+        if not entries or len(entries) > MAX_MANIFESTS:
+            return None
+        blobs = self.read(entries.values(), deadline) or {}
+        texts = {path: blobs.get(sha) for path, sha in entries.items()}
+        return _tree_npm({path: manifests.decode("package.json", data) for path, data in texts.items()
+                          if data is not None})
+
+    def entries(self, tree, deadline):
+        """{путь от корня: SHA блоба} дерева tree — ref или SHA дерева — из `ls-tree -r --full-tree`; None — git не
+        прочитал дерево (нет HEAD, не репозиторий). Дерево читается один раз."""
+        if tree not in self.listed:
+            out = _git(self.root, _remaining(deadline), "ls-tree", "-r", "-z", "--full-tree", tree, root=self.root)
+            self.listed[tree] = None if out is None else _tree_entries(out)
+        return self.listed[tree]
+
+    def read(self, shas, deadline):
+        """{SHA: байты блоба или None — не блоб, объекта нет или больше MAX_MANIFEST_BYTES} блобов shas: ещё не
+        прочитанные — одним `cat-file --batch`; None — git их не прочитал, тогда они не запоминаются."""
+        shas = list(dict.fromkeys(shas))
+        missing = [sha for sha in shas if sha not in self.blobs]
+        if missing:
+            out = _git(self.root, _remaining(deadline), "cat-file", "--batch", root=self.root,
+                       input=os.fsencode("".join(f"{sha}\n" for sha in missing)))
+            if out is None:
+                return None
+            objects = _objects(out)
+            for i, sha in enumerate(missing):
+                obj = objects[i] if i < len(objects) else None
+                self.blobs[sha] = (obj[1] if obj is not None and obj[0] == b"blob" and len(obj[1]) <= MAX_MANIFEST_BYTES
+                                   else None)
+        return {sha: self.blobs[sha] for sha in shas}
+
+
+def _tree_entries(out):
+    """{путь: SHA блоба} вывода `git ls-tree -r -z` out; out None (git не прочитал) — {}."""
+    entries = {}
+    for record in (out or b"").split(b"\0"):
+        meta, _, path = record.partition(b"\t")
+        meta = meta.split()
+        if len(meta) == 3 and meta[1] == b"blob":
+            entries[os.fsdecode(path)] = meta[2].decode("ascii")
+    return entries
+
+
+def _index_entries(out):
+    """{путь: {стадия: SHA}} вывода `git ls-files -s -z` out; out None (git не прочитал) — {}."""
+    entries = {}
+    for record in (out or b"").split(b"\0"):
+        meta, _, path = record.partition(b"\t")
+        meta = meta.split()
+        if len(meta) == 3:
+            entries.setdefault(os.fsdecode(path), {})[meta[2].decode("ascii")] = meta[1].decode("ascii")
+    return entries
 
 
 def fresh_names(old, new, head, project=frozenset):
@@ -480,14 +669,15 @@ def fresh_names(old, new, head, project=frozenset):
     return sorted(added)
 
 
-def edit_names(kind, before, after, head, project=frozenset, rel=None):
+def edit_names(kind, before, after, head, project=frozenset, rel=None, workspaces=(None, None)):
     """Новые имена манифеста вида kind с текстом before (None — файла не было) после правки в after;
     head и project — как у fresh_names; rel — путь манифеста от корня проекта для подключений (_rooted), None —
-    подключения как записаны. Unavailable — after не разобран."""
-    new = manifests.names(kind, after)
+    подключения как записаны; workspaces — manifests.NpmWorkspace package.json до и после правки или None.
+    Unavailable — after не разобран."""
+    new = manifests.names(kind, after, workspaces[1])
     if new is None:
         raise Unavailable("после правки не разобран")
-    old = frozenset() if before is None else manifests.known_names(kind, before)
+    old = frozenset() if before is None else manifests.known_names(kind, before, workspaces[0])
     if rel is not None:
         new, old = _rooted(new, rel), _rooted(old, rel)
     return fresh_names(old, new, head, project)
@@ -541,91 +731,279 @@ def _glob(pattern):
 
 
 # Корневой манифест реестра, чей workspace (manifests.workspace_members) ставит членов из их каталогов по имени.
+# Пакет проекта этих реестров менеджер ставит из каталога только по связи workspace: имя пакета манифеста HEAD и
+# ref здесь не прикрывает зависимость (_tree_names), в прочем манифесте npm и pip ставят его из реестра.
 _WORKSPACE_ROOTS = {"npm": "package.json", "pypi": "pyproject.toml"}
 
 
-def _workspace(root):
-    """{реестр: [(шаблон каталога, исключение)]} workspace корневых манифестов root рабочего дерева."""
-    out = {}
-    for registry, name in _WORKSPACE_ROOTS.items():
-        text = _text(os.path.join(root, name))
-        patterns = [] if text is None else manifests.workspace_members(manifests.kind(name), text)
-        out[registry] = [(_glob(p.removeprefix("!")), p.startswith("!")) for p in patterns]
+# Запомнен по тексту: _workspace_root зовёт его с текстом предка на каждого члена.
+@functools.lru_cache(maxsize=256)
+def _globs(name, text):
+    """((шаблон каталога _glob, исключение), …) workspace корневого манифеста name с текстом text; None — пусто."""
+    patterns = [] if text is None else manifests.workspace_members(manifests.kind(name), text)
+    return tuple((_glob(p.removeprefix("!")), p.startswith("!")) for p in patterns)
+
+
+def _ancestors(rel):
+    """Каталоги-предки манифеста rel (путь от корня с `/`), от ближнего до корня `""`; свой каталог не входит."""
+    directory, out = posixpath.dirname(rel), []
+    while directory:
+        directory = posixpath.dirname(directory)
+        out.append(directory)
     return out
 
 
-def _member(workspace, rel):
-    """Манифест rel — член workspace корня (_workspace) своего реестра: каталог совпал с последним подходящим
-    шаблоном без `!`. Зависимость по имени члена npm и uv ставят из его каталога, не из реестра: имя — пакет
-    проекта."""
-    kind = watched_kind(rel)
-    if os.path.basename(rel) != _WORKSPACE_ROOTS.get(manifests.registry(kind)):
-        return False
-    directory = os.path.dirname(rel.replace(os.sep, "/"))
-    member = False
-    for pattern, exclude in workspace.get(manifests.registry(kind), ()):
-        if pattern.match(directory):
-            member = not exclude
-    return member
+def _disk(root, override=None):
+    """Функция (путь манифеста от root с `/`) → текст файла рабочего дерева (_text) или None, запомненный;
+    override — {путь: текст или None} вместо файла (текст правки)."""
+    @functools.cache
+    def text_of(rel):
+        if override and rel in override:
+            return override[rel]
+        return _text(os.path.join(root, rel), watched_kind(rel))
+    return text_of
 
 
-def project_names(root, kind, deadline):
+def _workspace_root(rel, text_of):
+    """Каталог корня workspace (путь от корня проекта с `/`), чей член — package.json или pyproject.toml rel (путь от
+    корня проекта), или None; text_of(путь) — текст манифеста или None (нет, не прочитан). Корень ищется, как его
+    ищет менеджер из каталога члена, не выше корня проекта: npm — ближайший предок, чей package.json с `workspaces`
+    включает каталог rel (@npmcli/config loadLocalPrefix: предок без package.json, без `workspaces` или не
+    включающий пропускается); uv — первый предок с pyproject.toml, если его `[tool.uv.workspace]` включает каталог
+    rel, иначе не член: проект внутри другого проекта uv членом не считает (uv-workspace find_workspace; проверено
+    `uv lock --offline`, uv 0.13.0). Включает — последний подходящий шаблон без `!`. Не прочитанный pyproject.toml —
+    как нет."""
+    rel = rel.replace(os.sep, "/")
+    name = posixpath.basename(rel)
+    if os.path.isabs(rel) or name not in _WORKSPACE_ROOTS.values() or watched_kind(rel) is None:
+        return None
+    directory = posixpath.dirname(rel)
+    for ancestor in _ancestors(rel):
+        text = text_of(posixpath.join(ancestor, name))
+        if text is None:
+            continue
+        member = False
+        for pattern, exclude in _globs(name, text):
+            if pattern.match(directory[len(ancestor) + 1:] if ancestor else directory):
+                member = not exclude
+        if member:
+            return ancestor
+        if name == "pyproject.toml":
+            return None
+    return None
+
+
+def _npm_place(rel, text_of):
+    """(место, каталог корня) package.json rel в npm workspace: ("member", каталог корня) — член (_workspace_root),
+    ("root", свой каталог) — не член, а у него `workspaces`, (None, None) — прочий. Член со своими `workspaces` —
+    член: npm из его каталога поднимается к предку, чей `workspaces` включает каталог (@npmcli/config
+    loadLocalPrefix), и `workspaces` члена не читает."""
+    rel = rel.replace(os.sep, "/")
+    if os.path.isabs(rel) or watched_kind(rel) != "package.json":
+        return None, None
+    root = _workspace_root(rel, text_of)
+    if root is not None:
+        return "member", root
+    if _globs("package.json", text_of(rel)):
+        return "root", posixpath.dirname(rel)
+    return None, None
+
+
+class _Npm:
+    """npm workspace проекта или версии git для разбора package.json: text_of — тексты package.json по пути от корня
+    (_workspace_root), members — {каталог корня workspace: {имя члена: версия или None}} (_npm_members) и имена
+    бывших членов former (до правки или команды): зависимость на бывшего члена npm берёт из реестра."""
+    __slots__ = ("text_of", "members", "former")
+
+    def __init__(self, text_of, members, former=()):
+        self.text_of, self.members, self.former = text_of, members, frozenset(former)
+
+    def names(self):
+        """Имена членов всех корней."""
+        return frozenset().union(*self.members.values())
+
+    def of(self, kind, rel):
+        """manifests.NpmWorkspace манифеста rel вида kind: члены — своего корня (_npm_place), следимые имена — члены
+        всех корней и бывшие; None — не package.json или нет ни членов, ни бывших."""
+        watched = self.former | self.names()
+        if kind != "package.json" or not watched:
+            return None
+        place, root = _npm_place(rel, self.text_of)
+        return manifests.NpmWorkspace(self.members.get(root, {}), place, watched)
+
+
+def _npm_member(rel, text_of):
+    """Имя пакета манифеста rel — пакет проекта: rel — член npm workspace (_workspace_root). Связь с каталогом члена
+    или реестр различает разбор package.json (manifests.NpmWorkspace). Имя члена uv пакетом проекта не считается:
+    uv ставит его из каталога только по источнику `workspace = true` (_uv_inherited), pip — из PyPI."""
+    return watched_kind(rel) == "package.json" and _workspace_root(rel, text_of) is not None
+
+
+def _uv_inherited(rel, text, text_of):
+    """Имена с местным источником (manifests.uv_sources) `[tool.uv.sources]` корня uv workspace, которые uv ставит из
+    каталога для члена rel (_workspace_root; text_of — как там) с текстом text: источник корня действует на члена,
+    если член не задал источник этого имени сам (docs.astral.sh/uv, «Workspaces»: «Any tool.uv.sources definitions in
+    the workspace root apply to all members, unless overridden»). Не член — пусто; свои источники манифеста разбирает
+    manifests.names."""
+    if watched_kind(rel) != "pyproject":
+        return frozenset()
+    root = _workspace_root(rel, text_of)
+    if root is None:
+        return frozenset()
+    own = manifests.uv_sources(text)
+    return frozenset(name for name, local in manifests.uv_sources(text_of(posixpath.join(root, "pyproject.toml")))
+                     .items() if local and name not in own)
+
+
+def _npm_members(rels, text_of):
+    """{каталог корня: {имя: версия или None}} членов npm workspace (_workspace_root) среди манифестов rels;
+    text_of(путь) — текст или None. Имя члена без `name` — имя каталога, под каталогом `@scope` — `@scope/каталог`
+    (@npmcli/map-workspaces getPackageName, @npmcli/name-from-folder); не разобранный член пропускается."""
+    members = {}
+    for rel in rels:
+        root = _workspace_root(rel, text_of) if watched_kind(rel) == "package.json" else None
+        text = None if root is None else text_of(rel)
+        if text is None or manifests._json_object(text.removeprefix("\ufeff")) is None:
+            continue
+        name = manifests.own_name("package.json", text)
+        if name is None:
+            directory = posixpath.dirname(rel.replace(os.sep, "/"))
+            scope, name = posixpath.basename(posixpath.dirname(directory)), posixpath.basename(directory)
+            name = f"{scope}/{name}" if scope.startswith("@") else name
+        members.setdefault(root, {})[name] = manifests.npm_version(text)
+    return members
+
+
+def _tree_npm(texts):
+    """_Npm версии git по {путь package.json: текст} её дерева: корни workspace и члены — из той же версии; бывших
+    членов нет."""
+    return _Npm(texts.get, _npm_members(list(texts), texts.get))
+
+
+def project_names(root, kind, deadline, listed=None):
     """Имена манифестов реестра вида kind (manifests.registry) под root и, в git, манифестов и файлов _LEGACY
     версии HEAD (_tree_names) с транзитивными и имена пакетов самого проекта этого реестра: манифестов версии HEAD
-    и членов workspace корня (_member). Имя свежего манифеста вне workspace — не пакет проекта: его пишет кто угодно,
-    а проверяется только объявление зависимости. Файлы _LEGACY рабочего дерева имён не дают. Не разобранный и
-    больший MAX_MANIFEST_BYTES манифест не даёт ничего. Unavailable и TimeoutError — как у list_manifests и
-    _tree_names."""
-    mode, found = list_manifests(root, deadline)
+    (кроме npm и PyPI) и членов npm workspace (_npm_member). Имя свежего манифеста вне workspace — не пакет
+    проекта: его пишет кто угодно, а проверяется только объявление зависимости. Файлы _LEGACY рабочего дерева имён
+    не дают. Не разобранный и больший MAX_MANIFEST_BYTES манифест не даёт ничего. listed — перечень правки (listing)
+    корня root: манифесты и режим — из него, дерево HEAD — из его listed.versions(), общего с head_names; None — свой
+    list_manifests в срок deadline и своё дерево. Unavailable и TimeoutError — как у list_manifests и _tree_names."""
+    if listed is None:
+        (mode, found), versions = list_manifests(root, deadline), None
+    else:
+        found, mode, versions = listed()[1], listed.mode, listed.versions()
     registry = manifests.registry(kind)
-    workspace = _workspace(root)
+    text_of = _disk(root)
+    npm = _Npm(text_of, _npm_members(found, text_of) if registry == "npm" else {})
     out = set()
     for rel in found:
         _remaining(deadline)
         other = watched_kind(rel)
         if manifests.registry(other) != registry:
             continue
-        known, own = _parse(os.path.join(root, rel), other)
+        known, own = _parse(os.path.join(root, rel), other, npm.of(other, rel))
         out.update(_rooted(known, rel) or ())
-        if _member(workspace, rel):
+        if _npm_member(rel, text_of):
             out.add(own)
     out.discard(None)
     if mode == "git":
-        out.update((_tree_names(root, "HEAD", deadline) or {}).get(registry, ()))
+        out.update((_tree_names(root, "HEAD", deadline, versions) or {}).get(registry, ()))
     return frozenset(out)
 
 
 def check_edit(tool, tool_input, path, kind, project=frozenset, root=lambda: None, listed=None):
-    """Новые имена правки манифеста path без подключений проверяемых манифестов (_unchecked); project — как у
-    fresh_names; root() — корень проекта для head_names и перечня или None, зовётся только для версий git и
-    подключений; listed — перечень listing(root), None — свой. None — правку не вычислить. Unavailable — не
-    проверить: не разобран или манифесты проекта не перечислить; TimeoutError — перечень манифестов для подключения
-    не уложился в HEAD_TIMEOUT."""
-    texts = edit_texts(tool, tool_input, path)
+    """Новые имена правки манифеста path без подключений проверяемых манифестов (_unchecked) и с именами других
+    package.json, которые правка членов npm workspace переводит со связи на реестр (_edit_workspaces); project — как
+    у fresh_names; root() — корень проекта для head_names и перечня или None, зовётся только для версий git,
+    подключений и npm workspace; listed — перечень listing(root), его versions() читают версии git head_names, None —
+    свой. None — правку не вычислить.
+    Unavailable — не проверить: не разобран или манифесты проекта не перечислить; TimeoutError — перечень манифестов
+    для подключения или npm workspace не уложился в HEAD_TIMEOUT."""
+    texts = edit_texts(tool, tool_input, path, kind)
     if texts is None:
         return None
     before, after = texts
+    if kind == "requirements":
+        # Файл пишется в UTF-8, а pip декодирует его по BOM и объявлению PEP 263 (manifests.decode).
+        after = manifests.decode(kind, after.encode("utf-8", "surrogatepass"))
     rel = _project_rel(path, root())
-    names = edit_names(kind, before, after, lambda: _rooted(head_names(path, kind, HEAD_TIMEOUT, root()), rel),
-                       project, rel)
-    return _unchecked(names, listed or listing(root))
+    listed = listed or listing(root)
+    workspaces, effects = _edit_workspaces(kind, rel, before, after, root(), listed)
+
+    def own_project():
+        names = project()
+        if kind == "pyproject" and root() is not None:
+            names = names | _uv_inherited(rel, after, _disk(root()))
+        return names
+    names = edit_names(kind, before, after,
+                       lambda: _rooted(head_names(path, kind, HEAD_TIMEOUT, root(), listed.versions()), rel),
+                       own_project, rel, workspaces)
+    if effects:
+        effects -= project()
+    return _unchecked(sorted(set(names) | effects), listed, kind)
 
 
-def _unchecked(names, listed):
-    """names без подключений manifests.Include файлов, которые проверяются сами: путь без схемы URL от корня проекта
-    (_rooted), с разрешёнными ссылками, — манифест из перечня проекта listed() = (корень, [путь от корня])
-    (list_manifests) или None — проект неизвестен, подключения остаются. Файл, исключённый git, в перечень не входит
-    и не проверяется: его подключение — новое имя. listed() зовётся, только если подключение есть."""
+def _edit_workspaces(kind, rel, before, after, root, listed):
+    """((manifests.NpmWorkspace до правки или None, после или None), {новые имена других package.json проекта})
+    правки package.json rel: корни и члены npm workspace — по файлам проекта listed() (listing), у правленого файла —
+    по тексту before и after. Правка, которая меняет членов (имя, версия) или место package.json в workspace
+    (шаблоны, `workspaces`), переводит зависимость другого package.json на члена со связи с каталогом на реестр: такие
+    имена — второй элемент. Членов нет ни до, ни после — (None, None) и пусто. Перечень не получен (Unavailable) —
+    то же, если правленый файл ни до, ни после не корень и не член по предкам на диске: его имена без workspace
+    сверяет project() с тем же пределом list_manifests; иначе Unavailable."""
+    if kind != "package.json" or root is None or os.path.isabs(rel):
+        return (None, None), set()
+    rel = rel.replace(os.sep, "/")
+    sides = (_disk(root, {rel: before}), _disk(root, {rel: after}))
+    try:
+        found = listed()
+    except Unavailable:
+        if any(_npm_place(rel, text_of)[0] for text_of in sides):
+            raise
+        return (None, None), set()
+    if found is None:
+        return (None, None), set()
+    rels = [r for r in found[1] if r != rel and watched_kind(r) == "package.json"] + [rel]
+    npm = _Npm(sides[0], _npm_members(rels, sides[0]))
+    npm_after = _Npm(sides[1], _npm_members(rels, sides[1]), npm.names())
+    effects = set()
+    if (npm.members, [_npm_place(r, sides[0]) for r in rels]) != (npm_after.members,
+                                                                  [_npm_place(r, sides[1]) for r in rels]):
+        for r in rels[:-1]:
+            text = sides[0](r)
+            if text is None:
+                continue
+            old = manifests.names("package.json", text, npm.of("package.json", r))
+            new = manifests.names("package.json", text, npm_after.of("package.json", r))
+            if old is not None and new is not None:
+                effects |= new - old
+    return (npm.of(kind, rel), npm_after.of(kind, rel)), effects
+
+
+# Вид, которым менеджер читает подключённый файл под любым именем: pip — `-r` и `-c`, setuptools и
+# hatch-requirements-txt — файлы `dynamic` pyproject (manifests._dynamic_files) как требования, Bundler —
+# `eval_gemfile` как Gemfile.
+_INCLUDE_KINDS = {"requirements": "requirements", "pyproject": "requirements", "gemfile": "gemfile"}
+
+
+def _unchecked(names, listed, kind):
+    """names манифеста вида kind без подключений manifests.Include файлов, которые проверяются сами: путь без схемы
+    URL от корня проекта (_rooted), с разрешёнными ссылками, — манифест из перечня проекта listed() = (корень, [путь
+    от корня]) (list_manifests) того вида, которым подключённый файл читает менеджер (_INCLUDE_KINDS); None —
+    проект неизвестен, подключения остаются. Манифест другого вида (`-r Gemfile`) проверяется по своему виду, а
+    ставится по виду подключающего: его подключение — новое имя. Файл, исключённый git, в перечень не входит и не
+    проверяется: его подключение — новое имя. listed() зовётся, только если подключение есть."""
     if not any(isinstance(name, manifests.Include) for name in names):
         return names
     found = listed()
     if found is None:
         return names
     base, rels = found
-    checked = {os.path.realpath(os.path.join(base, rel)) for rel in rels}
+    read_as = _INCLUDE_KINDS.get(kind)
+    checked = {(os.path.realpath(os.path.join(base, rel)), watched_kind(rel)) for rel in rels}
     return [name for name in names if not (
         isinstance(name, manifests.Include) and not _SCHEME.match(name.path)
-        and os.path.realpath(os.path.join(base, name.path)) in checked)]
+        and (os.path.realpath(os.path.join(base, name.path)), read_as) in checked)]
 
 
 def _remaining(deadline):
@@ -680,35 +1058,39 @@ def _stat(path):
     return [st.st_size, st.st_mtime_ns, st.st_ctime_ns] if stat.S_ISREG(st.st_mode) else None
 
 
-def _text(path):
-    """Текст манифеста; None — нет, не прочитан или больше MAX_MANIFEST_BYTES."""
+def _text(path, kind=None):
+    """Текст манифеста вида kind (_read); None — нет, не прочитан или больше MAX_MANIFEST_BYTES."""
     try:
-        return _read(path)
+        return _read(path, kind)
     except Unavailable:
         return None
 
 
-def _parse(path, kind):
-    """(имена с транзитивными или None, имя пакета самого манифеста или None) манифеста."""
-    text = _text(path)
+def _parse(path, kind, workspace=None):
+    """(имена с транзитивными или None, имя пакета самого манифеста или None) манифеста; workspace — как у _known."""
+    text = _text(path, kind)
     if text is None:
         return None, None
-    return _known(kind, text), manifests.own_name(kind, text)
+    return _known(kind, text, workspace), manifests.own_name(kind, text)
 
 
 def take(root, deadline):
     """Снимок: {"root", "mode", "ts", "files": {путь: [size, mtime_ns, ctime_ns, имена с транзитивными (_dump_names)
-    или None, имя пакета манифеста или None]}}; поле "known" (restored_names) добавляет вызывающий. Файлы _LEGACY
-    рабочего дерева в снимок не входят."""
+    или None, имя пакета манифеста или None]}, "npm": {каталог корня npm workspace: {имя члена: версия или None}}}
+    (_npm_members); package.json разбирается с этими членами (_Npm). Поле "known" (restored_names) добавляет
+    вызывающий. Файлы _LEGACY рабочего дерева в снимок не входят."""
     mode, found = list_manifests(root, deadline)
-    entry = {"root": str(root), "mode": mode, "ts": time.time(), "files": {}}
+    text_of = _disk(root)
+    npm = _Npm(text_of, _npm_members(found, text_of))
+    entry = {"root": str(root), "mode": mode, "ts": time.time(), "files": {}, "npm": npm.members}
     for rel in found:
         _remaining(deadline)
         path = os.path.join(root, rel)
         st = _stat(path)
         if st is None:
             continue
-        known, own = _parse(path, watched_kind(rel))
+        kind = watched_kind(rel)
+        known, own = _parse(path, kind, npm.of(kind, rel))
         entry["files"][rel] = [*st, None if known is None else _dump_names(_rooted(known, rel)), own]
     return entry
 
@@ -739,9 +1121,13 @@ def compare(entry, deadline):
     списке непроверенных. Имя из любого манифеста того же реестра
     (manifests.registry) в снимке, из ref до начала сессии (entry["known"], restored_names, с именами пакетов их
     манифестов), в git — из манифестов и файлов _LEGACY версии HEAD и имена пакетов её манифестов (_tree_names,
-    читается, только если после old и версий файла что-то осталось) и имя пакета члена workspace корня после
-    команды (_member; в снимке или в манифесте после команды) — не новое: перенос, копия, член workspace, возврат
-    работы автора. Подключение манифеста из перечня после команды — не новое имя (_unchecked).
+    читается, только если после old и версий файла что-то осталось; без имён пакетов npm и PyPI), имя пакета члена
+    npm workspace после команды (_npm_member; в снимке или в манифесте после команды) и, в члене uv workspace,
+    имя с местным источником корня (_uv_inherited) — не новое: перенос, копия, член workspace, возврат работы
+    автора. Подключение манифеста из перечня после команды — не новое имя (_unchecked). Версии git изменённых
+    package.json разбираются с одним _VersionNpm на сравнение. package.json
+    разбирается с членами npm workspace после команды (_Npm); члены изменились против снимка (entry["npm"]) — каждый
+    package.json перечитывается и с тем же size, mtime и ctime: зависимость на члена могла уйти со связи на реестр.
 
     Режим сменился за команду (`git init`) или манифестов теперь не перечислить (больше MAX_MANIFESTS, вне git
     файлов больше MAX_WALK_FILES) — сверяются только пути снимка, третий элемент — причина: новые манифесты не
@@ -756,12 +1142,15 @@ def compare(entry, deadline):
         mode, found, lost = entry["mode"], [], str(e)
     if lost is not None:
         found = list(before)
-    workspace = _workspace(root)
+    text_of = _disk(root)
+    npm = _Npm(text_of, _npm_members(found, text_of), frozenset().union(*entry["npm"].values()))
+    members_changed = npm.members != entry["npm"]
+    versions = _VersionNpm(root)
     project = {registry: set(_load_names(names)) for registry, names in entry.get("known", {}).items()}
     for rel, (*_, known, own) in before.items():
         names = project.setdefault(manifests.registry(watched_kind(rel)), set())
         names.update(_load_names(known or ()))
-        if own is not None and _member(workspace, rel):
+        if own is not None and _npm_member(rel, text_of):
             names.add(own)
     changed, unknown = [], []
     for rel in found:
@@ -769,34 +1158,37 @@ def compare(entry, deadline):
         path = os.path.join(root, rel)
         st = _stat(path)
         was = before.get(rel)
-        if st is None or isinstance(was, list) and was[:3] == st:
-            continue
         kind = watched_kind(rel)
-        text = _text(path)
-        new = None if text is None else _rooted(manifests.names(kind, text), rel)
+        if st is None or isinstance(was, list) and was[:3] == st and not (members_changed and kind == "package.json"):
+            continue
+        text = text_of(rel)
+        new = None if text is None else _rooted(manifests.names(kind, text, npm.of(kind, rel)), rel)
         if new is None:
             unknown.append(rel)
             continue
-        own = manifests.own_name(kind, text) if _member(workspace, rel) else None
+        own = manifests.own_name(kind, text) if _npm_member(rel, text_of) else None
         project.setdefault(manifests.registry(kind), set()).update(() if own is None else (own,))
-        changed.append((rel, path, kind, new, was))
+        changed.append((rel, path, kind, new, was, _uv_inherited(rel, text, text_of)))
     head_tree = []
 
-    def project_of(kind):
+    def project_of(kind, inherited):
         if mode == "git" and not head_tree:
-            head_tree.append(_tree_names(root, "HEAD", deadline) or {})
+            head_tree.append(_tree_names(root, "HEAD", deadline, versions) or {})
         registry = manifests.registry(kind)
-        return frozenset(project.get(registry, ())).union(head_tree[0].get(registry, ()) if head_tree else ())
+        return frozenset(project.get(registry, ())).union(head_tree[0].get(registry, ()) if head_tree else (),
+                                                          inherited)
     added = {}
-    for rel, path, kind, new, was in changed:
+    for rel, path, kind, new, was, inherited in changed:
         if was is None:
             old = frozenset()
         else:
             old = None if was[3] is None else _load_names(was[3])
 
         def head(path=path, kind=kind, rel=rel):
-            return _rooted(head_names(path, kind, _remaining(deadline), root), rel) if mode == "git" else None
-        names = _unchecked(fresh_names(old, new, head, lambda kind=kind: project_of(kind)), lambda: (root, found))
+            return _rooted(head_names(path, kind, _remaining(deadline), root, versions), rel) if mode == "git" else None
+        names = _unchecked(fresh_names(old, new, head,
+                                       lambda kind=kind, inherited=inherited: project_of(kind, inherited)),
+                           lambda: (root, found), kind)
         if names:
             added[rel] = names
     return added, unknown, lost
@@ -917,32 +1309,35 @@ def _old_trees(root, refs, start, deadline):
     return list(dict.fromkeys(trees))
 
 
-def _tree_names(root, tree, deadline):
-    """{реестр: имена с транзитивными и имена пакетов манифестов} манифестов и файлов _LEGACY (source_kind) дерева
-    tree — ref или SHA дерева; None — git не прочитал дерево (нет HEAD, не репозиторий). Пути с переводом строки не
-    ложатся в построчный ввод --batch и пропускаются. Unavailable — манифестов в дереве больше MAX_MANIFESTS;
+def _tree_names(root, tree, deadline, versions=None):
+    """{реестр: имена с транзитивными и имена пакетов манифестов (кроме npm и PyPI, _WORKSPACE_ROOTS)} манифестов и
+    файлов _LEGACY (source_kind) дерева tree — ref или SHA дерева; None — git не прочитал дерево (нет HEAD, не
+    репозиторий) или его блобы. package.json разбирается с npm workspace того же дерева (_tree_npm). Пути с переводом
+    строки или возвратом каретки пропускаются. Дерево и блобы читает versions — _VersionNpm корня root, общий с
+    head_names правки или сравнения; None — свой. Unavailable — манифестов в дереве больше MAX_MANIFESTS;
     TimeoutError — срок deadline."""
-    listed = _git(root, _remaining(deadline), "ls-tree", "-r", "-z", "--name-only", "--full-tree", tree, root=root)
-    if listed is None:
+    if versions is None:
+        versions = _VersionNpm(root)
+    entries = versions.entries(tree, deadline)
+    if entries is None:
         return None
-    paths = [p for p in (os.fsdecode(e) for e in listed.split(b"\0") if e)
-             if source_kind(p) and "\n" not in p and "\r" not in p]
+    paths = [p for p in entries if source_kind(p) and "\n" not in p and "\r" not in p]
     if len(paths) > MAX_MANIFESTS:
         raise Unavailable(f"манифестов в {tree} больше {MAX_MANIFESTS}")
     known = {}
     if not paths:
         return known
-    out = _git(root, _remaining(deadline), "cat-file", "--batch", root=root,
-               input=os.fsencode("".join(f"{tree}:{p}\n" for p in paths)))
-    if out is None:
+    read = versions.read((entries[p] for p in paths), deadline)
+    if read is None:
         return None
-    for path, obj in zip(paths, _objects(out)):
-        if obj is None or obj[0] != b"blob" or len(obj[1]) > MAX_MANIFEST_BYTES:
-            continue
+    blobs = [(path, read[entries[path]]) for path in paths if read[entries[path]] is not None]
+    npm = _tree_npm({path: manifests.decode("package.json", data) for path, data in blobs
+                     if source_kind(path) == "package.json"})
+    for path, data in blobs:
         kind = source_kind(path)
-        text = obj[1].decode("utf-8", "replace")
-        names = set(_rooted(_known(kind, text), path) or ())
-        if kind not in _LEGACY:
+        text = manifests.decode(kind, data)
+        names = set(_rooted(_known(kind, text, npm.of(kind, path)), path) or ())
+        if kind not in _LEGACY and manifests.registry(kind) not in _WORKSPACE_ROOTS:
             names.add(manifests.own_name(kind, text))
         names.discard(None)
         if names:
@@ -1055,11 +1450,12 @@ def _old_patch_names(patches, start, base, deadline):
 
 
 def restored_names(root, command, start, deadline, cwd=None):
-    """{реестр: имена с транзитивными и имена пакетов (_dump_names)} манифестов и файлов _LEGACY ref, откуда command
-    возвращает файлы (command_refs), если ref создан до start — начала сессии (session_start), и слова изменённых
-    строк манифестов в файлах патчей `git apply` (command_patches), не менявшихся с start; относительный путь патча —
-    от cwd, без него — от root. Это работа до сессии, после команды такие имена не новые. start None, ref
-    моложе или не найден, патч изменён в сессии — имена не добавляются: сравнение блокирует, как без ref.
+    """{реестр: имена с транзитивными и имена пакетов (_tree_names, _dump_names)} манифестов и файлов _LEGACY ref,
+    откуда command возвращает файлы (command_refs), если ref создан до start — начала сессии (session_start), и
+    слова изменённых строк манифестов в файлах патчей `git apply` (command_patches), не менявшихся с start;
+    относительный путь патча — от cwd, без него — от root. Это работа до сессии, после команды такие имена не
+    новые. start None, ref моложе или не найден, патч изменён в сессии — имена не добавляются: сравнение блокирует,
+    как без ref.
     Unavailable — имена ref не прочитаны: срок deadline вышел, манифестов в дереве больше MAX_MANIFESTS или git
     не прочитал дерево.
 
@@ -1122,7 +1518,10 @@ def pop(session, tool_use_id):
              and all(isinstance(v, list) and len(v) == 5 and (v[3] is None or _valid_names(v[3]))
                      and (v[4] is None or isinstance(v[4], str)) for v in entry["files"].values())
              and isinstance(entry.get("known", {}), dict)
-             and all(_valid_names(v) for v in entry.get("known", {}).values()))
+             and all(_valid_names(v) for v in entry.get("known", {}).values())
+             and isinstance(entry.get("npm"), dict)
+             and all(isinstance(members, dict) and all(v is None or isinstance(v, str) for v in members.values())
+                     for members in entry["npm"].values()))
     return entry if valid else None
 
 

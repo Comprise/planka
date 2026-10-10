@@ -593,6 +593,15 @@ class SubscriptAssignmentTest(unittest.TestCase):
                 simple = shparse.simple_commands(shparse.parse(text))[0]
                 self.assertEqual((len(simple.assigns), len(simple.words)), (0, 4))
 
+    def test_subscript_word_quote_removal(self):
+        # Без `=` за `]` слово раскрывается как обычное: `\\` вне кавычек снимается (проверено bash 5.3: argv).
+        for text, word in [("y=1 x[\\n\\p\\m] c", "x[npm]"), ("x[\\a] c", "x[a]"), ("x[ |\\'] c", "x[ |']"),
+                           ("x[a\\\"b] c", 'x[a"b]'), ("x[\\\\] c", "x[\\]"), ("x[\\]] c", "x[]]"),
+                           ("x[\"\\a\"] c", "x[\\a]"), ("x[a]b[\\c] d", "x[a]b[c]")]:
+            with self.subTest(text):
+                simple = shparse.simple_commands(shparse.parse(text))[0]
+                self.assertEqual(simple.words[0].literal(), word)
+
 
 class ArrayBackslashReexpandTest(unittest.TestCase):
     """`\\` в слове скобок массива внутри подстановки: parse_compound_assignment снимает PST_NOEXPAND, и read_token_word
@@ -790,6 +799,94 @@ class HeredocTest(unittest.TestCase):
         docs = [n for n in shparse.walk(script) if type(n) is shparse.Heredoc]
         self.assertEqual([d.body_text for d in docs], ["npm i x\n"])
         self.assertFalse(runs("x=${ $(cat <<E\nnpm i x\nE\n); }"))
+
+    def test_terminator_with_substitution(self):
+        # bash сравнивает строку с текстом слова, где подстановка напечатана print_comsub; саму подстановку
+        # терминатора не исполняет. Печать проверена bash 5.3.20 (предупреждение о конце ввода называет ожидаемый
+        # терминатор).
+        printed = {"$(b)": "$(b)", "$( b )": "$(b)", "$(b;c)": "$(b; c)", "$(b;)": "$(b)", "$(b|c)": "$(b | c)",
+                   "$(b&&c||d)": "$(b && c || d)", "$(b&c)": "$(b & c)", "$(b;c&)": "$(b; c &)", "$(<b)": "$(< b)",
+                   "$(b 1>c)": "$(b > c)", "$(b 01>c)": "$(b > c)", "$(b 0<>c)": "$(b <> c)",
+                   "$(b 3<<<c)": "$(b 3<<< c)", "$(b &>>c)": "$(b &>> c)", "$(x=1 >c b d)": "$(x=1 b d > c)",
+                   "$(b;\nc)": "$(b; c)", "$(b &&\nc)": "$(b && c)", "$(b |\nc)": "$(b | c)", "$(b\n)": "$(b)",
+                   "$(b \"c\")": "$(b \"c\")", "\"$(b \"c\")\"": "$(b c)", "x\"$(b \"c\")\"": "x$(b c)",
+                   "$(b $'\\x41')": "$(b 'A')", "$(b c\\\nd)": "$(b cd)", "${ b;}": "${ b; }",
+                   "${ b & }": "${ b & }", "${| b; }": "${|b; }", "${|b;c;}": "${|b; c; }", ">(b;c)": ">(b; c)",
+                   "x<(b)y": "x<(b)y", "${x:-$(b;c)}": "${x:-$(b; c)}", "$(($(b;c)))": "$(($(b; c)))",
+                   "$(b \"$(c;d)\")": "$(b \"$(c; d)\")", "$(b <(c;d))": "$(b <(c; d))", "`b;c`": "`b;c`"}
+        for word, term in printed.items():
+            with self.subTest(word):
+                docs = nodes("cat <<" + word + "\nq", shparse.Heredoc)
+                self.assertEqual(docs[0].term, term)
+        for text in ["cat <<$(b)\nq\n$(b)\nnpm i x", "cat <<$(b;c)\nq\n$(b; c)\nnpm i x",
+                     "cat <<\"$(b)\"\nq\n$(b)\nnpm i x", "cat <<x$(b)\nq\nx$(b)\nnpm i x",
+                     "cat <<${ b; }\nq\n${ b; }\nnpm i x", "cat <<x<(b)\nq\nx<(b)\nnpm i x",
+                     "cat <<$(<b)\nq\n$(< b)\nnpm i x"]:
+            with self.subTest(text):
+                self.assertEqual(cmds(text), [["cat"], ["npm", "i", "x"]])
+        # Строка не в напечатанном виде тело не кончает.
+        self.assertEqual(cmds("cat <<$(b;c)\nq\n$(b;c)\nnpm i x"), [["cat"], ["b"], ["c"]])
+
+    def test_terminator_funsub_newline(self):
+        # Перевод строки перед `}` у `${ …}`, `${|…}` bash печатает `\n }` (was_newline в parse_comsub), `;` перед
+        # ним — нет. Печать проверена bash 5.3.20.
+        printed = {"${ b\n}": "${ b\n }", "${|b\n}": "${|b\n }", "${ b &\n}": "${ b &\n }",
+                   "${ b;\n}": "${ b\n }", "${ b; c\n}": "${ b; c\n }", "${ b && c\n}": "${ b && c\n }",
+                   "${ b\n\n}": "${ b\n }", "${ b;  \n}": "${ b\n }", "${ b;\\\n}": "${ b; }"}
+        for word, term in printed.items():
+            with self.subTest(word):
+                docs = nodes("cat <<" + word + "\nq", shparse.Heredoc)
+                self.assertEqual(docs[0].term, term)
+        # Терминатор с переводом строки bash сравнивает с одной строкой: тело — до конца ввода.
+        script = shparse.parse("cat <<${ b\n}\nq\n${ b\n }\nnpm i x")
+        self.assertEqual((cmds("cat <<${ b\n}\nq\n${ b\n }\nnpm i x"), script.error), ([["cat"], ["b"]], None))
+        for text in ["cat <<'a\nb'\nx\na\nb\nnpm i x",
+                     "cat <<a\"\n\"b\nx\na\nb\nnpm i x", "cat <<-'a\nb'\nx\na\nb\nnpm i x"]:
+            with self.subTest(text):
+                script = shparse.parse(text)
+                self.assertEqual((cmds(text), script.error), ([["cat"]], None))
+
+    def test_terminator_quotes_top_level(self):
+        # W_QUOTED — за кавычками и `\\` на верхнем уровне слова; внутри `${…}`, `$((…))`, `$[…]`, `` `…` ``,
+        # `$(…)` они терминатор в кавычках не делают: тело раскрывается, терминатор — без снятия кавычек.
+        # Проверено bash 5.3.20.
+        for word in ['${x:-"a"}', '$((1+"2"))', '`b "c"`', '$[1+"2"]', "${x#\\a}", '$(echo "a")']:
+            with self.subTest(word):
+                doc = nodes("cat <<" + word + "\nq", shparse.Heredoc)[0]
+                self.assertEqual((doc.term, doc.quoted), (word, False))
+                self.assertEqual(cmds("cat <<" + word + "\nq\n" + word + "\nnpm i x"), [["cat"], ["npm", "i", "x"]])
+                self.assertTrue(runs("cat <<" + word + "\n$(npm i x)\n" + word))
+        quoted = {"$'a'": "a", '$"a"': "a", 'a"b"': "ab", "a\\b": "ab", '"$(b)"': "$(b)", "`b`\\x": "`b`x"}
+        for word, term in quoted.items():
+            with self.subTest(word):
+                doc = nodes("cat <<" + word + "\nq", shparse.Heredoc)[0]
+                self.assertEqual((doc.term, doc.quoted), (term, True))
+        doc = nodes("cat <<${x:-$'a'}\nq", shparse.Heredoc)[0]
+        self.assertEqual((doc.term, doc.quoted), ("${x:-'a'}", False))
+
+    def test_terminator_print_unknown(self):
+        # Печать тела, которую разбор не повторяет (составная команда, `|&`, дублирование дескриптора, `!`,
+        # комментарий): тело кончить нечем — ошибка вида INTERNAL, а не тело до конца ввода.
+        for word in ["$(if b; then c; fi)", "$(b|&c)", "$(b 2>&1)", "$(! b)", "$(b # z\n)", "$(b # z\nc)",
+                     "$({ b; })", "$(b {x}>c)", "$( )", "$(cat <<E\nE\n)"]:
+            with self.subTest(word):
+                script = shparse.parse("cat <<" + word + "\nq\nnpm i x")
+                self.assertEqual(script.error, shparse.SyntaxIssue(0, True, shparse.INTERNAL))
+
+    def test_terminator_print_newline(self):
+        # Команды тела на разных строках print_comsub печатает через один `\n`, без отступов и пустых строк.
+        # Печать проверена bash 5.3.
+        printed = {"$(b\nc)": "$(b\nc)", "$(b\n\nc)": "$(b\nc)", "$(b\nc;d)": "$(b\nc; d)",
+                   "$(b|c\nd)": "$(b | c\nd)", "${ b\nc; }": "${ b\nc; }", "$(b\nc &)": "$(b\nc &)",
+                   "$(b $(c\nd))": "$(b $(c\nd))", "$(\nb\n\tc\n)": "$(b\nc)", "${ b\nc &\n}": "${ b\nc &\n }",
+                   "${|b\nc;}": "${|b\nc; }", "x<(b\nc)y": "x<(b\nc)y", "$(b && c\nd || e)": "$(b && c\nd || e)"}
+        for word, term in printed.items():
+            with self.subTest(word):
+                docs = nodes("cat <<" + word + "\nq", shparse.Heredoc)
+                self.assertEqual(docs[0].term, term)
+        # Терминатор с переводом строки bash сравнивает с одной строкой: тело — до конца ввода.
+        script = shparse.parse("cat <<$(b\nc)\nq\nnpm i x")
+        self.assertEqual((cmds("cat <<$(b\nc)\nq\nnpm i x"), script.error), ([["cat"]], None))
 
     def test_heredoc_limit(self):
         # Больше HEREDOC_MAX (16) heredoc в одной команде bash не принимает.

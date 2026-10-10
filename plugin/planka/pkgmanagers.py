@@ -10,9 +10,11 @@ _C_FLAGS = ("-c", "--command")
 # Команды, которым тело heredoc, строка here-string и вход конвейера передаются как команды, если у них нет
 # скрипта и `-c`.
 _SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "ssh"}
-# Скрипт-аргумент, который читает stdin: оболочка с ним — тоже без скрипта.
-_STDIN_SCRIPTS = {"-", "/dev/stdin"}
-# Команды, исполняющие в текущей оболочке файл процесс-подстановки `<(…)` или stdin со скриптом из _STDIN_SCRIPTS.
+# Скрипт-аргумент, который читает stdin или открытый дескриптор: `-`, `/dev/stdin`, `/dev/fd/N` (так bash передаёт
+# процесс-подстановку `<(…)`: `bash <(…) arg` исполняет её вывод), `/proc/<процесс>/fd/N`. Оболочка с ним читает
+# вход конвейера, heredoc или процесс-подстановки.
+_STDIN_SCRIPT = re.compile(r"-|/dev/stdin|/dev/fd/\d+|/proc/[^/]+/fd/\d+")
+# Команды, исполняющие в текущей оболочке файл-аргумент: со скриптом _STDIN_SCRIPT — вход или процесс-подстановку.
 _SOURCES = {"source", "."}
 # Оболочки, исполняющие строку после `-c`.
 _C_SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
@@ -93,12 +95,18 @@ _PIPENV_VALUE_FLAGS = {"-r", "--requirements", "--python", "--pypi-mirror", "-i"
                        "--extra-pip-args", "-e", "--editable"}
 _CONDA_VALUE_FLAGS = {"-n", "--name", "-p", "--prefix", "-c", "--channel", "--file", "-f", "--revision",
                       "--repodata-fn", "--solver", "--experimental-solver", "--subdir", "--platform", "-r",
-                      "--root-prefix", "--rc-file", "--channel-priority", "--cert"}
+                      "--root-prefix", "--rc-file", "--channel-priority", "--cert", "--clone"}
+# Общие флаги conda, mamba и micromamba со значением перед подкомандой (`micromamba -r /x install y`; micromamba
+# src/umamba.cpp: общие опции — и у корня).
+_CONDA_GLOBAL_VALUE_FLAGS = {"-r", "--root-prefix", "--rc-file", "--log-level"}
 _CONDA_RUN_VALUE_FLAGS = {"-n", "--name", "-p", "--prefix", "--cwd", "-r", "--root-prefix", "-a", "--attach"}
 _DOTNET_ADD_VALUE_FLAGS = {"-v", "--version", "-f", "--framework", "-s", "--source", "--package-directory",
                            "--project"}
 _DOTNET_TOOL_VALUE_FLAGS = {"--tool-path", "--version", "--add-source", "--configfile", "--framework", "-a",
                             "--arch", "--tool-manifest", "-v", "--verbosity"}
+# Флаги `dart pub` со значением перед подкомандой (`dart pub --help`: `-C, --directory=<dir>`; ещё `-v`,
+# `--trace`, `--[no-]color` без значения).
+_PUB_GLOBAL_VALUE_FLAGS = {"-C", "--directory"}
 _PUB_VALUE_FLAGS = {"-C", "--directory", "--git-url", "--git-ref", "--git-path", "--hosted-url", "--path", "--sdk",
                     "-s", "--source", "-x", "--executable"}
 _SWIFT_PACKAGE_VALUE_FLAGS = {"--package-path", "--scratch-path", "--build-path", "--cache-path", "--config-path",
@@ -113,7 +121,7 @@ _GLOBAL_FLAGS = {"npm": _NPM_VALUE_FLAGS, "pnpm": _PNPM_VALUE_FLAGS, "yarn": _YA
                  "uv": _UV_VALUE_FLAGS, "poetry": _POETRY_VALUE_FLAGS, "cargo": _CARGO_VALUE_FLAGS,
                  "composer": _COMPOSER_VALUE_FLAGS, "bundle": _BUNDLE_VALUE_FLAGS, "go": _GO_VALUE_FLAGS,
                  "pipenv": _PIPENV_VALUE_FLAGS, "pipx": _NO_VALUE_FLAGS, "dotnet": _NO_VALUE_FLAGS,
-                 "dart": _NO_VALUE_FLAGS, "flutter": _NO_VALUE_FLAGS,
+                 "dart": _NO_VALUE_FLAGS, "flutter": {"-d", "--device-id"},
                  "hatch": {"-e", "--env", "-p", "--project", "--data-dir", "--cache-dir", "--config"}}
 # Флаги со значением для команды, чьё имя — подстановка (_expanded_install): менеджер неизвестен, наборы
 # менеджеров JavaScript и pip.
@@ -135,8 +143,9 @@ _DRY_RUN_MANAGERS = {"pnpm", "bun", "deno", "uv", "poetry", "cargo", "composer",
                      "dnf5", "microdnf", "yum", "zypper", "pacman", "yay", "paru", "apk", "snap", "flatpak", "nix",
                      "nix-env", "pdm", "rye", "pixi", "cabal", "stack", "opam", "luarocks", "vcpkg", "conan"}
 _APT_SIMULATE = {"-s", "--simulate", "--just-print", "--dry-run", "--recon", "--no-act"}
-# Длинные имена пробного прогона apt и apt-get без `--`, в нижнем регистре.
-_APT_SIMULATE_LONG = {f[2:] for f in _APT_SIMULATE if f.startswith("--")}
+# Булевы флаги apt и apt-get без установки, длинные имена без `--` в нижнем регистре → буква флага: пробный прогон
+# `-s` и только скачивание `-d`/`--download-only` (apt-private/private-cmndline.cc).
+_APT_NO_INSTALL_LONG = {**{f[2:]: "s" for f in _APT_SIMULATE if f.startswith("--")}, "download-only": "d"}
 _APTS = {"apt", "apt-get", "aptitude"}
 
 # Локальные архивы пакетов.
@@ -145,8 +154,10 @@ _ARCHIVES = (".whl", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".tar.zst", ".zip
 # Протоколы локального пакета: путь (`file:`) и пакет своего workspace (`workspace:`, `link:`, `portal:` у
 # pnpm и yarn).
 _LOCAL_PROTOCOLS = ("file:", "workspace:", "link:", "portal:")
-# Именованное требование на локальный пакет: `name@file:///x`, `name @ file:x`, `@org/x@workspace:*`.
-_NAMED_LOCAL = re.compile(r"@\s*(?:file|workspace|link|portal):")
+# Именованное требование на локальный пакет: `name@file:///x`, `name @ file:x`, `name[extra] @ file:x`,
+# `@org/x@workspace:*`. Имя — с начала слова, без `:`, `/` (кроме scope `@org/`), `#`: у URL со схемой
+# (`https://e.com/x.tgz?a=@file:`) и спецификаций git (`github:u/x#@file:`) `@file:` — часть адреса, не признак.
+_NAMED_LOCAL = re.compile(r"(?:@[^@/:#\s]+/)?[^@/:#\s]+\s*@\s*(?:file|workspace|link|portal):")
 # Сколько пар «флаг значение» перед подкомандой по очереди склеивает _loosened.
 _LOOSE_FLAGS = 4
 # Глаголы установки после имени-подстановки (`$M install x`).
@@ -223,6 +234,21 @@ def _shell_join(words):
     return " ".join(out)
 
 
+# Длинные флаги su и runuser без значения (util-linux 2.42, `su --help`): getopt_long принимает однозначное
+# сокращение длинного флага (`su --comm` — `--command`, `su --s` — ошибка «двусмысленный параметр»), и сокращение
+# сверяется со всеми длинными флагами, не только со значением.
+_SU_PLAIN_LONG = frozenset({"--preserve-environment", "--login", "--fast", "--pty", "--no-pty", "--help", "--version"})
+
+
+def _long_flag(flag, names):
+    """Полное имя длинного флага flag по getopt_long: имя из names или его однозначное сокращение; иначе flag как
+    есть (неизвестный флаг или неоднозначное сокращение — ошибка разбора программы)."""
+    if flag in names or not flag.startswith("--") or flag == "--":
+        return flag
+    found = [name for name in names if name.startswith(flag)]
+    return found[0] if len(found) == 1 else flag
+
+
 def _c_wrapper(words, value_flags):
     """Слова words после `su`/`runuser` — как их разбирает getopt с перестановкой: флаги и их значения (value_flags)
     стоят где угодно до `--`, склейка коротких флагов забирает значением остаток слова (`-lc'…'`). С
@@ -234,12 +260,14 @@ def _c_wrapper(words, value_flags):
     Слова снимаются с начала words, хвост за `--` остаётся в очереди: цепочка обёрток разбирается за один
     проход."""
     script, shell, user, rest = None, "sh", False, []
+    names = _SU_PLAIN_LONG | {f for f in value_flags if f.startswith("--")}
     while words:
         word, lead = words.popleft()
         if word == "--":
             break
         if word.startswith("--"):
             flag, eq, value = word.partition("=")
+            flag = _long_flag(flag, names)
             value = _part_of(word, value)
             if flag in value_flags and not eq:
                 value = words.popleft()[0] if words else None
@@ -274,7 +302,7 @@ def _c_wrapper(words, value_flags):
 def _is_local(word, pip):
     """Слово — локальный путь, архив или пакет своего workspace, а не пакет; URL со схемой, кроме `file:`, —
     пакет."""
-    if word.startswith(_LOCAL_PROTOCOLS) or _NAMED_LOCAL.search(word):
+    if word.startswith(_LOCAL_PROTOCOLS) or _NAMED_LOCAL.match(word):
         return True
     if "://" in word:
         return False
@@ -477,6 +505,61 @@ def _dry_run(w, masked=False):
     return False
 
 
+# Подкоманды npm, ставящие пакет, после deref npm (lib/utils/cmd-list.js: псевдонимы и однозначные сокращения
+# имён команд и псевдонимов, camelCase — через `-`): `install` и `install-test`; `link` с пакетом ставит его из
+# реестра в глобальный каталог, если его там нет, и связывает в проект (lib/commands/link.js, missingArgsFromTree).
+_NPM_INSTALL = {"add", "i", "in", "ins", "inst", "insta", "instal", "install", "install-t", "install-te",
+                "install-tes", "install-test", "isnt", "isnta", "isntal", "isntall", "it", "lin", "link", "ln"}
+_NPM_CAMEL = re.compile(r"[A-Z]")
+
+
+def _npm_command(sub):
+    """Подкоманда npm, как её читает deref npm: заглавная буква — `-` и строчная (`installTest` — `install-test`)."""
+    return _NPM_CAMEL.sub(lambda m: "-" + m[0].lower(), sub)
+
+
+# `gem`: флаги, которые RubyGems снимает со слов где угодно до `--` (config_file.rb, handle_arguments).
+_GEM_DROPPED = {"--backtrace", "--traceback", "--debug"}
+
+
+def _gem_sub_args(w):
+    """Подкоманда gem в нижнем регистре и слова после неё, как их читает RubyGems: слова за `--` — аргументы сборки
+    (gem_runner.rb, extract_build_args), `--backtrace`, `--traceback`, `--debug` сняты, `-C каталог` первым словом
+    пропущен (command_manager.rb, process_args); иной флаг первым словом — ошибка: (None, [])."""
+    args = w[1:]
+    if "--" in args:
+        args = args[:args.index("--")]
+    args = [a for a in args if a not in _GEM_DROPPED]
+    if args[:1] == ["-C"]:
+        args = args[2:]
+    if not args or args[0].startswith("-"):
+        return None, []
+    return args[0].lower(), args[1:]
+
+
+def _gem_file(args):
+    """`-g`/`--file [FILE]` у `gem install`: ставятся зависимости файла (Gemfile), названные пакеты не ставятся
+    (commands/install_command.rb, install_from_gemdeps)."""
+    return any(a in ("-g", "--file") or a.startswith("--file=") or a.startswith("-g") and not a.startswith("--")
+               for a in args)
+
+
+# Флаги `yarn workspaces foreach` со значением (yarnpkg.com/cli/workspaces/foreach; `--since` значение берёт только
+# через `=`).
+_YARN_FOREACH_VALUE_FLAGS = {"--from", "--include", "--exclude", "-j", "--jobs"}
+
+
+def _yarn_foreach(args):
+    """Команда yarn, которую `yarn workspaces foreach` с флагами args запускает в каждом workspace: слова с первого
+    позиционного; None — пробный прогон `-n`/`--dry-run` или команды нет."""
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] in ("-n", "--dry-run"):
+            return None
+        i += 2 if _takes_value(args[i], _YARN_FOREACH_VALUE_FLAGS) else 1
+    return args[i:] or None
+
+
 def _npm_subcommand(w):
     """Слова npm с подкоманды, как _subcommand; `true` или `false` за флагом без `=` — значение флага: nopt берёт
     его и у булева флага, и у флага, которого npm не знает."""
@@ -566,7 +649,9 @@ _SNAP_VALUE_FLAGS = {"--channel", "--revision", "--name", "--cohort", "--quota-g
 _FLATPAK_VALUE_FLAGS = {"--arch", "--subpath", "--installation", "--sideload-repo", "--default-branch"}
 _NIX_VALUE_FLAGS = {"-f", "--file", "-p", "--profile", "-I", "--include", "--max-jobs", "-j", "--cores",
                     "--store", "--eval-store", "--log-format", "--priority", "--extra-experimental-features",
-                    "--experimental-features", "--expr", "-E"}
+                    "--experimental-features", "--expr"}
+# У nix-env `-E`/`--expr` — флаг без значения: аргументы — выражения Nix (руководство nix-env --install).
+_NIX_ENV_VALUE_FLAGS = _NIX_VALUE_FLAGS - {"--expr"}
 # Флаги nix с двумя значениями: `--arg имя выражение`.
 _NIX_PAIR_FLAGS = {"--arg", "--argstr", "--option", "--override-input", "--override-flake", "--arg-from-file"}
 _PDM_ADD_VALUE_FLAGS = {"-G", "--group", "-p", "--project", "-L", "--lockfile", "-S", "--strategy", "--venv",
@@ -631,14 +716,14 @@ def _sub_args(w, value_flags: Set[str] = _NO_VALUE_FLAGS):
 
 
 def _aptitude_simulates(args, flags):
-    """Среди флагов aptitude — пробный прогон: `-s` (и в склейке `-qs`), `--simulate` и синонимы. Остаток склейки
-    после флага со значением (`-tsid`) — значение."""
+    """Среди флагов aptitude — пробный прогон или только скачивание: `-s`, `-d` (и в склейке `-qs`), `--simulate` и
+    синонимы, `--download-only`. Остаток склейки после флага со значением (`-tsid`) — значение."""
     for a in args:
-        if a in _APT_SIMULATE:
+        if a in _APT_SIMULATE or a == "--download-only":
             return True
         if a.startswith("-") and not a.startswith("--"):
             for letter in a[1:]:
-                if letter == "s":
+                if letter in "sd":
                     return True
                 if "-" + letter in flags:
                     break
@@ -693,12 +778,13 @@ def _apt_level(argument, certain):
 
 
 def _apt_parse(args, flags):
-    """Разбор флагов apt и apt-get по CommandLine apt: (пробный прогон, args без слов-значений булевых флагов и
-    флагов уровня). Пробный прогон — последнее значение `-s`, `--simulate` и синонимов (имя без учёта регистра).
+    """Разбор флагов apt и apt-get по CommandLine apt: (установки нет, args без слов-значений булевых флагов и
+    флагов уровня). Установки нет при пробном прогоне — последнем значении `-s`, `--simulate` и синонимов (имя без
+    учёта регистра) — или только скачивании — последнем значении `-d`, `--download-only` (_APT_NO_INSTALL_LONG).
     Значение — после `=`, остаток склейки (`-s0`, `-q2`), следующее слово без `-` (`--simulate no`, `-q 2`) или
     слово перед `-` имени (`--no-simulate`); не булево после `=` или перед `-`, не целое после `=` у `-q` —
     ошибка, установки нет (True). Значения флагов из flags остаются в args. `--` завершает флаги."""
-    simulate = False
+    state = {"s": False, "d": False}
     eaten_words = set()
     i = 0
     while i < len(args):
@@ -717,14 +803,17 @@ def _apt_parse(args, flags):
                 if eaten is None:
                     return True, args
             else:
-                if low not in _APT_SIMULATE_LONG:
+                key = _APT_NO_INSTALL_LONG.get(low)
+                if key is None:
                     prefix, dash, rest = low.partition("-")
-                    if not dash or rest not in _APT_SIMULATE_LONG and rest != "s":
+                    key = (rest if rest in ("s", "d") else _APT_NO_INSTALL_LONG.get(rest)) if dash else None
+                    if key is None:
                         i += not eq and a in flags and following is not None
                         continue
-                simulate, eaten = _apt_sense(argument, bool(eq), prefix)
-                if simulate is None:
+                value, eaten = _apt_sense(argument, bool(eq), prefix)
+                if value is None:
                     return True, args
+                state[key] = value
             if eaten and not eq:
                 eaten_words.add(i)
                 i += 1
@@ -733,10 +822,11 @@ def _apt_parse(args, flags):
                 rest = a[j + 1:]
                 certain = rest.startswith("=")
                 argument = rest[1:] if certain else rest or following
-                if letter in ("s", "q"):
-                    if letter == "s":
-                        simulate, eaten = _apt_sense(argument, certain, None)
-                        error = simulate is None
+                if letter in ("s", "d", "q"):
+                    if letter != "q":
+                        value, eaten = _apt_sense(argument, certain, None)
+                        error = value is None
+                        state[letter] = value
                     else:
                         eaten = _apt_level(argument, certain)
                         error = eaten is None
@@ -752,7 +842,7 @@ def _apt_parse(args, flags):
                     break
                 elif certain or rest and _apt_bool(rest) is not None:
                     break
-    return simulate, [a for k, a in enumerate(args) if k not in eaten_words]
+    return state["s"] or state["d"], [a for k, a in enumerate(args) if k not in eaten_words]
 
 
 def _apt(w):
@@ -766,8 +856,12 @@ def _apt(w):
     if simulates:
         return False
     sub, args = _sub_args(w, flags)
-    # `satisfy` ставит пакеты, удовлетворяющие строкам зависимостей (`apt satisfy 'jq (>= 1)'`).
-    return sub in ("install", "satisfy") and _has(args, flags)
+    # `satisfy` ставит пакеты, удовлетворяющие строкам зависимостей (`apt satisfy 'jq (>= 1)'`); у apt и apt-get
+    # пакеты, названные `upgrade`, `full-upgrade`, `dist-upgrade`, ставятся, как у `install`, и неустановленные
+    # (apt-private/private-install.cc, DoCacheManipulationFromCommandLine: действие по умолчанию — MOD_INSTALL).
+    verbs = ("install", "satisfy") if w[0] == "aptitude" else (
+        "install", "satisfy", "upgrade", "full-upgrade", "dist-upgrade")
+    return sub in verbs and _has(args, flags)
 
 
 def _brew_dry_run(args):
@@ -795,7 +889,9 @@ def _dnf(w):
     if sub == "swap":
         # `dnf swap <удаляемый> <ставящийся>`.
         return len(list(_positionals(args, _DNF_VALUE_FLAGS))) > 1
-    return sub in ("install", "in", "groupinstall", "localinstall") and _has(args, _DNF_VALUE_FLAGS)
+    # `install-n`, `install-na`, `install-nevra` — install с формой имени (dnf/cli/commands/install.py, nevra_forms).
+    return sub in ("install", "in", "groupinstall", "localinstall", "install-n", "install-na",
+                   "install-nevra") and _has(args, _DNF_VALUE_FLAGS)
 
 
 def _zypper(w):
@@ -839,9 +935,20 @@ def _named(args, value_flags):
     return any(not p.lower().endswith(".config") for p in _positionals(args, value_flags))
 
 
+# Флаги `choco upgrade`, с которыми неустановленный пакет не ставится (docs.chocolatey.org, choco upgrade: «If you
+# do not have a package installed, upgrade will install it»), в нижнем регистре.
+_CHOCO_FAIL_NOT_INSTALLED = {"--failonnotinstalled", "--fail-on-not-installed"}
+
+
 def _choco(w):
+    """`choco install` и `choco upgrade` с названным пакетом; `upgrade` без `--failonnotinstalled` ставит и
+    неустановленный, `upgrade all` — обновление установленных."""
     sub, args = _sub_args(w, _CHOCO_VALUE_FLAGS)
-    return sub == "install" and _named(_lower_flags(args), _CHOCO_VALUE_FLAGS)
+    args = _lower_flags(args)
+    if sub == "upgrade":
+        return not _CHOCO_FAIL_NOT_INSTALLED & set(args) and any(
+            p.lower() != "all" and not p.lower().endswith(".config") for p in _positionals(args, _CHOCO_VALUE_FLAGS))
+    return sub == "install" and _named(args, _CHOCO_VALUE_FLAGS)
 
 
 def _nuget(w):
@@ -899,9 +1006,9 @@ def _nix_local_file(args):
     return value is not None and not value.startswith("<") and "://" not in value
 
 
-def _nix_installables(args):
+def _nix_installables(args, value_flags=_NIX_VALUE_FLAGS):
     """Есть позиционное, кроме локальных: путь, `path:`, `.#attr`."""
-    return any(not p.startswith(("path:", "git+file:")) for p in _positionals(args, _NIX_VALUE_FLAGS))
+    return any(not p.startswith(("path:", "git+file:")) for p in _positionals(args, value_flags))
 
 
 def _nix_env(w):
@@ -913,11 +1020,11 @@ def _nix_env(w):
         elif a == "--install":
             install = True
         elif a.startswith("--"):
-            skip = a in _NIX_VALUE_FLAGS
+            skip = a in _NIX_ENV_VALUE_FLAGS
         elif a.startswith("-") and len(a) > 1:
             install = install or "i" in a[1:]
-            skip = _takes_value(a, _NIX_VALUE_FLAGS)
-    return install and not _nix_local_file(args) and _nix_installables(args)
+            skip = _takes_value(a, _NIX_ENV_VALUE_FLAGS)
+    return install and not _nix_local_file(args) and _nix_installables(args, _NIX_ENV_VALUE_FLAGS)
 
 
 def _nix(w):
@@ -1044,7 +1151,7 @@ _DRY_VALUE_FLAGS = {
     "pipenv": _PIPENV_VALUE_FLAGS, "dotnet": _DOTNET_ADD_VALUE_FLAGS | _DOTNET_TOOL_VALUE_FLAGS,
     "dart": _PUB_VALUE_FLAGS, "flutter": _PUB_VALUE_FLAGS, "swift": _SWIFT_PACKAGE_VALUE_FLAGS | _SWIFT_ADD_VALUE_FLAGS,
     "brew": _BREW_VALUE_FLAGS, "zypper": _ZYPPER_VALUE_FLAGS, "apk": _APK_VALUE_FLAGS, "snap": _SNAP_VALUE_FLAGS,
-    "flatpak": _FLATPAK_VALUE_FLAGS, "nix-env": _NIX_VALUE_FLAGS, "nix": _NIX_VALUE_FLAGS,
+    "flatpak": _FLATPAK_VALUE_FLAGS, "nix-env": _NIX_ENV_VALUE_FLAGS, "nix": _NIX_VALUE_FLAGS,
     "pdm": _PDM_ADD_VALUE_FLAGS, "rye": _RYE_VALUE_FLAGS, "pixi": _PIXI_VALUE_FLAGS,
     "cabal": _CABAL_VALUE_FLAGS, "stack": _STACK_VALUE_FLAGS, "opam": _OPAM_VALUE_FLAGS,
     "luarocks": _LUAROCKS_VALUE_FLAGS, "vcpkg": _VCPKG_VALUE_FLAGS, "conan": _CONAN_VALUE_FLAGS,
@@ -1135,14 +1242,18 @@ def _ssh_command(args):
 
 
 def _heredoc_runs(words):
-    """Тело heredoc этой команды — команды: оболочка без скрипта и без `-c` (или с `-s`), ssh без
-    удалённой команды, `source` и `.` со скриптом `-` или `/dev/stdin`."""
+    """Тело heredoc, вход конвейера и процесс-подстановка `<(…)` скриптом этой команды — команды: оболочка без
+    скрипта и без `-c` (или с `-s`) или со скриптом _STDIN_SCRIPT, ssh без удалённой команды, `source` и `.` со
+    скриптом _STDIN_SCRIPT (процесс-подстановка словом — `/dev/fd/63`, depcheck._pairs)."""
     if not words:
         return False
     name, args = _basename(words[0]), words[1:]
     if name in _SOURCES:
+        # `source [-p путь] [--] файл` (bash 5.3).
+        if args[:1] == ["-p"]:
+            args = args[2:]
         args = args[1:] if args[:1] == ["--"] else args
-        return args[:1] in ([s] for s in _STDIN_SCRIPTS)
+        return bool(args) and bool(_STDIN_SCRIPT.fullmatch(args[0]))
     if name not in _SHELLS:
         return False
     if name == "ssh":
@@ -1173,8 +1284,8 @@ def _heredoc_runs(words):
     if runs is not None:
         return runs
     rest = args[i + 1:] if args[i:i + 1] == ["--"] else args[i:]
-    # Первое позиционное — скрипт; `-` и `/dev/stdin` — снова stdin.
-    return not rest or rest[0] in _STDIN_SCRIPTS
+    # Первое позиционное — скрипт; _STDIN_SCRIPT — снова stdin или процесс-подстановка.
+    return not rest or bool(_STDIN_SCRIPT.fullmatch(rest[0]))
 
 
 # Глобальные опции git со значением следующим словом (git.c, handle_options).

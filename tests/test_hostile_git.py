@@ -295,21 +295,22 @@ class HostileRootTest(HostileCase):
 # setup.py версии HEAD (legacydep). Жёсткая ссылка notes.json на package.json — манифест package.json: его находит
 # git ls-files манифестов проекта.
 EXPECTED_MANIFESTS = ("git", ["cf/requirements.txt", "new/requirements.txt", "nl/requirements\r.txt",
-                              "package.json", "sp ace/Cargo.toml", "ü/requirements.txt"],
+                              "package.json", "sp ace/Cargo.toml", "ws/m/package.json", "ws/m2/package.json",
+                              "ü/requirements.txt"],
                       {"package.json": ["lodash", "react"], "ü/requirements.txt": ["rich"],
                        "new/requirements.txt": None, "nl/requirements\r.txt": ["httpx"],
-                       "cf/requirements.txt": ["attrs", "base", "ours", "theirs"]},
-                      {"npm": ["lodash", "react"], "pypi": ["attrs", "click", "flask", "legacydep", "rich"],
-                       "crates.io": ["serde"]},
+                       "cf/requirements.txt": ["attrs", "base", "ours", "theirs"], "ws/m": ["m2 @ registry", "q"]},
+                      {"npm": ["lodash", "m2 @ registry", "react"],
+                       "pypi": ["attrs", "click", "flask", "legacydep", "rich"], "crates.io": ["serde"]},
                       ["attrs", "flask", "httpx", "legacydep", "rich"],
                       ({"new/requirements.txt": ["evilpkg"]}, [], None),
                       ([("package.json", "package.json")], None))
 
 
 class HostileManifestTest(HostileCase):
-    """Манифесты проекта (git ls-files, в том числе для жёсткой ссылки в edit_targets), их версии в HEAD (git cat-file)
-    и имена ref, откуда команда возвращает файлы (git cat-file и git ls-tree restored_names), под враждебным
-    конфигом."""
+    """Манифесты проекта (git ls-files, в том числе для жёсткой ссылки в edit_targets), их версии в HEAD (git cat-file;
+    у package.json — с npm workspace версии: git ls-tree и git ls-files -s) и имена ref, откуда команда возвращает
+    файлы (git cat-file и git ls-tree restored_names), под враждебным конфигом."""
 
     def manifest_scenario(self, cfg):
         root = self.repo()
@@ -319,7 +320,11 @@ class HostileManifestTest(HostileCase):
         # Файл _LEGACY версии HEAD: его имена читает git ls-tree и git cat-file --batch дерева HEAD.
         write(root, "setup.py", "setup(install_requires=['legacydep'])\n")
         write(root, "cf/requirements.txt", "attrs\n")
-        write(root, "package.json", '{"dependencies": {"react": "^18"}}\n')
+        write(root, "package.json", '{"workspaces": ["ws/*"], "dependencies": {"react": "^18"}}\n')
+        # Члены npm workspace: версии HEAD, ref и стороны конфликта члена разбираются с членами своей версии
+        # (git cat-file --batch, git ls-tree -r, git ls-files -s): m2 1.0.0 не подходит к `^2` — пакет из реестра.
+        write(root, "ws/m/package.json", '{"name": "m", "version": "1.0.0", "dependencies": {"m2": "^2"}}\n')
+        write(root, "ws/m2/package.json", '{"name": "m2", "version": "1.0.0"}\n')
         write(root, "ü/requirements.txt", "rich\n")
         write(root, "sp ace/Cargo.toml", "[dependencies]\nserde = \"1\"\n")
         # Имя с возвратом каретки (имя с переводом строки не манифест): версия HEAD — отдельным `git cat-file blob`,
@@ -329,7 +334,7 @@ class HostileManifestTest(HostileCase):
         git("add", ".", cwd=root)
         git("commit", "-qm", "m", cwd=root)
         git("checkout", "-qb", "feat", cwd=root)
-        write(root, "package.json", '{"dependencies": {"react": "^18", "lodash": "^4"}}\n')
+        write(root, "package.json", '{"workspaces": ["ws/*"], "dependencies": {"react": "^18", "lodash": "^4"}}\n')
         git("commit", "-qam", "feat", cwd=root)
         git("checkout", "-q", "-", cwd=root)
         # stash с отслеживаемым и неотслеживаемым манифестом: имена ref читаются тем же cat-file --batch.
@@ -339,7 +344,7 @@ class HostileManifestTest(HostileCase):
         # Незавершённое слияние feat: git пишет MERGE_HEAD файлом, update-ref псевдоссылку не создаёт.
         sha = subprocess.run([*GIT, "rev-parse", "feat"], cwd=root, check=True, capture_output=True, text=True)
         (root / ".git" / "MERGE_HEAD").write_text(sha.stdout, encoding="utf-8")
-        write(root, "package.json", '{"dependencies": {"react": "^18", "axios": "^1"}}\n')
+        write(root, "package.json", '{"workspaces": ["ws/*"], "dependencies": {"react": "^18", "axios": "^1"}}\n')
         write(root, "new/requirements.txt", "flask\n")
         write(root, "ign/requirements.txt", "flask\n")
         write(root, "tests/fixtures/x/package.json", "{}\n")
@@ -349,7 +354,10 @@ class HostileManifestTest(HostileCase):
             blob = subprocess.run([*GIT, "hash-object", "-w", "--stdin"], cwd=root, input=f"{name}\n", check=True,
                                   capture_output=True, text=True).stdout.strip()
             stages.append(f"100644 {blob} {stage}\tcf/requirements.txt\n")
-        git("rm", "-q", "--cached", "cf/requirements.txt", cwd=root)
+        blob = subprocess.run([*GIT, "hash-object", "-w", "--stdin"], cwd=root, check=True, capture_output=True,
+                              input='{"name": "m", "dependencies": {"m2": "^3", "q": "1"}}\n', text=True).stdout.strip()
+        stages.append(f"100644 {blob} 3\tws/m/package.json\n")
+        git("rm", "-q", "--cached", "cf/requirements.txt", "ws/m/package.json", cwd=root)
         subprocess.run([*GIT, "update-index", "--index-info"], cwd=root, input="".join(stages), check=True,
                        capture_output=True, text=True)
         with hostile(cfg):
@@ -359,6 +367,8 @@ class HostileManifestTest(HostileCase):
                         "cf/requirements.txt"):
                 names = manifest_watch.head_names(str(root / rel), manifest_watch.watched_kind(rel), 10)
                 heads[rel] = None if names is None else sorted(names)
+            heads["ws/m"] = sorted(manifest_watch.head_names(str(root / "ws/m/package.json"), "package.json", 10,
+                                                             root))
             # Начало сессии позже коммитов: ref — работа до сессии.
             restored = manifest_watch.restored_names(root, "git checkout feat -- package.json; git stash pop",
                                                      int(time.time()) + 100, time.monotonic() + 30)

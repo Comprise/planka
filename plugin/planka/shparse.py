@@ -56,6 +56,8 @@ _SPECIAL_PARAM = frozenset("@*#?-!$0123456789")
 _DQ_ESC = frozenset("\\`$\"\n")
 _HD_ESC = frozenset("\\`$")
 _PATTERN_CHAR = frozenset("*?+@!")
+# `\\` вне кавычек и символ за ним: снятие кавычек оставляет символ.
+_BACKSLASH = re.compile(r"\\(.)", re.S)
 
 # parser_state (parser.h).
 _CASEPAT = 0x1
@@ -215,8 +217,9 @@ class Simple(Node):
 
 
 class Pipeline(Node):
-    """Конвейер: commands; bang — `!` (нечётное число); time — None, "time" или "time -p"."""
-    __slots__ = ("commands", "bang", "time")
+    """Конвейер: commands; bang — `!` (нечётное число); time — None, "time" или "time -p"; _ops — операторы между
+    командами ("|", "|&")."""
+    __slots__ = ("commands", "bang", "time", "_ops")
     _fields = ("commands",)
 
 
@@ -363,8 +366,9 @@ class Param(Node):
 
 
 class Sub(Node):
-    """Подстановка, которую bash исполняет: kind — "$(", "`", "${ ", "${|", "<(", ">("; body — Script тела."""
-    __slots__ = ("kind", "body")
+    """Подстановка, которую bash исполняет: kind — "$(", "`", "${ ", "${|", "<(", ">("; body — Script тела; _nl — у
+    `${ …}`, `${|…}`: перед `}` была лексема перевода строки (was_newline в parse_comsub)."""
+    __slots__ = ("kind", "body", "_nl")
     _fields = ("body",)
 
 
@@ -1353,7 +1357,8 @@ class _R:
         s, n = self.s, self.n0
         tabs = r"\t*" if strip else ""
         ends = r"(?:\n|\Z" + (r"|[^\n]*" + re.escape(eof) if eof else "") + ")"
-        m = re.compile(r"^" + tabs + re.escape(term) + ends, re.MULTILINE).search(s, f, n)
+        # Терминатор с переводом строки bash сравнивает с одной строкой (make_here_document): тело — до конца ввода.
+        m = None if "\n" in term else re.compile(r"^" + tabs + re.escape(term) + ends, re.MULTILINE).search(s, f, n)
         line_start = m.start() if m else n
         line_end = s.find("\n", line_start, n) if m else n
         if line_end < 0:
@@ -1812,7 +1817,10 @@ class _R:
                     index = _node(Arith, P(bpos) + 1, P(close_pos), parts=list(inner))
                     parts.part(index)
                 else:
-                    parts.extend(inner)
+                    # Без `=` за `]` слово раскрывается как обычное: `\\` вне кавычек снимается (`x[\\n] c` —
+                    # `x[n]`, проверено bash 5.3); pmp отдаёт текст индекса с ним.
+                    parts.extend([_node(Lit, p.start, p.end, text=_BACKSLASH.sub(r"\1", p.text))
+                                  if type(p) is Lit and "\\" in p.text else p for p in inner])
                 parts.text("]", P(close_pos), _close_end(self, close_pos))
                 all_digit = False
                 c = self.getc(self._cd() != "'")
@@ -2674,6 +2682,7 @@ class _R:
         body, t = yield self.compound_list(t, True)
         if t.kind != close:
             raise _Fatal(t.start)
+        newline = self.last == "\n"
         if self.pending:
             yield self.gather()
         self._restore(saved)
@@ -2683,7 +2692,7 @@ class _R:
         else:
             kind = "${|" if spec == "|" else "${ "
         script = self._script(body, None, P(dpos), t.end, ncomments)
-        node = _node(Sub, P(dpos), t.end, kind=kind, body=script)
+        node = _node(Sub, P(dpos), t.end, kind=kind, body=script, _nl=newline)
         if split:
             self.shared[("reexpand", id(node))] = node
         self.tpl_out = self._memo(dpos, node, [("sub", node)], ctx, origin)
@@ -2899,6 +2908,7 @@ class _R:
             t = yield self.yylex()
             return _node(Pipeline, start, start, commands=[], bang=bang, time=timed), t
         cmds = []
+        ops = []
         while True:
             if top:
                 try:
@@ -2911,6 +2921,7 @@ class _R:
                 node, t = yield self.command(t)
             cmds.append(node)
             if t.kind in ("|", "|&"):
+                ops.append(t.kind)
                 t = yield self.yylex()
                 while t.kind == "\n":
                     t = yield self.yylex()
@@ -2918,7 +2929,7 @@ class _R:
             break
         if len(cmds) == 1 and not bang and not timed:
             return cmds[0], t
-        return _node(Pipeline, start, cmds[-1].end, commands=cmds, bang=bang, time=timed), t
+        return _node(Pipeline, start, cmds[-1].end, commands=cmds, bang=bang, time=timed, _ops=ops), t
 
     def command(self, t):
         """command: простая команда, составная с перенаправлениями, определение функции, coproc."""
@@ -3014,8 +3025,13 @@ class _R:
         else:
             raise _Fatal(target.start)
         if op in ("<<", "<<-"):
-            text = target.text
-            quoted = any(ch in text for ch in "'\"\\")
+            # W_QUOTED read_token_word ставит за '…', "…", $'…', $"…" и `\\` на верхнем уровне слова; кавычки и `\\`
+            # внутри `${…}`, `$(…)`, `$((…))`, `$[…]`, `` `…` `` его не ставят (`<<${x:-"a"}` кончает строка
+            # `${x:-"a"}`, тело раскрывается, проверено bash 5.3). В word._tok эти конструкции — вложенные _Tpl,
+            # верхний уровень — строки. Терминатор сравнивается с текстом, где подстановки напечатаны
+            # (`<<$(b;c)` кончает строка `$(b; c)`, проверено bash 5.3).
+            quoted = any(type(p) is str and ("'" in p or '"' in p or "\\" in p) for p in word._tok)
+            text = _term_text(word._tok)
             doc = _node(Heredoc, word.start, word.end, parts=[])
             doc.term = _quote_removal(text) if quoted else text
             doc.strip_tabs = op == "<<-"
@@ -3507,6 +3523,101 @@ def _flat(pieces):
                 del out[mark:]
                 out.append(seq.flat)
     return "".join(out)
+
+
+class _Unprinted(Exception):
+    """Терминатор heredoc с подстановкой, чью печать print_comsub разбор не повторяет точно: строку, которая кончает
+    тело, узнать нельзя. parse отдаёт ошибку вида INTERNAL — сомнение у вызывающих, а не тело до конца ввода."""
+
+
+# Перенаправления, которые печать терминатора повторяет: оператор → номер по умолчанию (print_redirection не
+# печатает его). Проверено печатью терминатора bash 5.3.
+_PRINT_REDIRS = {"<": 0, "<>": 0, "<<<": 0, ">": 1, ">>": 1, ">|": 1, "&>": None, "&>>": None}
+
+
+def _term_text(tok):
+    """Текст слова терминатора heredoc, как его хранит bash (read_token_word): подстановки `$(…)`, `${ …; }`,
+    `${| …; }`, `<(…)`, `>(…)` — печатью print_comsub. Печать повторяется для тел из простых команд, соединённых
+    `;`, `&`, `&&`, `||`, `|` и переводом строки, с перенаправлениями из _PRINT_REDIRS (`$(b;c)` — `$(b; c)`,
+    `$(<b)` — `$(< b)`, `$(b⏎⏎c)` — `$(b⏎c)`); иное тело — _Unprinted. Без рекурсии: стек элементов."""
+    out = []
+    stack = [tok]
+    while stack:
+        item = stack.pop()
+        kind = type(item)
+        if kind is str:
+            out.append(item)
+        elif kind is _Tpl or kind is list:
+            stack.extend(reversed(item))
+        elif kind is tuple and item[0] == "sub" and type(item[1]) is Sub:
+            stack.extend(reversed(_sub_print(item[1])))
+        elif kind is Word and item._tok is not None:
+            stack.append(item._tok)
+        elif kind is Simple:
+            stack.extend(reversed(_simple_print(item)))
+        elif kind is Sequence:
+            parts = []
+            for k, node in enumerate(item.items):
+                parts.append(node)
+                sep = item.seps[k] if k < len(item.seps) else None
+                last = k == len(item.items) - 1
+                if sep == "&":
+                    parts.append(" &" if last else " & ")
+                elif sep == ";" and not last:
+                    parts.append("; ")
+            stack.extend(reversed(parts))
+        elif kind is AndOr:
+            parts = [item.items[0]]
+            for op, node in zip(item.ops, item.items[1:]):
+                parts += [" " + op + " ", node]
+            stack.extend(reversed(parts))
+        elif (kind is Pipeline and not item.bang and not item.time and item.commands
+              and all(op == "|" for op in item._ops)):
+            parts = [item.commands[0]]
+            for node in item.commands[1:]:
+                parts += [" | ", node]
+            stack.extend(reversed(parts))
+        else:
+            raise _Unprinted()
+    return "".join(out)
+
+
+def _sub_print(node):
+    """Элементы печати подстановки без её первого символа (`$`, `<`, `>` — в тексте слова) для _term_text."""
+    body = node.body
+    if not body.commands or body.error is not None or body.dropped or body.comments:
+        raise _Unprinted()
+    # Команды тела, разделённые переводами строк, print_comsub печатает через один `\n`.
+    lines = [body.commands[0]]
+    for line in body.commands[1:]:
+        lines += ["\n", line]
+    if node.kind in ("$(", "<(", ">("):
+        return ["(", lines, ")"]
+    # Конец `${ …}` по parse_comsub: перевод строки перед `}` — `\n }`, иначе ` }` за `&` и `; }` за прочим.
+    command = body.commands[-1]
+    background = type(command) is Sequence and len(command.seps) == len(command.items) and command.seps[-1] == "&"
+    end = "\n }" if node._nl else " }" if background else "; }"
+    return ["{ " if node.kind == "${ " else "{|", lines, end]
+
+
+def _simple_print(node):
+    """Элементы печати простой команды: слова через пробел, перенаправления за ними (print_simple_command)."""
+    parts = []
+    for word in (node.assigns or []) + (node.words or []):
+        parts += [word, " "]
+    for redir in node.redirs or ():
+        if redir.op not in _PRINT_REDIRS or type(redir.target) is not Word:
+            raise _Unprinted()
+        fd = ""
+        if redir.fd is not None:
+            if not redir.fd.isdigit():
+                raise _Unprinted()
+            if int(redir.fd) != _PRINT_REDIRS[redir.op]:
+                fd = str(int(redir.fd))
+        parts += [fd + redir.op + " ", redir.target, " "]
+    if not parts:
+        raise _Unprinted()
+    return parts[:-1]
 
 
 def _skel(pieces):

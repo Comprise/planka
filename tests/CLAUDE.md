@@ -15,11 +15,12 @@ unittest плагина; запуск из корня — тесты затро�
   отключает глобальный и системный конфиг и системные атрибуты, подменяет `XDG_CONFIG_HOME` пустым каталогом,
   ставит `GIT_CEILING_DIRECTORIES`. Изоляцию проверяет `make test-hostile`.
 - Устойчивость плагина к чужому git-конфигу — `test_hostile_git.py`: враждебный `GIT_CONFIG_GLOBAL` передаётся явно
-  только вызовам плагина, git подготовки репозитория — под изолированным конфигом. Новый вызов git в плагине
-  проверяется там же (`git ls-files` в `common.project_root` — `HostileRootTest`, `git check-ignore` в
-  `guard_memory` — `HostileMemoryTest`, `git ls-files` (в том числе жёсткой ссылки в `edit_targets`), `git cat-file
-  --batch` (версии ref, стороны конфликта индекса, дерево HEAD в `project_names` и `compare`) и `git ls-tree` в
-  `manifest_watch` — `HostileManifestTest`).
+  только вызовам плагина, git подготовки репозитория — под изолированным конфигом. Новый вызов git в плагине проверяется
+  там же (`git ls-files` в `common.project_root` — `HostileRootTest`, `git check-ignore` в `guard_memory` —
+  `HostileMemoryTest`, `git ls-files` (в том числе жёсткой ссылки в `edit_targets`), `git cat-file --batch` (версии ref,
+  стороны конфликта индекса, `cat-file` package.json предков версии, блобы по SHA дерева HEAD в `project_names` и
+  `compare`), `git ls-tree -r -z --full-tree` (одно на дерево, общее у npm workspace версий `package.json` в
+  `head_names` и у `_tree_names`; `git ls-files -s` — стороны конфликта) в `manifest_watch` — `HostileManifestTest`).
 - Тест не импортирует другой тест: помощники, нужные нескольким файлам (`run_in_process`, `fill_budget`,
   `assert_not_logged`, `prompt_block`, `author_block`, `cpu_seconds`, `assert_linear`, `comment_lines`), — в
   `helpers.py`.
@@ -28,6 +29,9 @@ unittest плагина; запуск из корня — тесты затро�
 - `tools/` — скрипты разработки без `__init__.py` (unittest их не собирает): `build_corpus.py` собирает
   `fixtures/bash-transcripts.jsonl`, `bashdiff.py` — фаззер `make bashdiff` в песочнице `bwrap`. Команды корпусов не
   исполняются никогда; в bash идут только формы генератора фаззера.
+- В `plugin/planka/*.py` имя константы с текстом правил (например `planparse._READ_NOTE`) не складывается в выражения,
+  попадающие в возвращаемые значения функций: `test_contract._flow_strings` выводит тексты для модели по потоку значений
+  и принял бы такую константу за текст для модели.
 - `fixtures/` — корпуса настоящих форм входа; какой тест читает какой корпус и что сверяет —
   `context/testing.md`, «Устройство тестов». Новый край разборщика — образцом в корпус.
 

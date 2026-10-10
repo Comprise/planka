@@ -1,3 +1,4 @@
+import codecs
 import json
 import os
 import pathlib
@@ -102,6 +103,63 @@ CORPUS = {
                                      "jekyll-default-layout", "jekyll-titles-from-headings",
                                      "jekyll-readme-index", "jekyll-relative-links", "jekyll-include-cache"},
     "gemfile-cmock/Gemfile": {"bundler", "rake", "minitest", "require_all", "constructor", "diy"},
+    # Оператор на нескольких строках: опции гема (`path:`) на строках после запятой — его опции. Ожидание сверено с
+    # вычислением этого Gemfile в Ruby 3.4 заглушкой DSL Bundler (обе ветви `if next?`).
+    "gemfile-gitlab/Gemfile": set("""
+        CFPropertyList RedCloth acme-client addressable akismet amazing_print apnotic apollo_upload_server
+        app_store_connect arr-pm asciidoctor asciidoctor-include-ext asciidoctor-kroki asciidoctor-plantuml async
+        atlassian-jwt attr_encrypted aws-actionmailer-ses aws-sdk-cloudformation aws-sdk-core aws-sdk-s3
+        axe-core-rspec babosa base32 base64 batch-loader bcrypt benchmark-ips benchmark-memory benchmark-swap
+        bootsnap browser bullet capybara capybara-screenshot carrierwave charlock_holmes circuitbox
+        click_house-client commonmarker concurrent-ruby connection_pool countries coverband creole css_parser
+        cssbundling-rails cvss-suite database_cleaner-active_record debug declarative_policy derailed_benchmarks
+        devfile device_detector devise devise-two-factor diffy doorkeeper doorkeeper-device_authorization_grant
+        doorkeeper-openid_connect drb duo_api ed25519 elasticsearch-api elasticsearch-model elasticsearch-rails
+        email_reply_trimmer email_spec factory_bot_rails faraday faraday-multipart faraday-retry faraday-typhoeus
+        faraday_middleware-aws-sigv4 fast_blank ffaker ffi flipper flipper-active_record
+        flipper-active_support_cache_store fog-aliyun fog-aws fog-core fog-google fog-local fugit gdk-toogle gettext
+        gettext_i18n_rails git gitaly gitlab-chronic gitlab-cloud-connector gitlab-crystalball gitlab-dangerfiles
+        gitlab-experiment gitlab-fog-azure-rm gitlab-glaz gitlab-glfm-markdown gitlab-grape-openapi gitlab-kas-grpc
+        gitlab-labkit gitlab-license gitlab-mail_room gitlab-markup gitlab-net-dns gitlab-orbit-proto
+        gitlab-rspec-metrics-exporter gitlab-sdk gitlab-secret_detection gitlab-security_report_schemas
+        gitlab-styles gitlab_chronic_duration gitlab_omniauth-ldap gitlab_quality-test_tooling gitlab_query_language
+        gon google-apis-androidpublisher_v3 google-apis-cloudbilling_v1 google-apis-cloudresourcemanager_v1
+        google-apis-compute_v1 google-apis-container_v1 google-apis-container_v1beta1 google-apis-core
+        google-apis-iam_v1 google-apis-serviceusage_v1 google-apis-sqladmin_v1beta4 google-apis-storage_v1
+        google-cloud-artifact_registry-v1 google-cloud-compute-v1 google-cloud-storage google-protobuf googleauth
+        gpgme grape grape-entity grape-path-helpers grape-swagger grape-swagger-entity grape_logging graphlyte
+        graphql graphql-docs grpc grpc-tools gssapi guard-rspec gvltools haml_lint hamlit hashdiff hashie
+        health_check html-pipeline html2text httparty i18n_data icalendar invisible_captcha io-event ipaddress
+        jira-ruby js-routes js_regex json json_schemer jsonb_accessor jwt kaminari keela knapsack kramdown
+        kubeclient lefthook letter_opener_web license_finder licensee listen lockbox logger lograge loofah lookbook
+        lru_redux mail marcel memory_profiler mini_magick minitest multi_json nats-pure net-http net-ldap net-ntp
+        net-protocol nkf nokogiri oauth2 octokit ohai oj oj-introspect omniauth omniauth-alicloud
+        omniauth-atlassian-oauth2 omniauth-auth0 omniauth-azure-activedirectory-v2 omniauth-github
+        omniauth-google-oauth2 omniauth-oauth2-generic omniauth-saml omniauth-shibboleth-redux
+        omniauth_openid_connect openid_connect openssl opentelemetry-exporter-otlp
+        opentelemetry-instrumentation-action_pack opentelemetry-instrumentation-action_view
+        opentelemetry-instrumentation-active_job opentelemetry-instrumentation-active_record
+        opentelemetry-instrumentation-active_support opentelemetry-instrumentation-aws_sdk
+        opentelemetry-instrumentation-concurrent_ruby opentelemetry-instrumentation-ethon
+        opentelemetry-instrumentation-excon opentelemetry-instrumentation-faraday
+        opentelemetry-instrumentation-grape opentelemetry-instrumentation-graphql opentelemetry-instrumentation-http
+        opentelemetry-instrumentation-http_client opentelemetry-instrumentation-net_http
+        opentelemetry-instrumentation-pg opentelemetry-instrumentation-rack opentelemetry-instrumentation-rails
+        opentelemetry-instrumentation-rake opentelemetry-instrumentation-redis opentelemetry-instrumentation-sidekiq
+        opentelemetry-sdk org-ruby os pact paper_trail parallel parser parslet peek pg pg_query png_quantizator
+        prawn prawn-svg premailer-rails prometheus-client-mmap pry-byebug pry-rails pry-shell puma rack rack-attack
+        rack-cors rack-oauth2 rack-proxy rack-timeout rails rails-controller-testing rails-i18n rainbow rbtrace re2
+        recaptcha redis redis-actionpack redis-client redis-cluster-client redis-clustering request_store
+        resolv-replace responders retriable rexml rouge rqrcode rspec-benchmark rspec-parameterized rspec-rails
+        rspec_junit_formatter rspec_profiling rubocop ruby-lsp ruby-lsp-rails ruby-lsp-rspec ruby-magic
+        ruby-progressbar ruby-saml rubyzip sanitize sd_notify seed-fu selenium-webdriver semver_dialects
+        sentry-rails sentry-ruby sentry-sidekiq shoulda-matchers sidekiq-cron sigdump simple_po_parser simplecov
+        simplecov-cobertura simplecov-lcov slack-messenger snowplow-tracker solargraph solargraph-rspec spamcheck
+        spring spring-commands-rspec sprite-factory sprockets sprockets-rails ssh_data stackprof
+        state_machines-activerecord state_machines-rspec sys-filesystem tanuki_emoji telesignenterprise terser
+        test-prof test_file_finder thrift timfel-krb5-auth toml-rb truncato tty-prompt typhoeus undercover
+        unicode-emoji uri valid_email validates_hostname version_sorter view_component vite_rails vite_ruby vmstat
+        warning webauthn webmock webrick wikicloth yajl-ruby yard zeitwerk zlib zstd-ruby""".split()),
     # Местные зависимости: `{ workspace = true }` и `{ path = … }` в `tool.uv.sources`, `path:` и блок
     # `path … do` Gemfile, `replace` на путь в go.mod.
     "pyproject-uv-workspace/pyproject.toml": {"tqdm @ git+https://github.com/tqdm/tqdm"},
@@ -647,6 +705,13 @@ class RequirementsTest(unittest.TestCase):
             "-ra.txt\n": [INC("a.txt")],
             "--pre=1 -r a.txt\n": [],
             "--no-index --index-url=https://evil/simple\n": [],
+            # `--no-index` строки опций снимает индексы всего файла — до и после себя, но не `-f`; в строке требования
+            # и в строке `-r` pip опций не применяет (handle_line, _parse_and_recurse).
+            "--no-index\n--extra-index-url https://evil/simple\n": [],
+            "-i https://evil/simple\n--no-index\n": [],
+            "-f https://evil/links\n--no-index\n": ["index https://evil/links"],
+            "django --no-index\n-i https://evil/simple\n": ["django", "index https://evil/simple"],
+            "-r x.txt --no-index\n-i https://evil/simple\n": [INC("x.txt"), "index https://evil/simple"],
         }
         for text, expected in cases.items():
             with self.subTest(text):
@@ -694,6 +759,94 @@ class RequirementsTest(unittest.TestCase):
         small, large = "a" * 250_000 + "[" + " " * 25_000, "a" * 1_000_000 + "[" + " " * 100_000
         assert_linear(self, lambda: manifests.names("requirements", small),
                       lambda: manifests.names("requirements", large))
+
+
+class RequirementsEncodingTest(unittest.TestCase):
+    """Файл требований декодируется, как у pip 26.2 (req_file._decode_req_file): BOM UTF-8, UTF-16, UTF-32, объявление
+    PEP 263 в строке на `#` из первых двух, UTF-8, кодировка локали; имена — ещё и текста в UTF-8, как его читают
+    setuptools и hatch-requirements-txt. Образец формы — `pip freeze > requirements.txt` в Windows PowerShell 5:
+    UTF-16 LE с BOM."""
+
+    CASES = {
+        "utf-16": ("requests\nevil-pkg==1.0\n".encode("utf-16"), {"requests", "evil-pkg"}),
+        "utf-16-be": (codecs.BOM_UTF16_BE + "evil\n".encode("utf-16-be"), {"evil"}),
+        "utf-32": ("evil\n".encode("utf-32"), {"evil"}),
+        "utf-8-sig": ("evil\n".encode("utf-8-sig"), {"evil"}),
+        "utf-7": (b"# -*- coding: utf-7 -*-\n+AGUAdgBpAGw-\n", {"evil"}),
+        "second line": (b"\n# vim: set fileencoding=utf-7 :\n+AGUAdgBpAGw-\n", {"evil"}),
+        # Объявление в третьей строке или с отступом pip не читает.
+        "third line": (b"\n\n# coding: utf-7\n+AGUAdgBpAGw-\n", set()),
+        "indented": (b"  # coding: utf-7\n+AGUAdgBpAGw-\n", set()),
+        "latin-1": ("# coding: latin-1\nevil # caf\xe9\n".encode("latin-1"), {"evil"}),
+        "unknown codec": (b"# coding: nosuch\nevil\n", {"evil"}),
+        # pip читает UTF-16 LE, setuptools — UTF-8.
+        "utf-16-le declared": (b"# coding: utf-16-le\nevil\n\n", {"evil"}),
+    }
+
+    def test_decode_as_pip(self):
+        for name, (data, expected) in self.CASES.items():
+            with self.subTest(name):
+                text = manifests.decode("requirements", data)
+                self.assertEqual(manifests.names("requirements", text), frozenset(expected))
+                self.assertEqual(manifests.known_names("requirements", text), frozenset(expected))
+
+    def test_locale_fallback(self):
+        # Не UTF-8 без объявления — кодировка локали (utils.compat.get_locale_encoding).
+        data = "evil # \u0441\n".encode("cp1251")
+        with mock.patch("locale.getencoding", return_value="cp1251"):
+            self.assertEqual(manifests.decode("requirements", data), "evil # \u0441\n")
+        self.assertEqual(manifests.names("requirements", manifests.decode("requirements", data)), {"evil"})
+
+    def test_other_kinds_utf8(self):
+        # npm, uv, go отвергают UTF-16; BOM UTF-8 npm и uv принимают (npm 11.16, uv 0.12): разбор его снимает.
+        data = '{"dependencies": {"evil": "1"}}'.encode("utf-16")
+        self.assertIsNone(manifests.names("package.json", manifests.decode("package.json", data)))
+        data = '{"dependencies": {"evil": "1"}}'.encode("utf-8-sig")
+        self.assertEqual(manifests.names("package.json", manifests.decode("package.json", data)), {"evil"})
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = os.path.realpath(tmp.name)
+        self.path = os.path.join(self.root, "requirements.txt")
+
+    def write(self, data):
+        with open(self.path, "wb") as f:
+            f.write(data)
+
+    def check(self, tool, tool_input):
+        return manifest_watch.check_edit(tool, tool_input, self.path, "requirements", root=lambda: self.root)
+
+    def test_command(self):
+        self.write(b"requests\n")
+        entry = manifest_watch.take(self.root, time.monotonic() + 30)
+        self.write("requests\nevil-pkg==1.0\n".encode("utf-16"))
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30),
+                         ({"requirements.txt": ["evil-pkg"]}, [], None))
+
+    def test_edit(self):
+        # Edit файла в UTF-16 ложится на текст pip; Write с объявлением PEP 263 pip прочтёт в объявленной кодировке.
+        self.write("requests\n".encode("utf-16"))
+        self.assertEqual(self.check("Edit", {"old_string": "requests", "new_string": "requests\nevil-pkg"}),
+                         ["evil-pkg"])
+        self.assertEqual(self.check("Write", {"content": "# -*- coding: utf-7 -*-\nrequests\n+AGUAdgBpAGw-\n"}),
+                         ["evil"])
+        self.write("# coding: latin-1\nrequests # caf\xe9\n".encode("latin-1"))
+        for old in ("caf\xe9", "caf\ufffd"):
+            with self.subTest(old):
+                self.assertEqual(self.check("Edit", {"old_string": old, "new_string": "x\nevil"}), ["evil"])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_git_versions(self):
+        # Версия HEAD и дерево HEAD декодируются так же: прежнее имя файла в UTF-16 не новое.
+        _git("init", "-q", cwd=self.root)
+        self.write("requests\nflask\n".encode("utf-16"))
+        _git("add", ".", cwd=self.root)
+        _git("commit", "-qm", "i", cwd=self.root)
+        self.assertEqual(manifest_watch.head_names(self.path, "requirements", 30, self.root), {"requests", "flask"})
+        self.assertIn("flask", manifest_watch.project_names(self.root, "requirements", time.monotonic() + 30))
+        self.write("requests\n".encode("utf-16"))
+        self.assertEqual(self.check("Write", {"content": "requests\nflask\n"}), [])
 
 
 class CargoTest(unittest.TestCase):
@@ -975,6 +1128,52 @@ end
         for text, expected in cases.items():
             with self.subTest(text):
                 self.assertEqual(manifests.names("gemfile", text), frozenset(expected))
+
+
+    def test_statement_over_lines(self):
+        # Оператор продолжается после строки, которая кончается `,`, `\\`, открытой скобкой, `=>` или `ключ:`, через
+        # пустые строки и строки-комментарии: опции гема на строке-продолжении — его опции. Формы сверены с Ruby 3.4
+        # (вычисление заглушкой DSL); образец — gemfile-gitlab.
+        cases = {
+            'gem "rails",\n  git: "https://evil/a"\n': {"rails @ git+https://evil/a"},
+            'gem "b",\n\n  # comment\n  git: "https://evil/b"\n': {"b @ git+https://evil/b"},
+            'gem "c", git:\n  "https://evil/c"\n': {"c @ git+https://evil/c"},
+            'gem "d", "git" =>\n  "https://evil/d"\n': {"d @ git+https://evil/d"},
+            'gem "f", \\\n  git: "https://evil/f"\n': {"f @ git+https://evil/f"},
+            'gem "g", {\n  git: "https://evil/g" }\n': {"g @ git+https://evil/g"},
+            'gem "h", [\n  "1" ].first, git: "https://evil/h"\n': {"h @ git+https://evil/h"},
+            'gem(\n  "i",\n  github: "evil/i"\n)\n': {"i @ github:evil/i"},
+            'source(\n  "https://evil.example/src"\n)\n': {"index https://evil.example/src"},
+            'eval_gemfile(\n  "extra.rb"\n)\n': {INC("extra.rb")},
+            # Местный гем: `path:` на строке-продолжении.
+            'gem "e",\n  path: "../e"\n': set(),
+            'gem(\n  "e",\n  path: "../e"\n)\n': set(),
+            'gem "a", require: false\ngem "b",\n  path: "../b"\n': {"a"},
+            # Гем с начала строки внутри цепочки — свой оператор: блок `{ … }`, оператор после `;`.
+            '[1].each {\n  gem "x",\n    git: "https://evil/x"\n}\ngem "y"\n': {"x @ git+https://evil/x", "y"},
+            'gem "a", "~> 1",\n  require: false; gem "b"\n': {"a", "b"},
+            'group :development,\n      :test do\n  gem "a"\nend\ngem "b"\n': {"a", "b"},
+        }
+        for text, expected in cases.items():
+            with self.subTest(text):
+                self.assertEqual(manifests.names("gemfile", text), frozenset(expected))
+        old = 'source "https://rubygems.org"\ngem "rails"\n'
+        self.assertEqual(_added("Gemfile", old, old.replace('"rails"', '"rails",\n  git: "https://evil.example/r"')),
+                         ["rails @ git+https://evil.example/r"])
+
+    def test_linear_on_long_statement(self):
+        # Цепочка строк-продолжений до размера манифеста: опция гема ищется двоичным поиском.
+        cases = {
+            "gems": lambda n: 'gem "a",\n' * n,
+            "labels": lambda n: 'gem "a", git:\n' * n,
+            "sources": lambda n: "source(\n" * n,
+            "path at end": lambda n: 'gem "a",\n' * n + 'path: "x"\n',
+        }
+        for name, make in cases.items():
+            with self.subTest(name):
+                small, large = make(4000), make(16000)
+                assert_linear(self, lambda: manifests.names("gemfile", small),
+                              lambda: manifests.names("gemfile", large))
 
 
 class KnownNamesTest(unittest.TestCase):
@@ -1543,8 +1742,9 @@ def _write(root, rel, text):
 
 
 class OwnNameTrustTest(unittest.TestCase):
-    """Имя пакета манифеста — пакет проекта, только если манифест в HEAD или член workspace корня (`workspaces`
-    package.json, `[tool.uv.workspace]` pyproject.toml); имя свежего манифеста вне workspace — внешнее."""
+    """Имя пакета манифеста — пакет проекта, только если манифест в HEAD (кроме npm и PyPI) или член npm workspace
+    корня (`workspaces` package.json); имя свежего манифеста вне workspace — внешнее. Член uv workspace — не пакет
+    проекта по имени: uv ставит его из каталога только по источнику `workspace = true` (UvWorkspaceSourceTest)."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -1570,24 +1770,50 @@ class OwnNameTrustTest(unittest.TestCase):
                 _write(self.root, "package.json", '{"name": "app", "workspaces": %s}' % workspaces)
                 self.assertNotIn("evil-pkg", self.names())
 
-    def test_uv_workspace_member(self):
+    def test_uv_workspace_member_name_not_project_package(self):
         _write(self.root, "pyproject.toml", '[project]\nname = "app"\n\n[tool.uv.workspace]\nmembers = ["libs/*"]\n'
                                             'exclude = ["libs/skip"]\n')
         _write(self.root, "libs/a/pyproject.toml", '[project]\nname = "Lib_A"\n')
         _write(self.root, "libs/skip/pyproject.toml", '[project]\nname = "skipped"\n')
         _write(self.root, "other/pyproject.toml", '[project]\nname = "other"\n')
-        names = self.names("pyproject")
-        self.assertIn("lib-a", names)
-        self.assertNotIn("skipped", names)
-        self.assertNotIn("other", names)
+        self.assertFalse({"lib-a", "skipped", "other"} & self.names("pyproject"))
 
     @unittest.skipUnless(shutil.which("git"), "нет git")
-    def test_committed_manifest_name_is_project_package(self):
+    def test_committed_manifest_name(self):
+        # Имя пакета манифеста HEAD — пакет проекта у cargo; у npm и PyPI — нет: вне связи workspace npm и pip ставят
+        # пакет с этим именем из реестра.
+        _write(self.root, "crates/fake/Cargo.toml", '[package]\nname = "evil-crate"\n')
+        _write(self.root, "libs/fake/pyproject.toml", '[project]\nname = "evil-py"\n')
         _git("init", "-q", cwd=self.root)
-        self.assertNotIn("evil-pkg", self.names())
         _git("add", ".", cwd=self.root)
         _git("commit", "-qm", "i", cwd=self.root)
+        self.assertNotIn("evil-pkg", self.names())
+        self.assertNotIn("evil-py", self.names("requirements"))
+        self.assertIn("evil-crate", self.names("cargo"))
+        # Член npm workspace — пакет проекта и в HEAD.
+        _write(self.root, "package.json", '{"name": "app", "workspaces": ["tools/*"]}')
         self.assertIn("evil-pkg", self.names())
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_committed_name_new_outside_workspace(self):
+        # Имя пакета из HEAD не прикрывает ту же зависимость в package.json, который npm с каталогом не свяжет.
+        _git("init", "-q", cwd=self.root)
+        _git("add", ".", cwd=self.root)
+        _git("commit", "-qm", "i", cwd=self.root)
+        dep = '{"name": "app", "dependencies": {"left-pad": "^1", "evil-pkg": "^1"}}'
+        for workspaces, expected in [(None, ["evil-pkg"]), ('["other/*"]', ["evil-pkg"]), ('["tools/*"]', [])]:
+            with self.subTest(workspaces=workspaces):
+                text = dep if workspaces is None else dep.replace('"app",', '"app", "workspaces": %s,' % workspaces)
+                head = text.replace(', "evil-pkg": "^1"', "")
+                _write(self.root, "package.json", head)
+                self.assertEqual(manifest_watch.check_edit(
+                    "Write", {"content": text}, os.path.join(self.root, "package.json"), "package.json",
+                    lambda: manifest_watch.project_names(self.root, "package.json", time.monotonic() + 30),
+                    root=lambda: self.root), expected)
+                entry = manifest_watch.take(self.root, time.monotonic() + 30)
+                _write(self.root, "package.json", text)
+                self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30)[0],
+                                 {"package.json": expected} if expected else {})
 
     def test_compare_fresh_manifest_name_is_new(self):
         os.remove(os.path.join(self.root, "tools/fake/package.json"))
@@ -1607,6 +1833,412 @@ class OwnNameTrustTest(unittest.TestCase):
         _write(self.root, "package.json", '{"name": "app", "workspaces": ["tools/*"], '
                                           '"dependencies": {"evil-pkg": "*"}}')
         self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30)[0], {})
+
+
+class UvWorkspaceSourceTest(unittest.TestCase):
+    """uv ставит члена workspace из каталога только в pyproject.toml workspace с источником `workspace = true`:
+    своим или корня, если член не задал источник этого имени сам (docs.astral.sh/uv, «Workspaces»). Проверено
+    `uv lock --offline` (uv 0.13.0): член app без источника — запрос mylib к реестру; источник корня — mylib из
+    packages/mylib; свой источник члена `path` для mylib заменяет источник корня; pyproject вне `members` и в
+    `exclude` — mylib из реестра. Файл требований pip ставит из PyPI."""
+
+    ROOT = ('[project]\nname = "root"\n\n[tool.uv.workspace]\nmembers = ["packages/*"]\nexclude = ["packages/skip"]\n'
+            '%s')
+    APP = '[project]\nname = "app"\ndependencies = ["mylib"]\n%s'
+    WS = '\n[tool.uv.sources]\nmylib = { workspace = true }\n'
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = os.path.realpath(tmp.name)
+        _write(self.root, "pyproject.toml", self.ROOT % "")
+        _write(self.root, "packages/mylib/pyproject.toml", '[project]\nname = "mylib"\n')
+
+    def project(self, kind):
+        return manifest_watch.project_names(self.root, kind, time.monotonic() + 30)
+
+    def edit(self, rel, kind, content):
+        return manifest_watch.check_edit("Write", {"content": content}, os.path.join(self.root, rel), kind,
+                                         lambda: self.project(kind), root=lambda: self.root)
+
+    def command(self, rel, content):
+        entry = manifest_watch.take(self.root, time.monotonic() + 30)
+        _write(self.root, rel, content)
+        try:
+            return manifest_watch.compare(entry, time.monotonic() + 30)[0].get(rel, [])
+        finally:
+            os.remove(os.path.join(self.root, rel))
+
+    def check(self, rel, kind, content, expected):
+        with self.subTest(rel=rel, content=content):
+            self.assertEqual(self.edit(rel, kind, content), expected)
+            self.assertEqual(self.command(rel, content), expected)
+
+    def test_member_without_source_is_external(self):
+        self.check("packages/app/pyproject.toml", "pyproject", self.APP % "", ["mylib"])
+        self.check("requirements.txt", "requirements", "mylib\n", ["mylib"])
+        self.check("tools/x/pyproject.toml", "pyproject", self.APP % "", ["mylib"])
+
+    def test_own_source(self):
+        self.check("packages/app/pyproject.toml", "pyproject", self.APP % self.WS, [])
+
+    def test_root_source_inherited_by_member(self):
+        _write(self.root, "pyproject.toml", self.ROOT % self.WS)
+        self.check("packages/app/pyproject.toml", "pyproject", self.APP % "", [])
+        # Свой источник члена с другим именем источник корня не отменяет.
+        self.check("packages/app/pyproject.toml", "pyproject",
+                   self.APP % '\n[tool.uv.sources]\nother = { path = "../other" }\n', [])
+        # Свой источник того же имени заменяет источник корня.
+        self.check("packages/app/pyproject.toml", "pyproject",
+                   self.APP % '\n[tool.uv.sources]\nmylib = { index = "evil" }\n', ["mylib @ index:evil"])
+        # Не член (вне `members`, в `exclude`) и файл требований источник корня не наследуют.
+        self.check("tools/x/pyproject.toml", "pyproject", self.APP % "", ["mylib"])
+        self.check("packages/skip/pyproject.toml", "pyproject", self.APP % "", ["mylib"])
+        self.check("requirements.txt", "requirements", "mylib\n", ["mylib"])
+
+
+class NpmWorkspaceLinkTest(unittest.TestCase):
+    """Зависимость на члена npm workspace npm связывает с каталогом члена в корневом package.json всегда, в члене —
+    если версия члена подходит к диапазону, иначе ставит пакет из реестра (@npmcli/arborist 9.7: Node.#loadDepType,
+    buildIdealTree #nodeFromSpec, dep-valid.js): такое имя — `имя @ registry`, имя члена его не покрывает. Проверено
+    `npm install --dry-run --offline` (npm 11.16): член b с `"leftpadx": "^2.0.0"` при члене leftpadx 1.2.0 и с
+    `latest` — запрос к реестру (ENOTCACHED), с `^1.0.0` — связь; корень с `^2.0.0` — связь."""
+
+    DEP = '{"name": "b", "version": "1.0.0", "dependencies": {"leftpadx": "%s"}}'
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = os.path.realpath(tmp.name)
+        _write(self.root, "package.json", '{"name": "root", "workspaces": ["packages/*"]}')
+        _write(self.root, "packages/leftpadx/package.json", '{"name": "leftpadx", "version": "1.2.0"}')
+        _write(self.root, "packages/b/package.json", '{"name": "b", "version": "1.0.0"}')
+
+    def edit(self, rel, content):
+        return manifest_watch.check_edit(
+            "Write", {"content": content}, os.path.join(self.root, rel), "package.json",
+            lambda: manifest_watch.project_names(self.root, "package.json", time.monotonic() + 30),
+            root=lambda: self.root)
+
+    def test_satisfies_as_node_semver(self):
+        # Ожидания сняты с semver 7.8.1 и npm-package-arg npm 11.16 по правилу dep-valid.js; формы вне
+        # поддержанных (`>=`, `||`, пробел после `v`, пререлиз, `v` и нули в версии члена) — не подходят: отказ
+        # дешевле. Края спецификатора npm-package-arg обрезает, пробел после `^`, `~`, `~>`, `=` убирает node-semver;
+        # `\x1c` и `\u200b` — не пробел JavaScript: npm-package-arg отвергает спецификатор (EINVALIDTAGNAME).
+        cases = {
+            ("1.2.3", ""): True, ("1.2.3-beta.1", "*"): True, ("1.2.3", "x"): True, ("1.2.3", "1"): True,
+            ("1.2.3", "1.2"): True, ("1.2.3", "1.2.x"): True, ("1.2.3", "=v1.2.3"): True, ("1.2.3", "1.2.3"): True,
+            ("1.2.4", "1.2.3"): False, ("1.9.9", "^1.2"): True, ("2.0.0", "^1.2.3"): False,
+            ("1.2.3+build.1", "^1.2.3"): True, ("0.1.5", "^0.1"): True, ("0.2.0", "^0.1.5"): False,
+            ("0.0.3", "^0.0.3"): True, ("0.0.4", "^0.0.3"): False, ("0.0.4", "^0.0"): True, ("0.1.0", "^0.0.x"): False,
+            ("0.9.0", "^0"): True, ("1.0.0", "^0.x"): False, ("1.3.0", "~1.2.3"): False, ("1.2.9", "~>1.2.3"): True,
+            ("1.9.0", "~1"): True, ("1.2.3", "^v1.2.0"): True, ("10.0.0", "1.x.3"): False, ("1.2.3", "^01.2.3"): True,
+            ("1.2.3", "latest"): False, ("1.2.3", ">=1.0.0"): False, ("1.2.3", "1.2.3 || 2.0.0"): False,
+            ("1.2.3", " ^1.2.3"): True, ("1.2.3", "^1.2.3\n"): True, ("1.2.3", "\u3000^ 1.2.3 "): True,
+            ("1.2.3", "^ 1.2.3"): True, ("1.3.0", "~ 1.2.3"): False, ("1.2.9", "~> 1.2.3"): True,
+            ("1.2.3", "= 1.2.3"): True, ("1.2.3", " * "): True, ("1.2.3", " "): True, ("1.2.3", "^ \t1"): True,
+            ("1.2.3", "\x1c^1.2.3"): False, ("1.2.3", "v 1.2.3"): False, ("1.2.3", "\u200b^1.2.3"): False,
+            ("1.2.3-beta.1", "1.2.3-beta.1"): False, ("v1.2.3", "^1"): False,
+            ("1.2", "*"): True, ("1.2", "^1"): False, (None, "^1"): False, (None, "*"): True,
+            ("9007199254740993.0.0", "^9007199254740993.0.0"): False, ("9007199254740993.0.0", "x"): False,
+        }
+        for (version, spec), expected in cases.items():
+            with self.subTest(version=version, spec=spec):
+                self.assertIs(manifests._npm_satisfies(version, spec), expected)
+
+    def test_names_by_place(self):
+        members = {"leftpadx": "1.2.0"}
+        for place, spec, expected in [
+            ("root", "^2.0.0", set()), ("root", "npm:leftpadx@^9", set()),
+            ("member", "^1.0.0", set()), ("member", "*", set()), ("member", "^2.0.0", {"leftpadx @ registry"}),
+            ("member", "latest", {"leftpadx @ registry"}), ("member", "npm:leftpadx@^1", {"leftpadx @ registry"}),
+            ("member", "file:../leftpadx", set()),
+            ("member", "github:evil/leftpadx", {"leftpadx @ github:evil/leftpadx"}),
+            (None, "^1.0.0", {"leftpadx @ registry"}),
+        ]:
+            with self.subTest(place=place, spec=spec):
+                text = self.DEP % spec
+                self.assertEqual(manifests.names("package.json", text, manifests.NpmWorkspace(members, place, members)),
+                                 frozenset(expected))
+        # Псевдоним другого ключа и overrides ставят член из реестра и в корне.
+        text = '{"dependencies": {"y": "npm:leftpadx@^1"}, "overrides": {"z": "npm:leftpadx@1"}}'
+        self.assertEqual(manifests.names("package.json", text, manifests.NpmWorkspace(members, "root", members)),
+                         {"leftpadx @ registry"})
+        self.assertEqual(manifests.names("package.json", self.DEP % "^2.0.0"), {"leftpadx"})
+
+    def test_edit(self):
+        root = '{"name": "root", "workspaces": ["packages/*"], "dependencies": {"leftpadx": "%s"}}'
+        for rel, content, expected in [
+            ("packages/b/package.json", self.DEP % "^2.0.0", ["leftpadx @ registry"]),
+            ("packages/b/package.json", self.DEP % "latest", ["leftpadx @ registry"]),
+            ("packages/b/package.json", self.DEP % "^1.0.0", []),
+            ("packages/b/package.json", self.DEP % "*", []),
+            ("package.json", root % "^2.0.0", []),
+            ("tools/x/package.json", self.DEP % "^1.0.0", ["leftpadx @ registry"]),
+        ]:
+            with self.subTest(rel=rel, content=content):
+                self.assertEqual(self.edit(rel, content), expected)
+        # Уже взятый из реестра член — не новое имя; связанный — не прикрывает реестр в другом манифесте.
+        _write(self.root, "packages/b/package.json", self.DEP % "^2.0.0")
+        self.assertEqual(self.edit("packages/b/package.json", (self.DEP % "^2.0.0").replace("1.0.0", "1.0.1")), [])
+        _write(self.root, "packages/b/package.json", self.DEP % "^1.0.0")
+        _write(self.root, "packages/c/package.json", '{"name": "c"}')
+        self.assertEqual(self.edit("packages/c/package.json", self.DEP.replace('"b"', '"c"') % "^2.0.0"),
+                         ["leftpadx @ registry"])
+
+    def test_edit_moves_dependents_to_registry(self):
+        # Правка версии члена или шаблонов корня переводит зависимость другого члена со связи на реестр.
+        _write(self.root, "packages/b/package.json", self.DEP % "^1.0.0")
+        self.assertEqual(self.edit("packages/leftpadx/package.json", '{"name": "leftpadx", "version": "1.3.0"}'), [])
+        self.assertEqual(self.edit("packages/leftpadx/package.json", '{"name": "leftpadx", "version": "2.0.0"}'),
+                         ["leftpadx @ registry"])
+        self.assertEqual(self.edit("package.json", '{"name": "root", "workspaces": ["packages/b"]}'),
+                         ["leftpadx @ registry"])
+        self.assertEqual(self.edit("package.json", '{"name": "root"}'), ["leftpadx @ registry"])
+
+    def test_compare(self):
+        entry = json.loads(json.dumps(manifest_watch.take(self.root, time.monotonic() + 30)))
+        _write(self.root, "packages/b/package.json", self.DEP % "^1.0.0")
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30), ({}, [], None))
+        _write(self.root, "packages/b/package.json", self.DEP % "^2.0.0")
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30),
+                         ({"packages/b/package.json": ["leftpadx @ registry"]}, [], None))
+        # Версия члена меняется командой: зависимость неизменённого b уходит на реестр.
+        _write(self.root, "packages/b/package.json", self.DEP % "^1.0.0")
+        entry = json.loads(json.dumps(manifest_watch.take(self.root, time.monotonic() + 30)))
+        self.assertEqual(entry["npm"], {"": {"leftpadx": "1.2.0", "b": "1.0.0"}})
+        _write(self.root, "packages/leftpadx/package.json", '{"name": "leftpadx", "version": "2.0.0"}')
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30),
+                         ({"packages/b/package.json": ["leftpadx @ registry"]}, [], None))
+        _write(self.root, "packages/leftpadx/package.json", '{"name": "leftpadx", "version": "1.2.0"}')
+        _write(self.root, "package.json", '{"name": "root"}')
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30),
+                         ({"packages/b/package.json": ["leftpadx @ registry"]}, [], None))
+
+    def commit(self):
+        _git("init", "-q", cwd=self.root)
+        _git("add", ".", cwd=self.root)
+        _git("commit", "-qm", "i", cwd=self.root)
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_restored_member_text_not_new(self):
+        # Версия HEAD разбирается с npm workspace HEAD: возврат закоммиченного текста члена — командой или Write — не
+        # новое имя.
+        registry = self.DEP % "^2.0.0"
+        _write(self.root, "packages/b/package.json", registry)
+        self.commit()
+        _write(self.root, "packages/b/package.json", self.DEP % "^1.0.0")
+        entry = manifest_watch.take(self.root, time.monotonic() + 30)
+        _git("checkout", "--", "packages/b/package.json", cwd=self.root)
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30), ({}, [], None))
+        _write(self.root, "packages/b/package.json", self.DEP % "^1.0.0")
+        self.assertEqual(self.edit("packages/b/package.json", registry), [])
+        self.assertIn("leftpadx @ registry",
+                      manifest_watch.project_names(self.root, "package.json", time.monotonic() + 30))
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_head_workspace_not_working_tree(self):
+        # В HEAD зависимость b связана с членом 2.0.0; команда, сменившая версию члена на 1.2.0, переводит её на
+        # реестр, и версия HEAD, разобранная с членами HEAD, а не рабочего дерева, это имя не прикрывает.
+        _write(self.root, "packages/leftpadx/package.json", '{"name": "leftpadx", "version": "2.0.0"}')
+        _write(self.root, "packages/b/package.json", self.DEP % "^2.0.0")
+        self.commit()
+        entry = manifest_watch.take(self.root, time.monotonic() + 30)
+        _write(self.root, "packages/leftpadx/package.json", '{"name": "leftpadx", "version": "1.2.0"}')
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30),
+                         ({"packages/b/package.json": ["leftpadx @ registry"]}, [], None))
+        self.assertEqual(manifest_watch.head_names(os.path.join(self.root, "packages/b/package.json"),
+                                                   "package.json", 30, self.root), frozenset())
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_ref_and_index_versions_use_their_workspace(self):
+        # Дерево ref команды и сторона конфликта индекса разбираются с членами своей версии.
+        self.commit()
+        _git("checkout", "-qb", "feat", cwd=self.root)
+        _write(self.root, "packages/b/package.json", self.DEP % "^2.0.0")
+        _git("commit", "-qam", "feat", cwd=self.root)
+        _git("checkout", "-q", "-", cwd=self.root)
+        known = manifest_watch.restored_names(self.root, "git checkout feat -- packages/b/package.json",
+                                              int(time.time()) + 100, time.monotonic() + 30)
+        self.assertIn("leftpadx @ registry", known["npm"])
+        self.assertNotIn("leftpadx", known["npm"])
+        # Сторона :3: файла b — с зависимостью на реестр; корень и член — стадии 0.
+        blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=self.root, input=self.DEP % "^2.0.0",
+                              check=True, capture_output=True, text=True).stdout.strip()
+        _git("rm", "-q", "--cached", "packages/b/package.json", cwd=self.root)
+        subprocess.run(["git", "update-index", "--index-info"], cwd=self.root, check=True, capture_output=True,
+                       input=f"100644 {blob} 3\tpackages/b/package.json\n", text=True)
+        self.assertEqual(manifest_watch.head_names(os.path.join(self.root, "packages/b/package.json"),
+                                                   "package.json", 30, self.root), {"leftpadx @ registry"})
+
+
+class NestedWorkspaceTest(unittest.TestCase):
+    """Корень workspace в подкаталоге проекта: npm ищет его из каталога члена ближайшим предком, чей package.json с
+    `workspaces` включает каталог члена (@npmcli/config loadLocalPrefix), uv — первым предком с pyproject.toml, если
+    его `[tool.uv.workspace]` включает член (uv-workspace find_workspace). Проверено `npm install --offline` (npm
+    11.16: член web/packages/app связан с web/packages/ui) и `uv lock --offline -v` (uv 0.13.0: из каталога члена под
+    промежуточным pyproject.toml с `[project]`, без него, с workspace без члена — «No workspace root found»)."""
+
+    APP = '{"name": "@acme/app", "version": "1.0.0", "dependencies": {"@acme/ui": "%s"}}'
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = os.path.realpath(tmp.name)
+        _write(self.root, "web/package.json", '{"name": "web", "private": true, "workspaces": ["packages/*"]}')
+        _write(self.root, "web/packages/ui/package.json", '{"name": "@acme/ui", "version": "1.0.0"}')
+        _write(self.root, "web/packages/app/package.json", '{"name": "@acme/app", "version": "1.0.0"}')
+
+    def check(self, rel, kind, content, expected):
+        with self.subTest(rel=rel, content=content):
+            path = os.path.join(self.root, rel)
+            self.assertEqual(manifest_watch.check_edit(
+                "Write", {"content": content}, path, kind,
+                lambda: manifest_watch.project_names(self.root, kind, time.monotonic() + 30),
+                root=lambda: self.root), expected)
+            saved = manifest_watch._text(path, kind)
+            entry = manifest_watch.take(self.root, time.monotonic() + 30)
+            _write(self.root, rel, content)
+            try:
+                self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30)[0].get(rel, []), expected)
+            finally:
+                if saved is None:
+                    os.remove(path)
+                else:
+                    _write(self.root, rel, saved)
+
+    def test_npm_member_of_nested_root(self):
+        self.check("web/packages/app/package.json", "package.json", self.APP % "^1.0.0", [])
+        self.check("web/packages/app/package.json", "package.json", self.APP % "^2.0.0", ["@acme/ui @ registry"])
+        # Корень web связывает члена в своём package.json; package.json вне workspace web берёт имя из реестра.
+        self.check("web/package.json", "package.json",
+                   '{"name": "web", "workspaces": ["packages/*"], "dependencies": {"@acme/ui": "^2"}}', [])
+        self.check("api/package.json", "package.json", self.APP.replace("app", "api") % "^1.0.0",
+                   ["@acme/ui @ registry"])
+        self.check("package.json", "package.json", self.APP.replace("app", "top") % "^1.0.0", ["@acme/ui @ registry"])
+
+    def test_npm_skips_ancestor_without_member(self):
+        # Предок с package.json без `workspaces` или с шаблонами без члена npm пропускает и ищет корень выше.
+        _write(self.root, "web/packages/package.json", '{"name": "mid", "workspaces": ["other/*"]}')
+        self.check("web/packages/app/package.json", "package.json", self.APP % "^1.0.0", [])
+        # Ближний корень, который включает члена, решает: член другого корня — реестр.
+        _write(self.root, "web/packages/package.json", '{"name": "mid", "workspaces": ["app"]}')
+        self.check("web/packages/app/package.json", "package.json", self.APP % "^1.0.0", ["@acme/ui @ registry"])
+
+    def test_npm_member_with_own_workspaces(self):
+        # Член верхнего корня со своими `workspaces` — член: npm поднимается к корню, чей `workspaces` включает
+        # каталог (loadLocalPrefix), и `workspaces` члена не читает. Проверено `npm install --offline` (npm 11.16):
+        # сосед lib связан, @acme/ui из вложенных `workspaces` web — запрос в реестр (ENOTCACHED).
+        _write(self.root, "package.json", '{"name": "top", "workspaces": ["web", "lib"]}')
+        _write(self.root, "lib/package.json", '{"name": "lib", "version": "1.0.0"}')
+        web = '{"name": "web", "version": "1.0.0", "workspaces": ["packages/*"], "dependencies": {"%s": "^1.0.0"}}'
+        self.check("web/package.json", "package.json", web % "lib", [])
+        self.check("web/package.json", "package.json", web % "@acme/ui", ["@acme/ui @ registry"])
+
+    def test_npm_member_without_name(self):
+        # Член без `name` npm называет по каталогу, под каталогом `@scope` — `@scope/каталог` (@npmcli/map-workspaces
+        # getPackageName, @npmcli/name-from-folder).
+        _write(self.root, "web/package.json", '{"name": "web", "workspaces": ["packages/*", "packages/@acme/*"]}')
+        _write(self.root, "web/packages/ui/package.json", '{"version": "1.0.0"}')
+        _write(self.root, "web/packages/@acme/kit/package.json", '{"version": "1.0.0"}')
+        app = '{"name": "@acme/app", "version": "1.0.0", "dependencies": {"%s": "%s"}}'
+        self.check("web/packages/app/package.json", "package.json", app % ("ui", "^1.0.0"), [])
+        self.check("web/packages/app/package.json", "package.json", app % ("@acme/kit", "^1.0.0"), [])
+        self.check("web/packages/app/package.json", "package.json", app % ("ui", "^2.0.0"), ["ui @ registry"])
+        # Корень сужает `workspaces`: безымянный ui больше не член, зависимость app на него — из реестра.
+        _write(self.root, "web/packages/app/package.json", app % ("ui", "^1.0.0"))
+        entry = manifest_watch.take(self.root, time.monotonic() + 30)
+        _write(self.root, "web/package.json", '{"name": "web", "workspaces": ["packages/app"]}')
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30)[0],
+                         {"web/packages/app/package.json": ["ui @ registry"]})
+
+    def test_npm_root_change_moves_dependents(self):
+        # Правка шаблонов вложенного корня переводит зависимость члена со связи на реестр.
+        _write(self.root, "web/packages/app/package.json", self.APP % "^1.0.0")
+        narrowed = '{"name": "web", "workspaces": ["packages/app"]}'
+        self.assertEqual(manifest_watch.check_edit(
+            "Write", {"content": narrowed}, os.path.join(self.root, "web/package.json"), "package.json",
+            lambda: manifest_watch.project_names(self.root, "package.json", time.monotonic() + 30),
+            root=lambda: self.root), ["@acme/ui @ registry"])
+        entry = manifest_watch.take(self.root, time.monotonic() + 30)
+        _write(self.root, "web/package.json", narrowed)
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30)[0],
+                         {"web/packages/app/package.json": ["@acme/ui @ registry"]})
+
+    def test_uv_member_of_nested_root(self):
+        _write(self.root, "py/pyproject.toml", '[project]\nname = "root"\n\n[tool.uv.workspace]\n'
+                                               'members = ["packages/*", "mid/app"]\n\n[tool.uv.sources]\n'
+                                               'alib = { workspace = true }\n')
+        _write(self.root, "py/packages/alib/pyproject.toml", '[project]\nname = "alib"\n')
+        app = '[project]\nname = "app"\ndependencies = ["alib"]\n'
+        self.check("py/packages/app/pyproject.toml", "pyproject", app, [])
+        self.check("py/mid/app/pyproject.toml", "pyproject", app, [])
+        # Первый предок с pyproject.toml без workspace, включающего член, решает: не член, alib — из реестра.
+        for mid in ('[project]\nname = "mid"\n', '[tool.black]\nline-length = 1\n',
+                    '[project]\nname = "mid"\n\n[tool.uv.workspace]\nmembers = ["other"]\n'):
+            _write(self.root, "py/mid/pyproject.toml", mid)
+            self.check("py/mid/app/pyproject.toml", "pyproject", app, ["alib"])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_head_version_uses_nested_root(self):
+        _write(self.root, "web/packages/app/package.json", self.APP % "^2.0.0")
+        _git("init", "-q", cwd=self.root)
+        _git("add", ".", cwd=self.root)
+        _git("commit", "-qm", "i", cwd=self.root)
+        self.assertEqual(manifest_watch.head_names(os.path.join(self.root, "web/packages/app/package.json"),
+                                                   "package.json", 30, self.root), {"@acme/ui @ registry"})
+        _write(self.root, "web/packages/app/package.json", self.APP % "^1.0.0")
+        self.check("web/packages/app/package.json", "package.json", self.APP % "^2.0.0", [])
+
+
+@unittest.skipUnless(shutil.which("git"), "нет git")
+class VersionNpmOnceTest(unittest.TestCase):
+    """Сравнение после команды читает дерево версии HEAD для npm workspace один раз на все изменённые package.json, а
+    не на каждый: иначе 500 членов или 30 членов в репозитории на 100 000 файлов не укладываются в CHECK_BUDGET."""
+
+    def test_tree_read_once(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = os.path.realpath(tmp.name)
+        _write(root, "package.json", '{"name": "root", "workspaces": ["packages/*"]}')
+        for i in range(20):
+            _write(root, f"packages/m{i}/package.json", '{"name": "m%d", "version": "1.0.0"}' % i)
+        _git("init", "-q", cwd=root)
+        _git("add", ".", cwd=root)
+        _git("commit", "-qm", "i", cwd=root)
+        entry = manifest_watch.take(root, time.monotonic() + 30)
+        for i in range(20):
+            _write(root, f"packages/m{i}/package.json",
+                   '{"name": "m%d", "version": "1.0.0", "dependencies": {"left-pad": "1"}}' % i)
+        calls = []
+        git = manifest_watch._git
+
+        def counted(cwd, timeout, *args, **kwargs):
+            calls.append(args[0])
+            return git(cwd, timeout, *args, **kwargs)
+        with mock.patch.object(manifest_watch, "_git", counted):
+            added = manifest_watch.compare(entry, time.monotonic() + 30)[0]
+        self.assertEqual(added, {f"packages/m{i}/package.json": ["left-pad"] for i in range(20)})
+        # Одно ls-tree дерева HEAD, общее у npm workspace и _tree_names.
+        self.assertEqual(calls.count("ls-tree"), 1, calls)
+
+
+class WorkspaceGlobsOnceTest(unittest.TestCase):
+    """package.json корня workspace разбирается один раз на снимок, а не на каждого члена: корень на 300 КБ и 900
+    членов иначе не укладываются в SNAPSHOT_BUDGET."""
+
+    def test_root_parsed_once(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = os.path.realpath(tmp.name)
+        _write(root, "package.json", '{"name": "root", "workspaces": ["packages/*"]}')
+        for i in range(20):
+            _write(root, f"packages/m{i}/package.json", '{"name": "m%d", "version": "1.0.0"}' % i)
+        manifest_watch._globs.cache_clear()
+        with mock.patch.object(manifests, "workspace_members", wraps=manifests.workspace_members) as parsed:
+            entry = manifest_watch.take(root, time.monotonic() + 30)
+        self.assertEqual(len(entry["npm"][""]), 20)
+        self.assertEqual(parsed.call_count, 1, parsed.call_args_list)
 
 
 @unittest.skipUnless(hasattr(os, "mkfifo"), "нет FIFO")
@@ -1804,6 +2436,58 @@ class IncludeTest(unittest.TestCase):
         for rel, content, expected in cases:
             with self.subTest(rel=rel, content=content):
                 self.assertEqual(self.added(rel, content), expected)
+
+    def test_include_read_by_includer_kind(self):
+        # pip читает файл `-r`/`-c` как требования под любым именем (pip 26.2, req_file._parse_and_recurse), Bundler
+        # `eval_gemfile` — как Gemfile: манифест другого вида проверяется по своему виду, его подключение — новое имя.
+        _write(self.root, "Gemfile", "")
+        self.assertEqual(self.added("Gemfile", "evil-pkg==1.0\n"), [])
+        _write(self.root, "Gemfile", "evil-pkg==1.0\n")
+        cases = [
+            ("requirements.txt", "requests\n-r Gemfile\n", [INC("Gemfile"), "requests"]),
+            ("requirements.txt", "-c engines/Gemfile\n", [INC("engines/Gemfile")]),
+            ("Gemfile", 'eval_gemfile "requirements.txt"\n', [INC("requirements.txt")]),
+            ("engines/Gemfile", 'eval_gemfile "../Gemfile"\n', []),
+        ]
+        for rel, content, expected in cases:
+            with self.subTest(rel=rel, content=content):
+                self.assertEqual(self.added(rel, content), expected)
+        entry = manifest_watch.take(self.root, time.monotonic() + 30)
+        _write(self.root, "requirements.txt", "-r Gemfile\n")
+        self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30),
+                         ({"requirements.txt": [INC("Gemfile")]}, [], None))
+
+    def test_pyproject_dynamic_files(self):
+        # Файл зависимостей `dynamic` — подключение требований: setuptools 84 (`file` в `[tool.setuptools.dynamic]`,
+        # строка или список) и hatch-requirements-txt 0.4.1 (`files`, `filename`, без них requirements.txt; `filename`
+        # не строкой — TypeError load_requirements_files, файла нет); поле не в `project.dynamic` бэкенд не читает.
+        head = '[project]\nname = "app"\ndynamic = %s\n'
+        cases = [
+            ('["dependencies"]', '[tool.setuptools.dynamic]\ndependencies = {file = ["deps.list"]}\n',
+             [INC("deps.list")]),
+            ('["dependencies"]', '[tool.setuptools.dynamic]\ndependencies = {file = "deps.list"}\n',
+             [INC("deps.list")]),
+            ('["dependencies"]', '[tool.setuptools.dynamic]\ndependencies = {file = ["requirements-dev.txt"]}\n', []),
+            ('["dependencies"]', '[tool.setuptools.dynamic]\ndependencies = {file = ["engines/Gemfile"]}\n',
+             [INC("engines/Gemfile")]),
+            ('["version"]', '[tool.setuptools.dynamic]\ndependencies = {file = ["deps.list"]}\n', []),
+            ('["optional-dependencies"]', '[tool.setuptools.dynamic.optional-dependencies]\n'
+             'dev = {file = ["dev.list"]}\n', [INC("dev.list")]),
+            ('["dependencies"]', '[tool.hatch.metadata.hooks.requirements_txt]\nfiles = ["deps.list"]\n',
+             [INC("deps.list")]),
+            ('["dependencies"]', '[tool.hatch.metadata.hooks.requirements_txt]\nfilename = "deps.list"\n',
+             [INC("deps.list")]),
+            ('["dependencies"]', '[tool.hatch.metadata.hooks.requirements_txt]\nfilename = ["deps.list"]\n', []),
+            ('["dependencies"]', '[tool.hatch.metadata.hooks.requirements_txt]\n', []),
+            ('["optional-dependencies"]', '[tool.hatch.metadata.hooks.requirements_txt]\n'
+             'optional-dependencies = {cli = ["cli.list"]}\n', [INC("cli.list")]),
+        ]
+        for dynamic, tail, expected in cases:
+            with self.subTest(dynamic=dynamic, tail=tail):
+                self.assertEqual(self.added("pyproject.toml", head % dynamic + tail), expected)
+        # Путь — от каталога pyproject.toml.
+        self.assertEqual(self.added("sub/pyproject.toml", head % '["dependencies"]' + '[tool.setuptools.dynamic]\n'
+                                    'dependencies = {file = ["../requirements.txt"]}\n'), [])
 
     def test_package_named_include_not_dropped(self):
         # Пакет `include` с источником — имя пакета, не подключение, даже если текст как у подключения манифеста.

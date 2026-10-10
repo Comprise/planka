@@ -6,16 +6,74 @@
 и RubyGems — как записаны. Пакет не из реестра по умолчанию (git, URL, другой реестр) — имя с источником
 `имя @ источник`, источник для всех пакетов (индекс, репозиторий) — `index <url>`: смена источника имени — новое
 имя, другая ссылка того же источника (коммит, тег, ветка) — нет. Подключение файла, который ставится вместе с
-манифестом (`-r`, `-c`, `eval_gemfile`), — Include `include <путь>`, не равное строке с тем же текстом; строка
-requirements с переменной окружения `${…}` — сама строка, у её URL — без ссылки и фрагмента, где нет `${…}`, у
-архива — колесо `имя @ каталог`, другой архив — URL с именем файла.
+манифестом (`-r`, `-c`, `eval_gemfile`, файл `dynamic` pyproject), — Include `include <путь>`, не равное строке с
+тем же текстом; строка requirements с переменной окружения `${…}` — сама строка, у её URL — без ссылки и фрагмента,
+где нет `${…}`, у архива — колесо `имя @ каталог`, другой архив — URL с именем файла. Файл требований декодируется,
+как у pip (decode). Зависимость package.json на члена npm workspace, которую npm не связывает с каталогом члена, —
+`имя @ registry` (NpmWorkspace).
 """
+import bisect
+import codecs
 import json
+import locale
 import re
 import tomllib
 
 # Ошибки разбора JSON и TOML (TOMLDecodeError — подкласс ValueError); RecursionError — на глубокой вложенности.
 _PARSE_ERRORS = (ValueError, RecursionError)
+
+# Метки порядка байтов файла требований, как у pip (req_file.BOMS, pip 26.2): BOM UTF-16 LE — начало BOM UTF-32 LE,
+# поэтому порядок значим.
+_BOMS = [(codecs.BOM_UTF8, "utf-8"), (codecs.BOM_UTF32, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32-be"),
+         (codecs.BOM_UTF32_LE, "utf-32-le"), (codecs.BOM_UTF16, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16-be"),
+         (codecs.BOM_UTF16_LE, "utf-16-le")]
+# Объявление кодировки PEP 263 (req_file.PEP263_ENCODING_RE).
+_PEP263 = re.compile(rb"coding[:=]\s*([-\w.]+)")
+
+
+class Decoded(str):
+    """Текст файла требований, как его декодирует pip, с другим прочтением: other — тот же файл в UTF-8 с заменой. Файл
+    требований читает и pip (BOM, PEP 263), и UTF-8 — setuptools (`file` в `tool.setuptools.dynamic`) и
+    hatch-requirements-txt: names и known_names объединяют имена обоих текстов."""
+    __slots__ = ("other",)
+
+    def __new__(cls, text, other):
+        self = super().__new__(cls, text)
+        self.other = other
+        return self
+
+
+def _pip_decode(data):
+    """Текст файла требований, как его декодирует pip (req_file._decode_req_file, pip 26.2): по BOM, по объявлению
+    PEP 263 в строке на `#` из первых двух, UTF-8, иначе кодировкой локали; None — pip не декодирует файл и отвергает
+    его."""
+    try:
+        for bom, encoding in _BOMS:
+            if data.startswith(bom):
+                return data[len(bom):].decode(encoding)
+        for line in data.split(b"\n", 2)[:2]:
+            if line[0:1] == b"#":
+                m = _PEP263.search(line)
+                if m is not None:
+                    return data.decode(m.group(1).decode("ascii"))
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return data.decode(locale.getencoding())
+    except (LookupError, ValueError):
+        return None
+
+
+def decode(kind, data):
+    """Текст байтов data манифеста вида kind: UTF-8 с заменой, а у файла требований, который pip читает иначе, —
+    Decoded (текст pip, UTF-8 с заменой в other). JSON и TOML npm, uv, go читают в UTF-8, файл в UTF-16 они
+    отвергают."""
+    text = data.decode("utf-8", "replace")
+    if kind != "requirements":
+        return text
+    pip = _pip_decode(data)
+    return text if pip is None or pip == text else Decoded(pip, text)
+
 
 _REQUIREMENTS_NAME = re.compile(r"requirements.*\.(?:txt|in)\Z")
 _REQUIREMENTS_DIR_FILE = re.compile(r".*\.(?:txt|in)\Z")
@@ -175,9 +233,9 @@ def _override_target(key):
     return name if at < 0 else name[:at]
 
 
-def _npm_overrides(table, names):
+def _npm_overrides(table, add):
     """Имена overrides (вложенных по пакетам) и resolutions, которые ставят другой пакет или источник: псевдоним
-    `npm:` и спецификатор не из реестра. Версия только закрепляет уже стоящий пакет — не имя. Обход стеком:
+    `npm:` и спецификатор не из реестра, — в add. Версия только закрепляет уже стоящий пакет — не имя. Обход стеком:
     вложенность не ограничена."""
     stack = [(table, None)]
     while stack:
@@ -189,25 +247,124 @@ def _npm_overrides(table, names):
             elif isinstance(spec, str) and target:
                 name = _npm_spec(target, spec)
                 if name is not None and name != target:
-                    names.add(name)
+                    add(name)
 
 
-def _npm(text):
+class NpmWorkspace:
+    """npm workspace корня проекта для разбора package.json: members — {имя члена: версия или None}, place — место
+    манифеста: "root" — корневой package.json с `workspaces`, "member" — член, None — прочий; watched — имена членов
+    и бывших членов: их зависимость без связи с членом — пакет из реестра."""
+    __slots__ = ("members", "place", "watched")
+
+    def __init__(self, members, place, watched):
+        self.members, self.place, self.watched = members, place, frozenset(watched)
+
+
+# Источник пакета реестра, чьё имя — имя члена workspace: npm ставит его из реестра, а не из каталога члена.
+_REGISTRY_COPY = "registry"
+# Диапазон версий npm, который сверяется с версией члена (node-semver, loose): `^`, `~`, `~>`, `=` или ничего, `v`,
+# до трёх частей, часть — число или `x`, `X`, `*`. Число — до 16 цифр (MAX_SAFE_COMPONENT_LENGTH).
+_NPM_RANGE = re.compile(r"(\^|~>?|=)?v?(\d{1,16}|[xX*])(?:\.(\d{1,16}|[xX*])(?:\.(\d{1,16}|[xX*]))?)?")
+# Версия члена без пререлиза; сборка `+…` в сравнении не участвует.
+_NPM_VERSION = re.compile(r"(0|[1-9]\d{0,15})\.(0|[1-9]\d{0,15})\.(0|[1-9]\d{0,15})(?:\+[0-9A-Za-z.-]+)?")
+_MAX_SAFE_INTEGER = 2 ** 53 - 1
+# Пробельные символы String.prototype.trim и `\s` JavaScript: ими npm-package-arg обрезает края спецификатора, а
+# node-semver (Range: TILDETRIM, CARETTRIM, COMPARATORTRIM) убирает пробелы после `~`, `~>`, `^` и `=`.
+_JS_SPACE = ("\t\n\v\f\r \u00a0\u1680" + "".join(map(chr, range(0x2000, 0x200b)))
+             + "\u2028\u2029\u202f\u205f\u3000\ufeff")
+_NPM_OP_SPACE = re.compile(rf"\A(\^|~>?|=)[{_JS_SPACE}]+")
+
+
+def _npm_bounds(op, major, minor, patch):
+    """(нижняя граница включительно, верхняя исключительно или None) версий диапазона, как у node-semver
+    (Range: replaceCaret, replaceTilde, replaceXRange); часть None или `x`, `X`, `*` — любая."""
+    def wild(part):
+        return part is None or part in "xX*"
+    if wild(major):
+        return (0, 0, 0), None
+    major = int(major)
+    if wild(minor):
+        return (major, 0, 0), (major + 1, 0, 0)
+    minor = int(minor)
+    if wild(patch):
+        if op == "^":
+            return (major, minor, 0), ((0, minor + 1, 0) if major == 0 else (major + 1, 0, 0))
+        return (major, minor, 0), (major, minor + 1, 0)
+    patch = int(patch)
+    if op == "^":
+        if major == 0:
+            return (0, minor, patch), ((0, 0, patch + 1) if minor == 0 else (0, minor + 1, 0))
+        return (major, minor, patch), (major + 1, 0, 0)
+    if op in ("~", "~>"):
+        return (major, minor, patch), (major, minor + 1, 0)
+    return (major, minor, patch), (major, minor, patch + 1)
+
+
+def _npm_satisfies(version, spec):
+    """Версия члена version подходит к диапазону spec, как у arborist (dep-valid.js: `*` и пустой — любая версия,
+    иначе semver.satisfies). Диапазон вне _NPM_RANGE, версия вне _NPM_VERSION (пререлиз, нет версии) и числа больше
+    Number.MAX_SAFE_INTEGER — не подходит: npm возьмёт пакет из реестра или откажет. Края spec без пробелов _JS_SPACE,
+    пробелы после оператора убраны (_NPM_OP_SPACE)."""
+    spec = _NPM_OP_SPACE.sub(r"\1", spec.strip(_JS_SPACE), count=1)
+    if spec in ("", "*"):
+        return True
+    m = _NPM_RANGE.fullmatch(spec)
+    v = _NPM_VERSION.fullmatch(version) if isinstance(version, str) else None
+    if m is None or v is None:
+        return False
+    numbers = [int(part) for part in (*m.groups()[1:], *v.groups()) if part is not None and part.isdigit()]
+    if any(n > _MAX_SAFE_INTEGER for n in numbers):
+        return False
+    low, high = _npm_bounds(*m.groups())
+    current = tuple(int(part) for part in v.groups())
+    return low <= current and (high is None or current < high)
+
+
+def _npm_linked(spec, version, place):
+    """Зависимость со спецификатором spec на члена с версией version npm связывает с каталогом члена
+    (@npmcli/arborist): в корневом package.json — всегда (ребро workspace заменяет зависимость с тем же именем,
+    Node.#loadDepType), в члене — если версия подходит к диапазону (_npm_satisfies; buildIdealTree #nodeFromSpec),
+    иначе — пакет из реестра; псевдоним `npm:`, метка (`latest`) и прочий package.json — реестр."""
+    if place == "root":
+        return True
+    if place != "member" or not isinstance(spec, str) or spec.startswith("npm:"):
+        return False
+    return _npm_satisfies(version, spec)
+
+
+def _npm(text, workspace=None):
+    """Имена package.json. С workspace (NpmWorkspace) зависимость на члена, которую npm связывает с его каталогом
+    (_npm_linked), — местная, а прочее имя члена или бывшего члена (диапазон не подходит, псевдоним, overrides) —
+    пакет из реестра `имя @ registry`: имя члена его не покрывает."""
     data = _json_object(text)
     if data is None:
         return None
+    watched = frozenset() if workspace is None else workspace.watched
     names = set()
+
+    def add(name, spec=None, own=False):
+        if name not in watched:
+            names.add(name)
+        elif not (own and name in workspace.members and _npm_linked(spec, workspace.members[name], workspace.place)):
+            names.add(_sourced(name, _REGISTRY_COPY))
     # `pnpm.packageExtensions` дописывает зависимости в чужие пакеты (@pnpm/types, PackageExtension): они ставятся.
     extensions = [ext for ext in _table(data, "pnpm", "packageExtensions").values() if isinstance(ext, dict)]
     for table in [data, *extensions]:
         for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
-            for name, spec in _table(table, section).items():
-                name = _npm_spec(name, spec)
+            for key, spec in _table(table, section).items():
+                name = _npm_spec(key, spec)
                 if name is not None:
-                    names.add(name)
+                    add(name, spec, table is data and name == key)
     for table in (_table(data, "overrides"), _table(data, "resolutions"), _table(data, "pnpm", "overrides")):
-        _npm_overrides(table, names)
+        _npm_overrides(table, add)
     return frozenset(names)
+
+
+def npm_version(text):
+    """Поле `version` package.json или None."""
+    data = _json_object(text.removeprefix("\ufeff"))
+    version = None if data is None else data.get("version")
+    return version if isinstance(version, str) else None
 
 
 # Платформенные пакеты Composer (PlatformRepository::PLATFORM_PACKAGE_REGEX): не ставятся из реестра.
@@ -275,6 +432,54 @@ def _table_source(spec):
     return None
 
 
+def _file_list(value):
+    """Пути `file` setuptools: строка или список строк (expand.read_files, always_iterable)."""
+    return [value] if isinstance(value, str) else [v for v in _list(value) if isinstance(v, str)]
+
+
+def _dynamic_files(data, dynamic):
+    """Файлы требований, из которых бэкенд сборки берёт зависимости поля из `project.dynamic`: setuptools —
+    `file` в `[tool.setuptools.dynamic]` `dependencies` и `optional-dependencies.<группа>` (setuptools 84,
+    config/pyprojecttoml.py, _obtain_dependencies); hatch-requirements-txt 0.4.1 — `files` или `filename`
+    `[tool.hatch.metadata.hooks.requirements_txt]`, без них `requirements.txt`, и `optional-dependencies`.
+    Строки файла setuptools и hatch читают в UTF-8 как требования PEP 508 без опций pip: такой файл — вид
+    requirements."""
+    files = []
+    setuptools = _table(data, "tool", "setuptools", "dynamic")
+    hooks = _table(data, "tool", "hatch", "metadata", "hooks")
+    hatch = hooks.get("requirements_txt")
+    if "dependencies" in dynamic:
+        files += _file_list(_table(setuptools, "dependencies").get("file"))
+        if isinstance(hatch, dict):
+            if "files" in hatch:
+                files += [f for f in _list(hatch["files"]) if isinstance(f, str)]
+            elif "filename" in hatch:
+                files += [hatch["filename"]] if isinstance(hatch["filename"], str) else []
+            else:
+                files.append("requirements.txt")
+    if "optional-dependencies" in dynamic:
+        for directive in _table(setuptools, "optional-dependencies").values():
+            if isinstance(directive, dict):
+                files += _file_list(directive.get("file"))
+        for group in _table(hatch if isinstance(hatch, dict) else {}, "optional-dependencies").values():
+            files += [f for f in _list(group) if isinstance(f, str)]
+    return files
+
+
+def _uv_local(sources):
+    """Список источников uv одного имени местный: хоть один — член workspace (`workspace = true`) или каталог
+    (`path`)."""
+    return any(isinstance(s, dict) and (s.get("workspace") is True or "path" in s) for s in sources)
+
+
+def uv_sources(text):
+    """{имя PEP 503: источник местный (_uv_local)} таблицы `[tool.uv.sources]` pyproject.toml; пусто — таблицы нет
+    или текст не разобран."""
+    sources = _table(_toml(text.removeprefix("\ufeff")) or {}, "tool", "uv", "sources")
+    return {_pep503(name): _uv_local(source if isinstance(source, list) else [source])
+            for name, source in sources.items()}
+
+
 def _pyproject(text):
     data = _toml(text)
     if data is None:
@@ -326,7 +531,7 @@ def _pyproject(text):
     # иначе каждый источник — имя с источником.
     for name, source in _table(uv, "sources").items():
         sources = source if isinstance(source, list) else [source]
-        if any(isinstance(s, dict) and (s.get("workspace") is True or "path" in s) for s in sources):
+        if _uv_local(sources):
             names.discard(_pep503(name))
         elif _pep503(name) in names:
             remote = {_table_source(s) for s in sources} - {None}
@@ -337,6 +542,7 @@ def _pyproject(text):
                + _list(_table(data, "tool", "pdm").get("source")) if isinstance(index, dict)]
     indexes += [uv.get("index-url"), *_list(uv.get("extra-index-url")), *_list(uv.get("find-links"))]
     names.update(_pypi_index(url) for url in indexes)
+    names.update(Include(path) for path in _dynamic_files(data, _list(project.get("dynamic"))))
     names.discard(None)
     return frozenset(names)
 
@@ -553,36 +759,45 @@ def _env_line(line):
 
 
 def _requirement_line(line):
-    """Имена логической строки файла требований, как её читает pip (req_file.break_args_options, get_line_parser,
-    handle_line): до первого слова на `-` (слова — через пробел) — требование, остальное — опции: слова shlex
-    (_shell_words) и разбор optparse (_parse_options). Требование — его имя (_requirement_name); без него — первое
-    `-e`. Строка без требования: первое `-r`, иначе первое `-c` (файл ограничений тоже ставит пакеты своих `-r` и
-    меняет индекс), — Include; иначе индексы `-i`, `--extra-index-url` (без `--no-index`) и первый `-f` —
-    `index <url>` (_pypi_index). Строку с переменной окружения `${…}` pip подставляет при чтении: имя — сама строка
-    (_env_line). Опции, которые pip не разберёт, — пусто: pip отвергнет файл целиком."""
+    """(имена, индексы, есть ли `--no-index`) логической строки файла требований, как её читает pip
+    (req_file.break_args_options, get_line_parser, handle_line): до первого слова на `-` (слова — через пробел) —
+    требование, остальное — опции: слова shlex (_shell_words) и разбор optparse (_parse_options). Требование — его
+    имя (_requirement_name); без него — первое `-e`. Строка без требования: первое `-r`, иначе первое `-c` (файл
+    ограничений тоже ставит пакеты своих `-r` и меняет индекс), — Include, прочие опции такой строки pip не
+    применяет; иначе строка опций: первый `-f` — имя `index <url>` (_pypi_index), индексы `-i` и
+    `--extra-index-url` — отдельно, их снимает `--no-index` любой строки опций файла (_requirements). Строку с
+    переменной окружения `${…}` pip подставляет при чтении: имя — сама строка (_env_line). Опции, которые pip не
+    разберёт, — пусто: pip отвергнет файл целиком."""
     if _REQ_ENV.search(line):
-        return {_env_line(line)}
+        return {_env_line(line)}, set(), False
     words = line.split(" ")
     split = next((i for i, word in enumerate(words) if word.startswith("-")), len(words))
     requirement = " ".join(words[:split])
     try:
         opts = _parse_options(_shell_words(" ".join(words[split:])))
     except (ValueError, _OptionError):
-        return set()
+        return set(), set(), False
     requirement = requirement or opts.get("--editable", [""])[0]
     if requirement:
-        return {_requirement_name(requirement)}
+        return {_requirement_name(requirement)}, set(), False
     if "--requirement" in opts or "--constraint" in opts:
-        return {Include((opts.get("--requirement") or opts["--constraint"])[0])}
-    urls = [] if opts.get("--no-index") else opts.get("--index-url", [])[-1:] + opts.get("--extra-index-url", [])
-    return {_pypi_index(url) for url in urls + opts.get("--find-links", [])[:1]}
+        return {Include((opts.get("--requirement") or opts["--constraint"])[0])}, set(), False
+    indexes = {_pypi_index(url) for url in opts.get("--index-url", [])[-1:] + opts.get("--extra-index-url", [])}
+    return {_pypi_index(url) for url in opts.get("--find-links", [])[:1]}, indexes, opts.get("--no-index") is True
 
 
 def _requirements(text):
-    """Имена файла требований. Заголовок генератора и аннотации `# via` проверку не снимают: их впишет и агент."""
-    names = set()
+    """Имена файла требований. `--no-index` в строке опций pip применяет к поиску целиком (handle_option_line): индексы
+    до него он сбрасывает, после — пропускает; индексы такого файла — не имена. Заголовок генератора и аннотации
+    `# via` проверку не снимают: их впишет и агент."""
+    names, indexes, no_index = set(), set(), False
     for line in _requirement_lines(text):
-        names.update(_requirement_line(line))
+        found, index, off = _requirement_line(line)
+        names.update(found)
+        indexes.update(index)
+        no_index = no_index or off
+    if not no_index:
+        names.update(indexes)
     names.discard(None)
     return frozenset(names)
 
@@ -782,6 +997,66 @@ def _gem_source(kind, value):
 
 # Метка местного блока `path … do` в стеке источников _gemfile.
 _GEM_LOCAL = object()
+# Конец кода строки Ruby, после которого оператор продолжается на следующей строке: запятая, `\`, открытая
+# скобка, `=>`, метка `ключ:`; пустые строки и строки-комментарии между ними оператор не прерывают.
+_RUBY_CONTINUATION = (",", "\\", "(", "[", "{", ":", "=>")
+
+
+class _RubyChain:
+    """Логическая строка Ruby: код (без комментариев) физических строк, где каждая, кроме последней, кончается
+    продолжением (_RUBY_CONTINUATION), через пробел, операторы строки — через `;`. bounds — концы операторов в text
+    (позиции `;` между операторами строки и конец text), paths и sources — совпадения _GEM_PATH и _GEM_SOURCE в text
+    по порядку: поиск опции гема — двоичный, время линейно при любой длине цепочки."""
+    __slots__ = ("text", "bounds", "paths", "sources")
+
+    def __init__(self, parts, bounds):
+        self.text = "".join(parts)
+        self.bounds = [*bounds, len(self.text)]
+        self.paths = [m.start() for m in _GEM_PATH.finditer(self.text)]
+        self.sources = list(_GEM_SOURCE.finditer(self.text))
+
+    def end(self, start):
+        """Конец оператора, который начинается в start."""
+        return self.bounds[bisect.bisect_left(self.bounds, start)]
+
+    def has_path(self, pos, end):
+        i = bisect.bisect_left(self.paths, pos)
+        return i < len(self.paths) and self.paths[i] < end
+
+    def source(self, pos, end):
+        """Первая опция источника (_GEM_SOURCE) оператора от pos до end или None."""
+        i = bisect.bisect_left(self.sources, pos, key=re.Match.start)
+        return self.sources[i] if i < len(self.sources) and self.sources[i].end() <= end else None
+
+
+def _ruby_chains(lines):
+    """[(цепочка _RubyChain, [начала операторов строки в её тексте]) или None — в строке нет кода] по строкам lines."""
+    out, chains, parts, bounds, pos, continued = [], [], [], [], 0, False
+    for line in lines:
+        statements = _ruby_statements(line)
+        if not any(st.strip() for st in statements):
+            out.append(None)
+            continue
+        if parts and not continued:
+            chains.append(_RubyChain(parts, bounds))
+            parts, bounds, pos = [], [], 0
+        if parts:
+            parts.append(" ")
+            pos += 1
+        starts = []
+        for k, statement in enumerate(statements):
+            if k:
+                bounds.append(pos)
+                parts.append(";")
+                pos += 1
+            starts.append(pos)
+            parts.append(statement)
+            pos += len(statement)
+        out.append((len(chains), starts))
+        continued = statements[-1].rstrip().endswith(_RUBY_CONTINUATION)
+    if parts:
+        chains.append(_RubyChain(parts, bounds))
+    return [None if item is None else (chains[item[0]], item[1]) for item in out]
 
 
 def _gemfile(text):
@@ -789,15 +1064,18 @@ def _gemfile(text):
     `path … do` без своей опции источника; гем с опцией (_GEM_SOURCE) или в блоке `git`, `github`, `source` — имя с
     источником, опция важнее блока; `eval_gemfile "путь"` — Include;
     `source "url"` без блока, кроме RubyGems, — `index <url>` на любой глубине, в том числе внутри `path … do`: в
-    Bundler он глобален. Операторы одной строки, в том числе `source`, разделяет `;`. Источник гема — ближайший
-    блок источника на любой глубине (стек блоков): вложенный `path` внутри `source … do` — местный. Вложенность
-    считается по `do` в конце строки, ключевому слову блока (`if`, `unless`, `case`, `begin`, `while`, `until`, `for`,
-    `def`, `class`, `module`) в начале строки без `end` в конце и `end` в начале; незакрытый блок идёт до конца
-    файла."""
+    Bundler он глобален. Операторы одной строки, в том числе `source`, разделяет `;`; оператор, чья строка кончается
+    продолжением (`,`, `\\`, открытая скобка, `=>`, `ключ:`), идёт и по следующим строкам (_ruby_chains): опции гема
+    на строке-продолжении — его опции. Оператор ищется и с начала каждой строки цепочки: гем внутри блока `{ … }`.
+    Источник гема — ближайший блок источника на любой глубине (стек блоков): вложенный `path` внутри
+    `source … do` — местный. Вложенность считается по физическим строкам: `do` в конце строки, ключевое слово блока
+    (`if`, `unless`, `case`, `begin`, `while`, `until`, `for`, `def`, `class`, `module`) в начале строки без `end` в
+    конце и `end` в начале; незакрытый блок идёт до конца файла."""
     names = set()
     # Источник открытых блоков: прочий блок (`group`, `if`) наследует внешний; пустой стек — реестр.
     stack = []
-    for line in text.splitlines():
+    lines = text.splitlines()
+    for line, item in zip(lines, _ruby_chains(lines)):
         m = _GEM_BLOCK.match(line)
         if m:
             value = m.group(2) if m.group(2) is not None else m.group(3)
@@ -810,21 +1088,26 @@ def _gemfile(text):
             if stack:
                 stack.pop()
             continue
+        if item is None:
+            continue
+        chain, starts = item
+        code = chain.text
         block = stack[-1] if stack else None
-        for statement in _ruby_statements(line):
-            m = _GEM_GLOBAL_SOURCE.match(statement)
+        for start in starts:
+            end = chain.end(start)
+            m = _GEM_GLOBAL_SOURCE.match(code, start, end)
             if m:
                 if m.group(2).rstrip("/") not in _RUBYGEMS:
                     names.add(_index(m.group(2)))
                 continue
-            m = _GEM_EVAL.match(statement)
+            m = _GEM_EVAL.match(code, start, end)
             if m:
                 names.add(Include(m.group(2)))
                 continue
-            m = _GEM.match(statement)
-            if not m or _GEM_PATH.search(statement, m.end()):
+            m = _GEM.match(code, start, end)
+            if not m or chain.has_path(m.end(), end):
                 continue
-            option = _GEM_SOURCE.search(statement, m.end())
+            option = chain.source(m.end(), end)
             if option:
                 source = _gem_source(option.group(1) or option.group(2) or option.group(4), option.group(6))
             elif block is _GEM_LOCAL:
@@ -869,26 +1152,35 @@ def registry(kind):
     return _REGISTRY.get(kind)
 
 
-def names(kind, text):
+def _parse(parser, text, *args):
+    """Имена text разбором parser без BOM; у Decoded — объединённые с именами other."""
+    found = parser(text.removeprefix("\ufeff"), *args)
+    other = getattr(text, "other", None)
+    if other is None or found is None:
+        return found
+    more = parser(other.removeprefix("\ufeff"), *args)
+    return found if more is None else found | more
+
+
+def names(kind, text, workspace=None):
     """Имена внешних зависимостей, объявленных манифестом вида kind; None — текст не разобрать или вид
     неизвестен.
 
     requirements, go.mod и Gemfile разбираются построчно и None не дают. Транзитивные зависимости
-    не входят: `// indirect` go.mod.
+    не входят: `// indirect` go.mod. workspace — NpmWorkspace манифеста package.json или None.
     """
     parser = _PARSERS.get(kind)
     if parser is None:
         return None
-    return parser(text.removeprefix("\ufeff"))
+    return _parse(parser, text, workspace) if kind == "package.json" else _parse(parser, text)
 
 
-def known_names(kind, text):
+def known_names(kind, text, workspace=None):
     """names вместе с транзитивными: `// indirect` go.mod.
     Имя отсюда в новом тексте не новое: транзитивная, ставшая прямой, уже стоит."""
-    parser = _KNOWN.get(kind) or _PARSERS.get(kind)
-    if parser is None:
-        return None
-    return parser(text.removeprefix("\ufeff"))
+    if kind in _KNOWN:
+        return _parse(_KNOWN[kind], text)
+    return names(kind, text, workspace)
 
 
 def _own_json(text, normalize):

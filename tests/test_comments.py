@@ -166,6 +166,28 @@ class CommentLinesTest(unittest.TestCase):
         self.assertEqual(helpers.comment_lines("{- block\nline -}\nx = 1 -- tail\n", "hs"),
                          ["{- block", "line -}", "-- tail"])
 
+    def test_haskell_dashes_in_operator(self):
+        # Haskell 2010 Report, 2.3: серия тире — не комментарий, если она часть оператора; GHC Lexer.x — то же,
+        # не-ASCII знаки категорий Pc, Pd, Po, Sm, Sc, Sk, So — символы оператора (GHC.Parser.Lexer.Interface).
+        cases = {
+            "a --> b = c -- real\n": ["-- real"],
+            "x |-- y -- real\n": ["-- real"],
+            "x --| y\n": [],
+            "x ---> y\n": [],
+            "x ≤-- y\n": [],
+            "x --≤ y\n": [],
+            "-- | haddock\n": ["-- | haddock"],
+            "--- three\n": ["--- three"],
+            "x = 1 --\n": ["--"],
+            "x = 1 ----\n": ["----"],
+            "x = 1 --(c)\n": ["--(c)"],
+            "x = '-'--c\n": ["--c"],
+            "x = 1 --«c»\n": ["--«c»"],
+        }
+        for src, want in cases.items():
+            with self.subTest(src=src):
+                self.assertEqual(helpers.comment_lines(src, "hs"), want)
+
     def test_vue_script_comments(self):
         src = "<template>\n<!-- html -->\n</template>\n<script>\n// js comment\n</script>\n"
         self.assertEqual(helpers.comment_lines(src, "vue"), ["<!-- html -->", "// js comment"])

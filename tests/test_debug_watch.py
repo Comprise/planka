@@ -431,118 +431,139 @@ class ShownTest(unittest.TestCase):
         self.assertEqual(debug_watch._shown("a" * (limit + 1)), "a" * (limit - 1) + "…")
 
 
-class SegmentsTest(unittest.TestCase):
+def deciding(command):
+    """Текст команды, решающей код строки (debug_watch._deciding), или None."""
+    node = debug_watch._deciding(debug_watch.shparse.parse(command))
+    return None if node is None else command[node.start:node.end]
+
+
+class DecidingTest(unittest.TestCase):
+    """Команда, чей код выхода — код строки, по дереву shparse."""
+
     def test_arithmetic_shift_is_not_heredoc(self):
-        self.assertEqual(debug_watch._segments("(( n = x << 2 ))\ngrep foo f"),
-                         [("", "(( n = x << 2 ))"), ("\n", "grep foo f")])
-        self.assertEqual(debug_watch._segments("echo $((1<<2))\ngrep x f"),
-                         [("", "echo $((1<<2))"), ("\n", "grep x f")])
+        self.assertEqual(deciding("(( n = x << 2 ))\ngrep foo f"), "grep foo f")
+        self.assertEqual(deciding("echo $((1<<2))\ngrep x f"), "grep x f")
+        self.assertEqual(deciding("x=$[1<<2]\ngrep x f"), "grep x f")
+        self.assertEqual(deciding("echo $[ (1+2)<<3 ]\nls"), "ls")
 
-    def test_heredoc_body_quote_does_not_hide_arithmetic_pairs(self):
-        # Апостроф в теле heredoc не открывает кавычку при подсчёте скобок: «((…))» после терминатора — арифметика.
-        self.assertEqual(debug_watch._segments("cat <<EOF\ndon't\nEOF\n(( x = 1 << 2 )); make test\nmake lint"),
-                         [("", "cat <<EOF"), ("\n", "(( x = 1 << 2 ))"), (";", " make test"), ("\n", "make lint")])
-        self.assertEqual(debug_watch._segments("cat <<EOF\ndon't\nEOF\n((x>0 && y>0)) && make test"),
-                         [("", "cat <<EOF"), ("\n", "((x>0 && y>0)) "), ("&&", " make test")])
+    def test_heredoc_body_is_not_commands(self):
+        self.assertEqual(deciding("cat <<EOF\ndon't\nEOF\n(( x = 1 << 2 )); make test\nmake lint"), "make lint")
+        self.assertEqual(deciding("cat <<EOF\ndon't\nEOF\n((x>0 && y>0)) && make test"), "make test")
+        self.assertEqual(deciding("cat <<-EOF\n\tdon't\n\tEOF\n((x>0 && y>0)) && make test"), "make test")
+        self.assertEqual(deciding("cat <<< 'x'\n((x>0 && y>0)) && make test"), "make test")
+        self.assertEqual(deciding("echo $(cat <<E\nx\nE); ls"), "ls")
+        # Heredoc в «`…`» тела не читает: следующие строки — команды.
+        self.assertEqual(deciding("echo `cat <<E`\nls\nE"), "E")
 
-    def test_separators_inside_arithmetic_do_not_split(self):
-        self.assertEqual(debug_watch._segments("echo $((1|2)) && ls"), [("", "echo $((1|2)) "), ("&&", " ls")])
-        self.assertEqual(debug_watch._segments("echo $[1|2; 3] | wc"), [("", "echo $[1|2; 3] "), ("|", " wc")])
-        self.assertEqual(debug_watch._segments("(( a = 1 | 2 )); ls"), [("", "(( a = 1 | 2 ))"), (";", " ls")])
+    def test_separators_inside_words_do_not_split(self):
+        # Разделитель в арифметике, слове, перенаправлении «>|», образце case, подстановке и скобках массива —
+        # не граница команды.
+        self.assertEqual(deciding("echo $((1|2)) && ls"), "ls")
+        self.assertEqual(deciding("echo $[1|2; 3] | wc"), "wc")
+        self.assertEqual(deciding("(( a = 1 | 2 )); ls"), "ls")
+        self.assertEqual(deciding("echo $[a[1]] && false"), "false")
+        self.assertEqual(deciding("echo $[a[b[1]]+$[2]]\nmake test"), "make test")
+        self.assertEqual(deciding("echo x >| f"), "echo x >| f")
+        self.assertEqual(deciding("echo $(a; b) | wc"), "wc")
+        self.assertEqual(deciding("diff <(a; b) f"), "diff <(a; b) f")
+        self.assertEqual(deciding("x=(a\nb) ; z"), "z")
+        self.assertEqual(deciding("echo ${x:-a|b} | wc"), "wc")
+        self.assertEqual(deciding("echo ${x:- #}; ls"), "ls")
+        self.assertEqual(deciding("echo \\;x"), "echo \\;x")
+        self.assertFalse(debug_watch.code1_is_answer("case x in a|b) grep x f;; esac"))
 
     def test_nested_subshell_is_not_arithmetic(self):
-        # «((» — арифметика, только если её «(» закрывается «))», как у bash (parse_arith_cmd); иначе — подоболочка в
-        # подоболочке, и разделители внутри неё делят команды.
-        self.assertEqual(debug_watch._segments("((cd a && make test); false)"),
-                         [("", "((cd a "), ("&&", " make test)"), (";", " false)")])
-        self.assertEqual(debug_watch._segments("((cd a) || make)"), [("", "((cd a) "), ("||", " make)")])
-        self.assertEqual(debug_watch._segments("(( (a) | b )); ls"), [("", "(( (a) | b ))"), (";", " ls")])
-        self.assertEqual(debug_watch._segments("((echo ')'; make) | wc)"),
-                         [("", "((echo ')'"), (";", " make) "), ("|", " wc)")])
+        # «((» — арифметика, только если закрывается «))», как у bash (parse_arith_cmd); иначе — подоболочка в
+        # подоболочке.
+        self.assertEqual(deciding("((cd a && make test); false)"), "false")
+        self.assertEqual(deciding("((cd a) || make)"), "make")
+        self.assertEqual(deciding("(( (a) | b )); ls"), "ls")
+        self.assertEqual(deciding("((echo ')'; make) | wc)"), "wc")
         self.assertTrue(debug_watch.code1_is_answer("((cd a; make); grep x f)"))
+        self.assertFalse(debug_watch.code1_is_answer("((grep x f))"))
+
+    def test_line_continuation(self):
+        # bash снимает «\» с переводом строки до разбиения на слова, кроме «'…'», «$'…'» и комментариев.
+        self.assertTrue(debug_watch.code1_is_answer("ti\\\nmeout 5 grep x f"))
+        self.assertEqual(deciding("echo \"a\\\nb\"; ls"), "ls")
+        self.assertEqual(deciding("ls # c \\\nmake"), "make")
+        self.assertEqual(deciding("echo a\\\\\ngrep x f"), "grep x f")
+        self.assertEqual(deciding("echo a \\\n b | c"), "c")
+
+    def test_newline_after_operator(self):
+        self.assertEqual(deciding("a &&\n\nb"), "b")
+        self.assertEqual(deciding("a && # c\nb"), "b")
+        self.assertEqual(deciding("cat <<'E' |\nx\nE\nb"), "b")
+        self.assertEqual(deciding("a;\nb"), "b")
+
+    def test_syntax_error_has_no_deciding_command(self):
+        # Фатальная синтаксическая ошибка: eval отдаёт 2, кода 1 у строки нет (bash 5.3: `false\n)` — 2).
+        for command in ("ls; ) grep x f", "ls\nmake; ) grep x f", 'make; echo "a; b', "grep x f; )"):
+            with self.subTest(command=command):
+                self.assertIsNone(deciding(command))
+                self.assertFalse(debug_watch.code1_is_answer(command))
+
+    def test_dropped_array_line(self):
+        # Ошибка скобок массива отбрасывает свою строку, следующие исполняются.
+        self.assertEqual(deciding("x=( ; ) <<E\nls\nE"), "E")
+        self.assertTrue(debug_watch.code1_is_answer("x=( ; )\ngrep x f"))
+
+    def test_background_last_command(self):
+        # Команда в фоне «&» кода 1 не даёт (код списка — 0); команда после «&» решает (bash 5.3: `make & grep -q
+        # zzz f` — 1).
+        self.assertIsNone(deciding("grep x f &"))
+        self.assertEqual(deciding("make & grep x"), "grep x")
+
+    def test_assignment_substitution(self):
+        # Команда без имени отдаёт код последней подстановки (bash 5.3: `x=$(true) y=$(false)` — 1, `x=$(false)
+        # y=$(true)` — 0, `x=$(false)$(true)` — 0).
+        for command in ("x=$(grep a b)", "x=\"$(git diff --quiet)\"", "x=`grep a b`", "x=$(make; grep a b)",
+                        "x=$(make) y=$(grep a b)", "x=$(grep a b) y=1", "x=$(grep a b)$y"):
+            with self.subTest(command=command):
+                self.assertTrue(debug_watch.code1_is_answer(command))
+        # Подстановка в «${…}» исполняется не всегда (bash 5.3: `y=1; x=${y:-$(false)}` — 0): последней может
+        # оказаться она.
+        for command in ("x=$(grep a b) y=$(make)", "x=$(grep a b)${y:-$(make)}", "x=$(grep a b)$((1+$(make)))",
+                        "x=$(grep a b) >f", "x=<(grep a b)", "x=1", "x=$(grep a b) make"):
+            with self.subTest(command=command):
+                self.assertFalse(debug_watch.code1_is_answer(command))
+
+    def test_words_with_expansion(self):
+        # Слово с раскрытием на месте имени — не ответ; аргумент опции обёртки и «имя=$x» после env — пропускаются.
+        self.assertFalse(debug_watch.code1_is_answer("$cmd x f"))
+        self.assertFalse(debug_watch.code1_is_answer("sudo $grep x f"))
+        self.assertTrue(debug_watch.code1_is_answer("sudo -u $u grep x f"))
+        self.assertTrue(debug_watch.code1_is_answer("env FOO=$x grep x f"))
+        self.assertFalse(debug_watch.code1_is_answer("git $sub --quiet"))
+        # Слово «имя=…» в кавычках на месте имени — имя команды, не присваивание.
+        self.assertFalse(debug_watch.code1_is_answer("'FOO=1' grep x f"))
+
+    @mock.patch.object(debug_watch.shparse, "_STACK_MAX", 10 ** 9)  # глубина дерева больше предела рекурсии Python
+    def test_deep_tree_without_recursion(self):
+        self.assertTrue(debug_watch.code1_is_answer("( " * 3000 + "grep x f" + " )" * 3000))
+        self.assertTrue(debug_watch.code1_is_answer("x=$(" * 1500 + "grep x f" + ")" * 1500))
 
     def test_nested_parens_linear(self):
         small, large = ("((" * n for n in (25000, 100000))
-        assert_linear(self, lambda: debug_watch._segments(small), lambda: debug_watch._segments(large))
-
-    def test_subscript_inside_legacy_arithmetic_keeps_separators(self):
-        # «]» индекса внутри «$[…]» закрывает индекс, а не арифметику; вложенная «$[…]» закрывается своей «]».
-        self.assertEqual(debug_watch._segments("echo $[a[1]] && false"), [("", "echo $[a[1]] "), ("&&", " false")])
-        self.assertEqual(debug_watch._segments("echo $[a[b[1]]+$[2]]\nmake test"),
-                         [("", "echo $[a[b[1]]+$[2]]"), ("\n", "make test")])
-        self.assertEqual(debug_watch._segments("echo $[a[1]|2; 3] | wc"), [("", "echo $[a[1]|2; 3] "), ("|", " wc")])
-
-    def test_legacy_arithmetic_shift_is_not_heredoc(self):
-        self.assertEqual(debug_watch._segments("x=$[1<<2]\ngrep x f"), [("", "x=$[1<<2]"), ("\n", "grep x f")])
-        self.assertEqual(debug_watch._segments("echo $[ (1+2)<<3 ]\nls"), [("", "echo $[ (1+2)<<3 ]"), ("\n", "ls")])
-
-    def test_shift_does_not_hide_later_arithmetic_pairs(self):
-        # «<<» внутри «((…))» и «$[…]» — сдвиг и для подсчёта скобок: строки после него — не тело heredoc, «((…))» за
-        # ними — арифметика.
-        for first in ("(( n = x << 2 ))", "echo $[1<<2]", "echo $[a[1]<<2]", "echo $[$[1]<<2]"):
-            with self.subTest(first=first):
-                self.assertEqual(debug_watch._segments(f"{first}\n((x>0 && y>0)) && make test\nmake lint"),
-                                 [("", first), ("\n", "((x>0 && y>0)) "), ("&&", " make test"), ("\n", "make lint")])
-
-    def test_heredoc_beside_arithmetic_does_not_hide_arithmetic_pairs(self):
-        # «<<» в подоболочке «(» и после закрытой «((…))» — heredoc: апостроф его тела не кавычка.
-        for first in ("(cat <<EOF\ndon't\nEOF\n)", "(( n = 1 ))\ncat <<EOF\ndon't\nEOF"):
-            with self.subTest(first=first):
-                self.assertEqual(debug_watch._segments(f"{first}\n((x>0 && y>0)) && make test")[-2:],
-                                 [("\n", "((x>0 && y>0)) "), ("&&", " make test")])
-
-    def test_here_string_does_not_hide_arithmetic_pairs(self):
-        self.assertEqual(debug_watch._segments("cat <<< 'x'\n((x>0 && y>0)) && make test"),
-                         [("", "cat <<< 'x'"), ("\n", "((x>0 && y>0)) "), ("&&", " make test")])
-
-    def test_tab_stripped_heredoc_does_not_hide_arithmetic_pairs(self):
-        # Терминатор «<<-» с табуляцией в начале закрывает тело и для подсчёта скобок: апостроф тела не кавычка.
-        self.assertEqual(debug_watch._segments("cat <<-EOF\n\tdon't\n\tEOF\n((x>0 && y>0)) && make test"),
-                         [("", "cat <<-EOF"), ("\n", "((x>0 && y>0)) "), ("&&", " make test")])
+        assert_linear(self, lambda: debug_watch.code1_is_answer(small), lambda: debug_watch.code1_is_answer(large))
 
     @mock.patch.object(debug_watch.shparse, "_STACK_MAX", 10 ** 9)  # линейность разбора, а не предел
     def test_shift_after_open_parens_linear(self):
         small, large = ("( " * n + "< " * n + "((1))" for n in (2500, 10000))
-        assert_linear(self, lambda: debug_watch._segments(small), lambda: debug_watch._segments(large))
+        assert_linear(self, lambda: debug_watch.code1_is_answer(small), lambda: debug_watch.code1_is_answer(large))
 
     def test_unclosed_test_brackets_linear(self):
         small, large = ("[[ " * n for n in (25000, 100000))
-        assert_linear(self, lambda: debug_watch._segments(small), lambda: debug_watch._segments(large))
+        assert_linear(self, lambda: debug_watch.code1_is_answer(small), lambda: debug_watch.code1_is_answer(large))
 
-    def test_operators_outside_words_only(self):
-        # Разделитель внутри слова, перенаправления «>|», образца case, подстановки и скобок массива не делит.
-        self.assertEqual(debug_watch._segments("echo x >| f"), [("", "echo x >| f")])
-        self.assertEqual(debug_watch._segments("case x in a|b) y;; esac"),
-                         [("", "case x in a|b) y"), (";", " esac")])
-        self.assertEqual(debug_watch._segments("echo $(a; b) | wc"), [("", "echo $(a; b) "), ("|", " wc")])
-        self.assertEqual(debug_watch._segments("diff <(a; b) f"), [("", "diff <(a; b) f")])
-        self.assertEqual(debug_watch._segments("x=(a\nb) ; z"), [("", "x=(a\nb) "), (";", " z")])
-        self.assertEqual(debug_watch._segments("echo ${x:-a|b} | wc"), [("", "echo ${x:-a|b} "), ("|", " wc")])
-        self.assertEqual(debug_watch._segments("echo ${x:- #}; ls"), [("", "echo ${x:- #}"), (";", " ls")])
-        self.assertEqual(debug_watch._segments("echo a \\\n b | c"), [("", "echo a \\\n b "), ("|", " c")])
-        self.assertEqual(debug_watch._segments("echo \\;x"), [("", "echo \\;x")])
-
-    def test_heredoc_terminator_with_substitution_end(self):
-        self.assertEqual(debug_watch._segments("echo $(cat <<E\nx\nE); ls"),
-                         [("", "echo $(cat <<E\n)"), (";", " ls")])
-        self.assertEqual(debug_watch._segments("echo `cat <<E`\nls\nE"),
-                         [("", "echo `cat <<E`"), ("\n", "ls"), ("\n", "E")])
-
-    def test_syntax_error_line_is_one_command(self):
-        # bash не исполняет строку с синтаксической ошибкой целиком; строки до неё исполнены.
-        self.assertEqual(debug_watch._segments("ls; ) grep x f"), [("", "ls; ) grep x f")])
-        self.assertEqual(debug_watch._segments("ls\nmake; ) grep x f"), [("", "ls"), ("\n", "make; ) grep x f")])
-        self.assertEqual(debug_watch._segments('make; echo "a; b'), [("", 'make; echo "a; b')])
-
-    def test_dropped_array_line(self):
-        self.assertEqual(debug_watch._segments("x=( ; ) <<E\nls\nE"),
-                         [("", "x=( ; ) <<E"), ("\n", "ls"), ("\n", "E")])
+    def test_many_assignments_linear(self):
+        small, large = ('x="$(grep a b)" ' * n for n in (2500, 10000))
+        assert_linear(self, lambda: debug_watch.code1_is_answer(small), lambda: debug_watch.code1_is_answer(large))
 
     def test_invalid_input_does_not_raise(self):
         for command in ("", "\x00", "\ud800", "$(", "((", "<<", "'", "a\\", "`"):
             with self.subTest(command=command):
-                debug_watch._segments(command)
-                debug_watch._paren_pairs(command)
+                self.assertFalse(debug_watch.code1_is_answer(command))
 
 
 # Команды корпусов разбора shell: tests/fixtures/bash-commands.jsonl и bash-transcripts.jsonl (поле command).
@@ -562,12 +583,11 @@ def digest(command):
 
 
 # Результаты разбора корпусов записаны в tests/fixtures/debug-watch-results.json: sha256[:12] команды -> sha256[:12] от
-# (_segments, _paren_pairs, code1_is_answer). Запись сверена с bash (прогон через bwrap, `touch` вместо действия)
-# там, где она отличалась от прежнего посимвольного разборщика. Классы отличий (прежний разборщик расходился с bash,
-# нынешний — нет):
+# (границы решающей команды _deciding, code1_is_answer). Записи следующих классов форм сверены с bash (прогон через
+# bwrap, `touch` вместо действия):
 # A  разделитель в теле подстановки «$(…)», «<(…)», «${ …; }» и «|» образца case не делит команды строки (`diff
 #    <(echo a; true) /dev/null` — код 1, то есть код команды diff);
-# B  `\'` в строке `$'…'` не закрывает кавычку, прежний разборщик закрывал (`echo $'it\'s' ; touch P` — P создан);
+# B  `\'` в строке `$'…'` не закрывает кавычку (`echo $'it\'s' ; touch P` — P создан);
 # C  кавычка в теле обратных кавычек (`echo `'` && touch P` — P создан);
 # D  «#» в `${x:- #}` и после `\r` (`echo a$'\r'#$(touch P)` — P создан) — не комментарий;
 # E  `<<` в `${x:-a<<b}` — не heredoc (строка после него исполнена);
@@ -579,31 +599,15 @@ def digest(command):
 # J  `$(…)` в `'…'` арифметики `$[ ]`, `(( ))`, `${a[…]}`, `${x:…}` исполняется: скобки настоящие.
 
 
-class ParenPairsTest(unittest.TestCase):
-    def test_pairs(self):
-        self.assertEqual(debug_watch._paren_pairs("(a (b)) c"), {3: 5, 0: 6})
-        self.assertEqual(debug_watch._paren_pairs("echo '(' \\( \"(\" # (\n(x)"), {20: 22})
-        self.assertEqual(debug_watch._paren_pairs("cat <<E\n(\nE\n(x)"), {12: 14})
-        self.assertEqual(debug_watch._paren_pairs("((cd a && make); false)"), {1: 14, 0: 22})
-        self.assertEqual(debug_watch._paren_pairs("echo $'(' ("), {})
-
-    def test_skip_heredocs(self):
-        for command, cut in (("cat <<E\nx\nE\nls", (8, 12)), ("cat <<-E\n\tx\n\tE\nls", (9, 15)),
-                             ("cat <<E\nx", (8, 9)), ("echo $(cat <<E\nx\nE); ls", (15, 18)),
-                             ("echo `cat <<E`\nls\nE", None)):
-            with self.subTest(command=command):
-                got = debug_watch._skip_heredocs(command, debug_watch.shparse.parse(command))
-                self.assertEqual(got, [cut] if cut else [])
-
-
 RESULTS = pathlib.Path(__file__).parent / "fixtures" / "debug-watch-results.json"
 
 
 def result_digest(command):
-    """Свёртка всего, что debug_watch выводит из команды: разделители, пары скобок, ответ code1_is_answer."""
+    """Свёртка всего, что debug_watch выводит из команды: границы решающей команды (_deciding) и ответ
+    code1_is_answer."""
     script = debug_watch.shparse.parse(command)
-    got = (debug_watch._segments(command, script), sorted(debug_watch._paren_pairs(command, script).items()),
-           debug_watch.code1_is_answer(command))
+    node = debug_watch._deciding(script)
+    got = (None if node is None else (node.start, node.end), debug_watch.code1_is_answer(command, script))
     return hashlib.sha256(repr(got).encode("utf-8", "surrogatepass")).hexdigest()[:12]
 
 
@@ -670,24 +674,32 @@ class Code1IsAnswerTest(unittest.TestCase):
                         "grep -f - file <<-EOF\n\tpat\n\tEOF", "make\ngrep -f - file <<EOF\nmake test\nEOF",
                         "grep x f <<< 'a && b'", "echo $((1<<2))\ngrep x f", "(( n = x << 2 ))\ngrep foo f",
                         "echo $(( (1<<2) + 1 ))\ngrep x f", "for ((i=0;i<1<<2;i++)); do :; done\ngrep x f",
-                        "echo [[ -f x\ngrep a f"):
+                        "echo [[ -f x\ngrep a f",
+                        "timeout 10 \\\n  grep x f", "FOO=1 \\\ngrep x f", "sudo \\\ngrep x f",
+                        "cd /repo && \\\ngrep -rn foo src", "grep -q x f && \\\necho found",
+                        "echo a\\\\\ngrep x f", "grep x f &&\necho ok", "grep x f && # c\necho ok",
+                        "grep x f ||\n\ngrep y f",
+                        # Скобки код не меняют (bash 5.3: `(grep -q zzz f)`, `{ grep -q zzz f; }` — 1), команда после
+                        # одиночного «&» — последняя (`make & grep -q zzz f` — 1).
+                        "(grep x f)", "{ grep x f; }", "make & grep x", "( (make; grep x f) ) 2>/dev/null"):
             with self.subTest(command=command):
                 self.assertTrue(debug_watch.code1_is_answer(command))
 
     def test_failures(self):
         for command in ("make test", "grep x f && make test", "grep x f | sort -c", "git diff",
                         "git diff-tree HEAD", "find . -name x", "make test # grep", "grep 'x",
-                        "command make test", "xargs grep x", "bash -c 'grep x f'", "(grep x f)",
+                        "command make test", "xargs grep x", "bash -c 'grep x f'", "grep x f &",
                         "git", "env", "timeout 5", "sudo -u", "", "grep x f; make test",
-                        "make test;", "make & grep x", "make test && echo ok", "grep x f || echo no",
+                        "make test;", "grep x & make", "make test && echo ok", "grep x f || echo no",
                         "grep x f; echo ok", "grep x f | echo ok", "x=$(make test)", "x=$(grep a b) make",
                         "x=$(grep a b)$(make)", "echo ok", "x=$(grep a b) && echo ok && make",
                         "grep x f && echo ok > /ro/f", "grep x f && echo ok>/ro/f", "grep x f && echo ok 2>&1",
-                        "grep x f && echo ok < in", "make test;#grep", "grep a#b; make", "{ grep x f; }",
+                        "grep x f && echo ok < in", "make test;#grep", "grep a#b; make", "{ grep x f; } &",
                         "[[ -f a ]] && make test", "[[ -f a ]]; make test",
                         "grep -f - file <<EOF\npat\nEOF\nmake test", "cat <<EOF\ngrep x f\nEOF",
                         "grep -f - file <<-EOF\n\tpat\n\tEOF\nmake test", "grep x f <<< 'a'\nmake test",
-                        "cat <<EOF $((1<<2))\ngrep x f\nEOF"):
+                        "cat <<EOF $((1<<2))\ngrep x f\nEOF",
+                        "grep x f # c \\\nmake test", "grep x 'f\\\n' &&\nmake test", "grep x f;\necho ok"):
             with self.subTest(command=command):
                 self.assertFalse(debug_watch.code1_is_answer(command))
 
@@ -698,12 +710,11 @@ class Code1IsAnswerTest(unittest.TestCase):
                 assert_linear(self, lambda: debug_watch.code1_is_answer(small),
                               lambda: debug_watch.code1_is_answer(large))
 
-    def test_word_cut_by_head_limit_not_taken_as_flag(self):
-        # Слово «--quietzzz», разрезанное пределом на «--quiet», не флаг git diff.
-        head = "git diff "
-        pad = "x" * (debug_watch._HEAD_LIMIT - len(head) - len("--quiet") - 1)
-        self.assertTrue(debug_watch.code1_is_answer(f"{head}{pad} --quiet"))
-        self.assertFalse(debug_watch.code1_is_answer(f"{head}{pad} --quietzzz"))
+    def test_flag_far_from_start_seen(self):
+        # Слова команды берутся из дерева целиком: флаг git дальше 4096 символов виден.
+        pad = "x" * 5000
+        self.assertTrue(debug_watch.code1_is_answer(f"git diff {pad} --quiet"))
+        self.assertFalse(debug_watch.code1_is_answer(f"git diff {pad} --quietzzz"))
 
     def test_long_word_keeps_verdict(self):
         self.assertTrue(debug_watch.code1_is_answer("grep " + "a" * 100000 + " f"))

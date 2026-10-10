@@ -89,31 +89,33 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
     корпус собран; `test_bash_corpus` сверяет с ним `dependency_add`, затем `dependency_doubt` каждой строки. Строка
     меняет вердикт только по согласию автора;
   - `debug-watch-results.json` — записанный разбор `debug_watch` команд `bash-commands.jsonl` и
-    `bash-transcripts.jsonl`: `sha256[:12]` команды → `sha256[:12]` от `_segments`, `_paren_pairs` и `code1_is_answer`;
-    `CorpusResultsTest` в `tests/test_debug_watch.py` сверяет с ним каждую команду, `PLANKA_RECORD_RESULTS=1`
-    перезаписывает файл — после проверки каждого изменения по bash; классы форм, сверенных с bash, — комментарием
-    перед `ParenPairsTest`;
+    `bash-transcripts.jsonl`: `sha256[:12]` команды → `sha256[:12]` от границ решающей команды (`_deciding`) и
+    `code1_is_answer`; `CorpusResultsTest` в `tests/test_debug_watch.py` сверяет с ним каждую команду,
+    `PLANKA_RECORD_RESULTS=1` перезаписывает файл — после проверки каждого изменения по bash; классы форм, сверенных с
+    bash, — комментарием перед `CorpusResultsTest`;
   - `comments-shell-results.json` — записанные комментарии sh и bash (`comments._shell_comments`) образцов
     `comments/` и форм `ShellTreeTest` в `tests/test_comments.py`: вход → `[[номер строки, комментарий]]`; у входа
     `multiline-quote` — результат bash;
   - `manifests/<образец>/<манифест>` — настоящие `package.json`, `composer.json`, `pyproject.toml`, `requirements*.txt`,
     `Cargo.toml`, `go.mod`, `Gemfile` (источник — комментарием, в JSON — ключом `"//"`); `test_manifests` (`CorpusTest`)
     сверяет имена каждого с `CORPUS` (ожидание есть у каждого файла корпуса: файлом корпуса считается файл, который git
-    не игнорирует, `CorpusTest.test_every_fixture_has_expectation` берёт список `git ls-files --cached --others
-    --exclude-standard`; кэши инструментов, например `.ruff_cache`, — не образцы), имя пакета самого манифеста с
-    `OWN`, новые имена без старого текста и с тем же текстом (помощник `_added` — через `manifest_watch.edit_names`), и
-    добавление одной строки в настоящий манифест — ровно одно имя. Образцы `legacy-*` — файлы `_LEGACY` без проверки:
-    `setup.py` psf/requests v2.31.0, `setup.cfg` pytest 7.4.0, `Pipfile` pipenv v2023.12.1; их известные имена — `LEGACY_CORPUS`
-    (`LegacySourcesTest`), они же — `LEGACY_SOURCES` хуков в `tests/test_judge_tool.py`. Образцы местных источников —
-    `pyproject-uv-workspace`, `gemfile-path`, `gomod-replace-local`. Образцы `[project.optional-dependencies]` —
-    `pyproject-gyp-next`, `pyproject-pandas`; `gomod-tool` — формы go.dev/ref/mod: директива `tool` (строкой и блоком),
-    `toolchain`, `godebug`, `exclude`, `retract`, блок `require` со строкой-комментарием и `// indirect`; `tool`
-    зависимость не объявляет. Сгенерированные файлы требований (pip-compile, `uv export`) ожидают пустое множество,
-    `go.mod` — только прямые зависимости, без `// indirect`. Формы источников и подключений:
-    `requirements-cookiecutter-django` (настоящий шаблон: `-r`, строки Jinja, хвостовые комментарии; формы `-c`,
-    переноса, `--hash`, `${VAR}` — в `RequirementsTest`), `gomod-replace-versioned` (`replace` с версией и без, на
-    каталог `..`), `gemfile-bundler-dsl` (`plugin`, `eval_gemfile`, git_source, ключ строкой), `pyproject-uv-overrides`,
-    `pyproject-pdm-overrides`, `pyproject-poetry-multiple`, `npm-pnpm-extensions`, `composer-package-repo`.
+    не игнорирует, `CorpusTest.test_every_fixture_has_expectation` берёт список `git ls-files --cached
+    --others --exclude-standard`; кэши инструментов, например `.ruff_cache`, — не образцы), имя пакета самого манифеста
+    с `OWN`, новые имена без старого текста и с тем же текстом (помощник `_added` — через `manifest_watch.edit_names`),
+    и добавление одной строки в настоящий манифест — ровно одно имя. Образцы `legacy-*` — файлы `_LEGACY` без проверки:
+    `setup.py` psf/requests v2.31.0, `setup.cfg` pytest 7.4.0, `Pipfile` pipenv v2023.12.1; их известные имена —
+    `LEGACY_CORPUS` (`LegacySourcesTest`), они же — `LEGACY_SOURCES` хуков в `tests/test_judge_tool.py`. Образцы местных
+    источников — `pyproject-uv-workspace`, `gemfile-path`, `gomod-replace-local`. Образцы
+    `[project.optional-dependencies]` — `pyproject-gyp-next`, `pyproject-pandas`; `gomod-tool` — формы go.dev/ref/mod:
+    директива `tool` (строкой и блоком), `toolchain`, `godebug`, `exclude`, `retract`, блок `require` со
+    строкой-комментарием и `// indirect`; `tool` зависимость не объявляет. Сгенерированные файлы требований
+    (pip-compile, `uv export`) ожидают пустое множество, `go.mod` — только прямые зависимости, без `// indirect`. Формы
+    источников и подключений: `requirements-cookiecutter-django` (настоящий шаблон: `-r`, строки Jinja, хвостовые
+    комментарии; формы `-c`, переноса, `--hash`, `${VAR}` — в `RequirementsTest`), `gomod-replace-versioned` (`replace`
+    с версией и без, на каталог `..`), `gemfile-bundler-dsl` (`plugin`, `eval_gemfile`, git_source, ключ строкой),
+    `gemfile-gitlab` (gitlab-org/gitlab, коммит d77ac9dd, MIT: операторы, продолжающиеся на следующих строках),
+    `pyproject-uv-overrides`, `pyproject-pdm-overrides`, `pyproject-poetry-multiple`, `npm-pnpm-extensions`,
+    `composer-package-repo`.
   - `comments/<образец>/<файл>` — выдержки публичных проектов по синтаксисам (py, sh, yml/yaml — `run: |` с heredoc,
     `script:` GitLab, `post_build: - |` Read the Docs, `script: |` под `with:`, `description: |` OpenAPI и форма issue,
     rb, pl с вложенными `s{…}{…}se` и heredoc `<< "ID"`, go, rs, js, ts, tsx, jsx, sql, html, php (шаблоны
@@ -139,10 +141,12 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
   именем в `Package.json`, ветка real в `_named_target`) — `test_other_case_through_link_on_case_insensitive_fs`; пути
   снимка при смене режима и переполнении перечня — `CompareLostListTest`; края: цикл присваиваний, цепочка из 30 имён,
   `test_setup_py_references_linear`; источник не по умолчанию и `index <url>` — `SourceTest`, операторы строки Gemfile —
-  `StatementsTest`, имя пакета только из HEAD или члена workspace корня — `OwnNameTrustTest`, FIFO под именем манифеста
-  — `FifoManifestTest`; патчи `git apply` до начала сессии — `OldPatchTest` и `OldPatchGitTest`, mtime `start.json` в
-  долгой сессии — `SessionStartTtlTest`); хук — `tests/test_judge_tool.py`: `ManifestEditTest` (правка `Write`, `Edit`,
-  `MultiEdit`), `ManifestEditGitTest` (версии `_REPO_REFS` — база), `ManifestBashTest` и его наследник
+  `StatementsTest`, декодирование файла требований, как у pip, — `RequirementsEncodingTest`, зависимость на члена npm
+  workspace — `NpmWorkspaceLinkTest`, имя пакета только из HEAD или члена workspace корня — `OwnNameTrustTest`, FIFO под
+  именем манифеста — `FifoManifestTest`; патчи `git apply` до начала сессии — `OldPatchTest` и `OldPatchGitTest`, mtime
+  `start.json` в долгой сессии — `SessionStartTtlTest`); хук — `tests/test_judge_tool.py`: `ManifestEditTest` (правка
+  `Write`, `Edit`, `MultiEdit`), `ManifestEditGitTest` (версии `_REPO_REFS` — база), `ManifestEditReadsOnceTest` (один
+  `list_manifests` и одно `ls-tree` HEAD на правку члена npm workspace), `ManifestBashTest` и его наследник
   `ManifestBashGitTest` (снимок и сравнение вне git и в git: генератор requirements и заголовок генератора — блок, с
   маркером — нет, маркер, `PostToolUseFailure`, параллельные команды по `tool_use_id`, `mv`, `cp`, `git mv`; ref до
   начала сессии: stash и ref `checkout`, `restore --source`, `merge --squash`, `cherry-pick -n` старше начала — пропуск
@@ -204,36 +208,34 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
   тело heredoc — `test_marker_covers_heredoc`), имя команды — вывод подстановки (`NameOutputTest`); края разбора, на
   которых детектор падал или молчал (`ParserLimitsTest`: позиции слова, раскрытого по напечатанному тексту, и узлы в
   пределах каждого разобранного детектором текста — команды, строки `eval`, начала строк с ошибкой — на корпусах и
-  формах фаззера (`test_parsed_texts_in_bounds`); вложенность
-  10⁵ уровней — подпроцессом, сомнение `_WHY_NESTING`; сбой детектора и разбора — сомнение `_WHY_UNPARSED`, маркер в
-  начале команды; конструкция, не закрытая до конца ввода, — начало строки проверяется; линейность `_name_expands`);
-  вердикты корпусов — `CorpusTest` и `tests/test_bash_corpus.py`. Разбор shell сам по себе — `tests/test_shparse.py`:
-  `PositionsTest` — `0 ≤ start ≤ end ≤ len(text)` у каждого узла на корпусах `tests/fixtures/bash-*.jsonl` и формах
-  фаззера (зёрна 7 и 13, по 4000 форм обеих разновидностей; генератор `tests/tools/bashdiff.py` загружается по пути,
-  формы только разбираются); `DepthLimitTest` — предел стека разбора `shparse._STACK_MAX`: 10⁵ уровней каждого вида
-  вложенности подпроцессом (segfault не роняет тест-раннер) — ошибка `DEPTH`, корпуса и формы фаззера не доходят и до
-  100 уровней (`_STACK_MAX` подменён на 100), дерево до предела — не глубже двух пределов. Тесты линейности, чей вход
-  глубже предела, и `LinearityTest.test_deep_nesting` (глубина 10⁴ без `RecursionError`) снимают предел подменой
-  `_STACK_MAX`: они проверяют сам разбор, а на пределе вложенный вход кончался бы ошибкой `DEPTH` сразу, и проверка
-  прошла бы впустую. Такие тесты: `LinearityTest.test_nesting`, `test_heredocs`, `ReparseLinearityTest.test_nesting`,
+  формах фаззера (`test_parsed_texts_in_bounds`); вложенность 10⁵ уровней — подпроцессом, сомнение `_WHY_NESTING`; сбой
+  детектора и разбора — сомнение `_WHY_UNPARSED`, маркер в начале команды; конструкция, не закрытая до конца ввода, —
+  начало строки проверяется; линейность `_name_expands`); вердикты корпусов — `CorpusTest` и
+  `tests/test_bash_corpus.py`. Разбор shell сам по себе — `tests/test_shparse.py`: `PositionsTest` — `0 ≤ start ≤ end ≤
+  len(text)` у каждого узла на корпусах `tests/fixtures/bash-*.jsonl` и формах фаззера (зёрна 7 и 13, по 4000 форм обеих
+  разновидностей; генератор `tests/tools/bashdiff.py` загружается по пути, формы только разбираются); `DepthLimitTest` —
+  предел стека разбора `shparse._STACK_MAX`: 10⁵ уровней каждого вида вложенности подпроцессом (segfault не роняет
+  тест-раннер) — ошибка `DEPTH`, корпуса и формы фаззера не доходят и до 100 уровней (`_STACK_MAX` подменён на 100),
+  дерево до предела — не глубже двух пределов. Тесты линейности, чей вход глубже предела, и
+  `LinearityTest.test_deep_nesting` (глубина 10⁴ без `RecursionError`) снимают предел подменой `_STACK_MAX`: они
+  проверяют сам разбор, а на пределе вложенный вход кончался бы ошибкой `DEPTH` сразу, и проверка прошла бы впустую.
+  Такие тесты: `LinearityTest.test_nesting`, `test_heredocs`, `ReparseLinearityTest.test_nesting`,
   `PrintedTextTest.test_linear` (`tests/test_shparse.py`); `test_linear` классов `ArithmeticOutsideQuotesTest`,
   `ArithmeticQuotesTest`, `ArithmeticSubstitutionTest`, `ExpandedNameTest`, `FunctionSubstitutionTest`,
   `GrammarLinearTest`, `HeredocInSubstitutionEndTest`, `ParameterExpansionSpaceTest` (`tests/test_depcheck.py`);
   `LinearParseTest.test_string_substitutions_are_linear` (`tests/test_comments.py`),
-  `SegmentsTest.test_shift_after_open_parens_linear` (`tests/test_debug_watch.py`). Новый тест линейности с
-  вложенностью глубже предела подменяет его так же.
-- Разделители команд `debug_watch._segments` (по дереву `shparse`) — `SegmentsTest` в `tests/test_debug_watch.py`:
-  разделитель в подстановке, образце `case`, скобках массива и перенаправлении `>|` команды не делит
-  (`test_operators_outside_words_only`), строка с фатальной синтаксической ошибкой — одна команда
-  (`test_syntax_error_line_is_one_command`); арифметика без разделителей
-  и `<<` в ней — сдвиг; `((` без закрытия `))` — подоболочка в подоболочке, её разделители делят команды
-  (`test_nested_subshell_is_not_arithmetic`); тело heredoc с апострофом не прячет пары скобок `((…))` после терминатора
-  (`test_heredoc_body_quote_does_not_hide_arithmetic_pairs`); не прячут и не сдвигают пары скобок ни тело heredoc рядом
-  с арифметикой — в подоболочке `(` и после закрытой `((…))`
-  (`test_heredoc_beside_arithmetic_does_not_hide_arithmetic_pairs`), ни `<<` внутри `((…))` и `$[…]` — сдвиг
-  (`test_shift_does_not_hide_later_arithmetic_pairs`), ни here-string `<<<`
-  (`test_here_string_does_not_hide_arithmetic_pairs`), ни `<<-` с табуляцией перед терминатором
-  (`test_tab_stripped_heredoc_does_not_hide_arithmetic_pairs`).
+  `DecidingTest.test_shift_after_open_parens_linear` (`tests/test_debug_watch.py`). Новый тест линейности с вложенностью
+  глубже предела подменяет его так же.
+- Команда, решающая код строки (`debug_watch._deciding`, по дереву `shparse`), — `DecidingTest` в
+  `tests/test_debug_watch.py`: `<<` в арифметике — сдвиг, а не heredoc (`test_arithmetic_shift_is_not_heredoc`); тело
+  heredoc командами не считается (`test_heredoc_body_is_not_commands`); разделитель в слове, подстановке, образце
+  `case`, скобках массива и перенаправлении `>|` команды не делит (`test_separators_inside_words_do_not_split`); `((`
+  без закрытия `))` — подоболочка в подоболочке (`test_nested_subshell_is_not_arithmetic`); продолжение строки и перевод
+  строки после оператора (`test_line_continuation`, `test_newline_after_operator`); строка с фатальной синтаксической
+  ошибкой — решающей команды нет (`test_syntax_error_has_no_deciding_command`); строка, отброшенная ошибкой скобок
+  массива, не мешает следующим (`test_dropped_array_line`); последняя команда в фоне (`test_background_last_command`);
+  присваивание с подстановкой (`test_assignment_substitution`); слова с раскрытием (`test_words_with_expansion`);
+  глубокое дерево без рекурсии Python (`test_deep_tree_without_recursion`).
 - Линейность разбора проверяется отношением процессорного времени, а не абсолютным порогом: `helpers.cpu_seconds` —
   наименьшее `time.process_time` из трёх запусков, `helpers.assert_linear(test, small, large)` — запуск на входе
   вчетверо больше не дольше 8 запусков малого и 5 мс (линейный — около 4, квадратичный — около 16):
@@ -241,24 +243,23 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
   (setup.py с шестью уровнями имён по 4 и 16 ссылок), `LinearParseTest` (комментарии),
   `FilterTest.test_list_items_linear_in_blank_lines`, `BacktickInDoubleQuotesTest.test_linear` в
   `tests/test_depcheck.py` (подстановка `` `…` `` в `"…"`: закрытая, незакрытая до конца команды, на многих строках),
-  `GrammarLinearTest.test_linear` там же (формы грамматики над деревом),
-  `BacktickOutsideQuotesTest.test_linear` там же (`` `…` `` вне кавычек и в `$(…)`), `ArithmeticQuotesTest.test_linear`
-  там же (кавычки в арифметике `$((…))` и `$[…]`), `DoubtTest.test_linear` там же (формы сомнения детектора),
-  `ArithmeticOutsideQuotesTest.test_linear` там же (арифметика, индексы и смещения вне кавычек),
-  `ParameterExpansionSpaceTest.test_linear` там же (пробелы внутри `${…}` вне кавычек),
-  `SubscriptWordQuotesTest`, `DoubleDollarTest`, `FunctionSubstitutionTest`, `HeredocInSubstitutionEndTest`,
-  `EscapedBlankCommentTest` — их `test_linear` там же (кавычки в слове с `[`, `$$`, подстановка функции `${ …; }`,
-  конец heredoc внутри подстановки, `\` перед пробелом и `#`),
+  `GrammarLinearTest.test_linear` там же (формы грамматики над деревом), `BacktickOutsideQuotesTest.test_linear` там же
+  (`` `…` `` вне кавычек и в `$(…)`), `ArithmeticQuotesTest.test_linear` там же (кавычки в арифметике `$((…))` и
+  `$[…]`), `DoubtTest.test_linear` там же (формы сомнения детектора), `ArithmeticOutsideQuotesTest.test_linear` там же
+  (арифметика, индексы и смещения вне кавычек), `ParameterExpansionSpaceTest.test_linear` там же (пробелы внутри `${…}`
+  вне кавычек), `SubscriptWordQuotesTest`, `DoubleDollarTest`, `FunctionSubstitutionTest`,
+  `HeredocInSubstitutionEndTest`, `EscapedBlankCommentTest` — их `test_linear` там же (кавычки в слове с `[`, `$$`,
+  подстановка функции `${ …; }`, конец heredoc внутри подстановки, `\` перед пробелом и `#`),
   `RobustnessTest.test_adversarial_input_is_linear` (`tests/test_planparse.py`: каждый враждебный пункт и строка при
-  множителе 1 и 4), `SegmentsTest.test_unclosed_test_brackets_linear` (`tests/test_debug_watch.py`),
-  `SegmentsTest.test_shift_after_open_parens_linear` там же (`<` после тысяч открытых `(`),
-  `Code1IsAnswerTest.test_long_word_linear` там же (слово длиннее `_HEAD_LIMIT`),
+  множителе 1 и 4), `DecidingTest.test_nested_parens_linear` (`tests/test_debug_watch.py`),
+  `DecidingTest.test_unclosed_test_brackets_linear` там же, `DecidingTest.test_shift_after_open_parens_linear` там же
+  (`<` после тысяч открытых `(`), `DecidingTest.test_many_assignments_linear` там же (тысячи присваиваний с
+  подстановкой), `Code1IsAnswerTest.test_long_word_linear` там же (слово в сотни тысяч символов),
   `ShellTreeTest.test_many_fatal_errors_linear` в `tests/test_comments.py` (повторный разбор после каждой фатальной
   ошибки), `ParserLimitsTest.test_nested_parameter_name_linear` в `tests/test_depcheck.py` (имя команды из вложенных
-  `${a:-…}`), `UserAndWatchWrappersTest.test_linear`
-  в `tests/test_depcheck.py` (цепочки `su`/`runuser`/`watch`), `GemfileTest.test_linear_on_long_line` в
-  `tests/test_manifests.py` (строки Gemfile из кавычек и пробелов), `ImportParseTest.test_strip_code_linear` в
-  `tests/test_guard_memory.py` (незакрытые `<!--`, серии обратных кавычек);
+  `${a:-…}`), `UserAndWatchWrappersTest.test_linear` в `tests/test_depcheck.py` (цепочки `su`/`runuser`/`watch`),
+  `GemfileTest.test_linear_on_long_line` в `tests/test_manifests.py` (строки Gemfile из кавычек и пробелов),
+  `ImportParseTest.test_strip_code_linear` в `tests/test_guard_memory.py` (незакрытые `<!--`, серии обратных кавычек);
   `WalkCaptureTest.test_walk_cost_independent_of_ext_count` — обход при 1 и 2000 расширениях `.gitignore` через
   `helpers.cpu_seconds`, порог 4. Часы стены и абсолютный порог в секундах под нагрузкой машины флакуют.
 - Окружение `Env.environ` вычищает `PLANKA_*`, `CLAUDE_PLUGIN_OPTION_*`, `CLAUDE_PROJECT_DIR`, `CLAUDE_CONFIG_DIR`,
@@ -345,8 +346,8 @@ PID процесса. Ответ с текстом собирает `python3` с
   update-index --index-info`), `git cat-file blob` для манифеста с возвратом каретки в имени (`nl/requirements\r.txt`
   под `diff=junk`; имя с переводом строки не манифест), `git ls-files` жёсткой ссылки на манифест в `edit_targets`; `git
   cat-file --batch` и `git ls-tree` в `restored_names` — по ветке и `stash -u` с отслеживаемым и неотслеживаемым
-  манифестом; в `project_names` и `compare` — дерево HEAD с `setup.py` под `diff=junk` (имя `legacydep` известно,
-  `evilpkg` — новое).
+  манифестом; в `project_names` и `compare` — дерево HEAD (`git ls-tree -r -z --full-tree`, блобы по SHA) с `setup.py`
+  под `diff=junk` (имя `legacydep` известно, `evilpkg` — новое).
 
 Локаль с кодировкой ascii проверяет `NonUtf8LocaleTest` своим скриптом `_LOCALE_HOOK` подпроцессом
 (`LC_ALL=C`, `PYTHONUTF8=0`): судья с русским промптом через сторож, корень проекта и

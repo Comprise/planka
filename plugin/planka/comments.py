@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import time
+import unicodedata
 
 import common
 import shparse
@@ -30,7 +31,8 @@ class _Syntax:
 
     line — (маркер, правило) строчного комментария: правило "any" — маркер везде, "word" — в начале строки
     или после пробела, "code" — не сразу после «$», «${» и «\\», "php" — «#» не перед «[», "css" — не сразу после
-    «:» (url(http://…) без кавычек), "start" — только пробелы перед маркером, "make" — в строке рецепта (с
+    «:» (url(http://…) без кавычек), "start" — только пробелы перед маркером, "hs" — серия тире не часть оператора
+    (_hs_symbol), "make" — в строке рецепта (с
     табуляции) как "word" и сразу за префиксами «@», «-», «+» (_MAKE_PREFIX), в прочих — не сразу после «$», «{»
     и «\\», "vim" и "vim9" — по _vim_quote и _marker_ok. blocks — (открытие, закрытие) блочного комментария;
     nested — блоки вкладываются (счётчик глубины). strings —
@@ -279,7 +281,7 @@ _add(("ex", "exs"), line=_H, strings=(_T_DQ, _T_SQ, _DQ, _SQ), shebang=True, pre
      exdoc=True, sigil=True, interp=(dict.fromkeys(('"', "'", '"""', "'''"), _EX_INTERP), None))
 _add(("sql",), line=(("--", "any"),), blocks=_C_BLOCK, strings=(_DQ, _SQ))
 _add(("lua",), line=(("--", "any"),), strings=(_DQ, _SQ), lua=True)
-_add(("hs",), line=(("--", "any"),), blocks=(("{-", "-}"),), strings=(_DQ,), char=True, nested=True)
+_add(("hs",), line=(("--", "hs"),), blocks=(("{-", "-}"),), strings=(_DQ,), char=True, nested=True)
 _add(("html", "xml"), blocks=(("<!--", "-->"),))
 _add(("css",), blocks=_C_BLOCK, strings=(_DQ, _SQ))
 _add(("scss", "sass", "less"), line=(("//", "css"),), blocks=_C_BLOCK, strings=(_DQ, _SQ))
@@ -344,6 +346,13 @@ def _marker_ok(raw, i, rule):
         return i == 0 or raw[i - 1] != ":"
     if rule == "start":
         return _back(raw, i, str.isspace) == 0
+    if rule == "hs":
+        # Серия тире — комментарий, только если она вся лексема: перед ней и за последним тире нет знака оператора
+        # («-->», «|--», «--|» — операторы, «-- |» и «---» — комментарии).
+        j = i + 2
+        while j < len(raw) and raw[j] == "-":
+            j += 1
+        return not (i and _hs_symbol(raw[i - 1])) and not (j < len(raw) and _hs_symbol(raw[j]))
     if rule == "make":
         if not raw.startswith("\t"):
             # «#» в вызове функции и ссылке на переменную GNU make буквален: «$(shell echo $${#A})».
@@ -354,6 +363,18 @@ def _marker_ok(raw, i, rule):
     if rule == "vim9":
         return (i == 0 or raw[i - 1].isspace()) and not raw.startswith("{", i + 1)
     return True
+
+
+# Знаки операторов Haskell: ASCII — $ascsymbol, не-ASCII — категории Unicode, которые лексер GHC относит к symbol
+# (GHC.Parser.Lexer.Interface, adj_c); «_», «"», «'» и $special не входят (Haskell 2010 Report, 2.2).
+_HS_ASCII_SYMBOL = frozenset("!#$%&*+./<=>?@\\^|-~:")
+_HS_UNI_SYMBOL = frozenset(("Pc", "Pd", "Po", "Sm", "Sc", "Sk", "So"))
+
+
+def _hs_symbol(c):
+    if c <= "\x7f":
+        return c in _HS_ASCII_SYMBOL
+    return unicodedata.category(c) in _HS_UNI_SYMBOL
 
 
 def _vim_quote(raw, i):

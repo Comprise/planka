@@ -198,6 +198,35 @@ def _structure(plan):
     return [(t.wave, t.number, t.files) for t in planparse.parse_plan(plan) or []]
 
 
+class FenceInfoStringTest(unittest.TestCase):
+    def test_inline_code_with_triple_backticks_is_not_a_fence(self):
+        plan = ("### Задача 1: A\n**Файлы:**\n- Создать: `a.py`\n\n```make test``` запускает тесты\n"
+                "### Задача 2: B\n**Файлы:**\n- Создать: `b.py`\n")
+        self.assertEqual([(t.number, t.files) for t in planparse.parse_plan(plan)],
+                         [("1", ["a.py"]), ("2", ["b.py"])])
+
+    def test_fence_with_info_string_still_opens(self):
+        plan = ("### Задача 1: A\nFiles: `a.py`\n```python title\n### Задача 2: B\nFiles: `b.py`\n```\n")
+        self.assertEqual([t.number for t in planparse.parse_plan(plan)], ["1"])
+
+    def test_closing_fence_with_info_does_not_close(self):
+        plan = ("### Задача 1: A\nFiles: `a.py`\n```\n```py\n### Задача 2: B\nFiles: `b.py`\n```\n"
+                "### Задача 3: C\nFiles: `c.py`\n")
+        self.assertEqual([t.number for t in planparse.parse_plan(plan)], ["1", "3"])
+
+
+class MidListNoteTest(unittest.TestCase):
+    def test_note_in_middle_of_bare_list_is_stripped(self):
+        self.assertEqual(_files("Files: x.py (новый), a.py"), ["x.py", "a.py"])
+        self.assertEqual(_files("Файлы: x.py (новый, тест), a.py (изм), b.py"), ["x.py", "a.py", "b.py"])
+
+    def test_read_note_in_middle_drops_that_path(self):
+        self.assertEqual(_files("Files: x.py (read-only), a.py"), ["a.py"])
+
+    def test_two_notes_in_a_row_still_not_a_path(self):
+        self.assertEqual(_files("Files: x.py (a) (b), c.py"), [])
+
+
 class NestedNonOwnershipTest(unittest.TestCase):
     def test_nested_items_under_non_owning_item_are_not_owned(self):
         for head in ("**Не трогать:**", "Только чтение:", "**Читает:**", "Read-only:"):

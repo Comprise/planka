@@ -1142,6 +1142,49 @@ class ManifestEditGitTest(unittest.TestCase):
         self.assertEqual(self.write_tool(PACKAGE_JSON).stdout, "")
 
 
+@unittest.skipUnless(shutil.which("git"), "нет git")
+class ManifestEditReadsOnceTest(unittest.TestCase):
+    """Правка package.json члена npm workspace перечисляет манифесты проекта и читает дерево HEAD по одному разу:
+    перечень (manifest_watch.listing) и дерево HEAD общие у npm workspace версий (head_names) и имён проекта
+    (project_names)."""
+
+    def setUp(self):
+        self.env = Env()
+        self.p = self.env.project
+        (self.p / "package.json").write_text('{"name": "root", "workspaces": ["packages/*"]}', encoding="utf-8")
+        for name in ("a", "b"):
+            (self.p / "packages" / name).mkdir(parents=True)
+            (self.p / "packages" / name / "package.json").write_text(
+                '{"name": "%s", "version": "1.0.0", "dependencies": {"react": "^18"}}' % name, encoding="utf-8")
+        git("init", "-q", cwd=self.p)
+        git("add", ".", cwd=self.p)
+        git("commit", "-qm", "i", cwd=self.p)
+
+    def tearDown(self):
+        self.env.close()
+
+    def test_listing_and_head_tree_once(self):
+        calls = []
+        real_git, real_list = manifest_watch._git, manifest_watch.list_manifests
+
+        def counted_git(cwd, timeout, *args, **kwargs):
+            calls.append(args)
+            return real_git(cwd, timeout, *args, **kwargs)
+
+        def counted_list(root, deadline):
+            calls.append(("list_manifests",))
+            return real_list(root, deadline)
+        content = '{"name": "a", "version": "1.0.0", "dependencies": {"react": "^18", "left-pad": "1"}}'
+        with mock.patch.object(manifest_watch, "_git", counted_git), \
+                mock.patch.object(manifest_watch, "list_manifests", counted_list):
+            out = run_in_process(self.env, judge_tool.main, self.env.hook_input(
+                "PreToolUse", tool_name="Write", tool_input={
+                    "file_path": str(self.p / "packages" / "a" / "package.json"), "content": content}))
+        self.assertIn("left-pad", out["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertEqual(calls.count(("list_manifests",)), 1, calls)
+        self.assertEqual(len([c for c in calls if c[0] == "ls-tree" and "HEAD" in c]), 1, calls)
+
+
 def git(*args, cwd):
     subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args], cwd=cwd, check=True,
                    capture_output=True)
@@ -1311,8 +1354,9 @@ class ManifestBashTest(unittest.TestCase):
         self.assertTrue((self.p / "vendor/acme/x/composer.json").exists())
 
     def test_workspace_member_not_external(self):
-        # Член workspace корня ставится из каталога по имени; имя свежего манифеста вне workspace — внешнее.
-        (self.p / "package.json").write_text('{"name": "root", "workspaces": ["packages/*"]}', encoding="utf-8")
+        # Член workspace корня ставится из каталога по имени, если зависимый манифест — тоже член; имя свежего
+        # манифеста вне workspace — внешнее.
+        (self.p / "package.json").write_text('{"name": "root", "workspaces": ["packages/*", "web"]}', encoding="utf-8")
         command = ("mkdir -p packages/utils && printf '{\"name\": \"@acme/utils\"}' > packages/utils/package.json && "
                    "python3 -c \"import json; p='web/package.json'; d=json.load(open(p)); "
                    "d['dependencies']['@acme/utils']='*'; json.dump(d, open(p, 'w'))\"")
@@ -1320,14 +1364,30 @@ class ManifestBashTest(unittest.TestCase):
         self.assertEqual(r.stdout, "", r.stderr)
 
     def test_existing_workspace_member_not_external(self):
-        # Член workspace есть до команды; команда меняет только зависимый манифест.
-        (self.p / "package.json").write_text('{"name": "root", "workspaces": ["packages/*"]}', encoding="utf-8")
+        # Член workspace есть до команды; команда меняет только зависимый манифест — член workspace.
+        (self.p / "package.json").write_text('{"name": "root", "workspaces": ["packages/*", "web"]}', encoding="utf-8")
         (self.p / "packages" / "b").mkdir(parents=True)
         (self.p / "packages" / "b" / "package.json").write_text('{"name": "pkg-b"}', encoding="utf-8")
         command = ("python3 -c \"import json; p='web/package.json'; d=json.load(open(p)); "
                    "d['dependencies']['pkg-b']='*'; json.dump(d, open(p, 'w'))\"")
         r = self.run_command(command)
         self.assertEqual(r.stdout, "", r.stderr)
+
+    def test_workspace_member_from_registry_blocked(self):
+        # npm ставит пакет с именем члена из реестра в манифесте вне workspace и при неподходящем диапазоне
+        # (npm 11.16, `npm install --dry-run --offline` в web/ вне `workspaces` — запрос pkg-b к реестру).
+        (self.p / "packages" / "b").mkdir(parents=True)
+        (self.p / "packages" / "b" / "package.json").write_text('{"name": "pkg-b", "version": "1.0.0"}',
+                                                               encoding="utf-8")
+        for workspaces, spec in [('["packages/*"]', "*"), ('["packages/*", "web"]', "^2.0.0")]:
+            with self.subTest(workspaces=workspaces, spec=spec):
+                (self.p / "package.json").write_text('{"name": "root", "workspaces": %s}' % workspaces,
+                                                     encoding="utf-8")
+                (self.p / "web" / "package.json").write_text(PACKAGE_JSON, encoding="utf-8")
+                command = ("python3 -c \"import json; p='web/package.json'; d=json.load(open(p)); "
+                           f"d['dependencies']['pkg-b']='{spec}'; json.dump(d, open(p, 'w'))\"")
+                r = self.run_command(command)
+                self.assertIn("pkg-b @ registry", r.stdout)
 
     def test_requirements_moved_to_pyproject_not_new(self):
         command = ("printf '[project]\\nname = \"app\"\\ndependencies = [\"httpx\", \"rich\"]\\n' > pyproject.toml"
@@ -1660,8 +1720,10 @@ class ManifestBashGitTest(ManifestBashTest):
         self.branch_at(self.START, "same", "flask\n")
         command = "git checkout same -- requirements.txt"
         self.assertEqual(manifest_watch.restored_names(self.p, command, self.START, time.monotonic() + 30), {})
+        # Имя пакета package.json ref (`app`) — не пакет проекта: npm ставит его из каталога только по связи
+        # workspace (manifest_watch._tree_names).
         self.assertEqual(manifest_watch.restored_names(self.p, command, self.START + 1, time.monotonic() + 30),
-                         {"pypi": ["flask", "httpx", "rich"], "npm": ["app", "jest", "react"]})
+                         {"pypi": ["flask", "httpx", "rich"], "npm": ["jest", "react"]})
 
     def test_old_ref_without_session_start_blocked(self):
         # Начала сессии нет в состоянии (каталог данных был недоступен): время ref не с чем сравнить — блок.
@@ -2047,7 +2109,7 @@ class ManifestDeadlineTest(unittest.TestCase):
 
         def take(root, deadline):
             seen["take"] = deadline - time.monotonic()
-            return {"root": str(root), "mode": "walk", "ts": time.time(), "files": {}}
+            return {"root": str(root), "mode": "walk", "ts": time.time(), "files": {}, "npm": {}}
 
         def compare(entry, deadline):
             seen["compare"] = deadline - time.monotonic()
@@ -2066,7 +2128,7 @@ class ManifestDeadlineTest(unittest.TestCase):
 
         def take(root, deadline):
             seen["take"] = deadline - time.monotonic()
-            return {"root": str(root), "mode": "walk", "ts": time.time(), "files": {}}
+            return {"root": str(root), "mode": "walk", "ts": time.time(), "files": {}, "npm": {}}
 
         def slow_root(cwd):
             time.sleep(1.5)
@@ -2081,7 +2143,7 @@ class ManifestDeadlineTest(unittest.TestCase):
         # git ref, названного командой, — в том же сроке SNAPSHOT_BUDGET, что и снимок.
         def take(root, deadline):
             time.sleep(0.2)
-            return {"root": str(root), "mode": "git", "ts": time.time(), "files": {}}
+            return {"root": str(root), "mode": "git", "ts": time.time(), "files": {}, "npm": {}}
         with mock.patch.object(manifest_watch, "take", side_effect=take), \
                 mock.patch.object(manifest_watch, "_git", return_value=None) as git_call:
             run_in_process(self.env, judge_tool.main, self.env.hook_input(
@@ -2100,7 +2162,8 @@ class ManifestDeadlineTest(unittest.TestCase):
             run_in_process(self.env, judge_tool.main, self.env.hook_input(
                 "PreToolUse", tool_name="Write", tool_input={
                     "file_path": str(self.env.project / "package.json"), "content": "{}"}))
-        self.assertEqual(git_call.call_args.args[1], manifest_watch.HEAD_TIMEOUT)
+        self.assertTrue(manifest_watch.HEAD_TIMEOUT - 1 < git_call.call_args.args[1] <= manifest_watch.HEAD_TIMEOUT,
+                        git_call.call_args)
 
 
 class ManifestSnapshotFailureTest(unittest.TestCase):
@@ -2340,6 +2403,21 @@ class ManifestWatchStateTest(unittest.TestCase):
             "PreToolUse", tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="b1"), PLANKA_JUDGE="1")
         self.assertFalse(path.exists())
 
+    def test_pop_drops_entry_without_npm(self):
+        # Снимок без поля "npm" — не той формы: package.json в нём мог быть разобран без членов npm workspace, и
+        # сравнение дало бы зависимости на члена `имя @ registry` против простого имени.
+        entry = {"root": "/", "mode": "walk", "ts": time.time(), "files": {}}
+        self.in_process(manifest_watch.store, "s", "a", entry)
+        self.assertIsNone(self.in_process(manifest_watch.pop, "s", "a"))
+        self.in_process(manifest_watch.store, "s", "b", {**entry, "npm": {"a": 1}})
+        self.assertIsNone(self.in_process(manifest_watch.pop, "s", "b"))
+        # Члены — по каталогу корня workspace: плоский словарь {имя: версия} — не той формы.
+        self.in_process(manifest_watch.store, "s", "c", {**entry, "npm": {"a": "1.0.0"}})
+        self.assertIsNone(self.in_process(manifest_watch.pop, "s", "c"))
+        nested = {**entry, "npm": {"web": {"a": "1.0.0", "b": None}}}
+        self.in_process(manifest_watch.store, "s", "d", nested)
+        self.assertEqual(self.in_process(manifest_watch.pop, "s", "d"), nested)
+
     def test_store_drops_expired_entries(self):
         now = time.time()
         self.in_process(manifest_watch.store, "s", "old", {"ts": now - manifest_watch.ENTRY_TTL - 5})
@@ -2348,7 +2426,7 @@ class ManifestWatchStateTest(unittest.TestCase):
         self.assertEqual(sorted(json.loads(self.state_file().read_text(encoding="utf-8"))), ["fresh", "new"])
 
     def test_pop_removes_empty_state_file(self):
-        entry = {"root": "/", "mode": "walk", "ts": time.time(), "files": {}}
+        entry = {"root": "/", "mode": "walk", "ts": time.time(), "files": {}, "npm": {}}
         self.in_process(manifest_watch.store, "s", "a", entry)
         self.in_process(manifest_watch.store, "s", "b", entry)
         self.assertEqual(self.in_process(manifest_watch.pop, "s", "a"), entry)

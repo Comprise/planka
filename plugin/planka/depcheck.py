@@ -1,9 +1,11 @@
 """Детерминированный разбор команды Bash: добавляет ли она пакет в проект."""
+import base64
 import bisect
+import fnmatch
 import re
 import shlex
 from collections import deque
-from itertools import chain, islice
+from itertools import chain, islice, product
 
 import pkgmanagers
 import shparse
@@ -50,11 +52,18 @@ _WRAPPERS = {
                       "--supp-group", "-w", "--whitelist-environment"}), 0),
     "runuser": (frozenset({"-c", "--command", "--session-command", "-s", "--shell", "-g", "--group", "-G",
                            "--supp-group", "-w", "--whitelist-environment", "-u", "--user"}), 0),
-    # Пакеты из stdin xargs не видны: команду установки без пакета под xargs отдаёт _doubt.
-    "xargs": (frozenset({"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a", "--arg-file", "--delimiter",
-                         "--max-args", "--max-procs", "--max-lines", "--max-chars", "--eof",
-                         "--process-slot-var"}), 0),
+    # Слова из stdin xargs не видны: команду установки без пакета, менеджер без подкоманды и `sh -c` без строки под
+    # xargs отдаёт _doubt (_xargs_doubt); строку замены `-I`/`-i`/`--replace` в словах команды _strip_command
+    # заменяет заглушкой раскрытия _PLACEHOLDER. Флаги xargs разбирает _xargs_flag.
+    "xargs": (frozenset(), 0),
 }
+# Флаги GNU xargs (findutils 4.11): короткие — по optstring `+0a:E:e::i::I:l::L:n:oprs:txP:d:`, длинные — по
+# longopts xargs.c; 1 — значение обязательно, 2 — необязательно, остальные — без значения.
+_XARGS_SHORT = {**dict.fromkeys("aEILnsPd", 1), **dict.fromkeys("eil", 2)}
+_XARGS_LONG = {"--null": 0, "--arg-file": 1, "--delimiter": 1, "--eof": 2, "--replace": 2, "--max-lines": 2,
+               "--max-args": 1, "--open-tty": 0, "--interactive": 0, "--no-run-if-empty": 0, "--max-chars": 1,
+               "--verbose": 0, "--show-limits": 0, "--exit": 0, "--max-procs": 1, "--process-slot-var": 1,
+               "--version": 0, "--help": 0}
 # Флаг env, чьё значение — строка команды, разбиваемая на слова.
 _ENV_SPLIT = ("-S", "--split-string")
 # Обёртки, чья команда — строка оболочки `-c`/`--command`, у runuser — слова после `-u`, иначе — оболочка или
@@ -76,6 +85,8 @@ _MAX_WRAPPERS = 16
 _GEM_INSTALL = {"i", "ins", "inst", "insta", "instal", "install"}
 # `composer require`, его псевдоним `r` и однозначные сокращения имени (Symfony Console, от `req`).
 _COMPOSER_REQUIRE = {"r", "req", "requ", "requi", "requir", "require"}
+# `composer global` и однозначные сокращения имени (Symfony Console: других команд composer на `g` нет).
+_COMPOSER_GLOBAL = {"g", "gl", "glo", "glob", "globa", "global"}
 _ADD_FLAGS = {"poetry": pkgmanagers._POETRY_VALUE_FLAGS, "cargo": pkgmanagers._CARGO_VALUE_FLAGS, "bundle": pkgmanagers._BUNDLE_VALUE_FLAGS}
 # Пакеты, без которых окружение conda не создаётся: `conda create -n x python=3.11` нового пакета не вносит.
 _CONDA_BASE = {"python", "pip"}
@@ -87,9 +98,6 @@ _EXECS = {"npm": {"exec", "x"}, "pnpm": {"dlx", "exec"}, "yarn": {"dlx", "exec"}
 _NPX_VALUE_FLAGS = {"-p", "--package", "-c", "--call", "--cache", "--userconfig"}
 # Версия в спецификации пакета: `pnpm@9`, `@scope/x@1`.
 _VERSION = re.compile(r"(?<=.)@[^/]*$")
-# Псевдонимы `npm install`.
-_NPM_INSTALL = {"install", "i", "add", "in", "ins", "inst", "insta", "instal", "isnt", "isnta", "isntal",
-                "isntall", "it", "install-test"}
 # Сколько первых символов слов команды видит разбор (_strip_command): пакет, названный дальше, не виден — команду
 # установки без пакета в длинном сегменте отдаёт _doubt.
 _WORDS_LIMIT = 4096
@@ -104,7 +112,7 @@ _LOOSE, _MASKED, _DEEP, _COMPUTED = "loose", "masked", "deep", "computed"
 # Доводы сомнения dependency_doubt.
 _WHY_FLAG = "флаг перед подкомандой вне известных наборов: если он берёт значение, подкоманда — установка"
 _WHY_DRY = "`--dry-run` стоит значением другого флага: пробного прогона может не быть"
-_WHY_XARGS = "пакеты приходят из stdin xargs, разбор их не видит"
+_WHY_XARGS = "пакеты или слова команды приходят из stdin xargs, разбор их не видит"
 _WHY_DEPTH = f"вложенность глубже {_MAX_DEPTH} уровней разобрана только по словам"
 _WHY_CUT = f"команда длиннее {_WORDS_LIMIT} символов: пакет может стоять дальше"
 _WHY_NAME = "имя команды — подстановка или переменная: менеджер известен только при исполнении"
@@ -116,6 +124,13 @@ _WHY_COMPUTED = ("строка команд вычисляется при исп
                  "оболочке: её команды не видны")
 _WHY_LAUNCHER = ("программа, неизвестная разбору, получает словами менеджер пакетов и его команду установки: она "
                  "может их запустить")
+_WHY_STRING = ("программа получает строкой или на stdin текст, который разбирается как команда установки пакета: "
+               "она может его исполнить")
+_WHY_RENAMED = ("имя команды — переменная, шаблон имён или alias, и под ним стоит команда установки пакета: менеджер "
+                "известен только при исполнении")
+_WHY_RUNTIME_NAME = ("имя команды — ссылка на переменную со значением в тексте команды или склейка с ней, но значение "
+                     "имени известно только при исполнении (замена, обрезка, подстрока, смена регистра, косвенная "
+                     "ссылка или слишком много сочетаний значений): под ним может стоять менеджер пакетов")
 # Разбор не дал дерева: вложенность глубже предела shparse (_STACK_MAX уровней стека разбора) или сбой разбора или
 # детектора на этом тексте. Добавляет ли команда пакет, неизвестно, а пропуск открыл бы обход проверки той же
 # установкой рядом с такой конструкцией (`npm i x; echo $(… ×5000 …)`): сомнение, маркер — в начале всей команды.
@@ -131,12 +146,12 @@ _LAUNCH_VERBS = pkgmanagers._INSTALL_VERBS | {"get", "in", "inject", "a", "satis
 # Сколько пар «менеджер, глагол или флаг» в словах неизвестной программы разбирает _launches_install; больше —
 # сомнение.
 _MAX_LAUNCH_PAIRS = 16
-# Программы, чьи слова — данные, а не команда: текст, поиск, справка, git (команды, которые git запускает сам, —
-# _git_runs).
+# Программы, чьи слова — данные, а не команда: текст, поиск, справка, буфер обмена (`pbcopy`, `xclip`, `wl-copy`
+# кладут stdin в буфер, man pbcopy, man xclip, man wl-clipboard), git (команды, которые git запускает сам, — _git_runs).
 _DATA_PROGRAMS = {"echo", "printf", "grep", "egrep", "fgrep", "rg", "ag", "git", "gh", "cat", "sed", "awk", "head",
                   "tail", "jq", "wc", "ls", "diff", "man", "tldr", "help", "info", "apropos", "which", "type",
                   "whereis", "sort", "uniq", "tee", "less", "more", "test", "[", "[[", "true", "false", ":", "read",
-                  "export", "declare", "local", "set", "unset", "alias"}
+                  "export", "declare", "local", "set", "unset", "alias", "pbcopy", "xclip", "wl-copy"}
 
 
 # Сколько символов слов (и шагов) создаёт раскрытие фигурных скобок всех слов одного вызова dependency_add или
@@ -269,9 +284,16 @@ def _is_add(words, depth=0, mode=None):
         w = pkgmanagers._subcommand(w, pkgmanagers._GLOBAL_FLAGS[name])
     elif pkgmanagers._PIP.match(name):
         w = pkgmanagers._subcommand(w, pkgmanagers._PIP_GLOBAL_VALUE_FLAGS)
+    elif name in pkgmanagers._CONDAS:
+        w = pkgmanagers._subcommand(w, pkgmanagers._CONDA_GLOBAL_VALUE_FLAGS)
     if name == "yarn" and len(w) > 2 and w[1] == "workspace":
         w = [w[0], *w[3:]]
-    if name in ("poetry", "composer", "yarn") and len(w) > 1 and w[1] in ("self", "global"):
+    if name == "yarn" and w[1:3] == ["workspaces", "foreach"]:
+        # Команда yarn в каждом workspace.
+        rest = pkgmanagers._yarn_foreach(w[3:])
+        return rest is not None and _is_add([w[0], *rest], depth + 1, mode)
+    if name in ("poetry", "composer", "yarn") and len(w) > 1 and (
+            w[1] in ("self", "global") or name == "composer" and w[1] in _COMPOSER_GLOBAL):
         w = [w[0], *w[2:]]
     sub = w[1] if len(w) > 1 else None
     args = w[2:]
@@ -293,13 +315,15 @@ def _is_add(words, depth=0, mode=None):
         return False
     if name == "go":
         if sub == "get":
-            return pkgmanagers._has(args, pkgmanagers._GO_VALUE_FLAGS)
+            # `пакет@none` убирает зависимость.
+            return any(not p.endswith("@none") for p in pkgmanagers._positionals(args, pkgmanagers._GO_VALUE_FLAGS))
         if sub == "install":
             # `go install` без версии собирает пакет из go.mod проекта.
             return any("@" in p for p in pkgmanagers._positionals(args, pkgmanagers._GO_BUILD_VALUE_FLAGS))
         return False
     if name == "npm":
-        return sub in _NPM_INSTALL and pkgmanagers._has(args, pkgmanagers._NPM_VALUE_FLAGS)
+        return pkgmanagers._npm_command(sub) in pkgmanagers._NPM_INSTALL and pkgmanagers._has(
+            args, pkgmanagers._NPM_VALUE_FLAGS)
     if name == "pnpm":
         # `--workspace` берёт пакеты только из workspace проекта.
         return sub in ("add", "install", "i") and "--workspace" not in args and pkgmanagers._has(args, pkgmanagers._PNPM_VALUE_FLAGS)
@@ -352,7 +376,9 @@ def _is_add(words, depth=0, mode=None):
     if name in _ADD_FLAGS:
         return sub == "add" and pkgmanagers._has(args, _ADD_FLAGS[name])
     if name == "gem":
-        return sub in _GEM_INSTALL and pkgmanagers._has(args, pkgmanagers._GEM_VALUE_FLAGS)
+        sub, args = pkgmanagers._gem_sub_args(w)
+        return sub in _GEM_INSTALL and not pkgmanagers._gem_file(args) and pkgmanagers._has(
+            args, pkgmanagers._GEM_VALUE_FLAGS)
     if name == "composer":
         return sub in _COMPOSER_REQUIRE and pkgmanagers._has(args, pkgmanagers._COMPOSER_VALUE_FLAGS)
     if name == "dotnet":
@@ -369,6 +395,7 @@ def _is_add(words, depth=0, mode=None):
     if name in ("dart", "flutter"):
         if sub != "pub":
             return False
+        args = pkgmanagers._subcommand(["pub", *args], pkgmanagers._PUB_GLOBAL_VALUE_FLAGS)[1:]
         if args[:1] == ["add"]:
             return pkgmanagers._has(args[1:], pkgmanagers._PUB_VALUE_FLAGS)
         return args[:2] == ["global", "activate"] and pkgmanagers._has(args[2:], pkgmanagers._PUB_VALUE_FLAGS)
@@ -385,10 +412,6 @@ _PAIR_MANAGERS = (set(pkgmanagers._GLOBAL_FLAGS) | set(pkgmanagers._OTHER_MANAGE
 _KNOWN_PROGRAMS = (_PAIR_MANAGERS | {"r", "rscript", "corepack", "eval", "find", "trap", "cmd", "pwsh", "powershell",
                                      "nix-shell", "mise", "rtx"}
                    | pkgmanagers._NPX | set(_WRAPPERS) | pkgmanagers._SHELLS | pkgmanagers._C_SHELLS | pkgmanagers._SOURCES | _DATA_PROGRAMS)
-
-
-# Операнд `cat`, который читает stdin: `-`, `/dev/stdin`, `/dev/fd/N`, `/proc/<процесс>/fd/N`.
-_STDIN_OPERAND = re.compile(r"-|/dev/stdin|/dev/fd/\d+|/proc/[^/]+/fd/\d+")
 
 
 # Переменная с абсолютным путём в начале слова (`$HOME/x`, `${PWD}`): пустая даёт `/…`, тоже абсолютный путь.
@@ -457,7 +480,44 @@ def _launched(name, args):
             flag = a.lower().lstrip("-/")
             if a[:1] in "-/" and flag and "command".startswith(flag) and (flag == "c" or len(flag) >= 3):
                 return [pkgmanagers._joined(args[k + 1:], " ".join(args[k + 1:]))]
+            if a[:1] in "-/" and flag and (flag == "ec" or "encodedcommand".startswith(flag)):
+                # `-EncodedCommand` (`-e`, `-ec`): строка — base64 текста UTF-16LE (about_Pwsh).
+                # Не base64 или не UTF-16LE — pwsh команду не запустит.
+                value = args[k + 1] if k + 1 < len(args) else ""
+                try:
+                    text = base64.b64decode(value, validate=True).decode("utf-16-le")
+                except ValueError:
+                    text = None
+                return [text] if text else []
         return []
+    if name == "fish":
+        # Строки `-C`/`--init-command` — команды до строки `-c` или скрипта; флаги — getopt_long до первого
+        # слова-не-флага (_FISH_SHORT, _FISH_LONG).
+        out, k = [], 0
+        while k < len(args) and args[k].startswith("-") and args[k] not in ("-", "--"):
+            a = args[k]
+            k += 1
+            if a.startswith("--"):
+                flag, eq, value = a.partition("=")
+                flag = pkgmanagers._long_flag(flag, _FISH_LONG | _FISH_PLAIN_LONG)
+                if flag in _FISH_LONG and not eq:
+                    value = args[k] if k < len(args) else None
+                    k += 1
+                if flag == "--init-command" and value is not None:
+                    out.append(pkgmanagers._part_of(a, value) if eq else value)
+                continue
+            for j in range(1, len(a)):
+                if a[j] in _FISH_SHORT:
+                    value = a[j + 1:]
+                    if not value:
+                        value = args[k] if k < len(args) else None
+                        k += 1
+                    elif a[j] == "C":
+                        value = pkgmanagers._part_of(a, value)
+                    if a[j] == "C" and value is not None:
+                        out.append(value)
+                    break
+        return out
     if name == "nix" and args[:1] in (["develop"], ["shell"]):
         for k, a in enumerate(args):
             if a in ("-c", "--command"):
@@ -465,9 +525,46 @@ def _launched(name, args):
         return []
     if name == "nix-shell":
         return [args[k + 1] for k, a in enumerate(args[:-1]) if a in ("--run", "--command")]
-    if name in ("mise", "rtx") and args[:1] in (["exec"], ["x"]) and "--" in args:
-        return [pkgmanagers._shell_join(args[args.index("--") + 1:])]
+    if name in ("mise", "rtx") and args[:1] in (["exec"], ["x"]):
+        return _mise_runs(args[1:])
     return []
+
+
+# Флаги fish со значением (fish.rs, fish_parse_opt: SHORT_OPTS `+hPilNnvc:C:p:d:f:D:o:`, LONG_OPTS); длинные без
+# значения узнаются только для сокращений getopt_long.
+_FISH_SHORT = frozenset("cCpdfDo")
+_FISH_LONG = {"--command", "--init-command", "--features", "--debug", "--debug-output", "--debug-stack-frames",
+              "--profile", "--profile-startup"}
+_FISH_PLAIN_LONG = {"--interactive", "--login", "--no-config", "--no-execute", "--print-rusage-self",
+                    "--print-debug-categories", "--private", "--help", "--version"}
+
+
+# Флаги `mise exec` со значением следующим словом, кроме `-c`/`--command` (mise.jdx.dev/cli/exec.html).
+_MISE_EXEC_VALUE_FLAGS = {"-j", "--jobs", "--allow-env", "--allow-net", "--allow-read", "--allow-write", "--secrets"}
+
+
+def _mise_runs(args):
+    """Команды `mise exec` из слов за `exec`: строка оболочки `-c`/`--command` (`-c '…'`, `-c'…'`, `-c=…`,
+    `--command=…`) и слова за `--` (запуск без оболочки — запись _shell_join). Флаги и `TOOL@VERSION` — до `--`."""
+    out, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            out.append(pkgmanagers._shell_join(args[i + 1:]))
+            break
+        if a in ("-c", "--command"):
+            if i + 1 < len(args):
+                out.append(args[i + 1])
+            i += 2
+            continue
+        if a.startswith("--command="):
+            out.append(pkgmanagers._part_of(a, a.partition("=")[2]))
+        elif a.startswith("-c") and not a.startswith("--"):
+            out.append(pkgmanagers._part_of(a, a[3:] if a[2:3] == "=" else a[2:]))
+        elif a in _MISE_EXEC_VALUE_FLAGS:
+            i += 1
+        i += 1
+    return out
 
 
 # Разделители команд и кавычки в тексте глубже _MAX_DEPTH для _soup_add.
@@ -528,7 +625,7 @@ def _doubt(words, xargs, cut, wrapped):
     или флаг (_launches_install); None — сомнения нет."""
     if wrapped:
         return _WHY_WRAPPERS
-    if xargs and _is_add([*words, _STDIN_PACKAGE]):
+    if xargs and _xargs_doubt(words):
         return _WHY_XARGS
     if cut == _WHY_BRACES or cut and words and (pkgmanagers._installer(words[0]) or pkgmanagers._cut_script(words)) and not (
             pkgmanagers._PYTHON.match(pkgmanagers._basename(words[0])) and pkgmanagers._python_target(words)[0] in ("c", "script")):
@@ -546,6 +643,23 @@ def _doubt(words, xargs, cut, wrapped):
     if _launches_install(words):
         return _WHY_LAUNCHER
     return None
+
+
+def _xargs_doubt(words):
+    """Слова команды под xargs с дописанными словами stdin ставят пакет: пакет (_STDIN_PACKAGE в конце), подкоманда
+    менеджера (`xargs npm`: слово раскрытия в конце, _is_add в режиме _COMPUTED), менеджер или запускатель без
+    позиционных слов (`xargs pacman`, `xargs python3`: операция — из stdin), строка `-c` оболочки (`xargs bash
+    -c`) или вся команда — из stdin (_XARGS_STDIN)."""
+    if not words:
+        return False
+    if words[0] is _XARGS_STDIN:
+        return True
+    stdin = _Word(_PLACEHOLDER)
+    stdin.expands = True
+    tail = [*words, stdin]
+    return (_is_add([*words, _STDIN_PACKAGE]) or _is_add(tail, mode=_COMPUTED)
+            or pkgmanagers._installer(words[0]) and not pkgmanagers._after_flags(words[1:], pkgmanagers._NO_VALUE_FLAGS)
+            or pkgmanagers._inline_script(tail) is stdin)
 
 
 def _launches_install(words):
@@ -587,9 +701,14 @@ def _launches_install(words):
 # вложенности. Имя команды с раскрытием проверяет по узлу _name_doubt.
 _PLACEHOLDER = "$_"
 _EXPANSION_MAX = 256
-# Сколько символов текста имён команд с подстановкой (_name_doubt) разбирает один вызов dependency_doubt; дальше —
-# сомнение без разбора: проход линеен.
+# Сколько символов текста имён команд с подстановкой (_name_doubt) и значений имён-переменных и alias (_renamed)
+# разбирает один вызов dependency_doubt; дальше — сомнение без разбора: проход линеен.
 _NAME_BUDGET = 4 * _WORDS_LIMIT
+# Сколько символов строк и stdin программ (_string_doubt, _program_inputs) разбирает один вызов dependency_doubt;
+# дальше — сомнение _WHY_INPUT без разбора: разбор текста в сотни килобайт занял бы секунды при сроке хука 10 с.
+_INPUT_BUDGET = 1 << 16
+_WHY_INPUT = (f"строки и stdin программ в команде длиннее {_INPUT_BUDGET} символов: команда установки в них не "
+              "проверена; маркер согласия — в начале команды")
 # Операторы перенаправления вывода: `>(…)` их целью получает вывод команды.
 _OUT_REDIRECTS = {">", ">>", ">|", "&>", "&>>"}
 
@@ -604,6 +723,10 @@ class _Word(str):
     expands = False
     shell = None
 
+
+# Команда под xargs, вся пришедшая из stdin: за xargs обёртка без своей команды (`xargs env`, `xargs timeout 5`).
+_XARGS_STDIN = _Word(_PLACEHOLDER)
+_XARGS_STDIN.expands = True
 
 # Параметры, чьё значение — число или пусто: `$$`, `$?`, `$#`, `$!`.
 _NUMERIC_PARAM = re.compile(r"\$(?:[$?#!]|\{[$?#!]\})")
@@ -783,10 +906,16 @@ def _procsub(word):
     return None
 
 
+# Значение слова из одной процесс-подстановки: путь, который bash передаёт команде вместо неё.
+_PROCSUB_PATH = "/dev/fd/63"
+
+
 def _pairs(simple, text, budget, braces=True):
     """Пары (слово, начало) простой команды дерева: ведущие присваивания, затем слова (_word_text, _word_lead);
-    перенаправления не входят, слово из одной процесс-подстановки — тоже (её вход и выход — связи _procsub_feeds).
-    Начало присваивания — "_=" (присваивание при любом индексе: его узнал разбор, bash 5.3: `a["]"]=1`,
+    перенаправления не входят. Слово из одной процесс-подстановки — путь _PROCSUB_PATH (её вход и выход — связи
+    _procsub_feeds): оно держит место операнда (`bash <(…) arg` — скрипт `<(…)`, `pip install -r <(…) x` — `x`
+    пакет), а оболочка или `source` с ним скриптом исполняют её вывод (pkgmanagers._heredoc_runs); начало у него
+    пустое. Начало присваивания — "_=" (присваивание при любом индексе: его узнал разбор, bash 5.3: `a["]"]=1`,
     `a[b[1]]=1`), у маркера согласия без кавычек и `\\` — сам маркер. При braces фигурные скобки слов вне
     присваиваний раскрываются (_brace_marks, _brace_words), как в словах команды bash, с общим пределом budget (None
     — свой полный предел); у слов раскрытия начало пустое: они не присваивания и не ключевые слова. Возвращает (пары,
@@ -798,6 +927,7 @@ def _pairs(simple, text, budget, braces=True):
         out.append((_word_text(word, text), DEP_OK_MARKER if src == DEP_OK_MARKER else "_="))
     for word in simple.words:
         if _procsub(word) is not None:
+            out.append((_Word(_PROCSUB_PATH), ""))
             continue
         pairs, cut = _word_pairs(word, text, budget, braces)
         out.extend(pairs)
@@ -839,12 +969,16 @@ def _strip_command(pairs, braced):
     Ведущие присваивания (и элементу массива `a[0]=1`), ключевые слова shell, `function` и `coproc` с именем и до
     _MAX_WRAPPERS обёрток (`sudo`, `env`, `timeout`, `nice`, `xargs`, `stdbuf` и др.) с их флагами сняты; строка
     `env -S` разбита на слова (_env_split), `su`/`runuser`/`flock` с `-c` и `watch` без `-x` — команда `sh -c`,
-    `su`/`runuser` без `-c` и `-u` — оболочка (_c_wrapper). Предел _WORDS_LIMIT считается от первого слова команды:
-    длинные присваивания и обёртки перед ней его не прячут."""
+    `su`/`runuser` без `-c` и `-u` — оболочка (_c_wrapper); строка замены xargs (_xargs_flag) в словах за ним —
+    заглушка раскрытия _PLACEHOLDER с признаком expands, а команда из одних обёрток за xargs — слово _XARGS_STDIN.
+    Предел _WORDS_LIMIT считается от первого слова команды: длинные присваивания и обёртки перед ней его не
+    прячут."""
     # Очередь: снятие слова спереди и вставка строки `env -S` — без копирования хвоста, проход линеен.
     words = deque(pairs)
     marker = xargs = False
+    replace = None
     wrappers = 0
+    last = None
     while words:
         word, lead = words[0]
         if _ENV_ASSIGN.match(lead):
@@ -863,6 +997,7 @@ def _strip_command(pairs, braced):
             wrappers += 1
             name = pkgmanagers._basename(word)
             xargs = xargs or name == "xargs"
+            last = name
             value_flags, operands = _WRAPPERS[name]
             words.popleft()
             if name in _C_WRAPPERS:
@@ -875,6 +1010,12 @@ def _strip_command(pairs, braced):
                     break
                 if name == "watch" and _WATCH_EXEC.match(flag):
                     shell = False
+                if name == "xargs":
+                    found, takes = _xargs_flag(flag, words)
+                    replace = found or replace
+                    if takes and words:
+                        words.popleft()
+                    continue
                 if name == "env" and (flag in _ENV_SPLIT or flag.startswith(("-S", "--split-string="))):
                     if flag in _ENV_SPLIT:
                         value = words.popleft()[0] if words else ""
@@ -898,6 +1039,15 @@ def _strip_command(pairs, braced):
                 words.extend([("sh", "sh"), ("-c", "-c"), (script, script)])
         else:
             break
+    if xargs and not words and last != "xargs":
+        words.append((_XARGS_STDIN, _XARGS_STDIN))
+    if replace:
+        # xargs подставляет строку stdin на место строки замены в каждом слове: значение неизвестно до исполнения.
+        for k, (word, lead) in enumerate(words):
+            if replace in word:
+                value = _Word(word.replace(replace, _PLACEHOLDER))
+                value.expands = True
+                words[k] = (value, lead)
     out, offset = [], 0
     for word, _ in words:
         if offset >= _WORDS_LIMIT:
@@ -909,6 +1059,32 @@ def _strip_command(pairs, braced):
         not w.startswith("-") for w, _ in islice(words, len(out), None)) else None
     wrapped = bool(words) and pkgmanagers._basename(words[0][0]) in _WRAPPERS
     return out, marker, xargs, cut, wrapped
+
+
+def _xargs_flag(flag, words):
+    """Флаг xargs flag по getopt_long GNU xargs (_XARGS_SHORT, _XARGS_LONG; words — очередь пар за ним):
+    (строка замены или None, берёт ли флаг значением следующее слово). Склейка коротких флагов читается по буквам:
+    буква со значением забирает остаток склейки, а без остатка обязательное значение — следующее слово
+    (`-0I{}`, `-rI {}`); необязательное значение — только остаток склейки (`-ri` — замена `{}`, `-il` — замена `l`).
+    Длинный флаг узнаётся и по однозначному началу имени (`--rep`), значение необязательного — только после `=`.
+    Строка замены — значение `-I`, `-i`, `--replace`, без значения — `{}`."""
+    if flag.startswith("--"):
+        name, eq, value = flag.partition("=")
+        name = pkgmanagers._long_flag(name, _XARGS_LONG)
+        if name == "--replace":
+            return (value if eq else "{}"), False
+        return None, _XARGS_LONG.get(name) == 1 and not eq
+    for j in range(1, len(flag)):
+        letter = flag[j]
+        kind = _XARGS_SHORT.get(letter)
+        if kind is None:
+            continue
+        rest = flag[j + 1:]
+        replace = None
+        if letter in "Ii":
+            replace = rest or (words[0][0] if words else None) if letter == "I" else rest or "{}"
+        return replace, kind == 1 and not rest
+    return None, False
 
 
 def _heredoc_text(doc, text):
@@ -933,7 +1109,7 @@ def _within_call(find, command):
     разбирается и тратит предел один раз (_analysis)."""
     global _call
     outer = _call
-    _call = ([_BRACE_BUDGET], {}, [_NAME_BUDGET])
+    _call = ([_BRACE_BUDGET], {}, [_NAME_BUDGET], [_INPUT_BUDGET])
     try:
         return find(command, 0)
     finally:
@@ -1020,7 +1196,7 @@ def _analysis(command):
     if cache is not None and command in cache:
         return cache[command]
     budget = _call[0] if _call is not None else [_BRACE_BUDGET]
-    commands, feeds, scripts = [], [], []
+    commands, feeds, scripts, loops = [], [], [], []
     for text, script in _parses(command):
         simples, docs, pipes = [], [], []
         seen = set()
@@ -1043,6 +1219,8 @@ def _analysis(command):
                 docs.append((node, ctx))
             elif kind is shparse.Pipeline:
                 pipes.append(node)
+            elif kind is shparse.For and node.name is not None and node.words:
+                loops.append((node, text))
             stack.extend((child, ctx) for child in reversed(node.children()))
         simples.sort(key=lambda item: item[0].start)
         ordered = sorted((doc for doc, _ in docs), key=lambda doc: doc.start)
@@ -1064,7 +1242,7 @@ def _analysis(command):
                 feeds.extend((source, infos[id(t)]) for t in _stdin_heads(target) if id(t) in infos)
         for simple, _ in simples:
             feeds.extend(_procsub_feeds(simple, infos))
-    result = (commands, feeds, scripts)
+    result = (commands, feeds, scripts, loops)
     if cache is not None:
         cache[command] = result
     return result
@@ -1131,45 +1309,209 @@ def _command_info(simple, text, budget):
     return info
 
 
-def _echo_text(words):
-    """Вывод команды `echo …` или `printf …` по её словам; None — вывод неизвестен (не echo/printf, `printf -v`).
-    `\\n` — перевод строки, у printf каждый аргумент — с новой строки: лишний перевод строки команд не создаёт.
-    Слово с раскрытием несёт его текст: вычисляемое имя в выводе ловит _computed."""
+# Экранирования с `\\` и буквой в выводе `echo -e`, `%b` и формате printf (bash 5.3, builtins/printf.def и
+# lib/sh/strtrans.c).
+_ESCAPES = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v",
+            "\\": "\\"}
+# Спецификатор формата printf: флаги, ширина, точность, модификаторы длины (bash их пропускает), преобразование.
+_PRINTF_SPEC = re.compile(r"%([-+ #0]*)(\*|\d*)(?:\.(\*|\d*))?[hjlLtz]*(.)", re.S)
+# Целое для ширины и точности `*` из аргумента.
+_PRINTF_INT = re.compile(r"\s*[-+]?\d{1,9}")
+# Предел длины вывода echo/printf и ширины поля: дальше вывод не строится (сомнение), формат с повтором по
+# аргументам иначе дал бы вывод квадратичной длины.
+_ECHO_MAX = 1 << 16
+
+
+def _escape_at(text, i, kind):
+    """Экранирование `\\` в text с позиции i по bash 5.3: kind "echo" — `echo -e`, "b" — аргумент `%b`, "format" —
+    формат printf. (символы, позиция за экранированием, оборван ли вывод `\\c`); None — экранирование, которое bash
+    раскрывает иначе, чем внешние echo и printf (`\\c` в формате: bash печатает его как есть, coreutils обрывает
+    вывод), или `\\u` вне Юникода. Восьмеричное: в формате — `\\` и до 3 цифр, в `%b` — `\\0` и до 3 цифр или
+    `\\1`–`\\7` и до 2, у echo — только `\\0` и до 3 цифр; значение — младший байт. `\\x` — до 2 шестнадцатеричных
+    цифр, `\\u` — до 4, `\\U` — до 8; без цифр, неизвестная буква и `\\` в конце остаются как есть: в формате
+    печатается только `\\`, символ за ним разбирается дальше (`\\%s` — `\\` и спецификатор). Только в формате `\\"`,
+    `\\'`, `\\?` — сам символ."""
+    n = len(text)
+    if i + 1 >= n:
+        return "\\", i + 1, False
+    e = text[i + 1]
+    i += 2
+    if e in _ESCAPES:
+        return _ESCAPES[e], i, False
+    if e == "c":
+        return None if kind == "format" else ("", i, True)
+    if kind == "format" and e in "\"'?":
+        return e, i, False
+    if e in "01234567" and (kind == "format" or e == "0" or kind == "b"):
+        j = i - 1 if kind == "format" or e != "0" else i
+        limit = min(j + 3, n)
+        value = 0
+        while j < limit and text[j] in "01234567":
+            value = value * 8 + int(text[j])
+            j += 1
+        return chr(value & 0xFF), j, False
+    if e in "xuU":
+        limit = min(i + {"x": 2, "u": 4, "U": 8}[e], n)
+        j = i
+        while j < limit and text[j] in "0123456789abcdefABCDEF":
+            j += 1
+        if j == i:
+            return "\\" + e, i, False
+        value = int(text[i:j], 16)
+        if e != "x" and (value > 0x10FFFF or 0xD800 <= value <= 0xDFFF):
+            return None
+        return chr(value), j, False
+    if kind == "format":
+        return "\\", i - 1, False
+    return "\\" + e, i, False
+
+
+def _unescape(text, kind):
+    """Текст text с раскрытыми экранированиями (_escape_at): (вывод, оборван ли `\\c`); None — как у _escape_at."""
+    out, i = [], 0
+    while True:
+        j = text.find("\\", i)
+        if j < 0:
+            out.append(text[i:])
+            return "".join(out), False
+        out.append(text[i:j])
+        done = _escape_at(text, j, kind)
+        if done is None:
+            return None
+        piece, i, stop = done
+        out.append(piece)
+        if stop:
+            return "".join(out), True
+
+
+def _printf_output(args):
+    """Вывод `printf формат [аргументы]` по bash 5.3: экранирования формата (_unescape), `%%`, `%s`, `%b`, `%c` с
+    флагом `-`, шириной и точностью (`*` — из аргумента); формат повторяется, пока остаются аргументы и проход их
+    берёт; недостающий аргумент — пустая строка. None — вывод неизвестен: спецификатор не из этих (`%d`, `%q`),
+    ошибка формата (bash обрывает вывод), экранирование _unescape без значения, вывод или ширина больше
+    _ECHO_MAX."""
+    if not args:
+        return None
+    fmt, rest = args[0], deque(args[1:])
+    out, size = [], 0
+    while True:
+        took = False
+        i = 0
+        while i < len(fmt):
+            c = fmt[i]
+            if c == "%":
+                if fmt[i + 1:i + 2] == "%":
+                    piece, i = "%", i + 2
+                else:
+                    m = _PRINTF_SPEC.match(fmt, i)
+                    if m is None or m[4] not in "sbc":
+                        return None
+                    i = m.end()
+                    bounds = []
+                    for value in (m[2], m[3]):
+                        if value == "*":
+                            took = took or bool(rest)
+                            number = rest.popleft() if rest else "0"
+                            if not _PRINTF_INT.fullmatch(number):
+                                return None
+                            value = number.strip()
+                        bounds.append(None if value is None or value == "" and not bounds else int(value or 0))
+                    width, precision = bounds
+                    if width is not None and abs(width) > _ECHO_MAX:
+                        return None
+                    took = took or bool(rest)
+                    arg = rest.popleft() if rest else ""
+                    stop = False
+                    if m[4] == "b":
+                        done = _unescape(arg, "b")
+                        if done is None:
+                            return None
+                        arg, stop = done
+                    elif m[4] == "c":
+                        arg = arg[:1]
+                    if precision is not None and precision >= 0 and m[4] != "c":
+                        arg = arg[:precision]
+                    if width is not None and len(arg) < abs(width):
+                        pad = " " * (abs(width) - len(arg))
+                        arg = arg + pad if "-" in m[1] or width < 0 else pad + arg
+                    piece = arg
+                    if stop:
+                        out.append(piece)
+                        return "".join(out)
+            elif c == "\\":
+                done = _escape_at(fmt, i, "format")
+                if done is None:
+                    return None
+                piece, i, _ = done
+            else:
+                j = i
+                while j < len(fmt) and fmt[j] not in "\\%":
+                    j += 1
+                piece, i = fmt[i:j], j
+            out.append(piece)
+            size += len(piece)
+            if size > _ECHO_MAX:
+                return None
+        if not rest or not took:
+            return "".join(out)
+
+
+def _echo_texts(words):
+    """Варианты вывода команды `echo …` или `printf …` по её словам (bash 5.3); None — вывод неизвестен (не
+    echo/printf, `printf -v`, `printf` с иным флагом, формат _printf_output без вывода). `echo` — слова через пробел,
+    флаги `-n`, `-e`, `-E` — ведущие слова из этих букв, последний из `e`/`E` решает, раскрывать ли экранирования
+    (_unescape, `\\c` обрывает вывод); `echo` без `-e` и `-E` со `\\` — ещё вариант с раскрытыми экранированиями:
+    echo dash и bash с `xpg_echo` их раскрывает. Символ с кодом 0 bash при чтении скрипта отбрасывает. Слово с
+    раскрытием несёт его текст: вычисляемое имя в выводе ловит _computed."""
     if not words:
         return None
     name = pkgmanagers._basename(words[0])
     args = words[1:]
     if name == "echo":
+        escapes, flagged, newline = False, False, "\n"
         while args and re.fullmatch(r"-[neE]+", args[0]):
+            for letter in args[0][1:]:
+                if letter == "n":
+                    newline = ""
+                else:
+                    escapes, flagged = letter == "e", True
             args = args[1:]
         text = " ".join(args)
-    elif name == "printf":
+        if escapes:
+            texts = [_unescape(text, "echo")]
+        else:
+            texts = [(text, False)]
+            if not flagged and "\\" in text:
+                texts.append(_unescape(text, "echo"))
+        out = [(t[0] + ("" if t[1] else newline)).replace("\0", "") for t in texts if t is not None]
+        return out if out else None
+    if name == "printf":
         if args[:1] == ["--"]:
             args = args[1:]
-        if args[:1] == ["-v"]:
+        elif args[:1] and args[0].startswith("-") and args[0] != "-":
+            # `-v имя` пишет вывод в переменную; иной флаг — ошибка, вывода нет.
             return None
-        text = "\n".join(args)
-    else:
-        return None
-    return text.replace("\\n", "\n").replace("\\t", " ")
+        text = _printf_output(args)
+        return None if text is None else [text.replace("\0", "")]
+    return None
 
 
 def _heredoc_cat(info):
-    """Команда — `cat` без флагов с heredoc, без операндов или с операндом stdin (_STDIN_OPERAND): её вывод — тело
-    heredoc и файлы."""
+    """Команда — `cat` без флагов с heredoc, без операндов или с операндом stdin (pkgmanagers._STDIN_SCRIPT): её
+    вывод — тело heredoc и файлы."""
     words = info.words
     return words[:1] == ["cat"] and not any(a.startswith("-") and a != "-" for a in words[1:]) and (
-        len(words) == 1 or any(_STDIN_OPERAND.fullmatch(a) for a in words[1:])) and bool(info.bodies)
+        len(words) == 1 or any(pkgmanagers._STDIN_SCRIPT.fullmatch(a) for a in words[1:])) and bool(info.bodies)
 
 
 def _file_output(words):
-    """Вывод команды — содержимое названных файлов: `cat` с файлами без флагов и операндов stdin (_STDIN_OPERAND),
-    `git show <ревизия>:<путь>`. Скрипт из файла детектор не видит, как у `bash файл`."""
+    """Вывод команды — содержимое названных файлов: `cat` с файлами без флагов и операндов stdin
+    (pkgmanagers._STDIN_SCRIPT), `git show <ревизия>:<путь>`. Скрипт из файла детектор не видит, как у `bash файл`."""
     if not words:
         return False
     name, args = pkgmanagers._basename(words[0]), words[1:]
     if name == "cat":
-        return bool(args) and not any(a.startswith("-") or _STDIN_OPERAND.fullmatch(a) for a in args)
+        return bool(args) and not any(a.startswith("-") or pkgmanagers._STDIN_SCRIPT.fullmatch(a) for a in args)
     return name == "git" and args[:1] == ["show"] and len(args) > 1 and all(
         ":" in a and not a.startswith("-") for a in args[1:])
 
@@ -1181,9 +1523,10 @@ def _computed(text):
 
 
 def _stdin_scripts(feeds):
-    """Текст, который команда исполняет со stdin, по связям feeds (_analysis): (сегмент для отказа, текст). Вывод
-    `echo`/`printf` в оболочку без скрипта (`echo 'npm i x' | bash`, `bash <(echo …)`) или в `source` и `.` без
-    скрипта (`source <(…)`) либо со скриптом `-`, `/dev/stdin`, если приёмник без маркера; вывод `cat` с heredoc
+    """Текст, который команда исполняет со stdin или из процесс-подстановки, по связям feeds (_analysis): (сегмент
+    для отказа, текст). Вывод `echo`/`printf` (_echo_texts) в оболочку без скрипта или со скриптом
+    pkgmanagers._STDIN_SCRIPT (`echo 'npm i x' | bash`, `bash <(echo …) arg`) или в `source` и `.` с таким скриптом
+    (`source <(…)`), если приёмник без маркера; вывод `cat` с heredoc
     (_heredoc_cat) в оболочку, читающую stdin, — тела heredoc. Вход такого приёмника не из литерального
     `echo`/`printf` или из его слова с внешним раскрытием (`curl … | bash`, `echo $X | bash`, `echo "$t" | bash`) —
     (сегмент приёмника, None), тело heredoc `cat` с внешним раскрытием — (сегмент `cat`, None): текст неизвестен до
@@ -1196,9 +1539,7 @@ def _stdin_scripts(feeds):
     for source, target in feeds:
         if id(target) not in runs:
             words = target.words
-            runs[id(target)] = not target.marker and bool(words) and (
-                pkgmanagers._heredoc_runs(words) or pkgmanagers._basename(words[0]) in pkgmanagers._SOURCES
-                and len(words) == 1)
+            runs[id(target)] = not target.marker and pkgmanagers._heredoc_runs(words)
         if not runs[id(target)]:
             continue
         if source is None:
@@ -1210,18 +1551,21 @@ def _stdin_scripts(feeds):
             continue
         if _file_output(source.words) and id(source) not in fed:
             continue
-        text = _echo_text(source.words)
+        texts = _echo_texts(source.words)
         # Слово `echo`/`printf` с внешним раскрытием: его значение — текст для оболочки (`echo "$t" | bash`).
-        if text is None or _computed(text) or any(getattr(w, "expands", False) for w in source.words[1:]):
+        if texts is None or any(_computed(t) for t in texts) or any(
+                getattr(w, "expands", False) for w in source.words[1:]):
             yield target.segment, None
-        elif text:
-            yield source.segment, text
+            continue
+        for text in texts:
+            if text:
+                yield source.segment, text
 
 
 def _scripts(info):
     """Строки, которые команда исполняет как команды: `sh -c '…'`, `eval …` (_inline_script), here-string оболочки
     без скрипта или `source /dev/stdin` (`bash <<< '…'`, _heredoc_runs), удалённая команда ssh, `trap '…'`,
-    `find -exec …`, `cmd /c`, `pwsh -Command`, `nix develop -c`, `nix-shell --run`, `mise exec --`, команды git
+    `find -exec …`, `cmd /c`, `pwsh -Command`, `pwsh -EncodedCommand`, `fish -C`, `nix develop -c`, `nix-shell --run`, `mise exec -c|--`, команды git
     (_launched)."""
     words = info.words
     out = []
@@ -1238,7 +1582,7 @@ def _scripts(info):
 def _find(command, depth):
     """Первый сегмент текста, добавляющий пакет; вложенные строки (_scripts, тела heredoc оболочки, вход оболочки
     _stdin_scripts) разбираются до _MAX_DEPTH."""
-    commands, feeds, scripts = _analysis(command)
+    commands, feeds, scripts, _ = _analysis(command)
     for info in commands:
         if info.segment and _segment_adds(info, depth):
             return info.segment
@@ -1301,12 +1645,19 @@ def _name_doubt(info):
     budget[0] -= size
     if size > _WORDS_LIMIT or budget[0] < 0:
         return True
+    return _flat_install(texts, words[1:])
+
+
+def _flat_install(texts, tail=()):
+    """Слова текстов texts (кавычки сняты, `${…`-начала и `}` — пробелы, разделители команд — границы) и слова tail
+    ставят пакет с какого-то места (_is_add, _expanded_install); больше _MAX_LAUNCH_PAIRS мест с менеджером — True
+    без разбора: проход линеен."""
     flat = []
     for text in texts:
         text = _SOUP_QUOTES.sub("", _PARAM_OPEN.sub(" ", text).replace("}", " "))
         for piece in _SOUP_SPLIT.split(text):
             flat.extend(piece.split())
-    flat.extend(words[1:])
+    flat.extend(tail)
     pairs = 0
     for k, word in enumerate(flat):
         if not (pkgmanagers._installer(word) or pkgmanagers._expanded(word)
@@ -1343,35 +1694,620 @@ def _computed_script(info):
     return None
 
 
+# Символы, без которых строка не делится на команду со словами: пробельные и разделители команд.
+_STRING_SPLITS = re.compile(r"[\s;&|]")
+# Присваивание переменной словом: имя, индекс, `+=`, значение (`X=npm i x`, `export X=…`, `alias n=npm`).
+_VALUE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?\+?=(.*)", re.S)
+# Слово — ссылка целиком на переменную, элемент или все элементы массива (`${a[@]}`, `${a[0]}`), позиционные
+# параметры (`$@`, `${*}`, `$1`, `${10}`, `${01}` — номер с ведущими нулями; `$10` — `$1` и «0»; `$0`, `${0}` — не
+# позиционный), срез `${@:N}`, `${*:N:L}` (две последние группы: двоеточие среза и двоеточие длины): bash делит
+# значение без кавычек на слова.
+_NAME_VAR = re.compile(r"\$(?:\{(?:([A-Za-z_][A-Za-z0-9_]*|[@*])(?:\[[^\]]*\])?|(0*[1-9][0-9]*))\}"
+                       r"|([A-Za-z_][A-Za-z0-9_]*|[@*1-9])|\{[@*](:)[^:}]*(:)?[^}]*\})")
+# Текст `${…}` с оператором (bash 5.3, man bash, «Parameter Expansion»): `-`, `=`, `+`, `?` с двоеточием и без
+# у переменной, элемента массива или позиционного параметра (номер и с ведущими нулями); группы — имя, индекс,
+# оператор, слово (`${X:-w}`, `${a[0]+w}`, `${1:?w}`, `${01:-w}`).
+_PARAM_OP = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*|[@*]|0*[1-9][0-9]*)(?:\[([^\]]*)\])?(:?[-=+?])(.*)\}", re.S)
+# Срез массива `${a[@]:N}`, `${a[*]:N:L}`; группы — имя и двоеточие длины.
+_ARRAY_SLICE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]:[^:}]*(:)?[^}]*\}")
+# Элемент массива `${a[N]}` (индекс — не `@` и не `*`); группа — имя.
+_ARRAY_ITEM = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\[(?![@*]\])[^\]]*\]\}")
+# Начало текста раскрытия параметра: `!` косвенной ссылки или `#` длины и имя — переменная, позиционный параметр,
+# `@`, `*` (`${X/a/b}`, `${!Y}`, `${#X}`, `$1`); имени нет у специальных `$$`, `$?`, `$#`, `$-`.
+_REF = re.compile(r"\$\{?([!#]?)([A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*])")
+# Имена переменных по началу: `${!начало*}`, `${!начало@}`.
+_NAMES_BY_PREFIX = re.compile(r"\$\{!([A-Za-z_][A-Za-z0-9_]*)[*@]\}")
+# Интерпретаторы, чьи строки и stdin — код своего языка, а не команды оболочки (ещё _PYTHON — шаблоном): строка
+# оболочки в нём — литерал другого языка, разбор оболочки её не видит.
+_CODE_PROGRAMS = {"node", "nodejs", "perl", "ruby", "php", "lua", "luajit", "r", "rscript", "julia", "osascript"}
+# Имена, которые шаблон имён в имени команды может дать командой установки (_renamed): программы, разбор которых
+# детектор знает, и менеджеры с запускателями pkgmanagers._INSTALLERS, кроме программ-данных; имена, которые
+# разбор узнаёт регулярным выражением, — _NAME_FAMILIES.
+_GLOB_PROGRAMS = sorted((_KNOWN_PROGRAMS | pkgmanagers._INSTALLERS) - _DATA_PROGRAMS)
+# Имена, которые разбор узнаёт регулярным выражением (pkgmanagers._PIP, _PYTHON), семействами для сверки с шаблоном
+# имён (_glob_name): начала имени, имена без хвоста, символы суффикса; хвост за началом — `\d*(?:\.\d+)*` и суффиксы.
+_NAME_FAMILIES = ((("pip",), (), ""), (("python", "pypy"), ("py",), "dmt"))
+# Длина имени файла (NAME_MAX): шаблон длиннее даёт только имена длиннее, таких программ нет.
+_NAME_MAX = 255
+# Встроенные, чьи слова `ИМЯ=значение` — присваивания переменных.
+_DECLARES = {"export", "declare", "typeset", "local", "readonly"}
+
+
+def _text_program(words, git=False):
+    """Программа слов words может исполнить строку или stdin как команды оболочки: не программа-данные _DATA_PROGRAMS
+    (git — при git: он исполняет строки своих настроек и флагов) и не интерпретатор (_CODE_PROGRAMS, _PYTHON)."""
+    name = pkgmanagers._basename(words[0]) if words else None
+    if name is None or name in _DATA_PROGRAMS and not (git and name == "git"):
+        return False
+    return name not in _CODE_PROGRAMS and not pkgmanagers._PYTHON.match(name)
+
+
+def _family_step(family, state, c):
+    """Переход автомата имён семейства family (_NAME_FAMILIES) из state по символу c; None — имени дальше нет.
+    Состояние — ("h", начало имени) или хвост: "A" — за началом или цифрой, "B" — за `.`, "C" — за суффиксом."""
+    heads, exact, suffix = family
+    if state[0] == "h":
+        word = state[1] + c
+        if any(n.startswith(word) for n in heads + exact):
+            return ("h", word)
+        state = ("A",) if state[1] in heads else None
+        if state is None:
+            return None
+    if c.isdigit() and state[0] in "AB":
+        return ("A",)
+    if c == "." and state[0] == "A":
+        return ("B",)
+    return ("C",) if c in suffix and state[0] in "AC" else None
+
+
+def _family_accepts(family, state):
+    """Состояние state — конец имени семейства family."""
+    return state[0] in "AC" or state[0] == "h" and state[1] in family[0] + family[1]
+
+
+def _glob_tokens(pattern):
+    """Элементы шаблона имён по разбору fnmatch.translate: `*`, `?`, `[…]` (без `]` — литерал `[`), символ."""
+    out, i, n = [], 0, len(pattern)
+    while i < n:
+        j = i + 1
+        if pattern[i] == "[":
+            j += pattern[j:j + 1] == "!"
+            j += pattern[j:j + 1] == "]"
+            j = pattern.find("]", j) + 1 or i + 1
+        out.append(pattern[i:j])
+        i = j
+    return out
+
+
+def _glob_name(pattern, family):
+    """Имя семейства family (_NAME_FAMILIES), подходящее под шаблон имён pattern, или None: обход произведения
+    автомата имён (_family_step) и элементов шаблона (_glob_tokens), каждое состояние — с одним именем."""
+    heads, exact, suffix = family
+    alphabet = sorted(set("".join(heads + exact) + suffix + "0123456789."))
+    states = {("h", ""): ""}
+    for token in _glob_tokens(pattern):
+        chars = [c for c in alphabet if fnmatch.fnmatchcase(c, token)]
+        if token == "*":
+            queue = deque(states)
+            while queue:
+                state = queue.popleft()
+                for c in chars:
+                    following = _family_step(family, state, c)
+                    if following is not None and following not in states:
+                        states[following] = states[state] + c
+                        queue.append(following)
+            continue
+        following = {}
+        for state, name in states.items():
+            for c in chars:
+                nxt = _family_step(family, state, c)
+                if nxt is not None:
+                    following.setdefault(nxt, name + c)
+        states = following
+        if not states:
+            return None
+    return next((name for state, name in states.items() if _family_accepts(family, state)), None)
+
+
+def _installs(text, depth):
+    """Текст, разобранный как команды на уровень глубже, ставит пакет (_find; на глубине _MAX_DEPTH — _soup_add)."""
+    if depth >= _MAX_DEPTH:
+        return _soup_add(text)
+    return _find(text, depth + 1) is not None
+
+
+def _input_doubt(text, depth):
+    """Довод сомнения для строки или stdin text программы: _WHY_INPUT сверх остатка _INPUT_BUDGET вызова, _WHY_STRING,
+    если текст ставит пакет (_installs); иначе None."""
+    budget = _call[3] if _call is not None else [_INPUT_BUDGET]
+    budget[0] -= len(text)
+    if budget[0] < 0:
+        return _WHY_INPUT
+    return _WHY_STRING if _installs(text, depth) else None
+
+
+def _string_texts(word):
+    """Тексты слова, которые программа может исполнить строкой команд: слово целиком и значение за первым `=`
+    (`--tree-filter=…`, `core.pager=…`), каждый ещё без ведущего `!` (псевдоним git `!…`); только тексты с
+    пробельным символом или разделителем команд — без них команды со словами нет."""
+    texts = [word]
+    if "=" in word:
+        texts.append(pkgmanagers._part_of(word, word.partition("=")[2]))
+    texts += [pkgmanagers._part_of(t, t[1:]) for t in texts if t.startswith("!")]
+    return [t for t in texts if _STRING_SPLITS.search(t)]
+
+
+# Склейка коротких флагов git с `-m` (parse-options: буквы до `m` — флаги, остаток слова или следующее слово —
+# сообщение): `-m`, `-am`, `-sm'…'`.
+_GIT_MESSAGE = re.compile(r"-[A-Za-z]*m")
+
+
+def _git_texts(args):
+    """Слова git, кроме текстов, которые git хранит или разбирает сам: значений `-m`/`--message` и склейки с `-m`
+    (_GIT_MESSAGE; сообщение коммита, тега, слияния, stash) и строк `-c alias.<имя>=…` (псевдоним, вызванный
+    подкомандой, — _git_runs)."""
+    out, skip = [], False
+    for k, a in enumerate(args):
+        if skip:
+            skip = False
+            continue
+        if a in ("--message", "-c") or _GIT_MESSAGE.fullmatch(a):
+            skip = a != "-c" or args[k + 1:k + 2] and args[k + 1].partition(".")[0].lower() == "alias"
+            continue
+        if a.startswith("--message=") or _GIT_MESSAGE.match(a):
+            continue
+        out.append(a)
+    return out
+
+
+def _string_doubt(info, depth):
+    """Довод сомнения, если слово команды за именем или его значение за `=` разбирается как команда установки
+    (_input_doubt; сверх остатка _INPUT_BUDGET — _WHY_INPUT): программа может исполнить строку (`docker exec c sh -c
+    '…'`, `parallel ::: '…'`, `npm exec -c '…'`, `git -c core.pager='…'`, `git filter-branch --tree-filter '…'`).
+    Слова программ-данных
+    _DATA_PROGRAMS — текст, кроме git: он исполняет строки своих настроек и флагов (_git_texts). Строки оболочек
+    разбирают _inline_script, _heredoc_runs и _launched (`fish -C`), их позиционное слово — путь скрипта. Имя команды
+    строкой не исполняется: программы с пробелом в имени нет, а `sudo -s` экранирует пробелы слов (man sudo 1.9)."""
+    words = info.words
+    if not _text_program(words, git=True) or pkgmanagers._basename(words[0]) in pkgmanagers._C_SHELLS:
+        return None
+    args = _git_texts(words[1:]) if pkgmanagers._basename(words[0]) == "git" else words[1:]
+    for word in args:
+        for text in _string_texts(word):
+            why = _input_doubt(text, depth)
+            if why:
+                return why
+    return None
+
+
+def _program_inputs(commands, feeds):
+    """Тексты, которые получает на stdin программа не из _DATA_PROGRAMS и не оболочка или `source` (их вход и скрипт
+    разбирает _heredoc_runs: вход исполняет оболочка без скрипта, `source` — только скриптом stdin): тела её heredoc
+    и here-string, вывод литерального `echo`/`printf` (_echo_texts) и тела heredoc
+    `cat` (_heredoc_cat) по связям feeds; пары (сегмент программы, текст). Неизвестный вывод — не текст: что
+    программа получит, неизвестно, сомнения нет."""
+    def reads(info):
+        words = info.words
+        return (not info.marker and _text_program(words)
+                and pkgmanagers._basename(words[0]) not in pkgmanagers._SHELLS | pkgmanagers._SOURCES)
+
+    for info in commands:
+        if reads(info):
+            for text in chain(info.bodies, info.herestrings):
+                yield info.segment, text
+    for source, target in feeds:
+        if source is None or not reads(target):
+            continue
+        texts = source.bodies if _heredoc_cat(source) else _echo_texts(source.words) or []
+        for text in texts:
+            yield target.segment, text
+
+
+def _assigned(word, src, out, alias=False):
+    """Присваивание word (слово команды _Word или узел присваивания с исходным текстом src) пишет в out значение
+    (текст, вычисляемое ли): у массива `a=(…)` — слова в скобках текстом; вычисляемое — с подстановкой
+    (_name_expands: `X=$(…)`, `${x:-…}`). Ключ — имя, у alias — ("alias", имя)."""
+    m = _VALUE.fullmatch(word)
+    if not m:
+        return
+    value = m[2]
+    raw = _VALUE.fullmatch(src)
+    if raw and raw[2].startswith("(") and value.startswith("(") and value.endswith(")"):
+        value = value[1:-1]
+    node = getattr(word, "node", None)
+    out.setdefault(("alias", m[1]) if alias else m[1], []).append((value, node is not None and _name_expands(node)))
+
+
+def _set_args(args):
+    """Позиционные параметры `set` по его словам args: слова за флагами (каждая буква `o` флага — и в склейке
+    `-eo`, `-oe` — берёт значением имя настройки следующим словом, если оно непустое и не начато с `-` или `+`;
+    иначе печатает настройки, а слово разбирается дальше, как в bash 5.3), `--` или `-`; None — `set` их не
+    меняет."""
+    k = 0
+    while k < len(args) and args[k][:1] in ("-", "+"):
+        flag = args[k]
+        k += 1
+        if flag in ("--", "-"):
+            return args[k:]
+        for _ in range(flag[1:].count("o")):
+            if k < len(args) and args[k][:1] not in ("", "-", "+"):
+                k += 1
+    return args[k:] or None
+
+
+# Ключ значений _values: слова `set` и сумма сдвигов `shift` для позиционных параметров (_positional).
+_POSITIONAL = ("set",)
+# Флаги `read` со значением (bash 5.3, `help read`).
+_READ_VALUE_FLAGS = {"-a", "-d", "-i", "-n", "-N", "-p", "-t", "-u"}
+
+
+def _values(commands, loops):
+    """Значения переменных и alias текста: имя — список пар (текст значения, вычисляемое ли). Переменные —
+    присваивания перед командой и в словах `export`/`declare`/`typeset`/`local`/`readonly` (массив `a=(…)` — слова в
+    скобках, _assigned), слова цикла `for`, строка here-string или heredoc `read` во все её имена (вычисляемое) и
+    вывод `printf -v` (_printf_output; неизвестный — слова формата и аргументов, вычисляемое); alias — слова
+    `alias имя=…`, ключ ("alias", имя); слово оператора `=`, `:=` в раскрытиях слов (_default_assigns). Одинаковые
+    пары имени не повторяются. Позиционные параметры — слова `set` (_set_args) и сумма сдвигов `shift` (литерал N,
+    без числа — 1, иначе — любой сдвиг) под ключом _POSITIONAL: их значения считает _var_values по ссылке
+    (_positional). Значения `read` из файла или конвейера, `mapfile` и `readarray` не видны."""
+    out, sets, shifts = {}, [], 0
+    for info in commands:
+        for word in info.simple.assigns:
+            _assigned(_word_text(word, info.text), info.text[word.start:word.end], out)
+        words = info.words
+        name = pkgmanagers._basename(words[0]) if words else None
+        if name in _DECLARES or name == "alias":
+            for word in words[1:]:
+                src = info.text[word.node.start:word.node.end] if getattr(word, "node", None) else word
+                _assigned(word, src, out, name == "alias")
+        elif name == "set":
+            args = _set_args(words[1:])
+            if args is not None:
+                sets.append(args)
+        elif name == "shift":
+            # `shift N` сдвигает на N, без числа — на 1; N не литералом может быть любым.
+            n = words[1] if len(words) == 2 else "1" if len(words) == 1 else ""
+            shifts += int(n) if n.isdecimal() and len(n) < 5 else _WORDS_LIMIT
+        elif name == "read":
+            args, targets = list(words[1:]), []
+            while args and args[0].startswith("-") and args[0] != "--":
+                if args[0] in _READ_VALUE_FLAGS:
+                    targets += args[1:2] if args[0] == "-a" else []
+                    args = args[1:]
+                args = args[1:]
+            targets += args[args[:1] == ["--"]:]
+            for text in chain(info.bodies, info.herestrings):
+                for target in targets:
+                    out.setdefault(target, []).append((text, True))
+        elif name == "printf" and words[1:2] == ["-v"] and len(words) > 3:
+            args = words[3 + (words[3] == "--"):]
+            text = _printf_output(args)
+            computed = text is None or any(getattr(w, "expands", False) for w in args)
+            out.setdefault(words[2], []).append((" ".join(args) if text is None else text, computed))
+        _default_assigns(info.simple, out)
+    for node, text in loops:
+        out.setdefault(text[node.name.start:node.name.end], []).extend(
+            (_word_text(w, text), False) for w in node.words)
+    # Одинаковые пары (повторный `set` с теми же словами) умножали бы сочетания _renamed: остаётся первая.
+    out = {key: list(dict.fromkeys(pairs)) for key, pairs in out.items()}
+    out[_POSITIONAL] = (sets, shifts)
+    return out
+
+
+def _default_assigns(simple, out):
+    """Присваивания раскрытиями `${X=слово}`, `${X:=слово}` в словах и присваиваниях простой команды simple (и в "…",
+    и в словах других операторов) пишут в out слово без кавычек (вычисляемое — с раскрытием) значением имени.
+    Позиционному параметру bash так не присваивает (ошибка)."""
+    stack = [part for word in chain(simple.assigns, simple.words) for part in word.parts]
+    while stack:
+        part = stack.pop()
+        kind = type(part)
+        if kind is shparse.DQ:
+            stack.extend(part.parts)
+        elif kind is shparse.Param:
+            m = _PARAM_OP.fullmatch(part.text)
+            if m and m[3][-1] == "=" and m[1][0] not in "@*0123456789":
+                out.setdefault(m[1], []).append((shparse._quote_removal(m[4]), _expands(part.parts)))
+            stack.extend(part.parts or ())
+
+
+def _spans(n, length):
+    """Границы (k, j) срезов n элементов: хвосты [k:n] с любого k, при length — все отрезки [k:j] (срез с длиной
+    `:L` обрезает хвост, и отброшенный конец может быть `--dry-run`)."""
+    for k in range(n + 1):
+        for j in range(k, n + 1) if length else (n,):
+            yield k, j
+
+
+def _capped(pairs):
+    """Пары pairs без повторов; список обрывается, когда его тексты длиннее _NAME_BUDGET: _renamed тратит на каждое
+    значение не меньше его длины и символа, и полный список исчерпал бы остаток так же — сомнением."""
+    out, size = {}, 0
+    for pair in pairs:
+        if pair not in out:
+            out[pair] = None
+            size += len(pair[0]) + 1
+            if size > _NAME_BUDGET:
+                break
+    return list(out)
+
+
+def _positional(sets, shifts, key):
+    """Значения позиционных параметров key ("@" — все, "@:" — срез `${@:N}`, "@::" — срез с длиной `${@:N:L}`, номер
+    "1", "2", …) по словам `set` sets (_set_args) после сдвигов `shift` на сумму shifts: параметры с k-го для каждого
+    k от 0 до shifts — место сдвига в тексте не сверяется, — у среза любой хвост, у среза с длиной любой отрезок
+    (_spans). Одинаковые пары не повторяются, список обрезает _capped."""
+    index = (int(key) - 1 if len(key) < 6 else _WORDS_LIMIT) if key.isdecimal() else None
+
+    def pairs():
+        for args in sets:
+            if key in ("@:", "@::"):
+                spans = _spans(len(args), key == "@::")
+            else:
+                spans = ((k, len(args)) for k in range(min(shifts, len(args)) + 1))
+            for k, j in spans:
+                if index is None:
+                    run = args[k:j]
+                    yield " ".join(run), any(getattr(w, "expands", False) for w in run)
+                elif k + index < len(args):
+                    yield args[k + index], getattr(args[k + index], "expands", False)
+                else:
+                    break
+    return _capped(pairs())
+
+
+def _slices(pairs, length):
+    """Значения среза массива `${a[@]:N}` (при length — `${a[@]:N:L}`) по значениям массива pairs: отрезки _spans
+    по словам текста значения между пробельными символами — среди них все отрезки элементов (кавычки внутри
+    элемента дают лишние отрезки, разбор их отвергает); вычисляемое значение остаётся вычисляемым. Список обрезает
+    _capped."""
+    def runs():
+        for text, computed in pairs:
+            words = [m.span() for m in re.finditer(r"\S+", text)]
+            for k, j in _spans(len(words), length):
+                yield (text[words[k][0]:words[j - 1][1]] if j > k else ""), computed
+    return _capped(runs())
+
+
+# Предел глубины ссылок, чьи значения подставляет _ref_values: цепочка `X=$Y; Y=$X` замкнута.
+_REF_DEPTH = 4
+
+
+def _key_values(key, values, depth=0):
+    """Значения имени key из values. Позиционные параметры ("@" и "*" — все, номер — и с ведущими нулями `${01}`;
+    `$0` — не позиционный, значений нет) считает _positional с запоминанием в values под ключом (_POSITIONAL, key):
+    цель `read 1`, `printf -v @` или цикла с таким именем их не подменяет. Значение переменной — ссылку целиком
+    (`Y=$X`, `Y="${X}"`, `Y=${X:-q}`) — заменяют значения ссылки (_ref_values на глубине depth): текст значения
+    литерала `Y='$X'` от ссылки не отличим и тоже заменяется (лишнее сомнение); список запоминается по имени и
+    глубине и обрезается _capped."""
+    if key in ("@", "*"):
+        key = "@"
+    elif key.isdecimal():
+        key = key.lstrip("0")
+        if not key:
+            return []
+    if key[0] in "@123456789":
+        cache = (_POSITIONAL, key)
+        if cache not in values:
+            values[cache] = _positional(*values[_POSITIONAL], key)
+        return values[cache]
+    cache = ("var", key, depth)
+    if cache not in values:
+        values[cache] = _capped(chain.from_iterable(
+            _ref_values(text, values, depth) or [(text, computed)]
+            for text, computed in values.get(key, ())))
+    return values[cache]
+
+
+def _ref_values(text, values, depth):
+    """Значения текста text — ссылки целиком (и в "…") на переменную, элемент или срез массива, позиционные параметры
+    или ссылки с оператором (`$Y`, `${Y}`, `"${Y[@]}"`, `${Y:-q}`) — по values (_var_values) на глубине depth + 1.
+    Пусто — text не такая ссылка, значений нет в тексте команды или глубина достигла _REF_DEPTH."""
+    if depth >= _REF_DEPTH:
+        return []
+    if len(text) > 1 and text[0] == text[-1] == '"' and '"' not in text[1:-1]:
+        text = text[1:-1]
+    return _var_values(text, values, depth + 1) if text[:1] == "$" else []
+
+
+def _single_param(word):
+    """Раскрытие `${…}`, из которого целиком состоит слово word (и в "…"): узел shparse.Param; у слова без узла —
+    само слово; None — в слове есть другие части."""
+    node = getattr(word, "node", None)
+    if node is None:
+        return word
+    parts = node.parts
+    if len(parts) == 1 and type(parts[0]) is shparse.DQ:
+        parts = parts[0].parts
+    return parts[0] if len(parts) == 1 and type(parts[0]) is shparse.Param else None
+
+
+def _var_values(word, values, depth=0):
+    """Значения слова word — ссылки целиком на переменную, элемент или все элементы массива, позиционные параметры
+    (_NAME_VAR) — из values (_key_values на глубине ссылок depth); у среза массива — его отрезки (_slices), у
+    элемента `${a[N]}` — любой отрезок (_slices с длиной: слова массива и значение переменной целиком); у ссылки с
+    оператором (_PARAM_OP) — то, что оператор может подставить (bash 5.3): `-`, `=` — значения имени и слово, `+` —
+    слово и пустое значение, `?` — значения имени (иначе ошибка). Слово оператора — значения ссылки целиком
+    (_ref_values: `${X:-$Y}`), иначе сырой текст с кавычками (его слова делит разбор), с раскрытием — вычисляемое.
+    Пусто — слово не ссылка или значения нет в тексте."""
+    param = _single_param(word)
+    text = getattr(param, "text", param)
+    m = _PARAM_OP.fullmatch(text) if text else None
+    if m:
+        key = ("op", text, depth)
+        if key not in values:
+            name, index, op, arg = m[1], m[2], m[3][-1], m[4]
+            computed = _expands(param.parts) if type(param) is shparse.Param else "$" in arg or "`" in arg
+            if op == "+":
+                own = []
+            elif index is not None and index not in ("@", "*"):
+                own = _slices(_key_values(name, values, depth), True)
+            else:
+                own = _key_values(name, values, depth)
+            if op in "-=+":
+                own = own + (_ref_values(arg, values, depth) or [(arg, computed)])
+            values[key] = own + ([("", False)] if op == "+" else [])
+        return values[key]
+    m = _ARRAY_SLICE.fullmatch(word)
+    if m:
+        key = ("slice", m[1], bool(m[2]), depth)
+        if key not in values:
+            values[key] = _slices(_key_values(m[1], values, depth), bool(m[2]))
+        return values[key]
+    m = _ARRAY_ITEM.fullmatch(word)
+    if m:
+        key = ("item", m[1], depth)
+        if key not in values:
+            values[key] = _slices(_key_values(m[1], values, depth), True)
+        return values[key]
+    m = _NAME_VAR.fullmatch(word)
+    if not m:
+        return []
+    return _key_values(m[1] or m[2] or m[3] or ("@::" if m[5] else "@:"), values, depth)
+
+
+def _valued_ref(text, values):
+    """Раскрытие параметра с текстом text ссылается на имя со значениями в тексте команды (values): переменную,
+    массив, позиционные параметры, у косвенной `${!Y}` и ключей `${!a[@]}` — Y и a, у `${!начало*}` — переменную с
+    таким началом. Длина `${#…}` — число, не ссылка на значение."""
+    m = _NAMES_BY_PREFIX.fullmatch(text)
+    if m:
+        return any(type(key) is str and key.startswith(m[1]) for key in values)
+    m = _REF.match(text)
+    return bool(m) and m[1] != "#" and bool(_key_values(m[2], values))
+
+
+def _composed(word, values):
+    """Значения слова word (узел shparse.Word), склеенного из литералов и ссылок на переменные (`${X}ash`,
+    `$R/bin/run`, `${a[@]:1}ash`; части в "…" — тоже): сочетания значений частей (_var_values) склейкой, литерал — в
+    кавычках shlex, ссылка без значения в тексте — пустая и вычисляемая (значение из окружения не видно). Пусто — у
+    слова нет узла, в нём подстановка или арифметика (имя команды из них проверяет _name_doubt) или ни у одной
+    ссылки нет значений в тексте. None — значение известно только при исполнении: в слове ссылка, которую разбор не
+    вычисляет (замена, обрезка, подстрока, смена регистра, преобразование `@…`, косвенная `${!…}`), на имя со
+    значениями в тексте (_valued_ref), или тексты сочетаний длиннее остатка _NAME_BUDGET вызова."""
+    node = getattr(word, "node", None)
+    if node is None:
+        return []
+    options, valued, exact = [], False, True
+    stack = list(reversed(node.parts))
+    while stack:
+        part = stack.pop()
+        kind = type(part)
+        if kind is shparse.DQ:
+            stack.extend(reversed(part.parts))
+        elif kind is shparse.Param:
+            own = _var_values(part.text, values)
+            if not own and _valued_ref(part.text, values):
+                return None
+            valued = valued or bool(own)
+            options.append(own or [("", True)])
+        elif kind is shparse.Lit or kind is shparse.SQ:
+            options.append([(shlex.quote(part.text), False)])
+        elif kind is shparse.AnsiC:
+            options.append([(shlex.quote(part.value), False)])
+        else:
+            exact = False
+    if not valued or not exact:
+        return []
+    # Сочетания одинаковых значений не растят список, но тратят время: остаток _NAME_BUDGET вызова тратит каждое.
+    out, budget = {}, _call[2] if _call is not None else [_NAME_BUDGET]
+    for combo in product(*(dict.fromkeys(o) for o in options)):
+        text = "".join(t for t, _ in combo)
+        budget[0] -= len(text) + 1
+        if budget[0] < 0:
+            return None
+        out[text, any(c for _, c in combo)] = None
+    return list(out)
+
+
+def _renamed(info, values, depth):
+    """Довод сомнения, если имя команды — переменная без кавычек со значением из текста (`X="npm install x"; $X`,
+    массив `"${a[@]}"`, позиционные параметры `set` и `"$@"`, `$1`), alias из текста (`alias n=npm` ⏎
+    `n install x`) или шаблон имён, под который подходит имя известной программы (`/usr/bin/np? install x`) или
+    имя из семейств _NAME_FAMILIES (`pi[p] install x`, _glob_name), и с ним слова за именем — с подставленными
+    значениями слов-ссылок на переменные (_var_values, `$X $Y`) — ставят пакет: известное значение разбирается как
+    команда (_installs), вычисляемое (`X=$(…)`, `read`, неизвестный вывод `printf -v`) — по словам текста
+    (_flat_install). Значение переменной из окружения не видно: сомнения нет. Тексты сверх остатка _NAME_BUDGET
+    вызова — сомнение без разбора: проход линеен. Слово, склеенное из ссылок и литералов (`${X}ash`), даёт сочетания
+    значений частей (_composed); имя из ссылки, которую разбор не вычисляет (`${X/a/b}`, `${X,,}`, `${!Y}`), на имя
+    со значениями в тексте и имя со сочетаниями сверх остатка у _composed — сомнение _WHY_RUNTIME_NAME; такое слово
+    за именем остаётся своим текстом, и строка проверяется ещё как команда с раскрытием (_find_doubt: `npm ${Y,,}` —
+    подкоманда неизвестна)."""
+    words = info.words
+    texts = _var_values(words[0], values) or _composed(words[0], values)
+    if texts is None:
+        return _WHY_RUNTIME_NAME
+    texts = list(texts)
+    texts += values.get(("alias", words[0]), ())
+    node = getattr(words[0], "node", None)
+    if node is not None and any(type(p) is shparse.Lit and _globs(info.text, p) for p in node.parts):
+        pattern = pkgmanagers._basename(words[0])
+        texts += [(name, False) for name in _GLOB_PROGRAMS if fnmatch.fnmatchcase(name, pattern)]
+        if len(pattern) <= _NAME_MAX:
+            texts += [(name, False) for name in map(lambda f: _glob_name(pattern, f), _NAME_FAMILIES) if name]
+    if not texts:
+        return None
+    options = []
+    for w in words[1:]:
+        own = _var_values(w, values) or _composed(w, values)
+        # Значение известно только при исполнении (None у _composed): слово — своим текстом, признак None.
+        options.append(own or [(pkgmanagers._shell_join([w]), None if own is None else False)])
+    budget = _call[2] if _call is not None else [_NAME_BUDGET]
+    for text, computed in texts:
+        for rest in product(*options):
+            # Значений, их сочетаний и мест имени может быть много: текст сверх остатка _NAME_BUDGET — сомнение без
+            # разбора. Место с пустым текстом (`X=`) тоже тратит остаток.
+            line = " ".join([text] + [t for t, _ in rest])
+            budget[0] -= len(line) + 1
+            if budget[0] < 0:
+                return _WHY_RENAMED
+            if any(c is None for _, c in rest) and (depth >= _MAX_DEPTH or _find_doubt(line, depth + 1)):
+                return _WHY_RENAMED
+            if computed or any(c for _, c in rest):
+                if _flat_install([line]):
+                    return _WHY_RENAMED
+            elif _installs(line, depth):
+                return _WHY_RENAMED
+    return None
+
+
 def _segment_doubt(info, depth):
     """Довод сомнения команды: её слова (_doubt; имя команды — вывод подстановки, _name_doubt, — _WHY_NAME на месте,
     где _doubt проверяет имя), вычисляемая строка `eval` или here-string (_computed_script), строки _scripts — как в
-    _segment_adds; на глубине _MAX_DEPTH вложенный текст проверяет _soup_add."""
-    why = None
-    if not info.marker:
-        why = _doubt(info.words, info.xargs, info.cut, info.wrapped)
-        if why in (None, _WHY_SUBCOMMAND, _WHY_LAUNCHER) and _name_doubt(info):
-            why = _WHY_NAME
-        why = why or _computed_script(info)
+    _segment_adds (на глубине _MAX_DEPTH вложенный текст проверяет _soup_add), последней — строка в словах, которую
+    программа может исполнить (_string_doubt)."""
+    if info.marker:
+        return None
+    why = _doubt(info.words, info.xargs, info.cut, info.wrapped)
+    if why in (None, _WHY_SUBCOMMAND, _WHY_LAUNCHER) and _name_doubt(info):
+        why = _WHY_NAME
+    why = why or _computed_script(info)
     if why:
         return why
-    nested = [] if info.marker else _scripts(info)
+    nested = _scripts(info)
     if depth >= _MAX_DEPTH:
-        return _WHY_DEPTH if any(_soup_add(t) for t in nested) else None
-    for text in nested:
-        found = _find_doubt(text, depth + 1)
-        if found:
-            return found[1]
-    return None
+        if any(_soup_add(t) for t in nested):
+            return _WHY_DEPTH
+    else:
+        for text in nested:
+            found = _find_doubt(text, depth + 1)
+            if found:
+                return found[1]
+    return _string_doubt(info, depth)
 
 
 def _find_doubt(command, depth):
     """Первый сегмент текста с сомнением и довод (_segment_doubt, затем тела heredoc оболочки — с внешним раскрытием
     _WHY_COMPUTED — и _stdin_scripts: вход оболочки не из литерального `echo`/`printf`, heredoc `cat` и файлов —
-    _WHY_COMPUTED); None, если такого нет."""
-    commands, feeds, scripts = _analysis(command)
+    _WHY_COMPUTED, затем входы программ _program_inputs — _input_doubt); None, если такого нет."""
+    commands, feeds, scripts, loops = _analysis(command)
+    values = None
     for info in commands:
         why = _segment_doubt(info, depth)
+        if not why and not info.marker and info.words:
+            if values is None:
+                values = _values(commands, loops)
+            why = _renamed(info, values, depth)
         if why:
             return info.segment, why
     for segment, text in chain(((t.strip(), t) for t in scripts), _stdin_scripts(feeds)):
@@ -1385,6 +2321,10 @@ def _find_doubt(command, depth):
         found = _find_doubt(text, depth + 1)
         if found:
             return segment, found[1]
+    for segment, text in _program_inputs(commands, feeds):
+        why = _input_doubt(text, depth)
+        if why:
+            return segment, why
     return None
 
 
@@ -1447,8 +2387,8 @@ def _split(text, braces=False):
 
 def dependency_doubt(command):
     """Сегмент команды, где установка пакета под сомнением, и довод (_WHY_*): флаг перед подкомандой вне известных
-    наборов, `--dry-run` значением флага, пакеты из stdin xargs, вложенность глубже _MAX_DEPTH, слова за пределом
-    раскрытия скобок, слово менеджера или строка `eval`/`sh -c` за _WORDS_LIMIT (_installer, _cut_script), команда
+    наборов, `--dry-run` значением флага, пакеты или слова команды из stdin xargs (_xargs_doubt), вложенность
+    глубже _MAX_DEPTH, слова за пределом раскрытия скобок, слово менеджера или строка `eval`/`sh -c` за _WORDS_LIMIT (_installer, _cut_script), команда
     за _MAX_WRAPPERS обёртками, имя команды — подстановка с глаголом установки, вывод подстановки или `${…}` с
     пробелом (_WHY_NAME: _expanded_install, _expanded_name_install, _name_doubt), подкоманда менеджера — подстановка
     или переменная (_WHY_SUBCOMMAND), строка оболочки вычисляется при исполнении (_WHY_COMPUTED), неизвестная
