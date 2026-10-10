@@ -1894,6 +1894,7 @@ class LinearParseTest(unittest.TestCase):
         self.assertEqual(comments._comments("s{a}{b} " * 20000 + "# c\n", "pl"), [(1, "# c")])
         self.assert_linear(((lambda k: "s{a}{b} " * k, "pl", 20000),))
 
+    @mock.patch.object(comments.shparse, "_STACK_MAX", 10 ** 9)  # линейность разбора, а не предел
     def test_string_substitutions_are_linear(self):
         # Подстановки строк: незакрытые, вложенные до глубины k, строки и символьные литералы в коде подстановки,
         # спецификации формата Python, «\» в коде подстановки shell; «$'…'» shell.
@@ -2074,6 +2075,16 @@ class ShellTreeTest(unittest.TestCase):
         with mock.patch.object(comments.shparse, "parse", side_effect=RuntimeError):
             self.assertIsNone(comments._shell_comments("# a\n"))
             self.assertEqual(comments._comments("# a\n", "sh"), [(1, "# a")])
+
+    def test_shparse_depth_limit_falls_back(self):
+        # Вложенность глубже предела shparse: разбора нет — общий разбор с предупреждением, как при сбое.
+        common._reset()
+        self.addCleanup(common._reset)
+        text = "# a\necho " + "$(" * 10000 + "a" + ")" * 10000 + "\n# b\n"
+        self.assertIsNone(comments._shell_comments(text))
+        self.assertEqual(common._messages,
+                         ["planka: комментарии скрипта shell взяты общим разбором: вложенность глубже предела разбора"])
+        self.assertEqual(comments._comments(text, "sh")[0], (1, "# a"))
 
     def test_zsh_stays_on_old_engine(self):
         with mock.patch.object(comments, "_shell_comments", side_effect=AssertionError):

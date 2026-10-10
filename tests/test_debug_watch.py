@@ -138,6 +138,15 @@ class DebugWatchTest(unittest.TestCase):
         self.assertIsNone(self.context(self.failure()))
         self.assertIsNotNone(self.context(self.failure()))
 
+    def test_deep_nesting_counts_failure_with_warning(self):
+        # Вложенность глубже предела разбора shparse: дерева нет, код 1 — неудача, с предупреждением; хук не падает
+        # (без предела `${a:-` ×10⁵ съедал память, и CPython падал segfault).
+        command = "grep x f; echo " + "${a:-" * 100000 + "x" + "}" * 100000
+        first = self.failure(command, error="Exit code 1")
+        self.assertIsNone(self.context(first))
+        self.assertIn("planka: команда не разобрана (вложенность глубже предела разбора)", "\n".join(messages(first)))
+        self.assertIsNotNone(self.context(self.failure(command, error="Exit code 1")))
+
     def test_wrong_shape_state_starts_over(self):
         self.state_file().parent.mkdir(parents=True, exist_ok=True)
         self.state_file().write_text(json.dumps({"counts": {"x": "y"}, "shown_prompt": 5}), encoding="utf-8")
@@ -491,6 +500,7 @@ class SegmentsTest(unittest.TestCase):
         self.assertEqual(debug_watch._segments("cat <<-EOF\n\tdon't\n\tEOF\n((x>0 && y>0)) && make test"),
                          [("", "cat <<-EOF"), ("\n", "((x>0 && y>0)) "), ("&&", " make test")])
 
+    @mock.patch.object(debug_watch.shparse, "_STACK_MAX", 10 ** 9)  # линейность разбора, а не предел
     def test_shift_after_open_parens_linear(self):
         small, large = ("( " * n + "< " * n + "((1))" for n in (2500, 10000))
         assert_linear(self, lambda: debug_watch._segments(small), lambda: debug_watch._segments(large))
@@ -625,6 +635,15 @@ class CorpusResultsTest(unittest.TestCase):
 class Code1IsAnswerTest(unittest.TestCase):
     def test_hash_inside_word_is_not_comment(self):
         self.assertTrue(debug_watch.code1_is_answer("VAR=a#b grep x f"))
+
+    def test_unparsed_is_failure_with_warning(self):
+        # Разбор без дерева (вложенность глубже предела shparse): код 1 — неудача, пользователю — предупреждение.
+        common._reset()
+        self.addCleanup(common._reset)
+        self.assertFalse(debug_watch.code1_is_answer("echo " + "$(" * 10000 + "a" + ")" * 10000 + "; grep x f"))
+        self.assertEqual(common._messages,
+                         ["planka: команда не разобрана (вложенность глубже предела разбора): её код выхода 1 "
+                          "считается неудачей"])
 
     def test_corpus(self):
         for sample in corpus():

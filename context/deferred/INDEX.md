@@ -18,6 +18,8 @@
 | [Разбор комментариев: свои слова Perl, области видимости Ruby, вложенность s{…}{…}e, входы-скрипты действий](comment-syntaxes.md) | низкий |
 | [Детектор зависимостей перечисляет формы записи установки](depcheck-enumerated-forms.md) | средний |
 | [Разбор shell: хвост расхождений с bash на глубокой вложенности](shparse-depth3-tail.md) | средний |
+| [Разбор shell: позиции частей в повторных разборах одним сдвигом](shparse-reparse-positions.md) | низкий |
+| [Разбор shell: текст вложенных `${…}` растёт квадратично](shparse-param-text-quadratic.md) | низкий |
 | [Ярус модели судьи](judge-tier-cascade.md) | низкий |
 | [`debug_watch._paren_pairs` не вызывается кодом плагина](debug-watch-paren-pairs-unused.md) | низкий |
 | [`depcheck.heredocs` не вызывается кодом плагина](depcheck-heredocs-unused.md) | низкий |

@@ -1657,7 +1657,8 @@ def _shell_comments(text, deadline=None):
     """Комментарии скрипта bash по разбору shparse: [(номер строки с 1, строка комментария)], как у _parse; None —
     shparse упал (исключение). bash прекращает чтение на фатальной синтаксической ошибке, но комментарии после неё
     остаются в выводе (отказ судьи без них дороже лишней строки): остаток разбирается заново со следующей строки
-    после ошибки, не больше _SHELL_RECOVERIES раз, и комментарии берутся со всех кусков. Перевод строки «\\r\\n»
+    после ошибки, не больше _SHELL_RECOVERIES раз, и комментарии берутся со всех кусков. Разбор без дерева
+    (shparse.DEPTH, shparse.INTERNAL) — None с предупреждением. Перевод строки «\\r\\n»
     снимается, как у _parse (файл с CRLF), BOM в начале — тоже; «#!» первой строки — не комментарий. Срок deadline
     проверяется до и после каждого разбора."""
     if deadline is not None and time.monotonic() >= deadline:
@@ -1671,6 +1672,13 @@ def _shell_comments(text, deadline=None):
         try:
             script = shparse.parse(chunk)
         except Exception:  # noqa: BLE001
+            return None
+        kind = script.error.kind if script.error is not None else None
+        if kind is not None:
+            # Разбор без дерева (вложенность глубже предела shparse, сбой разбора): тот же путь, что исключение, —
+            # общий разбор, с предупреждением.
+            why = "вложенность глубже предела разбора" if kind == shparse.DEPTH else "сбой разбора"
+            common.warn(f"комментарии скрипта shell взяты общим разбором: {why}")
             return None
         line, at = 1 + first, 0
         for start, end in script.comments:

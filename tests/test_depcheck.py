@@ -1,8 +1,11 @@
+import importlib.util
 import json
 import pathlib
 import shlex
+import subprocess
 import sys
 import unittest
+from unittest import mock
 
 PLANKA_DIR = pathlib.Path(__file__).resolve().parent.parent / "plugin" / "planka"
 sys.path.insert(0, str(PLANKA_DIR))
@@ -1997,6 +2000,7 @@ class ExpandedNameTest(unittest.TestCase):
                 self.assertIsNone(depcheck.dependency_add(cmd))
                 self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_NAME)
 
+    @mock.patch.object(shparse, "_STACK_MAX", 10 ** 9)  # линейность разбора, а не предел (DepthLimitTest)
     def test_linear(self):
         for make in [lambda n: "npm install " + "$(a) " * n, lambda n: "npm install " + "`a` " * n,
                      lambda n: "$(" * n + "npm install x", lambda n: "echo " + "<(a) " * n]:
@@ -2928,6 +2932,7 @@ class ArithmeticSubstitutionTest(unittest.TestCase):
             with self.subTest(cmd):
                 self.assertIsNone(depcheck.dependency_add(cmd))
 
+    @mock.patch.object(shparse, "_STACK_MAX", 10 ** 9)  # линейность разбора, а не предел (DepthLimitTest)
     def test_linear(self):
         for make in [lambda n: 'echo "' + "$(( " * n + "1" + " ))" * n + '"',
                      lambda n: 'echo "' + "$(( (" * n + "1" + ") ))" * n + '"']:
@@ -3179,6 +3184,7 @@ class ArithmeticQuotesTest(unittest.TestCase):
         cmd = "echo \"$(( '1'$(npm i x) ))\""
         self.assertEqual(_commands(cmd), [cmd, "npm i x"])
 
+    @mock.patch.object(shparse, "_STACK_MAX", 10 ** 9)  # линейность разбора, а не предел (DepthLimitTest)
     def test_linear(self):
         for make in [lambda n: 'echo "$(( ' + "'$(\"' " * n + '))"', lambda n: 'echo "$(( ' + '"$(( ' * n,
                      lambda n: "echo $[ " + "'`a' " * n + "]", lambda n: 'echo "$(( ' + "'$(a) `b` ' " * n + '))"']:
@@ -3289,6 +3295,7 @@ class ArithmeticOutsideQuotesTest(unittest.TestCase):
         self.assertEqual(_commands("a['$(b)' c"), [])
         self.assertTrue(shparse.parse("a['$(b)' c").error.fatal)
 
+    @mock.patch.object(shparse, "_STACK_MAX", 10 ** 9)  # линейность разбора, а не предел (DepthLimitTest)
     def test_linear(self):
         for make in [lambda n: "echo " + "$(( '$(a)' )) " * n, lambda n: "echo " + "(( " * n,
                      lambda n: "echo " + "$((x " * n + ") " * n, lambda n: "a[" * n + "=1",
@@ -3332,6 +3339,7 @@ class ParameterExpansionSpaceTest(unittest.TestCase):
                          ["a", "${x:- b}c", "${y:-\\}}", "d"])
         self.assertEqual([w for w, _ in depcheck._split("a ${x:- b}c d")], ["a", "${x:- b}c", "d"])
 
+    @mock.patch.object(shparse, "_STACK_MAX", 10 ** 9)  # линейность разбора, а не предел (DepthLimitTest)
     def test_linear(self):
         for make in [lambda n: "echo " + "${x:- " * n, lambda n: "echo " + "${x:- a} " * n + "; npm i x"]:
             small, large = make(2000), make(8000)
@@ -3473,6 +3481,7 @@ class FunctionSubstitutionTest(unittest.TestCase):
         self.assertEqual([w for w, _ in depcheck._split("x=${ a b; } c", braces=True)], ["x=${ a b; }", "c"])
         self.assertEqual(depcheck.heredocs('echo "${ cat <<E'), [("E", False)])
 
+    @mock.patch.object(shparse, "_STACK_MAX", 10 ** 9)  # линейность разбора, а не предел (DepthLimitTest)
     def test_linear(self):
         for make in [lambda n: "echo " + "${ " * n, lambda n: 'echo "' + "${ { " * n,
                      lambda n: 'echo "${ ' + "echo } " * n + '; }"', lambda n: 'echo "${ ' + "then " * n + '}"',
@@ -3519,6 +3528,7 @@ class HeredocInSubstitutionEndTest(unittest.TestCase):
                 self.assertIsNone(depcheck.dependency_add(cmd))
                 self.assertIsNone(depcheck.dependency_doubt(cmd))
 
+    @mock.patch.object(shparse, "_STACK_MAX", 10 ** 9)  # линейность разбора, а не предел (DepthLimitTest)
     def test_linear(self):
         # Много heredoc на одной строке и строка из их терминаторов: тела кончаются по одному.
         for make in [lambda n: "echo $(cat <<E\n" + "E x\n" * n + "E)", lambda n: "echo $(" + "cat <<E\nE );" * n,
@@ -3749,9 +3759,126 @@ class GrammarFormsTest(unittest.TestCase):
         self.assertIsNone(depcheck.dependency_doubt(b"npm i x"))
 
 
+class ParserLimitsTest(unittest.TestCase):
+    """Края разбора, на которых детектор падал или молчал: позиции слова, раскрытого заново по напечатанному тексту
+    (bash 5.3 в песочнице bashdiff: `touch P1; echo $(for a do a=(\\\\);done); touch P2` создаёт P1 и P2)."""
+
+    def test_reexpanded_word_positions(self):
+        # Позиции частей за концом текста роняли _glob_marks IndexError, и хук пропускал команду.
+        command = "npm i evil; echo $(for a do a=(\\\\);done)"
+        self.assertEqual(depcheck.dependency_add(command), "npm i evil")
+        # Печать короче исходного текста (пробелы): сегмент — текст команды на её месте (bash: `touch P3` вместо
+        # `npm i x` создаёт P3).
+        self.assertEqual(depcheck.dependency_add("echo $(for a   in 1;   do npm i x; a=(\\\\);done)"), "npm i x")
+
+    def test_deep_nesting_doubt_in_subprocess(self):
+        # Вложенность глубже предела разбора: дерева нет — сомнение у всей команды (segfault прежде ронял хук, и
+        # команда исполнялась). Процесс отдельный: сбой CPython не роняет тест-раннер.
+        script = (
+            "import sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "import depcheck\n"
+            "head, opening, middle, closing = sys.argv[2:6]\n"
+            "n = 100000\n"
+            "command = 'npm i evil; ' + head + opening * n + middle + closing * n\n"
+            "doubt = depcheck.dependency_doubt(command)\n"
+            "print(depcheck.dependency_add(command), doubt and doubt[1] == depcheck._WHY_NESTING)\n")
+        for head, opening, middle, closing in [("echo ", "${a:-", "x", "}"), ("echo ", "$(( ", "1", " ))"),
+                                               ("echo ", "${a[", "1", "]}"), ("echo ", "$(", "a", ")"),
+                                               ("", "( ", "a", " )")]:
+            with self.subTest(opening):
+                done = subprocess.run([sys.executable, "-c", script, str(PLANKA_DIR), head, opening, middle, closing],
+                                      capture_output=True, text=True, timeout=300)
+                self.assertEqual((done.returncode, done.stdout.strip()), (0, "None True"), done.stderr[-500:])
+
+    def test_unparsed_doubt(self):
+        deep = "echo " + "$(" * 1000 + "a" + ")" * 1000
+        segment, why = depcheck.dependency_doubt("npm i x; " + deep)
+        self.assertEqual(why, depcheck._WHY_NESTING)
+        self.assertTrue(segment.startswith("npm i x; echo $($(") and len(segment) == depcheck._UNPARSED_SHOWN)
+        # Вложенная строка оболочки — тоже.
+        self.assertEqual(depcheck.dependency_doubt("bash -c '" + deep + "'")[1], depcheck._WHY_NESTING)
+        # Маркер в начале всей команды снимает сомнение; в середине — нет.
+        self.assertIsNone(depcheck.dependency_doubt("PLANKA_DEP_OK=1 npm i x; " + deep))
+        self.assertIsNotNone(depcheck.dependency_doubt("cd a && PLANKA_DEP_OK=1 npm i x; " + deep))
+        self.assertIsNone(depcheck.dependency_add("npm i x; " + deep))
+        # Неглубокая вложенность разбирается.
+        self.assertEqual(depcheck.dependency_add("echo " + "$(" * 100 + "npm i x" + ")" * 100), "npm i x")
+        # Помощники проверки манифестов (manifest_watch): текст без дерева — один сегмент без слов, маркер — в начале.
+        self.assertEqual(depcheck._segments(" " + deep + " "), [deep])
+        self.assertEqual(depcheck._command("PLANKA_DEP_OK=1 " + deep), ([], True))
+        self.assertEqual(depcheck._command(deep), ([], False))
+        self.assertEqual(depcheck._split(deep), [])
+
+    def test_detector_failure_doubt(self):
+        # Сбой детектора на тексте — сомнение, а не пропуск: команду не удалось разобрать, пропуск открыл бы обход
+        # проверки той же установкой (CLAUDE.md, «Сомнение детектора зависимостей — отказ с обходом маркером»).
+        with mock.patch.object(depcheck, "_word_text", side_effect=IndexError("x")):
+            self.assertIsNone(depcheck.dependency_add("npm i x"))
+            self.assertEqual(depcheck.dependency_doubt("npm i x"), ("npm i x", depcheck._WHY_UNPARSED))
+            self.assertIsNone(depcheck.dependency_doubt("PLANKA_DEP_OK=1 npm i x"))
+        # Сбой только прохода добавления — тоже сомнение (хук спрашивает сомнение, когда добавление не найдено).
+        with mock.patch.object(depcheck, "_segment_adds", side_effect=KeyError("x")):
+            self.assertEqual(depcheck.dependency_doubt("ls")[1], depcheck._WHY_UNPARSED)
+        # Сбой разбора shparse (исключение внутри parse) — тоже.
+        with mock.patch.object(shparse._R, "toplevel", side_effect=RuntimeError("x")):
+            self.assertEqual(depcheck.dependency_doubt("npm i x")[1], depcheck._WHY_UNPARSED)
+
+    def test_error_at_end_checks_line_start(self):
+        # Конструкция, не закрытая до конца ввода: начало строки до команды, где она открыта, проверяется
+        # (README, «Известные ограничения»: ошибка разбора, которой у bash нет, не прячет команды). bash 5.3 в
+        # песочнице bashdiff: каждая форма с `touch P1` вместо `npm i x` не исполняет ничего — ложный отказ, как у
+        # `echo )` ⏎ `npm i x`.
+        for command in ["npm i x; echo $(a=(\\\\ \"\\'))", "npm i x; echo $(a", "npm i x && echo $(a",
+                        "npm i x | if a", "npm i x; (a", "npm i x; echo $(a;b;c;d;e;f \"", 'npm i x; echo ")']:
+            with self.subTest(command):
+                self.assertEqual(depcheck.dependency_add(command), "npm i x")
+        # Команда внутри незакрытой конструкции не видна: начало — до её команды верхнего уровня.
+        self.assertIsNone(depcheck.dependency_add('echo $(npm i x; "b'))
+
+    def test_parsed_texts_in_bounds(self):
+        # Каждый текст, который разбирает детектор (команда, строки `eval`/`sh -c`, тела heredoc оболочки, начала
+        # строк с ошибкой), даёт узлы в пределах текста: позиция за концом роняла детектор IndexError (форма фаззера
+        # зерно 7, номер 4138 — строка `eval` с `\\` в конце; зерно 13, номер 3208).
+        path = pathlib.Path(__file__).parent / "tools" / "bashdiff.py"
+        spec = importlib.util.spec_from_file_location("bashdiff", path)
+        bashdiff = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bashdiff)
+        commands = []
+        for corpus in sorted((pathlib.Path(__file__).parent / "fixtures").glob("bash-*.jsonl")):
+            with open(corpus, encoding="utf-8") as fh:
+                commands += [json.loads(line).get("command") for line in fh if line.strip()]
+        forms = [(7, 4138), (13, 3208)] + [(seed, index) for seed in (7, 13) for index in range(1500)]
+        commands += [bashdiff.MARKER.sub(bashdiff.EVIL, bashdiff.generate(seed, index)[0]) for seed, index in forms]
+        parse = shparse.parse
+        bad = []
+
+        def checked(text, eof=""):
+            script = parse(text, eof)
+            bad.extend((text[:200], type(n).__name__, n.start, n.end) for n in shparse.walk(script)
+                       if not 0 <= n.start <= n.end <= len(text))
+            return script
+
+        with mock.patch.object(depcheck.shparse, "parse", checked):
+            for command in commands:
+                if isinstance(command, str):
+                    depcheck.dependency_add(command)
+                    depcheck.dependency_doubt(command)
+        self.assertEqual(bad[:3], [])
+
+    def test_nested_parameter_name_linear(self):
+        # Пробел ищется только в тексте внешнего `${…}`: вложенные — внутри него, их текст не перечитывается.
+        make = lambda n: "${a:-" * n + "x" + "}" * n  # noqa: E731
+        small, large = make(250), make(1000)
+        assert_linear(self, lambda: depcheck.dependency_doubt(small), lambda: depcheck.dependency_doubt(large))
+        self.assertEqual(depcheck.dependency_doubt("${a:-" * 3 + "npm i x" + "}" * 3)[1], depcheck._WHY_NAME)
+        self.assertEqual(depcheck.dependency_doubt('${a:-"${b:-' + "npm i x" + '}"}')[1], depcheck._WHY_NAME)
+
+
 class GrammarLinearTest(unittest.TestCase):
     """Разбор над деревом линеен по длине команды."""
 
+    @mock.patch.object(shparse, "_STACK_MAX", 10 ** 9)  # линейность разбора, а не предел (DepthLimitTest)
     def test_linear(self):
         forms = {
             "nested": lambda n: "$(" * n + "npm i x" + ")" * n,

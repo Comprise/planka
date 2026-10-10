@@ -669,6 +669,19 @@ class BashTest(unittest.TestCase):
         reason = output(self.bash("npm --dry-run false install x"))["hookSpecificOutput"]["permissionDecisionReason"]
         self.assertNotIn("сомнени", reason)
 
+    def test_nesting_beyond_parser_limit_denied(self):
+        # Вложенность сверх предела разбора: хук завершается и отказывает с сомнением, маркер в начале — пропуск.
+        nested = "echo " + "${a:-" * 100000 + "x" + "}" * 100000
+        r = self.bash("npm i evil; " + nested)
+        self.assertEqual(r.returncode, 0)
+        out = output(r)["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("вложенность", out["permissionDecisionReason"])
+        self.assertEqual(self.env.log_lines()[-1]["verdict"], "deny-dep")
+        r = self.bash("PLANKA_DEP_OK=1 " + nested)
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+
     def test_doubtful_dependency_marker_passes(self):
         r = self.bash("echo x | PLANKA_DEP_OK=1 xargs npm install")
         self.assertEqual(r.stdout, "")

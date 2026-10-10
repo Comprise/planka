@@ -116,6 +116,15 @@ _WHY_COMPUTED = ("строка команд вычисляется при исп
                  "оболочке: её команды не видны")
 _WHY_LAUNCHER = ("программа, неизвестная разбору, получает словами менеджер пакетов и его команду установки: она "
                  "может их запустить")
+# Разбор не дал дерева: вложенность глубже предела shparse (_STACK_MAX уровней стека разбора) или сбой разбора или
+# детектора на этом тексте. Добавляет ли команда пакет, неизвестно, а пропуск открыл бы обход проверки той же
+# установкой рядом с такой конструкцией (`npm i x; echo $(… ×5000 …)`): сомнение, маркер — в начале всей команды.
+_WHY_NESTING = (f"вложенность конструкций глубже предела разбора ({shparse._STACK_MAX} уровней стека разбора): "
+                "команды не разобраны; маркер согласия — в начале всей команды")
+_WHY_UNPARSED = ("разбор команды не удался (внутренняя ошибка детектора): команды не разобраны; маркер согласия — в "
+                 "начале всей команды")
+# Сколько знаков команды показывает сомнение без разбора.
+_UNPARSED_SHOWN = 200
 # Глаголы установки за именем менеджера в словах неизвестной программы (_launches_install; флаг за менеджером —
 # тоже: `pacman -S`, `npm -g i`): `go get`, `pipx inject`, `dnf in`, `bun a`, `apt satisfy`.
 _LAUNCH_VERBS = pkgmanagers._INSTALL_VERBS | {"get", "in", "inject", "a", "satisfy"}
@@ -938,30 +947,58 @@ _PREFIX_TRIES = 4
 _RECOVERIES = 16
 
 
+class _Unparsed(Exception):
+    """Разбор текста не дал дерева (shparse.DEPTH, shparse.INTERNAL): why — довод сомнения."""
+
+    def __init__(self, why):
+        super().__init__(why)
+        self.why = why
+
+
+def _parse(text):
+    """shparse.parse(text); разбор без дерева — _Unparsed."""
+    script = shparse.parse(text)
+    kind = script.error.kind if script.error is not None else None
+    if kind is not None:
+        raise _Unparsed(_WHY_NESTING if kind == shparse.DEPTH else _WHY_UNPARSED)
+    return script
+
+
 def _parses(command):
     """Разборы текста (текст, Script). После фатальной синтаксической ошибки bash не исполняет ни её команды, ни
     остаток, но ошибка разбора, которой у bash нет, не должна прятать команды («Ошибка дешевле»: ложный отказ
     дешевле пропуска): остаток разбирается заново со следующей строки, а начало строки с ошибкой до её лексемы — с
     командой `:` на следующей строке (оператор `&&`, `|` в конце начала не ошибка); новая ошибка в нём укорачивает
-    его до себя, не больше _PREFIX_TRIES раз. Остаток разбирается заново не больше _RECOVERIES раз."""
+    его до себя, не больше _PREFIX_TRIES раз. Ошибка на конце начала (конструкция, не закрытая до конца ввода:
+    `npm i x; echo $(a`) и ошибка скобок массива, отбросившая строку начала, укорачивают его до начала команды
+    верхнего уровня, где ошибка (SyntaxIssue.open).
+    Остаток разбирается заново не больше _RECOVERIES раз. Разбор без дерева — _Unparsed."""
     out = []
     for _ in range(_RECOVERIES + 1):
-        script = shparse.parse(command)
+        script = _parse(command)
         out.append((command, script))
         error = script.error
         if error is None or not error.fatal:
             return out
         last = script.commands[-1].end if script.commands else 0
-        prefix = command[max(last, command.rfind("\n", 0, error.pos) + 1):error.pos]
+        begin = max(last, command.rfind("\n", 0, error.pos) + 1)
+        prefix = command[begin:error.pos]
         for _ in range(_PREFIX_TRIES):
             if not prefix.strip():
                 break
             text = prefix + "\n:"
-            head = shparse.parse(text)
+            head = _parse(text)
             out.append((text, head))
-            if head.error is None or not head.error.fatal or head.error.pos >= len(prefix):
+            if head.error is None:
                 break
-            prefix = prefix[:head.error.pos]
+            cut = head.error.pos
+            if not head.error.fatal or cut >= len(prefix):
+                # Ошибка скобок массива отбросила строку начала, или конструкция не закрыта до его конца: начало —
+                # до команды верхнего уровня, где ошибка (SyntaxIssue.open).
+                cut = head.error.open
+                if cut is None or cut >= len(prefix):
+                    break
+            prefix = prefix[:cut]
         eol = command.find("\n", error.pos)
         if eol < 0:
             return out
@@ -1229,17 +1266,20 @@ def _segment_adds(info, depth):
 
 def _name_expands(word):
     """В слове есть подстановка (в том числе в "…" и в операторах `${…}`) или `${…}` с пробелом внутри: вывод или
-    значение делится на слова, и первое из них — имя команды. Тела подстановок не обходятся."""
-    stack = list(word.parts)
+    значение делится на слова, и первое из них — имя команды. Тела подстановок не обходятся. Пробел ищется только в
+    тексте внешнего `${…}`: текст вложенного — часть его текста, и перечитывать его на каждом уровне вложенности
+    значило бы квадратичное время."""
+    stack = [(part, False) for part in word.parts]
     while stack:
-        part = stack.pop()
+        part, inner = stack.pop()
         kind = type(part)
         if kind is shparse.Sub:
             return True
-        if kind is shparse.Param and any(c.isspace() for c in part.text):
+        if kind is shparse.Param and not inner and any(c.isspace() for c in part.text):
             return True
         if kind is shparse.DQ or kind is shparse.Param or kind is shparse.Arith:
-            stack.extend(part.parts or ())
+            inner = inner or kind is shparse.Param
+            stack.extend((child, inner) for child in part.parts or ())
     return False
 
 
@@ -1355,14 +1395,22 @@ def heredocs(line):
 
 def _segments(command):
     """Сегменты текста — простые команды дерева (_analysis) по порядку текста, в том числе в подстановках, телах
-    функций и heredoc оболочки, без пробелов по краям; их слова даёт _command."""
-    return [info.segment for info in _analysis(command)[0]]
+    функций и heredoc оболочки, без пробелов по краям; их слова даёт _command. Разбор без дерева (_Unparsed) — весь
+    текст одним сегментом: маркер согласия — в его начале, как у сомнения без разбора."""
+    try:
+        return [info.segment for info in _analysis(command)[0]]
+    except _Unparsed:
+        return [command.strip()] if command.strip() else []
 
 
 def _command(segment):
     """Слова команды сегмента (_strip_command) и стоит ли маркер согласия среди её ведущих присваиваний. Сегмент —
-    текст простой команды (_segments); из нескольких команд текста берётся первая по тексту."""
-    commands = _analysis(segment)[0]
+    текст простой команды (_segments); из нескольких команд текста берётся первая по тексту. Разбор без дерева — слов
+    нет, маркер — в начале текста (_UNPARSED_MARKER)."""
+    try:
+        commands = _analysis(segment)[0]
+    except _Unparsed:
+        return [], bool(_UNPARSED_MARKER.match(segment))
     if not commands:
         return [], False
     return list(commands[0].words), commands[0].marker
@@ -1372,8 +1420,11 @@ def _split(text, braces=False):
     """Пары (слово, начало) первой по тексту простой команды text (_pairs; при braces — с раскрытием фигурных
     скобок), с перенаправлениями по порядку текста: перенаправление — пара (оператор с номером и целью слитно,
     оператор с номером), её узнаёт _REDIRECT (`2>&1`; `< p.patch` — `<p.patch` и `<`); цель heredoc — терминатор.
-    Процесс-подстановка словом — её текст."""
-    commands = _analysis(text)[0]
+    Процесс-подстановка словом — её текст. Разбор без дерева — пар нет."""
+    try:
+        commands = _analysis(text)[0]
+    except _Unparsed:
+        return []
     if not commands:
         return []
     simple, text = commands[0].simple, commands[0].text
@@ -1401,17 +1452,46 @@ def dependency_doubt(command):
     за _MAX_WRAPPERS обёртками, имя команды — подстановка с глаголом установки, вывод подстановки или `${…}` с
     пробелом (_WHY_NAME: _expanded_install, _expanded_name_install, _name_doubt), подкоманда менеджера — подстановка
     или переменная (_WHY_SUBCOMMAND), строка оболочки вычисляется при исполнении (_WHY_COMPUTED), неизвестная
-    программа получает словами менеджер и глагол установки (_WHY_LAUNCHER). None — сомнения нет. Смысл — для
-    команды, где dependency_add добавления не нашёл; маркер согласия снимает сомнение там же, где и проверку."""
+    программа получает словами менеджер и глагол установки (_WHY_LAUNCHER); разбор без дерева — вложенность глубже
+    предела shparse (_WHY_NESTING) — или сбой разбора или детектора на тексте (_WHY_UNPARSED): сегмент — начало
+    команды, маркер — в начале всей команды. None — сомнения нет. Смысл — для команды, где dependency_add добавления
+    не нашёл; маркер согласия снимает сомнение там же, где и проверку."""
     if not isinstance(command, str):
         return None
-    return _within_call(_find_doubt, command)
+    try:
+        return _within_call(_doubt_pass, command)
+    except _Unparsed as exc:
+        why = exc.why
+    except Exception:  # noqa: BLE001 — сбой детектора на тексте команды: сомнение (_WHY_UNPARSED)
+        why = _WHY_UNPARSED
+    if _UNPARSED_MARKER.match(command):
+        return None
+    shown = command.strip()
+    if len(shown) > _UNPARSED_SHOWN:
+        shown = shown[:_UNPARSED_SHOWN - 1] + "…"
+    return shown, why
+
+
+# Маркер согласия в начале всей команды снимает сомнение без разбора (_WHY_NESTING, _WHY_UNPARSED).
+_UNPARSED_MARKER = re.compile(r"\s*" + re.escape(DEP_OK_MARKER) + r"[ \t]")
+
+
+def _doubt_pass(command, depth):
+    """Проход сомнения: сначала проход добавления (_find) — его сбой на тексте тоже сомнение, а не пропуск: хук
+    спрашивает dependency_doubt, когда dependency_add ничего не вернул, в том числе из-за сбоя; затем _find_doubt.
+    Разборы текстов вызова общие (_within_call): проход добавления их не повторяет."""
+    _find(command, depth)
+    return _find_doubt(command, depth)
 
 
 def dependency_add(command):
     """Сегмент команды, добавляющий пакет; None, если такого нет. Маркер согласия снимает проверку с
     сегмента, где он стоит среди ведущих присваиваний команды, в том числе после `sudo`, `env`, `if`
-    (`PLANKA_DEP_OK=1 npm install x`)."""
+    (`PLANKA_DEP_OK=1 npm install x`). Разбор без дерева и сбой детектора — None: сомнение о такой команде отдаёт
+    dependency_doubt."""
     if not isinstance(command, str):
         return None
-    return _within_call(_find, command)
+    try:
+        return _within_call(_find, command)
+    except Exception:  # noqa: BLE001 — разбор без дерева или сбой детектора: сомнение отдаёт dependency_doubt
+        return None

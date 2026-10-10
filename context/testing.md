@@ -201,8 +201,27 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
 - Детектор зависимостей над деревом `shparse` — `tests/test_depcheck.py`: формы, которые разбор читает как bash
   (`GrammarFormsTest`; проверка остатка после фатальной ошибки — `test_syntax_error_recovery`), внешнее раскрытие в
   строке оболочки (`OuterExpansionScriptTest`: сомнение и его исключения, вход оболочки, маркер у оболочки покрывает
-  тело heredoc — `test_marker_covers_heredoc`), имя команды — вывод подстановки (`NameOutputTest`); вердикты корпусов —
-  `CorpusTest` и `tests/test_bash_corpus.py`. Разбор shell сам по себе — `tests/test_shparse.py`.
+  тело heredoc — `test_marker_covers_heredoc`), имя команды — вывод подстановки (`NameOutputTest`); края разбора, на
+  которых детектор падал или молчал (`ParserLimitsTest`: позиции слова, раскрытого по напечатанному тексту, и узлы в
+  пределах каждого разобранного детектором текста — команды, строки `eval`, начала строк с ошибкой — на корпусах и
+  формах фаззера (`test_parsed_texts_in_bounds`); вложенность
+  10⁵ уровней — подпроцессом, сомнение `_WHY_NESTING`; сбой детектора и разбора — сомнение `_WHY_UNPARSED`, маркер в
+  начале команды; конструкция, не закрытая до конца ввода, — начало строки проверяется; линейность `_name_expands`);
+  вердикты корпусов — `CorpusTest` и `tests/test_bash_corpus.py`. Разбор shell сам по себе — `tests/test_shparse.py`:
+  `PositionsTest` — `0 ≤ start ≤ end ≤ len(text)` у каждого узла на корпусах `tests/fixtures/bash-*.jsonl` и формах
+  фаззера (зёрна 7 и 13, по 4000 форм обеих разновидностей; генератор `tests/tools/bashdiff.py` загружается по пути,
+  формы только разбираются); `DepthLimitTest` — предел стека разбора `shparse._STACK_MAX`: 10⁵ уровней каждого вида
+  вложенности подпроцессом (segfault не роняет тест-раннер) — ошибка `DEPTH`, корпуса и формы фаззера не доходят и до
+  100 уровней (`_STACK_MAX` подменён на 100), дерево до предела — не глубже двух пределов. Тесты линейности, чей вход
+  глубже предела, и `LinearityTest.test_deep_nesting` (глубина 10⁴ без `RecursionError`) снимают предел подменой
+  `_STACK_MAX`: они проверяют сам разбор, а на пределе вложенный вход кончался бы ошибкой `DEPTH` сразу, и проверка
+  прошла бы впустую. Такие тесты: `LinearityTest.test_nesting`, `test_heredocs`, `ReparseLinearityTest.test_nesting`,
+  `PrintedTextTest.test_linear` (`tests/test_shparse.py`); `test_linear` классов `ArithmeticOutsideQuotesTest`,
+  `ArithmeticQuotesTest`, `ArithmeticSubstitutionTest`, `ExpandedNameTest`, `FunctionSubstitutionTest`,
+  `GrammarLinearTest`, `HeredocInSubstitutionEndTest`, `ParameterExpansionSpaceTest` (`tests/test_depcheck.py`);
+  `LinearParseTest.test_string_substitutions_are_linear` (`tests/test_comments.py`),
+  `SegmentsTest.test_shift_after_open_parens_linear` (`tests/test_debug_watch.py`). Новый тест линейности с
+  вложенностью глубже предела подменяет его так же.
 - Разделители команд `debug_watch._segments` (по дереву `shparse`) — `SegmentsTest` в `tests/test_debug_watch.py`:
   разделитель в подстановке, образце `case`, скобках массива и перенаправлении `>|` команды не делит
   (`test_operators_outside_words_only`), строка с фатальной синтаксической ошибкой — одна команда
@@ -235,7 +254,8 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
   `SegmentsTest.test_shift_after_open_parens_linear` там же (`<` после тысяч открытых `(`),
   `Code1IsAnswerTest.test_long_word_linear` там же (слово длиннее `_HEAD_LIMIT`),
   `ShellTreeTest.test_many_fatal_errors_linear` в `tests/test_comments.py` (повторный разбор после каждой фатальной
-  ошибки), `UserAndWatchWrappersTest.test_linear`
+  ошибки), `ParserLimitsTest.test_nested_parameter_name_linear` в `tests/test_depcheck.py` (имя команды из вложенных
+  `${a:-…}`), `UserAndWatchWrappersTest.test_linear`
   в `tests/test_depcheck.py` (цепочки `su`/`runuser`/`watch`), `GemfileTest.test_linear_on_long_line` в
   `tests/test_manifests.py` (строки Gemfile из кавычек и пробелов), `ImportParseTest.test_strip_code_linear` в
   `tests/test_guard_memory.py` (незакрытые `<!--`, серии обратных кавычек);

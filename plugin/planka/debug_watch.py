@@ -164,8 +164,14 @@ def _segments(command, script=None):
     оператор между командами (_SEPARATOR) вне слов, перенаправлений, «((…))», «[[ … ]]», комментариев и тел
     heredoc; внутри подстановки, группы слов и скобок массива разделителей нет; комментарии и тела heredoc из
     текста команд убраны. После синтаксической ошибки bash не исполняет остаток: от начала команды с ошибкой он
-    одна команда без разделителей. script — готовый shparse.parse(command)."""
+    одна команда без разделителей. script — готовый shparse.parse(command). Разбор без дерева (вложенность глубже
+    предела shparse, сбой разбора) — команд нет, с предупреждением: код 1 такой строки считается неудачей."""
     script = shparse.parse(command) if script is None else script
+    kind = script.error.kind if script.error is not None else None
+    if kind is not None:
+        why = "вложенность глубже предела разбора" if kind == shparse.DEPTH else "сбой разбора"
+        common.warn(f"команда не разобрана ({why}): её код выхода 1 считается неудачей")
+        return []
     nodes = list(shparse.walk(script))
     cuts = _merge(list(_comment_ranges(nodes)) + _skip_heredocs(command, script, nodes))
     cut_starts = [start for start, _ in cuts]

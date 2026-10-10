@@ -1,9 +1,13 @@
 import contextlib
+import importlib.util
+import json
 import pathlib
 import signal
+import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 
 PLANKA_DIR = pathlib.Path(__file__).resolve().parent.parent / "plugin" / "planka"
 sys.path.insert(0, str(PLANKA_DIR))
@@ -128,6 +132,164 @@ class ContractTest(unittest.TestCase):
         for line, want in cases:
             with self.subTest(line):
                 self.assertEqual(shparse.heredocs(line), want)
+
+
+def _bashdiff():
+    """Генератор форм фаззера tests/tools/bashdiff.py (скрипт разработки без пакета): формы только разбираются."""
+    path = pathlib.Path(__file__).parent / "tools" / "bashdiff.py"
+    spec = importlib.util.spec_from_file_location("bashdiff", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def out_of_bounds(text):
+    """Узлы дерева text, чьи позиции не в 0 ≤ start ≤ end ≤ len(text): (вид, start, end)."""
+    return [(type(n).__name__, n.start, n.end) for n in shparse.walk(shparse.parse(text))
+            if not 0 <= n.start <= n.end <= len(text)]
+
+
+class PositionsTest(unittest.TestCase):
+    """Позиции каждого узла — в исходном тексте: 0 ≤ start ≤ end ≤ len(text). Детектор и разбор комментариев режут
+    текст по ним (depcheck._glob_marks, _part_text); позиция за концом текста роняла детектор IndexError, и хук
+    пропускал команду."""
+
+    def test_reexpanded_word(self):
+        # Слово, раскрытое заново по напечатанному тексту (`for a do` печатается `for a in "$@"; do`): позиции
+        # частей — по узлам, а не одним сдвигом от начала слова.
+        text = "echo $(for a do a=(\\\\);done)"
+        self.assertEqual(out_of_bounds(text), [])
+        lits = [n for n in shparse.walk(shparse.parse(text)) if type(n) is shparse.Lit and n.text == "a=(\\)"]
+        self.assertEqual([(n.start, n.end) for n in lits], [(text.index("a=("), text.index(";done"))])
+
+    def test_heredoc_body_at_end(self):
+        # Тело, склеенное `\` с переводом строки до конца ввода, кончается дописанным переводом строки.
+        for text in [":  <<E1\nx \\\nE1", ": <<E\na $(echo b\nE\\\nE"]:
+            with self.subTest(text):
+                self.assertEqual(out_of_bounds(text), [])
+
+    def test_trailing_backslash(self):
+        # Нечётный ряд `\` в конце ввода: shell_getc дописывает ещё `\`, и последний `\` текста — литерал; его
+        # позиция — последний символ текста (строка `eval` формы фаззера: зерно 7, номер 4138).
+        text = "! true \\\n\\ \\\n\\"
+        self.assertEqual(out_of_bounds(text), [])
+        self.assertEqual(shparse.parse(text).commands[0].commands[0].words[-1].literal(), " \\")
+
+    def test_corpora(self):
+        root = pathlib.Path(__file__).parent / "fixtures"
+        for path in sorted(root.glob("bash-*.jsonl")):
+            with open(path, encoding="utf-8") as fh:
+                commands = [json.loads(line).get("command") for line in fh if line.strip()]
+            for number, text in enumerate(commands, 1):
+                if isinstance(text, str):
+                    bad = out_of_bounds(text)
+                    if bad:
+                        with self.subTest(file=path.name, line=number):
+                            self.fail(f"{bad[:3]}: {text[:200]!r}")
+
+    def test_fuzz_forms(self):
+        # Зёрна 7 и 13, обе разновидности генератора: здесь находились позиции за концом текста (зерно 13, номера
+        # 2682, 3208; зерно 7 без исполнения, номер 1465) и конец раньше начала (зерно 13, номер 1649).
+        bashdiff = _bashdiff()
+        for seed in (7, 13):
+            for runtime in (True, False):
+                for index in range(4000):
+                    text = bashdiff.generate(seed, index, runtime=runtime)[0]
+                    bad = out_of_bounds(text)
+                    if bad:
+                        with self.subTest(seed=seed, runtime=runtime, index=index):
+                            self.fail(f"{bad[:3]}: {text[:200]!r}")
+
+
+# Вложенность на 10⁵ уровней каждого вида: (начало, открытие, середина, закрытие).
+DEEP_FORMS = {
+    "param": ("echo ", "${a:-", "x", "}"),
+    "arith": ("echo ", "$(( ", "1", " ))"),
+    "subscript": ("echo ", "${a[", "1", "]}"),
+    "comsub": ("echo ", "$(", "a", ")"),
+    "comsub_dq": ("echo ", '"$(', "a", ')"'),
+    "funsub": ("echo ", "${ ", "a", "; }"),
+    "procsub": ("cat ", "<(", "a", ")"),
+    "subshell": ("", "( ", "a", " )"),
+    "group": ("", "{ ", "a", "; }"),
+    "if": ("", "if a; then ", "b", "; fi"),
+    "case": ("", "case a in a) ", "b", " ;; esac"),
+    "cond": ("[[ ", "( ", "a", " )"),
+}
+
+# Разбор в отдельном процессе: segfault CPython не роняет тест-раннер. Печатает вид ошибки разбора.
+DEEP_SCRIPT = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import shparse
+head, opening, middle, closing = sys.argv[2:6]
+n = int(sys.argv[6])
+script = shparse.parse(head + opening * n + middle + closing * n + (" ]]" if head == "[[ " else ""))
+print(script.error.kind if script.error is not None else None)
+"""
+
+
+class DepthLimitTest(unittest.TestCase):
+    """Стек разбора глубже shparse._STACK_MAX — ошибка вида DEPTH: дерево не строится. Без предела вложенность
+    10⁴–10⁵ уровней съедала память и роняла CPython segfault (код 139 без ответа хука — команда исполнялась)."""
+
+    def test_deep_forms_in_subprocess(self):
+        for name, form in DEEP_FORMS.items():
+            with self.subTest(name):
+                done = subprocess.run([sys.executable, "-c", DEEP_SCRIPT, str(PLANKA_DIR), *form, "100000"],
+                                      capture_output=True, text=True, timeout=300)
+                self.assertEqual((done.returncode, done.stdout.strip()), (0, shparse.DEPTH), done.stderr[-500:])
+
+    def test_error_and_empty_tree(self):
+        text = "npm i x; echo " + "$(" * 10000 + "a" + ")" * 10000
+        script = shparse.parse(text)
+        self.assertEqual((script.error.fatal, script.error.kind), (True, shparse.DEPTH))
+        self.assertEqual(script.commands, [])
+        self.assertEqual(shparse.heredocs("cat <<E " + "$(" * 10000), [])
+
+    def test_real_inputs_far_below_limit(self):
+        # Корпуса и формы фаззера не доходят и до 100 уровней стека: предел 4000 — с запасом в 40 раз.
+        root = pathlib.Path(__file__).parent / "fixtures"
+        texts = []
+        for path in sorted(root.glob("bash-*.jsonl")):
+            with open(path, encoding="utf-8") as fh:
+                texts += [json.loads(line).get("command") for line in fh if line.strip()]
+        bashdiff = _bashdiff()
+        texts += [bashdiff.generate(seed, index)[0] for seed in (7, 13) for index in range(2000)]
+        with mock.patch.object(shparse, "_STACK_MAX", 100):
+            deep = [text[:100] for text in texts if isinstance(text, str)
+                    and getattr(shparse.parse(text).error, "kind", None) == shparse.DEPTH]
+        self.assertEqual(deep, [])
+
+    def test_tree_depth_within_limit(self):
+        # Дерево, построенное до предела, — не глубже двух пределов: у вложенных видов узлов на уровень не больше
+        # 1,5 уровня стека (heredoc в `$((…) …)`), в том числе у повторных разборов — они идут тем же стеком.
+        limit = 400
+        kinds = {**LinearityTest.KINDS, **LinearityTest.HEREDOCS}
+        kinds.update({"reparse_" + name: (lambda wrap: lambda n: chain(wrap, n))(wrap)
+                      for name, wrap in ReparseLinearityTest.KINDS.items()})
+        with mock.patch.object(shparse, "_STACK_MAX", limit):
+            for name, make in kinds.items():
+                with self.subTest(name):
+                    for n in range(1, limit, 7):
+                        script = shparse.parse(make(n))
+                        self.assertLessEqual(tree_depth(script), 2 * limit)
+                        if script.error is not None and script.error.kind == shparse.DEPTH:
+                            break
+
+
+def tree_depth(node):
+    """Глубина дерева узлов без рекурсии; узел, взятый готовым в нескольких местах, считается один раз."""
+    depth = {}
+    stack = [(node, False)]
+    while stack:
+        cur, done = stack.pop()
+        if done:
+            depth[id(cur)] = 1 + max((depth[id(c)] for c in cur.children()), default=0)
+        elif id(cur) not in depth:
+            stack.append((cur, True))
+            stack.extend((c, False) for c in cur.children() if id(c) not in depth)
+    return depth[id(node)]
 
 
 class InputClassesTest(unittest.TestCase):
@@ -524,6 +686,7 @@ class PrintedTextTest(unittest.TestCase):
             with self.subTest(text):
                 self.assertEqual(cmds(self.printed(text)), cmds(text))
 
+    @mock.patch.object(shparse, "_STACK_MAX", 10 ** 9)  # линейность разбора, а не предел (DepthLimitTest)
     def test_linear(self):
         for make in [lambda n: "echo " + "$(" * n + "a" + ")" * n,
                      lambda n: "echo \"" + "$(echo " * n + "a" + ")" * n + "\"",
@@ -895,11 +1058,13 @@ class LinearityTest(unittest.TestCase):
         small, large = make(n), make(4 * n)
         assert_linear(self, lambda: self.walk_all(small), lambda: self.walk_all(large))
 
+    @mock.patch.object(shparse, "_STACK_MAX", 10 ** 9)  # линейность разбора, а не предел (DepthLimitTest)
     def test_nesting(self):
         for name, make in self.KINDS.items():
             with self.subTest(name):
                 self.check(make)
 
+    @mock.patch.object(shparse, "_STACK_MAX", 10 ** 9)  # линейность разбора, а не предел (DepthLimitTest)
     def test_heredocs(self):
         for name, make in self.HEREDOCS.items():
             with self.subTest(name):
@@ -909,7 +1074,9 @@ class LinearityTest(unittest.TestCase):
         small, large = "cat <<E " * 2000, "cat <<E " * 8000
         assert_linear(self, lambda: shparse.heredocs(small), lambda: shparse.heredocs(large))
 
+    @mock.patch.object(shparse, "_STACK_MAX", 10 ** 9)
     def test_deep_nesting(self):
+        # Глубина 10⁴ без предела стека разбора: рекурсии Python нет (предел — DepthLimitTest).
         limit = sys.getrecursionlimit()
         sys.setrecursionlimit(1000)
         kinds = {**self.KINDS, **self.HEREDOCS}
@@ -988,6 +1155,7 @@ class ReparseLinearityTest(unittest.TestCase):
         shparse.simple_commands(script)
         list(shparse.walk(script))
 
+    @mock.patch.object(shparse, "_STACK_MAX", 10 ** 9)  # линейность разбора, а не предел (DepthLimitTest)
     def test_nesting(self):
         for name, wrap in self.KINDS.items():
             small, large = chain(wrap, 200), chain(wrap, 800)

@@ -21,17 +21,22 @@
 - `$(…)` bash хранит напечатанной (print_comsub) и при раскрытии слова разбирает заново без стека разделителей.
   Расходится с чтением только `\\` в словах скобок массива внутри подстановки: при чтении разделитель — `(`, `{`
   подстановки или `"` вокруг неё, и `\\` не экранирует (read_token_word); при раскрытии — экранирует. Такое слово
-  раскрывается заново по своему тексту (`_reexpand_word`); его границу задаёт чтение.
+  раскрывается заново по своему тексту (`_reexpand_word`); его границу задаёт чтение. Позиции частей такого слова
+  переводятся в исходный текст по узлам напечатанного текста (`_printed_pieces`): печать длиннее или короче исходного.
+- Позиции узлов — в исходном тексте: 0 ≤ start ≤ end ≤ len(text).
 - Рекурсии Python по глубине входа нет: разбор написан генераторами, вложенный вызов — `yield генератор`, стек
   вызовов ведёт `_run`. Разбор, `walk` и `simple_commands` линейны по длине текста; исключения, как в bash, —
   цепочки heredoc в подстановке в теле heredoc (строки тела внутреннего heredoc перечитываются на каждом уровне) и
   вложенные подстановки, чьи слова скобок массива с `\\` при чтении и при раскрытии делятся по-разному (`\\'`
   открывает кавычку только при чтении): каждый уровень раскрытия читает весь вложенный текст заново.
+- Стек генераторов не глубже `_STACK_MAX`: за пределом разбор кончается ошибкой вида DEPTH, дерево не строится.
 
 Синтаксическая ошибка (`Script.error`): `fatal=True` — bash прекращает чтение (команды до неё исполнены, её команда и
 следующие — нет); `fatal=False` — ошибка скобок присваивания массива (parse_compound_assignment): bash отбрасывает
 команду и остаток физической строки (reset_parser) и читает со следующей строки (`Script.dropped`). Тела heredoc,
 уже прочитанные с той строки, остаются прочитанными; heredoc после ошибки не открыт, его тело читается командами.
+`SyntaxIssue.kind` — DEPTH (предел стека) или INTERNAL (сбой разбора): дерева нет, `commands` пусты;
+`SyntaxIssue.open` — начало команды верхнего уровня, где ошибка.
 """
 
 import bisect
@@ -160,28 +165,37 @@ def _collect(value, out):
 
 
 def _node(cls, start, end, **fields):
-    """Узел класса cls с позициями и полями (не заданные — None)."""
+    """Узел класса cls с позициями и полями (не заданные — None). Конец — не раньше начала: bash читает отложенные
+    куски ввода не по порядку текста (push_string `((…)`, оказавшейся подоболочкой, остаток строки терминатора), и
+    последняя лексема узла бывает левее первой."""
     node = cls.__new__(cls)
     node.start = start
-    node.end = end
+    node.end = end if end >= start else start
     for name in cls.__slots__:
         setattr(node, name, fields.get(name))
     return node
 
 
 class SyntaxIssue:
-    """Синтаксическая ошибка: pos — начало лексемы, на которой bash её нашёл; fatal — прекращает ли bash чтение."""
-    __slots__ = ("pos", "fatal")
+    """Синтаксическая ошибка: pos — начало лексемы, на которой bash её нашёл; fatal — прекращает ли bash чтение.
+    kind — None (ошибка грамматики bash), DEPTH (вложенность глубже _STACK_MAX: разбор остановлен, дерево не
+    построено) или INTERNAL (сбой разбора: весь текст — ошибка в начале); open — у ошибки в команде верхнего уровня
+    начало этой команды (у ошибки на конце ввода — команды, где открыта незакрытая конструкция), иначе None."""
+    __slots__ = ("pos", "fatal", "kind", "open")
 
-    def __init__(self, pos, fatal):
+    def __init__(self, pos, fatal, kind=None, open=None):
         self.pos = pos
         self.fatal = fatal
+        self.kind = kind
+        self.open = open
 
     def __repr__(self):
-        return f"SyntaxIssue({self.pos}, fatal={self.fatal})"
+        kind = f", kind={self.kind!r}" if self.kind is not None else ""
+        return f"SyntaxIssue({self.pos}, fatal={self.fatal}{kind})"
 
     def __eq__(self, other):
-        return isinstance(other, SyntaxIssue) and (self.pos, self.fatal) == (other.pos, other.fatal)
+        return isinstance(other, SyntaxIssue) and (self.pos, self.fatal, self.kind) == (other.pos, other.fatal,
+                                                                                         other.kind)
 
     __hash__ = None
 
@@ -305,7 +319,7 @@ class Heredoc(Node):
     кавычках — один Lit); body_text — текст тела, как его читает bash (`\\` с переводом строки снят у терминатора
     без кавычек, табы `<<-` сняты); word — Word терминатора. start, end — слово терминатора."""
     __slots__ = ("term", "strip_tabs", "quoted", "body_start", "body_end", "parts", "word", "body_text", "_ranges",
-                 "memo", "skel")
+                 "_pieces", "memo", "skel")
     _fields = ("parts",)
 
 
@@ -385,17 +399,25 @@ def _literal(parts):
 
 
 class _Fatal(Exception):
-    """Синтаксическая ошибка, после которой bash прекращает чтение (yyerror, YYABORT)."""
+    """Синтаксическая ошибка, после которой bash прекращает чтение (yyerror, YYABORT). open — начало команды
+    верхнего уровня, внутри которой она найдена (SyntaxIssue.open)."""
     def __init__(self, pos):
         super().__init__(pos)
         self.pos = pos
+        self.open = None
+
+
+class _TooDeep(Exception):
+    """Стек генераторов разбора глубже _STACK_MAX: разбор остановлен (SyntaxIssue.kind == DEPTH)."""
 
 
 class _Discard(Exception):
-    """Ошибка скобок присваивания массива: jump_to_top_level (DISCARD) — команда и остаток строки отброшены."""
+    """Ошибка скобок присваивания массива: jump_to_top_level (DISCARD) — команда и остаток строки отброшены. open —
+    как у _Fatal."""
     def __init__(self, pos):
         super().__init__(pos)
         self.pos = pos
+        self.open = None
 
 
 class _ScanStop(Exception):
@@ -408,9 +430,23 @@ class _ScanStop(Exception):
         self.pos = pos
 
 
+# Вид SyntaxIssue.kind: вложенность глубже предела и сбой разбора.
+DEPTH = "depth"
+INTERNAL = "internal"
+
+# Наибольшая глубина стека генераторов разбора (_run). Вложенная конструкция занимает от 2 (`${a:-…}`) до 25
+# (`$([[ a =~ ($(…)) ]])`) уровней стека; на корпусах tests/fixtures/bash-*.jsonl и формах фаззера — не больше 80.
+# Без предела глубокая вложенность (`${a:-` ×16000, `$(( ` ×16000, `$(` ×20000…40000) съедала память (текст
+# `${…}` хранит текст вложенных, печать `$((…))` — тоже) и роняла CPython segfault при освобождении дерева под
+# пределом памяти: хук выходил с кодом 139 без ответа, и команда исполнялась. За пределом разбор кончается ошибкой
+# DEPTH; дерево глубже не строится (у повторных разборов — тот же стек: они вызываются из того же _run).
+_STACK_MAX = 4000
+
+
 def _run(gen):
     """Исполняет генератор разбора: `yield g` — вызов вложенного генератора g, его возврат — значение `yield`.
-    Стек вызовов — список, рекурсии Python нет. Исключение вложенного генератора бросается в вызвавший."""
+    Стек вызовов — список, рекурсии Python нет. Исключение вложенного генератора бросается в вызвавший. Стек глубже
+    _STACK_MAX — _TooDeep из самого _run, мимо обработчиков генераторов."""
     stack = [gen]
     value = None
     error = None
@@ -435,6 +471,8 @@ def _run(gen):
             error = exc
             continue
         stack.append(sub)
+        if len(stack) > _STACK_MAX:
+            raise _TooDeep()
         value = None
 
 
@@ -947,6 +985,9 @@ class _R:
         self.pieces = pieces  # [(локальное начало, исходное начало)] по возрастанию или None
         self.limit = limit  # наибольшая исходная позиция (строка напечатана bash: позиции — в пределах подстановки)
         self.piece_starts = [p[0] for p in pieces] if pieces else None
+        # Наибольшая исходная позиция каждого куска или None (_printed_pieces): у напечатанного текста кусок между
+        # двумя узлами бывает длиннее исходного, и без предела позиции его конца обгоняли бы начало следующего.
+        self.caps = None
         # Ввод: текущий кусок [pos, lim], стек отложенных кусков, первая непрочитанная строка.
         self.pos = 0
         self.lim = -1
@@ -1017,7 +1058,7 @@ class _R:
         """Новый разбор той же строки с позиции start (без копии текста): bash разбирает её ещё раз при раскрытии."""
         sub = _R("", None, self.comments, shared=self.shared, foreign=dict(self.sub_memo))
         sub.s, sub.n0, sub.n, sub.limit = self.s, self.n0, self.n, self.limit
-        sub.pieces, sub.piece_starts = self.pieces, self.piece_starts
+        sub.pieces, sub.piece_starts, sub.caps = self.pieces, self.piece_starts, self.caps
         sub.frontier = start
         # Пары скобок, которые нашёл parse_matched_pair этой строки: `((` в теле `<(((…) …)` — подоболочка без
         # нового прохода (arith_cmd), `<((` — без нового parse_matched_pair (parse_comsub).
@@ -1033,9 +1074,19 @@ class _R:
             return i
         k = max(0, bisect.bisect_right(self.piece_starts, i) - 1)
         local, orig = self.pieces[k]
+        out = orig + (i - local)
+        if self.caps is not None and self.caps[k] is not None:
+            out = min(out, self.caps[k])
         if self.limit is not None:
-            return min(orig + (i - local), self.limit)
-        return orig + (i - local)
+            return min(out, self.limit)
+        return out
+
+    def CP(self, i):
+        """Позиция символа строки i в исходном тексте: `\\`, дописанный в конце ввода (shell_getc, _R), — на месте
+        последнего символа текста: его позиция вышла бы за конец текста."""
+        if i >= self.n0 and self.n0 > 0:
+            return self.P(self.n0 - 1)
+        return self.P(i)
 
     def PE(self, i):
         """Конец диапазона: позиция после последнего символа."""
@@ -1060,7 +1111,10 @@ class _R:
                     pl, po = self.pieces[k]
                     nxt = self.pieces[k + 1][0] if k + 1 < len(self.pieces) else b
                     stop = min(b, nxt)
-                    out.append((local + (i - a), po + (i - pl)))
+                    orig = po + (i - pl)
+                    if self.caps is not None and self.caps[k] is not None:
+                        orig = min(orig, self.caps[k])
+                    out.append((local + (i - a), orig))
                     i = stop
                     k += 1
             local += b - a
@@ -1285,6 +1339,8 @@ class _R:
         text = "".join(body_text)
         doc.body_text = text
         doc._ranges = body_ranges
+        # Перевод позиций тела в исходный текст: печать (_render с where) ставит тело за строкой команды.
+        doc._pieces = self.orig_pieces(body_ranges)
         if doc.quoted:
             doc.parts = [_node(Lit, doc.body_start, doc.body_end, text=text)] if text else []
 
@@ -1366,8 +1422,10 @@ class _R:
         text = doc.body_text
         if not text:
             return []
-        sub = _R(text, self.orig_pieces(doc._ranges) or [(0, doc.body_start)], self.comments, shared=self.shared,
-                 tail=False, foreign=self.memo_in(doc._ranges))
+        # Предел — последний символ тела в исходном тексте: в конце ввода тело кончается переводом строки, которого
+        # в тексте нет (read_a_line), и его позиция вышла бы за конец текста.
+        sub = _R(text, doc._pieces or [(0, doc.body_start)], self.comments, shared=self.shared,
+                 tail=False, limit=max(doc.body_start, doc.body_end - 1), foreign=self.memo_in(doc._ranges))
         sub.pos, sub.lim, sub.frontier = 0, -1, 0
         parts = yield sub.scan_text(_P_HEREDOC)
         doc.memo = sub.sub_memo
@@ -1587,7 +1645,7 @@ class _R:
             if pass_next:
                 pass_next = False
                 tok.append(c)
-                parts.char(c, P(self.cpos), True)
+                parts.char(c, self.CP(self.cpos), True)
                 all_digit = all_digit and c in _DIGITS
                 c = self.getc(self._cd() != "'")
                 continue
@@ -1616,14 +1674,14 @@ class _R:
                 quoted = True
                 tok.append(c)
                 if not pass_next:
-                    parts.char(c, P(self.cpos), True)
+                    parts.char(c, self.CP(self.cpos), True)
                 all_digit = False
                 c = self.getc(False if pass_next else cd != "'")
                 continue
             if (not whole and (self.state & _FUNSUBST) and not tok and not quoted and c == "}"
                     and self.resword_ok(self.last)):
                 tok.append(c)
-                parts.char(c, P(self.cpos))
+                parts.char(c, self.CP(self.cpos))
                 all_digit = dollar_present = False
                 end_char = None
                 self.reexpand = outer
@@ -1652,7 +1710,7 @@ class _R:
             if not whole and (self.state & _REGEXP) and c in "(|":
                 if c == "|":
                     tok.append(c)
-                    parts.char(c, P(self.cpos))
+                    parts.char(c, self.CP(self.cpos))
                     all_digit = False
                     c = self.getc(self._cd() != "'")
                     continue
@@ -1771,7 +1829,7 @@ class _R:
                             tok.append(" ")
                         tok.append(_Tpl(w.value._tok or [w.text]))
                     tok.append(")")
-                    parts.char("=", P(epos))
+                    parts.char("=", self.CP(epos))
                     parts.text("(", P(epos + 1), P(epos + 1) + 1)
                     for k, w in enumerate(words):
                         if k:
@@ -1788,7 +1846,7 @@ class _R:
                 end_char = c
                 break
             tok.append(c)
-            parts.char(c, P(self.cpos))
+            parts.char(c, self.CP(self.cpos))
             all_digit = all_digit and c in _DIGITS
             if c == "$":
                 dollar_present = True
@@ -1822,11 +1880,18 @@ class _R:
         при раскрытии бывает дальше или ближе, чем при чтении: `"$(a=(\\)) ; touch P)"` исполняет `touch P`."""
         anchors = []
         text = _render(tok, anchors)
-        key = ("reexpand_word", self.P(start), text)
+        lo, hi = self.P(start), max(self.P(start), self.PE(end) - 1)
+        key = ("reexpand_word", lo, text)
         done = self.shared.get(key)
         if done is None:
-            sub = _R(text, [(0, self.P(start))], self.comments, shared=self.shared, tail=False,
-                     limit=self.PE(end), foreign=_seeds(anchors))
+            # Печать длиннее или короче исходного текста (`for a do` — `for a in "$@"; do`): позиции её частей
+            # переводятся в исходный текст по узлам, чьи начала и концы известны (_printed_pieces), а не одним
+            # сдвигом от начала слова; предел — последний символ слова.
+            where = []
+            _render(tok, where=where)
+            pieces, caps = _printed_pieces([(0, lo)] + where, lo, hi)
+            sub = _R(text, pieces, self.comments, shared=self.shared, tail=False, limit=hi, foreign=_seeds(anchors))
+            sub.caps = caps
             done = yield sub.scan_word()
             self.shared[key] = done
         parts = _Parts()
@@ -2154,13 +2219,13 @@ class _R:
                     continue
                 if dq or heredoc:
                     if ch in esc_set and not (heredoc and ch == "\n"):
-                        parts.char(ch, P(cp), True)
+                        parts.char(ch, self.CP(cp), True)
                     else:
-                        parts.char("\\", P(cp) - 1, True)
-                        parts.char(ch, P(cp), True)
+                        parts.char("\\", self.CP(cp) - 1, True)
+                        parts.char(ch, self.CP(cp), True)
                 else:
-                    parts.char("\\", P(cp) - 1, True)
-                    parts.char(ch, P(cp), True)
+                    parts.char("\\", self.CP(cp) - 1, True)
+                    parts.char(ch, self.CP(cp), True)
                 continue
             if ch == close:
                 count -= 1
@@ -2338,7 +2403,7 @@ class _R:
                 raise _ScanStop(parts.done(), exc.pos) from None
             if not handled:
                 if not bq:
-                    parts.char(ch, P(cp))
+                    parts.char(ch, self.CP(cp))
             if index_open:
                 index_open = False
                 index_mark = (parts.mark(), P(cp) + 1)
@@ -2636,6 +2701,8 @@ class _R:
         local, orig = self.pieces[k]
         if self.limit is not None and orig + (b - 1 - local) > self.limit:
             return None
+        if self.caps is not None and self.caps[k] is not None and orig + (b - 1 - local) > self.caps[k]:
+            return None
         return orig + (a - local)
 
     def _shared_get(self, dpos, ctx):
@@ -2787,11 +2854,12 @@ class _R:
             break
         return _seq(items, seps), t
 
-    def and_or(self, t):
-        """list1 без `;`, `&`, перевода строки: конвейеры через `&&`, `||` (перевод строки за ними пропускается)."""
+    def and_or(self, t, top=False):
+        """list1 без `;`, `&`, перевода строки: конвейеры через `&&`, `||` (перевод строки за ними пропускается).
+        top — список верхнего уровня (simple_list): фатальная ошибка в команде отмечает её начало (_Fatal.open)."""
         items, ops = [], []
         while True:
-            node, t = yield self.pipeline_command(t)
+            node, t = yield self.pipeline_command(t, top)
             items.append(node)
             if t.kind in ("&&", "||"):
                 ops.append(t.kind)
@@ -2804,8 +2872,9 @@ class _R:
             return items[0], t
         return _node(AndOr, items[0].start, items[-1].end, items=items, ops=ops), t
 
-    def pipeline_command(self, t):
-        """pipeline_command: `!` и `time` перед конвейером (или пустой командой, nullcmd_terminator)."""
+    def pipeline_command(self, t, top=False):
+        """pipeline_command: `!` и `time` перед конвейером (или пустой командой, nullcmd_terminator). top — как у
+        and_or."""
         bang = False
         timed = None
         start = t.start
@@ -2831,7 +2900,15 @@ class _R:
             return _node(Pipeline, start, start, commands=[], bang=bang, time=timed), t
         cmds = []
         while True:
-            node, t = yield self.command(t)
+            if top:
+                try:
+                    node, t = yield self.command(t)
+                except (_Fatal, _Discard) as exc:
+                    if exc.open is None:
+                        exc.open = t.start
+                    raise
+            else:
+                node, t = yield self.command(t)
             cmds.append(node)
             if t.kind in ("|", "|&"):
                 t = yield self.yylex()
@@ -3328,11 +3405,11 @@ class _R:
                     break
             except _Fatal as exc:
                 if error is None or not error.fatal:
-                    error = SyntaxIssue(exc.pos, True)
+                    error = SyntaxIssue(exc.pos, True, open=exc.open)
                 break
             except _Discard as exc:
                 if error is None:
-                    error = SyntaxIssue(exc.pos, False)
+                    error = SyntaxIssue(exc.pos, False, open=exc.open)
                 self._reset()
                 begin = self.P(self.unit_mark) if self.unit_mark is not None else exc.pos
                 dropped.append((begin, max(begin, self.PE(min(self.frontier, self.n0)))))
@@ -3360,7 +3437,7 @@ class _R:
         """simple_list верхнего уровня: до перевода строки или конца ввода (без переводов строки внутри)."""
         items, seps = [], []
         while True:
-            node, t = yield self.and_or(t)
+            node, t = yield self.and_or(t, True)
             items.append(node)
             if t.kind in (";", "&"):
                 seps.append(t.kind)
@@ -3522,7 +3599,7 @@ def _doc_skel(doc, need):
     return doc.skel
 
 
-def _render(pieces, anchors=None, skel=False, need=None):
+def _render(pieces, anchors=None, skel=False, need=None, where=None):
     """Текст, как его хранит и печатает bash (make_command_string, print_comsub в print_cmd.c): слова — текстом
     лексем, подстановки `$(…)`, `${ …; }`, `<(…)` — печатью их тела, heredoc — заголовок в строке команды, тела —
     за разделителем после неё. Пробелы и отступы bash не повторяются — только то, что меняет повторный разбор.
@@ -3530,7 +3607,11 @@ def _render(pieces, anchors=None, skel=False, need=None):
 
     anchors — список, куда добавляются (начало, конец, кусок) подстановок, уже разобранных parse_comsub (кусок с
     seed), внешних в тексте: повторный разбор текста берёт их готовыми (_seeds). skel — текст для chk_arithsub
-    (_skel): вложенные подстановки — их skel; need — список, куда добавляются подстановки без skel (_sub_skel)."""
+    (_skel): вложенные подстановки — их skel; need — список, куда добавляются подстановки без skel (_sub_skel).
+    where — список, куда добавляются пары (позиция результата, позиция исходного текста) у начала и конца каждого
+    узла, подстановки и тела heredoc, по порядку результата: перевод позиций повторного разбора результата в
+    исходный текст (_printed_pieces). С where куски с готовым текстом печатаются заново по их узлам; anchors с where
+    не задаётся."""
     out = []
     size = 0
     tail = ""
@@ -3555,6 +3636,14 @@ def _render(pieces, anchors=None, skel=False, need=None):
                     need.append(item)
                 else:
                     stack.extend(reversed(item))
+                continue
+            if where is not None:
+                # Текст каждого куска печатается заново по узлам.
+                if item.seed is not None:
+                    node = item.seed[0]
+                    where.append((size, node.start + 1))
+                    stack.append(("at", node.end))
+                stack.extend(reversed(item))
                 continue
             if anchors is not None:
                 if item.memo:
@@ -3583,7 +3672,12 @@ def _render(pieces, anchors=None, skel=False, need=None):
                 del out[mark:]
                 out.append(obj.text)
             elif tag == "sub":
+                if where is not None:
+                    where.append((size, item[1].start + 1))
+                    stack.append(("at", item[1].end))
                 stack.extend(reversed(_sub_items(item[1])))
+            elif tag == "at":
+                where.append((size, item[1]))
             elif tag == "hd":
                 pending[-1].append(item[1])
             elif tag == "conn":
@@ -3613,6 +3707,10 @@ def _render(pieces, anchors=None, skel=False, need=None):
                     continue
                 if anchors is not None and getattr(doc, "memo", None):
                     _memo_anchors(doc.memo, size, anchors)
+                if where is not None:
+                    where.extend((size + local, orig) for local, orig in getattr(doc, "_pieces", None)
+                                 or [(0, doc.body_start)])
+                    stack.append(("at", doc.body_end))
                 stack.append(doc.body_text)
             elif tag == "semi":
                 if not (tail.endswith("\n") or tail.endswith(";") or tail == " &"):
@@ -3624,8 +3722,30 @@ def _render(pieces, anchors=None, skel=False, need=None):
             elif tag == "leave":
                 pending.pop()
             continue
+        if where is not None:
+            where.append((size, item.start))
+            stack.append(("at", item.end))
         stack.extend(reversed(_node_items(item)))
     return "".join(out)
+
+
+def _printed_pieces(entries, lo, hi):
+    """Перевод позиций напечатанного текста (_render с where) в исходный текст: (куски [(начало в печати, начало
+    в исходном)], наибольшая исходная позиция каждого куска). Позиции — в [lo, hi]; кусок, который ведёт назад
+    (тело heredoc печатается за строкой команды, ввод bash читает отложенные куски не по порядку текста),
+    пропускается; предел куска — начало следующего: перевод не убывает, и начало узла повторного разбора не
+    дальше его конца."""
+    pieces = []
+    for local, orig in entries:
+        orig = min(max(orig, lo), hi)
+        if pieces and orig < pieces[-1][1]:
+            continue
+        if pieces and pieces[-1][0] == local:
+            pieces[-1] = (local, orig)
+        else:
+            pieces.append((local, orig))
+    caps = [pieces[k + 1][1] for k in range(len(pieces) - 1)] + [None]
+    return pieces, caps
 
 
 def _memo_anchors(memo, base, anchors):
@@ -3869,18 +3989,24 @@ def _split_lines(node):
 def parse(text, eof=""):
     """Разбор text так, как его читает bash 5.3 в `eval`. eof — знак конца heredoc внешней подстановки (")" для
     тела `$(…)`, "}" для `${ …; }`, "" — текст команды целиком): с ним text разбирается как тело подстановки, а
-    строка тела heredoc, начатая терминатором, со знаком конца в остатке кончает тело (make_here_document)."""
+    строка тела heredoc, начатая терминатором, со знаком конца в остатке кончает тело (make_here_document).
+    Вложенность глубже предела стека — Script без команд с ошибкой вида DEPTH, сбой разбора — с ошибкой вида
+    INTERNAL на позиции 0."""
     if not isinstance(text, str):
         text = str(text)
     reader = _R(text)
     try:
         return _run(reader.toplevel(eof or None))
+    except _TooDeep:
+        # Вложенность глубже предела: дерево не строится, ошибка — там, где остановилось чтение.
+        error = SyntaxIssue(min(reader.cpos, reader.n0), True, DEPTH)
     except Exception:  # noqa: BLE001 — сбой разбора не выходит наружу: весь текст — ошибка в начале
-        script = _node(Script, 0, len(text), commands=[])
-        script.error = SyntaxIssue(0, True)
-        script.dropped = []
-        script.comments = []
-        return script
+        error = SyntaxIssue(0, True, INTERNAL)
+    script = _node(Script, 0, len(text), commands=[])
+    script.error = error
+    script.dropped = []
+    script.comments = []
+    return script
 
 
 def walk(node):
