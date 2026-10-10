@@ -17,7 +17,7 @@ planka — плагин Claude Code уровня пользователя: ше�
 | `planka/remind.py` | часть ядра с номером из аргумента (`part_number`) как `additionalContext`: деление по разделам (`split_core`, `core_parts`, `PARTS`, предел `CONTEXT_LIMIT`); в части 1 — снимок дерева (`take_snapshot`) и строка `NO_DOCS_LINE` об отсутствии `CLAUDE.md` (`remind_project`) |
 | `planka/judge_tool.py` | судья вопроса (`judge_question`), плана (`judge_plan`), яруса модели субагента (`judge_subagent`: форк `FORK_TYPE` — пропуск, нет `model` — отказ `MODEL_REASON` без судьи), отказ на добавление пакета и на команду установки под сомнением (`judge_bash`, причины `DEP_REASON`, `DEP_DOUBT_REASON`) и снимок манифестов перед командой и вызовом MCP-инструмента (`snapshot_manifests`); отказ правке манифеста (`judge_manifest_edit`, `MANIFEST_REASON`); после команды `Bash` и вызова `mcp__*` — блок на новые имена в манифестах (`check_command_manifests`, `COMMAND_REASON`, `MCP_REASON`) |
 | `planka/guard_memory.py` | судья записи в постоянную память: цель — `is_memory_path` (в том числе `CLAUDE.local.md` — `_local_memory`, импорты `@путь` — `_imported_files`), `is_memory_mcp`; содержимое — `render_content` |
-| `planka/judge_stop.py` | фильтры «варианты» (`looks_like_options`), «готово» (`claims_done`) по последнему сообщению, «документация» (`docs_check`) по изменениям со снимка; один вызов судьи на шаги реплики (`turn_messages`, `prompts.Step`, до `prompts.MAX_TURN_CHARS`); отметка снимка проверенным после Stop без блока (`release_snapshot`, в `finally` `main`) |
+| `planka/judge_stop.py` | признак «просит решения»: варианты (`looks_like_options`) или «?» в последнем абзаце (`asks_author`) — без него ни судьи, ни блока; затем фильтры «варианты», «готово» (`claims_done`) по последнему сообщению, «документация» (`docs_check`) по изменениям со снимка; один вызов судьи на шаги реплики (`turn_messages`, `prompts.Step`, до `prompts.MAX_TURN_CHARS`); отметка снимка проверенным после Stop без блока (`release_snapshot`, в `finally` `main`) |
 | `planka/debug_watch.py` | счётчик неудач подряд одной команды `Bash` (`update`; хранятся последние `MAX_COUNTS` счётчиков и `MAX_SHOWN` отметок показа); с `REPEAT_THRESHOLD`-й неудачи — модуль `debugging.md` контекстом; команда-ответ с кодом 1 (`code1_is_answer`, сегменты строки — по дереву `shparse`) |
 | `planka/model_watch.py` | модель сессии из `model` входа `SessionStart` и `to_model` входа `PostModelSwitch` в состояние (`store`); агенту ничего не выводит |
 | `planka/common.py` | барьер, чтение входа, тексты правил и рубрика, транскрипт (`read_transcript`), модель и запуск судьи (`judge_model`, `stored_session_model`, `usable_model`, `run_judge`), лимит отказов, журнал, корень проекта (`project_root`) и окружение git о нём (`git_env`), классы путей, формат ответа (`run_hook`) |
@@ -286,6 +286,17 @@ cat-file --batch` изменённых манифестов, и дерево HEA
 `guard_memory._repository_file` передаёт `CHECK_IGNORE_TIMEOUT` и `git -C <проект>` — `RepositoryFileTest` в
 `tests/test_guard_memory.py`; что `judge_tool` передаёт `SNAPSHOT_BUDGET`, `CHECK_BUDGET` и `HEAD_TIMEOUT` —
 `ManifestDeadlineTest` в `tests/test_judge_tool.py`.
+
+## Судья Stop: признак «просит решения»
+
+`judge_stop.judge` зовёт судью, только когда последнее сообщение просит у автора решения: `looks_like_options` или
+`asks_author`. `asks_author` ищет «?» в последнем абзаце — последнем непустом блоке строк, отделённом пустой строкой;
+строки код-блоков ``` … ``` не считаются, незакрытый блок тянется до конца сообщения, блок из одного кода — абзац без
+вопроса. Признак проверяется до `docs_check` (git, снимок, комментарии). Без признака — выход без судьи и без блока,
+как при отсутствии фильтров; `main` отмечает снимок реплики проверенным. Когда признак есть, фильтры «варианты»,
+«готово» и «документация» работают как прежде и объединяются в один вызов; вопрос без совпавшего фильтра судью не
+зовёт. Цена: заявка «готово» и правка кода в сообщении без вопроса и без вариантов не проверяются; вопрос без «?» в
+последнем абзаце судью не включает («Известные ограничения» в `README.md`).
 
 ## Лимит отказов
 

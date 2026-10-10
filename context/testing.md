@@ -49,7 +49,7 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
 - Обращение к модели: место и регистр обращения `prompts.ADDRESS` в причине и контексте, без задвоения — `OutputsTest` в
   `tests/test_common.py`; промпты судьи с обращением и на «вы», `common.ADDRESS` — тот же объект, что `prompts.ADDRESS`,
   — `tests/test_prompts.py`; конец причины блока `Stop` — `judge_stop.RETELL_NOTE`, копией текста в
-  `tests/test_judge_stop.py` (`StopHookTest`, `DoneHookTest`, `DocsFilterTest`). Судья яруса субагента —
+  `tests/test_judge_stop.py` (`StopHookTest`, `DoneHookTest`, `DocsFilterTest`). Признак «просит решения»: `AsksAuthorFilterTest` (где ищется «?») и `AskGateTest` (без вопроса и без вариантов судья не зовётся, `PLANKA_STUB_RECORD` не создан, в журнале нет `stop`; с вопросом в последнем абзаце — зовётся); сообщения тестов судьи `Stop` содержат вопрос в последнем абзаце (`DONE_MSG`, `EDIT_MSG`), без него — `DONE_NO_ASK_MSG`, `EDIT_NO_ASK_MSG`. Судья яруса субагента —
   `SubagentTest` в `tests/test_judge_tool.py`: форк без судьи, нет `model` — отказ без судьи в лимите, вердикты судьи,
   его ошибка, лимит до вызова, в промпте модель, задание и реплика автора, обрезка задания, нет модуля, matcher
   пропускает `Agent`; текст входа — `RenderSubagentTest` в `tests/test_prompts.py`. Ожидаемый ответ хука в тестах хуков

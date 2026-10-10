@@ -445,9 +445,9 @@ class HostileHookTest(unittest.TestCase):
             {"type": "assistant", "message": {"model": "claude-test-model", "content": [
                 {"type": "text", "text": "Комментарии в a.py."}]}})), encoding="utf-8")
         rec = env.data / "rec.txt"
-        # Сообщение без заявки «готово»: судью зовёт фильтр документации.
-        r = env.run("judge_stop.py", env.hook_input("Stop", last_assistant_message="Комментарии в a.py.",
-                                                    stop_hook_active=False),
+        # Сообщение с вопросом и без заявки «готово»: судью зовёт фильтр документации.
+        message = "Комментарии в a.py.\n\nПродолжать?"
+        r = env.run("judge_stop.py", env.hook_input("Stop", last_assistant_message=message, stop_hook_active=False),
                     PLANKA_STUB="ok", PLANKA_STUB_RECORD=str(rec), **extra)
         self.assertEqual(r.stdout, "", r.stderr)
         return prompt_block(rec.read_text(encoding="utf-8"), "content")
