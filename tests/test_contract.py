@@ -717,10 +717,10 @@ class RulesMatchJudgeTest(unittest.TestCase):
 
     def test_findings_tail_asks_author(self):
         # plugin/rules/debugging.md и его строка в индексе plugin/philosophy.md: два круга правок подряд с новым
-        # классом находок — вопрос автору, продолжать или записать остаток долгом.
+        # классом находок — вопрос автору, продолжать или записать остаток долгом; рекомендация — по цене находок.
         rules = " ".join(common.rule_texts("debugging").split())
         self.assertIn("два круга правок подряд находят новый класс того же рода", rules)
-        self.assertIn("продолжать круги — первым — или записать остаток долгом", rules)
+        self.assertIn("продолжать круги или записать остаток долгом. Рекомендация — по цене находок", rules)
         index = self.flat(common.philosophy_sections("Модули"))
         self.assertIn("круги правок находят всё новые находки", index)
 
@@ -762,33 +762,6 @@ class RulesMatchJudgeTest(unittest.TestCase):
                       "context/deferred/", prompts._DOCS_CHECKS)
         self.assertIn("Изолированный каталог без роутера получает его той же правкой; не сделано — запись в "
                       "`context/deferred/`", self.flat(self.rules["docs"]))
-
-
-def _readme_missing(readme, name, values):
-    """Значения values, которых нет в блоках README (BLOCK_START), где упомянута константа name."""
-    blocks = [b for b in BLOCK_START.split(readme) if name in b]
-    return sorted(v for v in values
-                  if not any(re.search(r"(?<![\w.-])" + re.escape(v) + r"(?![\w-])", b) for b in blocks))
-
-
-class ReadmeCopiesTest(unittest.TestCase):
-    """README перечисляет значения списков кода, которые названы рядом: копию сверяет тест."""
-
-    def test_lists_named_in_readme_complete(self):
-        import manifests
-        import snapshot
-        readme = (REPO / "README.md").read_text(encoding="utf-8")
-        lists = {"snapshot.IGNORED_DIRS": snapshot.IGNORED_DIRS,
-                 "manifest_watch.FOREIGN_DIRS": set(manifest_watch.FOREIGN_DIRS) - set(snapshot.IGNORED_DIRS),
-                 "manifests._BUILD_BACKENDS": manifests._BUILD_BACKENDS, "CODE_NAMES": common.CODE_NAMES}
-        for name, values in lists.items():
-            with self.subTest(name=name):
-                self.assertEqual(_readme_missing(readme, name, values), [])
-
-    def test_readme_missing_found(self):
-        readme = "Каталоги `snapshot.IGNORED_DIRS` (`.git`, `build`).\n\nИ `dist` в другом блоке."
-        self.assertEqual(_readme_missing(readme, "snapshot.IGNORED_DIRS", {".git", "build", "dist", "git"}),
-                         ["dist", "git"])
 
 
 class TimeoutsTest(unittest.TestCase):

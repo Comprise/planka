@@ -418,7 +418,7 @@ PID процесса. Ответ с текстом собирает `python3` с
   `test_fact_question_rule_matches_planning`; форма «X, а не Y» в «Поведении» — утверждение с контрастом,
   `test_positive_statement_rule_names_its_form`), разбор форм вызова сборщиком
   (`CodeNamesTest`; имя ищется в своей функции, объемлющих и модуле, параметр функции не разрешается — `_Scopes`),
-  списки кода, скопированные в `README.md` рядом с именем константы (`ReadmeCopiesTest`), форма «вы» (`PoliteFormTest`:
+  форма «вы» (`PoliteFormTest`:
   нет «ты» и повелительного ед. числа в ядре, модулях, литералах `prompts.py` и текстах хуков, которые сборщик
   `_hook_texts` выводит из кода по аргументам `deny_output`, `block_output`, `context_output`; повелительное ед. числа
   ловится по форме слова на месте указания (`IMPERATIVE_PLACE`, не-глаголы на этом месте — `IMPERATIVE_EXCEPT`) и

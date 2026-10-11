@@ -8,8 +8,9 @@ sys.path.insert(0, str(PLANKA_DIR))
 import depcheck  # noqa: E402
 
 # Корпус команд Bash из транскриптов Claude Code автора (tests/tools/build_corpus.py): обезличен, без секретов;
-# add и doubt — ожидаемые вердикты depcheck; у строки 2409 ожидается doubt (решение автора о ложном отказе — README,
-# «Известные ограничения»). Команды только читаются как строки, не исполняются.
+# add и doubt — ожидаемые вердикты depcheck; у строки 2409 ожидается doubt:
+# `xargs … sh -c '…{}…'` отдаёт оболочке строку, известную только при исполнении.
+# Команды только читаются как строки, не исполняются.
 CORPUS = pathlib.Path(__file__).parent / "fixtures" / "bash-transcripts.jsonl"
 
 

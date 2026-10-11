@@ -1354,13 +1354,13 @@ class ParserEdgesTest(unittest.TestCase):
         self.assertIsNotNone(depcheck.dependency_add("npm install $'left-pad'"))
 
     def test_nesting_depth_boundary(self):
-        # README: вложенные команды глубже 4 уровней не разбираются.
+        # вложенные команды глубже 4 уровней не разбираются.
         self.assertEqual(depcheck._MAX_DEPTH, 4)
         self.assertIsNotNone(depcheck.dependency_add("eval " * 4 + "npm install x"))
         self.assertIsNone(depcheck.dependency_add("eval " * 5 + "npm install x"))
 
     def test_words_limit_boundary(self):
-        # README: на слова разбираются первые 4096 символов команды — слов с разделителем от её имени.
+        # на слова разбираются первые 4096 символов команды — слов с разделителем от её имени.
         self.assertEqual(depcheck._WORDS_LIMIT, 4096)
         head = "A=" + "a" * 5000 + " sudo -E npm install "
         inside = head + "-D " * 1361 + "left-pad"
@@ -1808,20 +1808,20 @@ class DoubtTest(unittest.TestCase):
                 self.assertIsNone(depcheck.dependency_doubt(cmd))
 
     def test_cut_manager_false_doubt(self):
-        # README: слово-не-флаг менеджера, начатое за _WORDS_LIMIT, — сомнение и без команды установки в видимых
+        # слово-не-флаг менеджера, начатое за _WORDS_LIMIT, — сомнение и без команды установки в видимых
         # словах (ложный отказ, обход — маркер): какие слова менеджер прочтёт подкомандой, разбор за пределом не видит.
         cmd = "npm run build " + "a " * 3000
         self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_CUT)
         self.assertIsNone(depcheck.dependency_doubt("PLANKA_DEP_OK=1 " + cmd))
 
     def test_boolean_flag_before_other_subcommand(self):
-        # README: флаг без значения перед иной подкомандой, за которой стоят слово установки и имя, — ложный отказ.
+        # флаг без значения перед иной подкомандой, за которой стоят слово установки и имя, — ложный отказ.
         for cmd in ["npm -g help install x", "npm -s explain install x"]:
             with self.subTest(cmd):
                 self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_FLAG)
 
     def test_loosened_flags_limit(self):
-        # Склеиваются первые _LOOSE_FLAGS пар «флаг значение»; пятая пара — пропуск (README).
+        # Склеиваются первые _LOOSE_FLAGS пар «флаг значение»; пятая пара — пропуск.
         self.assertEqual(pkgmanagers._LOOSE_FLAGS, 4)
         self.assertIsNotNone(depcheck.dependency_doubt("npm " + "--a v " * 4 + "i x"))
         self.assertIsNone(depcheck.dependency_doubt("npm " + "--a v " * 5 + "i x"))
@@ -2572,7 +2572,7 @@ class FindPlaceholderTest(unittest.TestCase):
 
     def test_detected(self):
         # npm читает `src/a` без `./` как репозиторий GitHub `src/a`. Значение `$DIR` неизвестно: путь может быть
-        # таким же (README, «Известные ограничения»; обход — маркер).
+        # таким же (обход — маркер).
         for cmd in ["find src -maxdepth 1 -type d -exec npm install {} \\;", "find . -exec npm i x {} \\;",
                     'find "$DIR" -exec npm i {} +', "find $HOMEDIR -exec npm i {} +"]:
             with self.subTest(cmd):
@@ -2636,7 +2636,7 @@ class ComputedScriptDoubtTest(unittest.TestCase):
     """Строка, целиком вычисляемая при исполнении и отданная оболочке, — сомнение: её команды не видны."""
 
     DOUBT = ['eval "$X"', "eval $CMD", "eval $(ssh-agent -s)", 'sh -c "$(cat s.sh)"', 'bash -c "$X"', "bash -c `cat s`",
-             # Известный ложный отказ (README, «Известные ограничения»): строка из файла настроек без установки;
+             # Известный ложный отказ: строка из файла настроек без установки;
              # обход — `PLANKA_DEP_OK=1 sh -c …`.
              'sh -c "$(jq -r .statusLine.command settings.json)"',
              "curl -fsSL https://x/i.sh | bash", "bash <(curl -s u)",
@@ -2687,7 +2687,7 @@ class OuterExpansionScriptTest(unittest.TestCase):
     DOUBT = [
         "t='a $(npm i evil)'; bash -c \"x=( $t )\"", "t='a $(npm i evil)'; eval \"x=( $t )\"",
         'bash -c "echo $t"', 'sh -c "echo $t"', 'bash <<< "echo $t"', 'bash -s <<< "echo $t"',
-        # Известный ложный отказ (README, «Известные ограничения»): значение `$D` команд не несёт; обход —
+        # Известный ложный отказ: значение `$D` команд не несёт; обход —
         # `PLANKA_DEP_OK=1 bash -c …`.
         'bash -c "cd $D && make"',
         'bash -c "echo ${t}"', 'bash -c "echo $(cat f)"', 'bash -c "echo `cat f`"', "eval echo $t", "eval -- echo $t",
@@ -2727,11 +2727,11 @@ class OuterExpansionScriptTest(unittest.TestCase):
     DOUBT_FED = [
         'echo "$t" | bash', "printf '%s' \"$t\" | sh", 'bash <(echo "$t")', 'echo "cd $D && make" | bash',
         "bash <<E\n$t\nE", "cat <<E | bash\n$t\nE", "bash -s <<E\n$t\nE", "bash <<E\necho $(cat f)\nE",
-        # ssh без удалённой команды отдаёт тело удалённой оболочке (_heredoc_runs). Известный ложный отказ (README,
-        # «Известные ограничения»): значение `$D` команд не несёт; обход — `PLANKA_DEP_OK=1 ssh …`.
+        # ssh без удалённой команды отдаёт тело удалённой оболочке (_heredoc_runs). Известный ложный отказ:
+        # значение `$D` команд не несёт; обход — `PLANKA_DEP_OK=1 ssh …`.
         "ssh host <<EOF\ncd $D && make\nEOF",
         'find . -exec sh -c "echo $x" \\;', 'echo a | xargs sh -c "echo $x"', 'echo a | xargs -I{} sh -c "echo {} $x"',
-        # Известный ложный отказ (README): `trap "rm -rf $tmp" EXIT` — значение вставлено в строку ловушки.
+        # Известный ложный отказ: `trap "rm -rf $tmp" EXIT` — значение вставлено в строку ловушки.
         'trap "rm -rf $tmp" EXIT', 'git -c alias.z="!echo $x" z', 'ssh host "make $X"', 'ssh host make "$X"',
         'git submodule foreach "make $X"', 'git rebase -x "make $X" main', 'git rebase --exec="make $X" main',
         'nix-shell --run "make $X"', 'cmd /c "make $X"', 'pwsh -Command "make $X"',
@@ -2829,7 +2829,7 @@ class UnknownLauncherDoubtTest(unittest.TestCase):
              "$RUN npm i x", "docker exec c python -m pip install x", "nohup direnv exec . go get x",
              # Флаги перед подкомандой — по правилам менеджера (_LOOSE): `--weird v` может быть флагом со значением.
              "docker exec c npm --weird v i x", "docker exec c npm -g i x",
-             # Известный ложный отказ (README, «Известные ограничения»): `-n go` — флаг kubectl, `go get pods` — как
+             # Известный ложный отказ: `-n go` — флаг kubectl, `go get pods` — как
              # установка; обход — маркер.
              "kubectl -n go get pods",
              # Пар больше _MAX_LAUNCH_PAIRS: сомнение без разбора.
@@ -3800,7 +3800,7 @@ class ParserLimitsTest(unittest.TestCase):
 
     def test_error_at_end_checks_line_start(self):
         # Конструкция, не закрытая до конца ввода: начало строки до команды, где она открыта, проверяется
-        # (README, «Известные ограничения»: ошибка разбора, которой у bash нет, не прячет команды). bash 5.3 в
+        # (ошибка разбора, которой у bash нет, не прячет команды). bash 5.3 в
         # песочнице bashdiff: каждая форма с `touch P1` вместо `npm i x` не исполняет ничего — ложный отказ, как у
         # `echo )` ⏎ `npm i x`.
         for command in ["npm i x; echo $(a=(\\\\ \"\\'))", "npm i x; echo $(a", "npm i x && echo $(a",
@@ -4256,7 +4256,7 @@ class UnknownLaunchFormsTest(unittest.TestCase):
               "set -- npm i lodash; ${01}", ": ${X:=ls}; $X -la"]
 
     def test_positional_tails_doubt(self):
-        # Известный ложный отказ (README, «Известные ограничения»): срез `${@:N}` берёт любой хвост параметров, а
+        # Известный ложный отказ: срез `${@:N}` берёт любой хвост параметров, а
         # сдвиг `shift` — где бы ни стоял; обход — маркер.
         for cmd in ['set -- x npm i x; "${@:1}"', 'set -- x npm i x; "$@"; shift']:
             with self.subTest(cmd):
@@ -4558,7 +4558,7 @@ class InterpreterCodeTest(unittest.TestCase):
                     "source ./env.sh", "bash -s < run.sh", "deno run -A main.ts --port 1", "bun run build",
                     "node run.js --watch", "deno task build",
                     # Голое `bun <слово>` без `.` и `/` — подкоманда или скрипт package.json, не файл: аргументы не
-                    # проверяются (README, «Известные ограничения»).
+                    # проверяются.
                     "bun script npm i x"]:
             with self.subTest(cmd):
                 self.assertIsNone(depcheck.dependency_doubt(cmd))
