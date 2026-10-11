@@ -2,6 +2,7 @@ import codecs
 import json
 import os
 import pathlib
+import posixpath
 import shutil
 import subprocess
 import sys
@@ -1575,6 +1576,19 @@ class SourceTest(unittest.TestCase):
             old + "\nreplace golang.org/x/text => ../text\n": [],
         })
 
+    def test_go_replace_same_path(self):
+        # Замена модулем, даже тем же путём с версией, — источник не каталог (go.dev/ref/mod, «replace directive»:
+        # замена конкретной версии перекрывает общую): местный по `replace` каталогом модуль ею снова из сети.
+        base = "module m\n\ngo 1.22\nrequire evil/x v1.0.0\nreplace evil/x => ./x\n"
+        self.assertEqual(manifests.names("gomod", base), frozenset())
+        self.assertEqual(manifests.names("gomod", base + "replace evil/x v1.0.0 => evil/x v1.0.0\n"), {"evil/x"})
+        self.assertEqual(manifests.names("gomod", base + "replace evil/x v0.9.0 => evil/x v1.0.0\n"), {"evil/x"})
+        self.assertEqual(manifests.names("gomod", base.replace("./x", "evil/x v1.0.0")), {"evil/x"})
+        # Каталогом для версии из require — местный, хоть общая замена и модулем.
+        self.assertEqual(manifests.names("gomod", "module m\nrequire evil/x v1.0.0\nreplace evil/x => evil/y v1\n"
+                                                  "replace evil/x v1.0.0 => ./x\n"), {"evil/y"})
+        self.assertEqual(manifests.names("gowork", "go 1.22\nuse .\nreplace evil/x => evil/x v1.0.0\n"), {"evil/x"})
+
     def test_cargo_sources(self):
         old = '[package]\nname = "app"\n\n[dependencies]\nserde = "1"\nx = { git = "https://x/x", rev = "a" }\n'
         self.assert_added("Cargo.toml", old, {
@@ -1742,8 +1756,9 @@ def _write(root, rel, text):
 
 
 class OwnNameTrustTest(unittest.TestCase):
-    """Имя пакета манифеста — пакет проекта, только если манифест в HEAD (кроме npm и PyPI) или член npm workspace
-    корня (`workspaces` package.json); имя свежего манифеста вне workspace — внешнее. Член uv workspace — не пакет
+    """Имя пакета манифеста — пакет проекта, только если манифест — член npm workspace корня (`workspaces`
+    package.json); имя свежего манифеста вне workspace и манифеста HEAD — внешнее (Cargo, Composer, go связывают
+    зависимость с каталогом только по связи, ManagerLinkTest). Член uv workspace — не пакет
     проекта по имени: uv ставит его из каталога только по источнику `workspace = true` (UvWorkspaceSourceTest)."""
 
     def setUp(self):
@@ -1761,11 +1776,12 @@ class OwnNameTrustTest(unittest.TestCase):
         self.assertIn("left-pad", self.names())
 
     def test_workspace_member_name_is_project_package(self):
-        for workspaces in ('["tools/*"]', '{"packages": ["tools/**"]}', '["./tools/fake/"]'):
+        for workspaces in ('["tools/*"]', '{"packages": ["tools/*"]}', '["./tools/fake/"]'):
             with self.subTest(workspaces):
                 _write(self.root, "package.json", '{"name": "app", "workspaces": %s}' % workspaces)
                 self.assertIn("evil-pkg", self.names())
-        for workspaces in ('["tools/*", "!tools/fake"]', '["other/*"]', '["tools"]'):
+        # Шаблон, который хук не сверяет как npm (`**`, `!`), — членов нет (_glob).
+        for workspaces in ('["tools/*", "!tools/fake"]', '["other/*"]', '["tools"]', '{"packages": ["tools/**"]}'):
             with self.subTest(workspaces):
                 _write(self.root, "package.json", '{"name": "app", "workspaces": %s}' % workspaces)
                 self.assertNotIn("evil-pkg", self.names())
@@ -1780,8 +1796,8 @@ class OwnNameTrustTest(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("git"), "нет git")
     def test_committed_manifest_name(self):
-        # Имя пакета манифеста HEAD — пакет проекта у cargo; у npm и PyPI — нет: вне связи workspace npm и pip ставят
-        # пакет с этим именем из реестра.
+        # Имя пакета манифеста HEAD — не пакет проекта: вне связи с каталогом менеджер ставит пакет с этим именем из
+        # реестра.
         _write(self.root, "crates/fake/Cargo.toml", '[package]\nname = "evil-crate"\n')
         _write(self.root, "libs/fake/pyproject.toml", '[project]\nname = "evil-py"\n')
         _git("init", "-q", cwd=self.root)
@@ -1789,7 +1805,7 @@ class OwnNameTrustTest(unittest.TestCase):
         _git("commit", "-qm", "i", cwd=self.root)
         self.assertNotIn("evil-pkg", self.names())
         self.assertNotIn("evil-py", self.names("requirements"))
-        self.assertIn("evil-crate", self.names("cargo"))
+        self.assertNotIn("evil-crate", self.names("cargo"))
         # Член npm workspace — пакет проекта и в HEAD.
         _write(self.root, "package.json", '{"name": "app", "workspaces": ["tools/*"]}')
         self.assertIn("evil-pkg", self.names())
@@ -1895,6 +1911,356 @@ class UvWorkspaceSourceTest(unittest.TestCase):
         self.check("tools/x/pyproject.toml", "pyproject", self.APP % "", ["mylib"])
         self.check("packages/skip/pyproject.toml", "pyproject", self.APP % "", ["mylib"])
         self.check("requirements.txt", "requirements", "mylib\n", ["mylib"])
+
+
+class UvInheritedRemoteSourceTest(unittest.TestCase):
+    """Удалённый источник `[tool.uv.sources]` корня uv workspace (`git`, `index`) uv применяет к члену без своего
+    источника этого имени (docs.astral.sh/uv, «Workspaces»): простое имя члена — имя с источником (manifests.names
+    с источниками корня), и простое имя в другом манифесте его не прикрывает. Источник корня workspace — имя корня,
+    даже если корень сам имя не объявил: правка корня меняет источник у членов."""
+
+    ROOT = '[project]\nname = "root"\n\n[tool.uv.workspace]\nmembers = ["packages/*"]\n'
+    SOURCE = '\n[tool.uv.sources]\nrequests = %s\n'
+    GIT = '{ git = "https://github.com/evil/requests" }'
+    MEMBER = '[project]\nname = "%s"\ndependencies = [%s]\n'
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = os.path.realpath(tmp.name)
+        _write(self.root, "pyproject.toml", self.ROOT)
+        _write(self.root, "requirements.txt", "requests\n")
+        _write(self.root, "packages/b/pyproject.toml", self.MEMBER % ("b", '"requests"'))
+
+    def edit(self, rel, after, project=None):
+        project = project or (lambda: manifest_watch.project_names(self.root, "pyproject", time.monotonic() + 30))
+        return manifest_watch.check_edit("Write", {"content": after}, os.path.join(self.root, rel), "pyproject",
+                                         project, root=lambda: self.root)
+
+    def check(self, rel, after, expected):
+        with self.subTest(rel=rel, after=after):
+            self.assertEqual(self.edit(rel, after), expected)
+            entry = manifest_watch.take(self.root, time.monotonic() + 30)
+            _write(self.root, rel, after)
+            self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30)[0].get(rel, []), expected)
+
+    def test_names_with_inherited_sources(self):
+        member = self.MEMBER % ("a", '"requests>=2", "attrs"')
+        for source, expected in [(self.GIT, "requests @ git+https://github.com/evil/requests"),
+                                 ('{ index = "evil" }', "requests @ index:evil"),
+                                 ('{ workspace = true }', None), ('{ path = "../r" }', None)]:
+            with self.subTest(source):
+                inherited = manifests.uv_sources(self.ROOT + self.SOURCE % source)
+                self.assertEqual(manifests.names("pyproject", member, inherited),
+                                 frozenset({"attrs"} | ({expected} if expected else set())))
+        # Свой источник члена того же имени заменяет источник корня.
+        own = member + '\n[tool.uv.sources]\nrequests = { path = "../r" }\n'
+        self.assertEqual(manifests.names("pyproject", own, manifests.uv_sources(self.ROOT + self.SOURCE % self.GIT)),
+                         frozenset({"attrs"}))
+
+    def test_member_name_with_root_source(self):
+        _write(self.root, "pyproject.toml", self.ROOT + self.SOURCE % self.GIT)
+        rel = "packages/a/pyproject.toml"
+        _write(self.root, rel, self.MEMBER % ("a", ""))
+        # Без имён проекта видно само имя члена: с источником корня, а не простое.
+        self.assertEqual(self.edit(rel, self.MEMBER % ("a", '"requests"'), project=lambda: frozenset()),
+                         ["requests @ git+https://github.com/evil/requests"])
+        # Не член источник корня не наследует: простое имя, оно есть в requirements.txt.
+        _write(self.root, "tools/x/pyproject.toml", self.MEMBER % ("x", ""))
+        self.assertEqual(self.edit("tools/x/pyproject.toml", self.MEMBER % ("x", '"requests"'),
+                                   project=lambda: frozenset()), ["requests"])
+
+    def test_root_source_is_new_name(self):
+        # Простое `requests` уже в requirements.txt и соседнем члене: источник корня, который uv применит к членам,
+        # — новое имя корня, и правка члена после него имя с источником не прячет за простым.
+        self.check("pyproject.toml", self.ROOT + self.SOURCE % self.GIT,
+                   ["requests @ git+https://github.com/evil/requests"])
+        _write(self.root, "pyproject.toml", self.ROOT)
+        self.check("pyproject.toml", self.ROOT + self.SOURCE % '{ index = "evil" }', ["requests @ index:evil"])
+        _write(self.root, "pyproject.toml", self.ROOT)
+        self.check("pyproject.toml", self.ROOT + '\n[tool.uv.sources]\nb = { workspace = true }\n', [])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_member_name_not_covered_by_plain(self):
+        # Корень с источником закоммичен, в рабочем дереве источник другой: член с простым `requests` — имя с новым
+        # источником, простое `requests` requirements.txt и соседа его не прикрывает.
+        _write(self.root, "pyproject.toml", self.ROOT + self.SOURCE % self.GIT)
+        _git("init", "-q", cwd=self.root)
+        _git("add", ".", cwd=self.root)
+        _git("commit", "-qm", "i", cwd=self.root)
+        evil2 = '{ git = "https://github.com/evil2/requests" }'
+        _write(self.root, "pyproject.toml", self.ROOT + self.SOURCE % evil2)
+        rel = "packages/a/pyproject.toml"
+        _write(self.root, rel, self.MEMBER % ("a", ""))
+        project = lambda: frozenset(n for n in manifest_watch.project_names(self.root, "pyproject",
+                                                                            time.monotonic() + 30) if "evil2" not in n)
+        self.assertEqual(self.edit(rel, self.MEMBER % ("a", '"requests"'), project),
+                         ["requests @ git+https://github.com/evil2/requests"])
+
+
+class ManagerLinkTest(unittest.TestCase):
+    """Имя пакета манифеста другого каталога зависимость Cargo, Composer и go не прикрывает: связь с каталогом —
+    только местный источник в самом манифесте (`path` Cargo, `replace` каталогом в go.mod). `[patch]`/`[replace]`
+    Cargo, репозиторий `path` Composer, go.work — не связь (решение автора). Закоммиченный манифест с тем же именем —
+    тоже: менеджер ставит пакет из реестра."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = os.path.realpath(tmp.name)
+
+    def commit(self):
+        _git("init", "-q", cwd=self.root)
+        _git("add", ".", cwd=self.root)
+        _git("commit", "-qm", "i", cwd=self.root)
+
+    def check(self, rel, kind, before, after, expected):
+        with self.subTest(rel=rel, after=after):
+            _write(self.root, rel, before)
+            project = lambda: manifest_watch.project_names(self.root, kind, time.monotonic() + 30)
+            self.assertEqual(manifest_watch.check_edit("Write", {"content": after}, os.path.join(self.root, rel),
+                                                       kind, project, root=lambda: self.root), expected)
+            entry = manifest_watch.take(self.root, time.monotonic() + 30)
+            _write(self.root, rel, after)
+            self.assertEqual(manifest_watch.compare(entry, time.monotonic() + 30)[0].get(rel, []), expected)
+
+    CARGO = '[package]\nname = "app"\nversion = "0.1.0"\n%s\n[dependencies]\n'
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_cargo_committed_name_not_link(self):
+        _write(self.root, "tools/x/Cargo.toml", '[package]\nname = "serde"\nversion = "1.0.5"\n')
+        _write(self.root, "Cargo.toml", self.CARGO % "")
+        self.commit()
+        self.check("Cargo.toml", "cargo", self.CARGO % "", self.CARGO % "" + 'serde = "1"\n', ["serde"])
+
+    def test_cargo_patch_not_link(self):
+        # `[patch]` и `[replace]` с `path` имя местным не делают (решение автора: связь, которую надо сверять с
+        # версией, Cargo.lock и корнем workspace, хук не засчитывает): местна только `path`-зависимость самого
+        # манифеста.
+        _write(self.root, "tools/x/Cargo.toml", '[package]\nname = "serde"\nversion = "1.0.5"\n')
+        for table in ['\n[patch.crates-io]\nserde = { path = "tools/x" }\n',
+                      '\n[replace]\n"serde:1.0.5" = { path = "tools/x" }\n']:
+            self.check("Cargo.toml", "cargo", self.CARGO % table, self.CARGO % table + 'serde = "=1.0.5"\n', ["serde"])
+        self.check("Cargo.toml", "cargo", self.CARGO % "", self.CARGO % "" + 'serde = { path = "tools/x" }\n', [])
+
+    COMPOSER = '{"name": "acme/app", "require": {%s}%s}'
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_composer_committed_name_not_link(self):
+        _write(self.root, "packages/x/composer.json", '{"name": "monolog/monolog"}')
+        _write(self.root, "composer.json", self.COMPOSER % ("", ""))
+        self.commit()
+        self.check("composer.json", "composer.json", self.COMPOSER % ("", ""),
+                   self.COMPOSER % ('"monolog/monolog": "^3"', ""), ["monolog/monolog"])
+
+    def test_composer_path_repository_not_link(self):
+        # Репозиторий `path` имя местным не делает (решение автора): пакет каталога — новое имя, обход — маркер.
+        _write(self.root, "packages/x/composer.json", '{"name": "acme/x"}')
+        tail = ', "repositories": [{"type": "path", "url": "packages/*"}]'
+        self.check("composer.json", "composer.json", self.COMPOSER % ("", tail),
+                   self.COMPOSER % ('"acme/x": "*"', tail), ["acme/x"])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_go_committed_module_not_link(self):
+        _write(self.root, "b/go.mod", "module example.com/b\n")
+        _write(self.root, "a/go.mod", "module example.com/a\n")
+        self.commit()
+        self.check("a/go.mod", "gomod", "module example.com/a\n",
+                   "module example.com/a\n\nrequire example.com/b v1.0.0\n", ["example.com/b"])
+
+    def test_go_work_not_link(self):
+        # go.work не связывает (решение автора): связь модуля с каталогом — только `replace` каталогом в самом
+        # go.mod, от вызова go она не зависит; `use` и замены каталогом в go.work — нет, GOWORK их снимает.
+        _write(self.root, "b/go.mod", "module example.com/b\n")
+        before, after = "module example.com/a\n", "module example.com/a\n\nrequire example.com/b v1.0.0\n"
+        for work in ["go 1.22\n\nuse (\n\t./a\n\t./b\n)\n", "go 1.22\nuse ./a\nreplace example.com/b => ./b\n"]:
+            _write(self.root, "go.work", work)
+            self.check("a/go.mod", "gomod", before, after, ["example.com/b"])
+        self.check("a/go.mod", "gomod", before, after + "replace example.com/b => ../b\n", [])
+
+class LinkConditionTest(unittest.TestCase):
+    """Правка или команда, которая меняет условие местности имени вне самого манифеста — источник корня uv workspace
+    (_edit_uv, recheck снимка), — переводит имя члена на реестр: оно новое. go.work условием не служит: связь go —
+    только `replace` каталогом в самом go.mod; имена удалённых замен go.mod и go.work — новые."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = os.path.realpath(tmp.name)
+
+    def commit(self):
+        _git("init", "-q", cwd=self.root)
+        _git("add", ".", cwd=self.root)
+        _git("commit", "-qm", "i", cwd=self.root)
+
+    def edit(self, rel, kind, after, write=True):
+        project = lambda: manifest_watch.project_names(self.root, kind, time.monotonic() + 30)
+        names = manifest_watch.check_edit("Write", {"content": after}, os.path.join(self.root, rel), kind, project,
+                                          root=lambda: self.root)
+        if write:
+            _write(self.root, rel, after)
+        return names
+
+    def command(self, action):
+        entry = json.loads(json.dumps(manifest_watch.take(self.root, time.monotonic() + 30)))
+        action()
+        return manifest_watch.compare(entry, time.monotonic() + 30)[0]
+
+    def remove(self, rel):
+        return lambda: shutil.rmtree(os.path.join(self.root, rel)) if os.path.isdir(os.path.join(self.root, rel)) \
+            else os.remove(os.path.join(self.root, rel))
+
+    GO_A = "module example.com/a\n\nrequire example.com/b v1.0.0\n"
+
+    def go(self):
+        _write(self.root, "w/b/go.mod", "module example.com/b\n")
+        _write(self.root, "w/a/go.mod", "module example.com/a\n")
+        _write(self.root, "w/go.work", "go 1.22\nuse ./a\nuse ./b\n")
+        self.commit()
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_go_work_not_link(self):
+        # Модуль workspace в require go.mod без `replace` каталогом в самом go.mod — новое имя правкой и любой
+        # командой, как бы та ни вызывала go; правка и удаление go.work связь go.mod не меняют.
+        self.go()
+        self.assertEqual(self.edit("w/a/go.mod", "gomod", self.GO_A, write=False), ["example.com/b"])
+        self.assertEqual(self.command(lambda: _write(self.root, "w/a/go.mod", self.GO_A)),
+                         {"w/a/go.mod": ["example.com/b"]})
+        local = self.GO_A + "replace example.com/b => ../b\n"
+        _write(self.root, "w/a/go.mod", "module example.com/a\n")
+        self.assertEqual(self.edit("w/a/go.mod", "gomod", local), [])
+        self.assertEqual(manifest_watch.take(self.root, time.monotonic() + 30).get("recheck"), None)
+        self.assertEqual(self.edit("w/go.work", "gowork", "go 1.22\nuse ./a\n", write=False), [])
+        self.assertEqual(self.edit("w/b/go.mod", "gomod", "module example.com/c\n", write=False), [])
+        self.assertEqual(self.command(self.remove("w/go.work")), {})
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_go_work_hard_link(self):
+        # go.work — манифест: жёсткая ссылка на него под другим именем — правка манифеста (_linked_targets).
+        _write(self.root, "w/b/go.mod", "module example.com/b\n")
+        _write(self.root, "w/a/go.mod", self.GO_A)
+        _write(self.root, "w/go.work", "go 1.22\nuse ./a\nuse ./b\n")
+        os.link(os.path.join(self.root, "w/go.work"), os.path.join(self.root, "README.txt"))
+        targets = manifest_watch.edit_targets(os.path.join(self.root, "README.txt"), lambda: self.root)[0]
+        self.assertEqual([os.path.relpath(p, self.root) for p, _ in targets], ["w/go.work"])
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_go_work_remote_replace(self):
+        # Замена go.work модулем из другого пути — имя, как та же замена в go.mod (go.dev/ref/mod: замены go.work
+        # перекрывают замены go.mod рабочих модулей).
+        _write(self.root, "a/go.mod", "module example.com/a\n\nrequire golang.org/x/text v0.3.0\n")
+        _write(self.root, "go.work", "go 1.22\nuse ./a\n")
+        self.commit()
+        evil = "go 1.22\nuse ./a\nreplace golang.org/x/text => github.com/evil/text v0.3.0\n"
+        self.assertEqual(manifest_watch.edit_targets(os.path.join(self.root, "go.work"), lambda: self.root)[0],
+                         [(os.path.join(self.root, "go.work"), "gowork")])
+        self.assertEqual(self.edit("go.work", "gowork", evil, write=False), ["github.com/evil/text"])
+        self.assertEqual(self.command(lambda: _write(self.root, "go.work", evil)),
+                         {"go.work": ["github.com/evil/text"]})
+        # Замена каталогом и `use` — не имена.
+        self.assertEqual(self.edit("go.work", "gowork", "go 1.22\nuse ./a\nreplace golang.org/x/text => ./text\n",
+                                   write=False), [])
+
+    ROOT = '[project]\nname = "root"\n\n[tool.uv.workspace]\nmembers = ["packages/*"]\n'
+    SOURCE = '\n[tool.uv.sources]\nmylib = { path = "libs/mylib" }\n'
+    MEMBER = '[project]\nname = "a"\ndependencies = [%s]\n'
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_uv_root_drops_local_source(self):
+        _write(self.root, "pyproject.toml", self.ROOT + self.SOURCE)
+        _write(self.root, "libs/mylib/pyproject.toml", '[project]\nname = "mylib"\n')
+        _write(self.root, "packages/a/pyproject.toml", self.MEMBER % "")
+        self.commit()
+        self.assertEqual(self.edit("packages/a/pyproject.toml", "pyproject", self.MEMBER % '"mylib"'), [])
+        self.assertEqual(self.edit("pyproject.toml", "pyproject", self.ROOT, write=False), ["mylib"])
+        # Корень перестал включать члена: источник корня к нему не применяется.
+        self.assertEqual(self.edit("pyproject.toml", "pyproject", self.ROOT.replace("packages/*", "other/*")
+                                   + self.SOURCE, write=False), ["mylib"])
+        self.assertEqual(self.command(lambda: _write(self.root, "pyproject.toml", self.ROOT)),
+                         {"packages/a/pyproject.toml": ["mylib"]})
+
+
+class WorkspacePatternTest(unittest.TestCase):
+    """Член npm и uv workspace засчитывается только по шаблону, который хук сверяет как менеджер: путь каталога
+    буквально или `каталог/*` (имя без точки в начале). Прочий шаблон (`!`, `**`, `x**`, `?`, `[`, `{`, длинный) —
+    членов у корня нет: имя члена новое (сомнение — отказ), сопоставление — сразу, без regex."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = os.path.realpath(tmp.name)
+
+    def member(self, rel, root_text):
+        name = posixpath.basename(rel)
+        text_of = {name: root_text, rel: "{}" if name == "package.json" else '[project]\nname = "m"\n'}.get
+        return manifest_watch._workspace_root(rel, text_of)
+
+    def test_npm_patterns(self):
+        for patterns, rel, expected in [
+                (["packages/*"], "packages/a/package.json", ""), (["./packages/*/"], "packages/a/package.json", ""),
+                (["packages/a"], "packages/a/package.json", ""), (["*"], "a/package.json", ""),
+                (["packages/*"], "packages/.a/package.json", None), (["packages/*"], "packages/a/b/package.json", None),
+                (["packages/*", "!packages/b"], "packages/a/package.json", None),
+                (["packages/**"], "packages/a/package.json", None),
+                (["packages/x**"], "packages/xa/package.json", None),
+                (["packages/a?"], "packages/ab/package.json", None),
+                (["packages/{a,b}"], "packages/a/package.json", None),
+                (["packages/[a]"], "packages/a/package.json", None),
+                (["packages/a*"], "packages/ab/package.json", None),
+                (["p" * 300 + "/*"], "p" * 300 + "/a/package.json", None)]:
+            with self.subTest(patterns=patterns, rel=rel):
+                self.assertEqual(self.member(rel, json.dumps({"workspaces": patterns})), expected)
+        # Корень с непонятным шаблоном остаётся корнем (`workspaces` есть), членов у него нет.
+        self.assertEqual(manifest_watch._npm_place("package.json", {"package.json": '{"workspaces": ["**"]}'}.get),
+                         ("root", ""))
+
+    def test_uv_patterns(self):
+        root = '[project]\nname = "r"\n[tool.uv.workspace]\nmembers = %s\nexclude = %s\n'
+        for members, exclude, rel, expected in [
+                ('["packages/*"]', "[]", "packages/a/pyproject.toml", ""),
+                ('["packages/*"]', '["packages/a"]', "packages/a/pyproject.toml", None),
+                ('["packages/*"]', '["packages/b"]', "packages/a/pyproject.toml", ""),
+                ('["packages/**"]', "[]", "packages/a/pyproject.toml", None),
+                ('["packages/*"]', '["packages/a*"]', "packages/b/pyproject.toml", None)]:
+            with self.subTest(members=members, exclude=exclude):
+                self.assertEqual(self.member(rel, root % (members, exclude)), expected)
+
+    def test_long_pattern_fast(self):
+        # Шаблон из текста агента не сопоставляется с откатом: `*a`×12 против имени `a`×200 — отказ сразу.
+        started = time.monotonic()
+        pattern = "packages/" + "*a" * 12 + "*b"
+        self.assertIsNone(manifest_watch._glob(pattern))
+        self.assertIsNone(self.member("packages/" + "a" * 200 + "/package.json", json.dumps({"workspaces": [pattern]})))
+        self.assertLess(time.monotonic() - started, 0.5)
+
+
+class RestoredOwnNameTest(unittest.TestCase):
+    """Имя пакета манифеста ref, откуда команда возвращает файлы (restored_names), зависимость Composer и go не
+    прикрывает: без связи менеджер ставит его из реестра."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = os.path.realpath(tmp.name)
+
+    @unittest.skipUnless(shutil.which("git"), "нет git")
+    def test_ref_own_names(self):
+        _write(self.root, "packages/x/composer.json", '{"name": "acme/x"}')
+        _write(self.root, "b/go.mod", "module example.com/b\n")
+        _write(self.root, "composer.json", '{"name": "acme/app"}')
+        _write(self.root, "a/go.mod", "module example.com/a\n")
+        _git("init", "-q", cwd=self.root)
+        _git("add", ".", cwd=self.root)
+        _git("commit", "-qm", "i", cwd=self.root)
+        command = "git checkout HEAD -- packages b"
+        deadline = time.monotonic() + 30
+        entry = manifest_watch.take(self.root, deadline)
+        entry["known"] = manifest_watch.restored_names(self.root, command, int(time.time()) + 100, deadline)
+        self.assertTrue(entry["known"] is not None)
+        _write(self.root, "composer.json", '{"name": "acme/app", "require": {"acme/x": "*"}}')
+        _write(self.root, "a/go.mod", "module example.com/a\n\nrequire example.com/b v1.0.0\n")
+        self.assertEqual(manifest_watch.compare(entry, deadline)[0],
+                         {"composer.json": ["acme/x"], "a/go.mod": ["example.com/b"]})
 
 
 class NpmWorkspaceLinkTest(unittest.TestCase):

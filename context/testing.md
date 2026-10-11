@@ -61,7 +61,7 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
   `CLAUDE_PROJECT_DIR` сняты; глобальный и системный конфиг и системные атрибуты git не читаются (`GIT_CONFIG_GLOBAL`,
   `GIT_CONFIG_NOSYSTEM`, `GIT_ATTR_NOSYSTEM`); `XDG_CONFIG_HOME` — пустой временный каталог (`ignore` и `attributes` из
   `XDG_CONFIG_HOME/git` git читает и при `GIT_CONFIG_GLOBAL`); `GIT_CEILING_DIRECTORIES` — временный каталог: внешний
-  репозиторий не находится.
+  репозиторий не находится. Хуки подпроцессом наследуют это окружение.
 - Входные данные тестов — `tests/fixtures/`, корпуса настоящих форм входа (`plugin/rules/heuristics.md`); источник формы
   назван в каждом файле:
   - `plan-*.md` — планы (волны, формат superpowers, канонический формат `planning.md`); `test_planparse` (`CorpusTest`)
@@ -140,43 +140,54 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
   различных только регистром, на такой файловой системе не бывает); регистр у разрешённого пути (ссылка с непохожим
   именем в `Package.json`, ветка real в `_named_target`) — `test_other_case_through_link_on_case_insensitive_fs`; пути
   снимка при смене режима и переполнении перечня — `CompareLostListTest`; края: цикл присваиваний, цепочка из 30 имён,
-  `test_setup_py_references_linear`; источник не по умолчанию и `index <url>` — `SourceTest`, операторы строки Gemfile —
+  `test_setup_py_references_linear`; источник не по умолчанию и `index <url>` — `SourceTest` (замена модулем тем же
+  путём в `go.mod` и `go.work`, замена версии поверх общей — `test_go_replace_same_path`), операторы строки Gemfile —
   `StatementsTest`, декодирование файла требований, как у pip, — `RequirementsEncodingTest`, зависимость на члена npm
-  workspace — `NpmWorkspaceLinkTest`, имя пакета только из HEAD или члена workspace корня — `OwnNameTrustTest`, FIFO под
-  именем манифеста — `FifoManifestTest`; патчи `git apply` до начала сессии — `OldPatchTest` и `OldPatchGitTest`, mtime
-  `start.json` в долгой сессии — `SessionStartTtlTest`); хук — `tests/test_judge_tool.py`: `ManifestEditTest` (правка
-  `Write`, `Edit`, `MultiEdit`), `ManifestEditGitTest` (версии `_REPO_REFS` — база), `ManifestEditReadsOnceTest` (один
-  `list_manifests` и одно `ls-tree` HEAD на правку члена npm workspace), `ManifestBashTest` и его наследник
-  `ManifestBashGitTest` (снимок и сравнение вне git и в git: генератор requirements и заголовок генератора — блок, с
-  маркером — нет, маркер, `PostToolUseFailure`, параллельные команды по `tool_use_id`, `mv`, `cp`, `git mv`; ref до
-  начала сессии: stash и ref `checkout`, `restore --source`, `merge --squash`, `cherry-pick -n` старше начала — пропуск
-  (`test_author_stash_before_session_passes`, `test_author_stash_untracked_manifest_passes`,
-  `test_restore_from_old_ref_passes`), моложе, в ту же секунду или без записи начала — блок с безопасным текстом
-  (`test_stash_after_session_start_blocked_with_safe_reason`, `test_restore_from_young_ref_blocked`,
-  `test_ref_in_session_start_second_not_old`, `test_old_ref_without_session_start_blocked`); начало сессии подменяется
-  записью `start.json`; время ref — по коммиттеру, не автору, имена HEAD убранного манифеста, `Unavailable`
-  `restored_names` по сроку, пределу и нечитаемому дереву ref (`test_restored_names_unreadable_tree_unavailable`) и
-  пропуск снимка с предупреждением; перенос из незакоммиченного `_LEGACY` вне git и в git блокируется —
-  `test_uncommitted_legacy_source_names_new`, из закоммиченного проходит —
-  `test_committed_legacy_source_moved_to_pyproject_not_new`), `ManifestConflictTest` (стороны конфликта индекса после
-  `git stash pop`, `git merge --squash`, `git cherry-pick -n`: `Write`, `Edit` разрешения и `git checkout --theirs`
-  проходят, имя ни одной стороны отклоняется; источник `git rebase` — `REBASE_HEAD` после `git add` нашей стороны;
-  стадии `:1:`, `:2:`, `:3:`, записанные `git update-index --index-info` в форме `git ls-files -s`, у каждой своё имя —
-  `test_each_index_stage_read`), `ManifestTransferEditTest` (имена версии HEAD убранного манифеста и файлов `_LEGACY`
-  версии HEAD проходят; имена `_LEGACY` рабочего дерева — неотслеживаемого, в подкаталоге `scratch/`, изменённого после
-  коммита — новые: обход в два шага, `test_legacy_source_in_tree_only_names_new`; `SyntaxWarning` закоммиченного
-  setup.py не в stderr), `ManifestFailureBranchesTest` (сбои `pop`, `compare`, срок правки — точный `systemMessage` и
-  `skipped`), `CommandRefsTest` (формы команд git, из которых `command_refs` берёт ref, и формы без ref — `git apply`),
-  `ManifestProjectUnderFixturesTest` (`FOREIGN_DIRS` — от проекта), `ManifestProjectUnderHomeRepoTest` (проект без
-  своего git под `HOME`-репозиторием с `status.showUntrackedFiles=no` и `.gitignore` `*`: `list_manifests` — режим
-  `walk`, правка и команда с новым именем — отказ и блок, имена версии HEAD и stash `~` не известны; файл вне корня
-  читает версии своего репозитория), `ManifestBypassTest` (имя свежего манифеста вне workspace, правка через ссылку на
-  файл и каталог, FIFO, `FOREIGN_DIRS` выше репозитория, возвращённые размер и mtime, запись в файл генератора до и
-  после него), `ManifestWatchStateTest` (файл состояния снимков: срок записей, удаление пустого файла, предел обхода вне
-  git, повторно не читаются файлы с тем же размером и mtime, та же длина с новым mtime перечитывается, смена режима
-  git/walk — причина третьим элементом `compare`, `test_mode_change_lost`; `start.json` пишет первый `PreToolUse` один
-  раз, `PostToolUse` и хук внутри судьи — нет); старый патч по относительному пути из подкаталога —
-  `test_old_patch_by_relative_path_from_subdir_passes` (`ManifestBashGitTest`).
+  workspace — `NpmWorkspaceLinkTest`, имя пакета манифеста — пакет проекта только у члена npm workspace корня —
+  `OwnNameTrustTest`, `[patch]`/`[replace]` Cargo и репозиторий `path` Composer имя местным не делают
+  (`test_cargo_patch_not_link`, `test_composer_path_repository_not_link`), go.work не связывает
+  (`test_go_work_not_link`) — `ManagerLinkTest`; go.work: жёсткая ссылка `test_go_work_hard_link`, удалённая замена в
+  `replace` — новое имя `test_go_work_remote_replace`, разрыв источников корня uv правкой и командой (`_edit_uv`,
+  `recheck`) — `LinkConditionTest`; шаблоны членов npm и uv workspace (путь и `каталог/*`; прочие — корень без членов)
+  — `WorkspacePatternTest` (`test_npm_patterns`, `test_uv_patterns`, `test_long_pattern_fast`), имя пакета
+  манифеста ref не прикрывает зависимость — `RestoredOwnNameTest`, удалённые источники корня uv у члена workspace —
+  `UvInheritedRemoteSourceTest`, FIFO под именем манифеста — `FifoManifestTest`; патчи `git apply` до начала сессии —
+  `OldPatchTest` и `OldPatchGitTest`, mtime `start.json` в долгой сессии — `SessionStartTtlTest`); хук —
+  `tests/test_judge_tool.py`: `ManifestEditTest` (правка `Write`, `Edit`, `MultiEdit`), `ManifestEditGitTest` (версии
+  `_REPO_REFS` — база), `ManifestEditReadsOnceTest` (один `list_manifests` и одно `ls-tree` HEAD на правку члена npm
+  workspace), `ManifestBashTest` и его наследник `ManifestBashGitTest` (снимок и сравнение вне git и в git: генератор
+  requirements и заголовок генератора — блок, с маркером — нет, маркер, `PostToolUseFailure`, параллельные команды по
+  `tool_use_id`, `mv`, `cp`, `git mv`; модуль go.work в require go.mod без `replace` каталогом — блок и при прямом
+  вызове go (`test_go_work_module_blocked`); ref до начала сессии: stash и ref `checkout`, `restore --source`,
+  `merge --squash`, `cherry-pick -n` старше начала — пропуск (`test_author_stash_before_session_passes`,
+  `test_author_stash_untracked_manifest_passes`, `test_restore_from_old_ref_passes`), моложе, в ту же секунду или без
+  записи начала — блок с безопасным текстом (`test_stash_after_session_start_blocked_with_safe_reason`,
+  `test_restore_from_young_ref_blocked`, `test_ref_in_session_start_second_not_old`,
+  `test_old_ref_without_session_start_blocked`); начало сессии подменяется записью `start.json`; время ref — по
+  коммиттеру, не автору, имена HEAD убранного манифеста, `Unavailable` `restored_names` по сроку, пределу и нечитаемому
+  дереву ref (`test_restored_names_unreadable_tree_unavailable`) и пропуск снимка с предупреждением; перенос из
+  незакоммиченного `_LEGACY` вне git и в git блокируется — `test_uncommitted_legacy_source_names_new`, из закоммиченного
+  проходит — `test_committed_legacy_source_moved_to_pyproject_not_new`), `ManifestConflictTest` (стороны конфликта
+  индекса после `git stash pop`, `git merge --squash`, `git cherry-pick -n`: `Write`, `Edit` разрешения и `git checkout
+  --theirs` проходят, имя ни одной стороны отклоняется; источник `git rebase` — `REBASE_HEAD` после `git add` нашей
+  стороны; стадии `:1:`, `:2:`, `:3:`, записанные `git update-index --index-info` в форме `git ls-files -s`, у каждой
+  своё имя — `test_each_index_stage_read`), `ManifestTransferEditTest` (имена версии HEAD убранного манифеста и файлов
+  `_LEGACY` версии HEAD проходят; имена `_LEGACY` рабочего дерева — неотслеживаемого, в подкаталоге `scratch/`,
+  изменённого после коммита — новые: обход в два шага, `test_legacy_source_in_tree_only_names_new`; `SyntaxWarning`
+  закоммиченного setup.py не в stderr), `ManifestFailureBranchesTest` (сбои `pop`, `compare`, срок правки — точный
+  `systemMessage` и `skipped`), `CommandRefsTest` (формы команд git, из которых `command_refs` берёт ref, и формы без
+  ref — `git apply`), `ManifestProjectUnderFixturesTest` (`FOREIGN_DIRS` — от проекта),
+  `ManifestProjectUnderHomeRepoTest` (проект без своего git под `HOME`-репозиторием с `status.showUntrackedFiles=no` и
+  `.gitignore` `*`: `list_manifests` — режим `walk`, правка и команда с новым именем — отказ и блок, имена версии HEAD и
+  stash `~` не известны; файл вне корня читает версии своего репозитория), `ManifestBypassTest` (имя свежего манифеста
+  вне workspace, правка через ссылку на файл и каталог, FIFO, `FOREIGN_DIRS` выше репозитория, возвращённые размер и
+  mtime, запись в файл генератора до и после него), `ManifestWatchStateTest` (файл состояния снимков: срок записей,
+  удаление пустого файла, предел обхода вне git, повторно не читаются файлы с тем же размером и mtime, та же длина с
+  новым mtime перечитывается, смена режима git/walk — причина третьим элементом `compare`, `test_mode_change_lost`;
+  запись без поля `npm`, с плоским `npm` и с полем `recheck` не той формы `pop` отбрасывает —
+  `test_pop_drops_entry_without_npm`; `start.json` пишет первый `PreToolUse` один раз, `PostToolUse` и хук внутри судьи
+  — нет); старый патч по относительному пути из подкаталога — `test_old_patch_by_relative_path_from_subdir_passes`
+  (`ManifestBashGitTest`).
 - `tests/test_hostile_git.py` передаёт враждебный конфиг явно — `GIT_CONFIG_GLOBAL` на временный файл — только вызовам
   плагина (`snapshot.capture`, `snapshot.changed_since`, `comments.extract`, `common.project_root` (`git rev-parse`,
   `git ls-files` под домашним каталогом-репозиторием — `HostileRootTest`), `guard_memory.is_memory_path`,
@@ -205,27 +216,60 @@ CI нет; цели — в `Makefile`. Проверяются два разны�
 - Детектор зависимостей над деревом `shparse` — `tests/test_depcheck.py`: формы, которые разбор читает как bash
   (`GrammarFormsTest`; проверка остатка после фатальной ошибки — `test_syntax_error_recovery`), внешнее раскрытие в
   строке оболочки (`OuterExpansionScriptTest`: сомнение и его исключения, вход оболочки, маркер у оболочки покрывает
-  тело heredoc — `test_marker_covers_heredoc`), имя команды — вывод подстановки (`NameOutputTest`); края разбора, на
-  которых детектор падал или молчал (`ParserLimitsTest`: позиции слова, раскрытого по напечатанному тексту, и узлы в
-  пределах каждого разобранного детектором текста — команды, строки `eval`, начала строк с ошибкой — на корпусах и
-  формах фаззера (`test_parsed_texts_in_bounds`); вложенность 10⁵ уровней — подпроцессом, сомнение `_WHY_NESTING`; сбой
-  детектора и разбора — сомнение `_WHY_UNPARSED`, маркер в начале команды; конструкция, не закрытая до конца ввода, —
-  начало строки проверяется; линейность `_name_expands`); вердикты корпусов — `CorpusTest` и
+  тело heredoc — `test_marker_covers_heredoc`), имя команды — вывод подстановки (`NameOutputTest`), потоки значений к
+  имени команды (`ValueFlowFormsTest`: `eval` из литералов, `declare -n`, массивы по индексам и дописанные, скобки
+  массива на нескольких строках, присваивание с преобразованием, `read` с IFS и `mapfile`; известное значение имени
+  проверяется как литеральное имя — `test_renamed_literal_doubt`, значения внешнего текста в строке `eval` —
+  `test_eval_outer_values`, строка `sh -c` из значения `read` и строка программы из переменной со значением в тексте —
+  `test_runtime_string`; повторные `IFS=, read` не растят значения IFS — `test_ifs_read_linear`; значение имени
+  списывается с остатка `_NAME_BUDGET` один раз — `test_renamed_budget_once`; каждая форма сверена с bash 5.3), код
+  интерпретатора и аргументы скрипта (`InterpreterCodeTest`, `_WHY_INTERPRETER`: склейка литерала со значением, списки
+  литералов, awk, bun, deno, tsx, интерпретатор за запускателем; аргументы скрипта, склеенные в команду, у оболочки,
+  `source`, python, `_CODE_PROGRAMS`, deno и bun, голое `bun <слово>` — пропуск, — `test_launchers`, значения ссылок в
+  аргументах скрипта — `test_script_arg_values`; остаток `_INPUT_BUDGET` тратят только кандидаты — `test_input_budget`);
+  края разбора, на которых детектор падал или молчал (`ParserLimitsTest`: позиции слова, раскрытого по напечатанному
+  тексту, и узлы в пределах каждого разобранного детектором текста — команды, строки `eval`, начала строк с ошибкой — на
+  корпусах и формах фаззера (`test_parsed_texts_in_bounds`); вложенность 10⁵ уровней — подпроцессом, сомнение
+  `_WHY_NESTING`; сбой детектора и разбора — сомнение `_WHY_UNPARSED`, маркер в начале команды; конструкция, не закрытая
+  до конца ввода, — начало строки проверяется; линейность `_name_expands`); вердикты корпусов — `CorpusTest` и
   `tests/test_bash_corpus.py`. Разбор shell сам по себе — `tests/test_shparse.py`: `PositionsTest` — `0 ≤ start ≤ end ≤
   len(text)` у каждого узла на корпусах `tests/fixtures/bash-*.jsonl` и формах фаззера (зёрна 7 и 13, по 4000 форм обеих
-  разновидностей; генератор `tests/tools/bashdiff.py` загружается по пути, формы только разбираются); `DepthLimitTest` —
-  предел стека разбора `shparse._STACK_MAX`: 10⁵ уровней каждого вида вложенности подпроцессом (segfault не роняет
-  тест-раннер) — ошибка `DEPTH`, корпуса и формы фаззера не доходят и до 100 уровней (`_STACK_MAX` подменён на 100),
-  дерево до предела — не глубже двух пределов. Тесты линейности, чей вход глубже предела, и
-  `LinearityTest.test_deep_nesting` (глубина 10⁴ без `RecursionError`) снимают предел подменой `_STACK_MAX`: они
-  проверяют сам разбор, а на пределе вложенный вход кончался бы ошибкой `DEPTH` сразу, и проверка прошла бы впустую.
-  Такие тесты: `LinearityTest.test_nesting`, `test_heredocs`, `ReparseLinearityTest.test_nesting`,
-  `PrintedTextTest.test_linear` (`tests/test_shparse.py`); `test_linear` классов `ArithmeticOutsideQuotesTest`,
-  `ArithmeticQuotesTest`, `ArithmeticSubstitutionTest`, `ExpandedNameTest`, `FunctionSubstitutionTest`,
-  `GrammarLinearTest`, `HeredocInSubstitutionEndTest`, `ParameterExpansionSpaceTest` (`tests/test_depcheck.py`);
-  `LinearParseTest.test_string_substitutions_are_linear` (`tests/test_comments.py`),
+  разновидностей; генератор `tests/tools/bashdiff.py` загружается по пути, формы только разбираются; текст каждого узла
+  по позициям — его текст в исходном: `test_node_text_corpora` на корпусах, `test_node_text_in_reparsed_text` в повторно
+  разобранных текстах, `test_fuzz_forms` на 16 000 формах; куски без посимвольного соответствия, `Script.rewritten`, —
+  `test_rewritten_text`, значение `$'…'` в `${имя OP …}` тела heredoc — `test_heredoc_dolbrace_ansi_positions`, тело ``
+  `…` `` в таком куске — `test_backquote_body_in_rewritten`; пустая `''` в арифметике — `test_empty_arith_quote`; `)`
+  скобок массива с `\` и переводом строки за ней в конце ввода — `test_array_close_at_end`; сверку текста узла
+  `text_mismatches` проходят `Simple`, `Word` и `Lit`, кроме узлов внутри `${…}` и арифметики с подстановкой, `Lit` с
+  печатью подстановки, тел heredoc и слов с неразобранной подстановкой); формы, на которых `make bashdiff` терял команды
+  на глубине 3, — `DparenExpansionEndTest` (конец `$((…)` при раскрытии), `HeredocDolbraceTest` (`${имя OP …}` в теле
+  heredoc), `CompoundAssignmentHeredocTest` (тела heredoc после перевода строки в `a=(…)`), `GroupAnsiQuoteTest` (`$'…'`
+  в группе `=~`), `PrintedSemicolonTest` (`;` за телом heredoc в печати подстановки; позиции слов команды за телом
+  heredoc в печати — `test_merged_command_positions`), `FunsubInArithTest` (печать `${ …}` в `"${…}"` в `$((…)`: перевод
+  строки перед `}`, конец `$((…)`, неизвестный без разбора, — не расхождение; `;` перед `}` по виду последней команды —
+  `test_print_before_brace`), `HeredocBodySubstitutionTest` (подстановка в теле heredoc — без знака конца); линейность
+  `$(( #` — виды `arith_comment*`, `arith_comment_paren`, `arith_param_paren` в `LinearityTest.KINDS`; комментарии в
+  скобках массива — `LinearityTest.test_array_comments`, `Lit` по обе стороны комментария на всех промежутках скобок —
+  `PositionsTest.test_text_of_words_and_literals`; предел цепочки повторного раскрытия —
+  `ReparseLinearityTest.test_reexpand_chain_limit`; линейную память разбора по глубине вложенности —
+  `MemoryLinearityTest` (пик `tracemalloc` при удвоении глубины, все виды вложенности и цепочки
+  повторного раскрытия, `test_heredoc_body_chain` — тела heredoc в телах без предела стека) и
+  `LinearityTest.test_param_text_memory`; `DepthLimitTest` — предел стека разбора `shparse._STACK_MAX`: 10⁵ уровней
+  каждого вида вложенности подпроцессом (segfault не роняет тест-раннер) — ошибка `DEPTH`, корпуса и формы фаззера не
+  доходят и до 100 уровней (`_STACK_MAX` подменён на 100), дерево до предела — не глубже двух пределов. Тесты
+  линейности, чей вход глубже предела, и `LinearityTest.test_deep_nesting` (глубина 10⁴ без `RecursionError`) снимают
+  предел подменой `_STACK_MAX`: они проверяют сам разбор, а на пределе вложенный вход кончался бы ошибкой `DEPTH` сразу,
+  и проверка прошла бы впустую. Такие тесты: `LinearityTest.test_nesting`, `test_heredocs`,
+  `ReparseLinearityTest.test_nesting`, `PrintedTextTest.test_linear` (`tests/test_shparse.py`); `test_linear` классов
+  `ArithmeticOutsideQuotesTest`, `ArithmeticQuotesTest`, `ArithmeticSubstitutionTest`, `ExpandedNameTest`,
+  `FunctionSubstitutionTest`, `GrammarLinearTest`, `HeredocInSubstitutionEndTest`, `ParameterExpansionSpaceTest`
+  (`tests/test_depcheck.py`); `LinearParseTest.test_string_substitutions_are_linear` (`tests/test_comments.py`),
   `DecidingTest.test_shift_after_open_parens_linear` (`tests/test_debug_watch.py`). Новый тест линейности с вложенностью
   глубже предела подменяет его так же.
+- Комментарии Perl: имена, объявленные в файле выше в том же пакете, решают `/` и `<<`
+  (`test_perl_declared_names_decide_slash_and_heredoc`, `test_perl_declared_names_follow_package_and_place`, линейность
+  — `test_perl_declarations_are_linear`); `\` перед `{`/`}` второй части `s{…}{…}e` снимается
+  (`test_perl_substitution_code_drops_escaped_delimiters`); все — в `tests/test_comments.py`.
 - Команда, решающая код строки (`debug_watch._deciding`, по дереву `shparse`), — `DecidingTest` в
   `tests/test_debug_watch.py`: `<<` в арифметике — сдвиг, а не heredoc (`test_arithmetic_shift_is_not_heredoc`); тело
   heredoc командами не считается (`test_heredoc_body_is_not_commands`); разделитель в слове, подстановке, образце

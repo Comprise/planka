@@ -2,16 +2,18 @@
 
 Правка — текст манифеста до и после по входу Write, Edit, MultiEdit. Команда — снимок имён всех
 манифестов проекта перед ней (state/<session>.manifests.json по tool_use_id) и сравнение после.
-Новым не считается имя из текста до правки вместе с транзитивными, из версии манифеста в HEAD, в
-источнике незавершённых merge, cherry-pick, rebase, revert и в сторонах конфликта индекса, из другого манифеста
-того же реестра в проекте и в HEAD, из файла _LEGACY в HEAD, имя пакета самого проекта — манифеста в HEAD
-(кроме npm и PyPI) или члена workspace (монорепозиторий, корень — _workspace_root): у npm — только зависимость,
-которую npm связывает с каталогом члена (manifests.NpmWorkspace), у uv — только в pyproject.toml workspace с
-источником `workspace = true` (_uv_inherited и manifests.names), — и, после команды, имя из манифестов ref, откуда
-команда git возвращает файлы (stash, ветка, коммит), если ref создан до начала сессии, и из изменённых строк
-манифестов в файле патча `git apply`, не менявшемся с начала сессии. Подключение файла (manifests.Include) — путь
-цели от корня проекта (_rooted) в каждом источнике имён; не новое имя, если файл — манифест из перечня проекта того
-вида, которым его читает менеджер, и проверяется сам (_unchecked).
+Новым не считается имя из текста до правки вместе с транзитивными, из версии манифеста в HEAD, в источнике незавершённых
+merge, cherry-pick, rebase, revert и в сторонах конфликта индекса, из другого манифеста того же реестра в проекте и в
+HEAD, из файла _LEGACY в HEAD, имя пакета, которое менеджер связывает с каталогом проекта: у npm — член workspace
+(монорепозиторий, корень — _workspace_root), только в зависимости, которую npm связывает с каталогом члена
+(manifests.NpmWorkspace), у uv — источник `workspace = true` или `path`, свой или корня workspace (_uv_inherited и
+manifests.names), у Cargo — `path`-зависимость самого манифеста, у go — только `replace` каталогом в самом go.mod
+(manifests.names; `[patch]` Cargo, репозиторий `path` Composer и go.work не связывают); имя пакета манифеста HEAD само
+по себе не прикрывает, — и, после команды, имя из манифестов ref, откуда команда git возвращает файлы (stash, ветка,
+коммит), если ref создан до начала сессии, и из изменённых строк манифестов в файле патча `git apply`, не менявшемся с
+начала сессии. Подключение файла (manifests.Include) — путь цели от корня проекта (_rooted) в каждом источнике имён; не
+новое имя, если файл — манифест из перечня проекта того вида, которым его читает менеджер, и проверяется сам
+(_unchecked).
 """
 import ast
 import configparser
@@ -712,36 +714,53 @@ def _project_rel(path, root):
     return path
 
 
-def _glob(pattern):
-    """Регулярное выражение шаблона каталога workspace от корня: `*` и `?` — в пределах части пути, `**` — любые
-    части; `./` в начале и `/` в конце не значат."""
-    out, i = [], 0
-    pattern = pattern.strip().removeprefix("./").rstrip("/")
-    while i < len(pattern):
-        if pattern.startswith("**/", i):
-            out.append("(?:.*/)?")
-            i += 3
-        elif pattern.startswith("**", i):
-            out.append(".*")
-            i += 2
-        else:
-            out.append({"*": "[^/]*", "?": "[^/]"}.get(pattern[i], re.escape(pattern[i])))
-            i += 1
-    return re.compile("".join(out) + r"\Z")
-
-
 # Корневой манифест реестра, чей workspace (manifests.workspace_members) ставит членов из их каталогов по имени.
-# Пакет проекта этих реестров менеджер ставит из каталога только по связи workspace: имя пакета манифеста HEAD и
-# ref здесь не прикрывает зависимость (_tree_names), в прочем манифесте npm и pip ставят его из реестра.
+# Пакет проекта менеджер ставит из каталога только по связи (workspace здесь, местный источник: `path` Cargo, uv,
+# `replace` каталогом в go.mod): имя пакета манифеста HEAD и ref зависимость не прикрывает (_tree_names), вне связи
+# менеджер ставит его из реестра.
 _WORKSPACE_ROOTS = {"npm": "package.json", "pypi": "pyproject.toml"}
+
+
+# Знаки шаблона, при которых член workspace не сверить (_glob); предел длины шаблона.
+_GLOB_SPECIAL = re.compile(r"[*?\[\]{}!\\]")
+MAX_WORKSPACE_PATTERN = 255
+
+
+def _glob(pattern):
+    """Функция (каталог от корня workspace, `/`) → подходит ли он к шаблону члена pattern или None — шаблон не
+    сверить. Понятны два вида: путь каталога буквально и `каталог/*` (одна звёздочка — вся последняя часть, имя без
+    точки в начале, как glob npm без dot); `./` в начале и `/` в конце не значат. Прочее (`!`, `**`, `?`, `[`, `{`,
+    `*` внутри имени, шаблон длиннее MAX_WORKSPACE_PATTERN) — None: сопоставление шаблонов из текста агента не
+    повторяет менеджер точно (npm: `!` — общий ignore, `x**` — `x*`, каталоги с точкой) и регулярным выражением было
+    бы экспоненциальным."""
+    if len(pattern) > MAX_WORKSPACE_PATTERN:
+        return None
+    pattern = pattern.strip().removeprefix("./").rstrip("/")
+    head, _, last = pattern.rpartition("/")
+    if last == "*" and not _GLOB_SPECIAL.search(head):
+        return lambda directory: (posixpath.dirname(directory) == head and directory.rpartition("/")[2] != ""
+                                  and not directory.rpartition("/")[2].startswith("."))
+    if pattern and not _GLOB_SPECIAL.search(pattern):
+        return lambda directory: directory == pattern
+    return None
 
 
 # Запомнен по тексту: _workspace_root зовёт его с текстом предка на каждого члена.
 @functools.lru_cache(maxsize=256)
 def _globs(name, text):
-    """((шаблон каталога _glob, исключение), …) workspace корневого манифеста name с текстом text; None — пусто."""
+    """((функция шаблона каталога _glob или None, исключение), …) workspace корневого манифеста name с текстом text
+    (у uv исключения — `exclude`, manifests.workspace_members даёт их с `!`); пусто — workspace нет. Хоть один шаблон
+    не сверить (_glob None, `!` в `workspaces` npm) — ((None, False),): workspace есть, членов нет — сомнение, имя
+    члена новое."""
     patterns = [] if text is None else manifests.workspace_members(manifests.kind(name), text)
-    return tuple((_glob(p.removeprefix("!")), p.startswith("!")) for p in patterns)
+    out = []
+    for p in patterns:
+        exclude = name == "pyproject.toml" and p.startswith("!")
+        match = _glob(p[1:] if exclude else p)
+        if match is None:
+            return ((None, False),)
+        out.append((match, exclude))
+    return tuple(out)
 
 
 def _ancestors(rel):
@@ -771,8 +790,8 @@ def _workspace_root(rel, text_of):
     включает каталог rel (@npmcli/config loadLocalPrefix: предок без package.json, без `workspaces` или не
     включающий пропускается); uv — первый предок с pyproject.toml, если его `[tool.uv.workspace]` включает каталог
     rel, иначе не член: проект внутри другого проекта uv членом не считает (uv-workspace find_workspace; проверено
-    `uv lock --offline`, uv 0.13.0). Включает — последний подходящий шаблон без `!`. Не прочитанный pyproject.toml —
-    как нет."""
+    `uv lock --offline`, uv 0.13.0). Включает — последний подходящий шаблон без `!` (_globs: шаблон, который не сверить,
+    — членов у корня нет). Не прочитанный pyproject.toml — как нет."""
     rel = rel.replace(os.sep, "/")
     name = posixpath.basename(rel)
     if os.path.isabs(rel) or name not in _WORKSPACE_ROOTS.values() or watched_kind(rel) is None:
@@ -784,7 +803,7 @@ def _workspace_root(rel, text_of):
             continue
         member = False
         for pattern, exclude in _globs(name, text):
-            if pattern.match(directory[len(ancestor) + 1:] if ancestor else directory):
+            if pattern is not None and pattern(directory[len(ancestor) + 1:] if ancestor else directory):
                 member = not exclude
         if member:
             return ancestor
@@ -839,20 +858,25 @@ def _npm_member(rel, text_of):
     return watched_kind(rel) == "package.json" and _workspace_root(rel, text_of) is not None
 
 
-def _uv_inherited(rel, text, text_of):
-    """Имена с местным источником (manifests.uv_sources) `[tool.uv.sources]` корня uv workspace, которые uv ставит из
-    каталога для члена rel (_workspace_root; text_of — как там) с текстом text: источник корня действует на члена,
-    если член не задал источник этого имени сам (docs.astral.sh/uv, «Workspaces»: «Any tool.uv.sources definitions in
-    the workspace root apply to all members, unless overridden»). Не член — пусто; свои источники манифеста разбирает
-    manifests.names."""
-    if watched_kind(rel) != "pyproject":
-        return frozenset()
+def _uv_inherited(rel, text_of):
+    """Источники `[tool.uv.sources]` корня uv workspace (manifests.uv_sources), которые uv применяет к члену rel
+    (_workspace_root; text_of — как там), если член не задал источник того же имени сам (docs.astral.sh/uv,
+    «Workspaces»: «Any tool.uv.sources definitions in the workspace root apply to all members, unless overridden in
+    the tool.uv.sources of a specific member»); их подставляет разбор члена (manifests.names). None — не член, не
+    pyproject.toml или у корня источников нет."""
+    if os.path.isabs(rel) or watched_kind(rel) != "pyproject":
+        return None
     root = _workspace_root(rel, text_of)
-    if root is None:
-        return frozenset()
-    own = manifests.uv_sources(text)
-    return frozenset(name for name, local in manifests.uv_sources(text_of(posixpath.join(root, "pyproject.toml")))
-                     .items() if local and name not in own)
+    text = None if root is None else text_of(posixpath.join(root, "pyproject.toml"))
+    return (manifests.uv_sources(text) or None) if text is not None else None
+
+
+def _context(kind, rel, text_of, npm=None):
+    """Связь манифеста rel вида kind с workspace для manifests.names: NpmWorkspace package.json (npm — _Npm или
+    None), источники корня uv workspace члена pyproject (_uv_inherited); прочее — None."""
+    if kind == "pyproject":
+        return _uv_inherited(rel, text_of)
+    return None if npm is None else npm.of(kind, rel)
 
 
 def _npm_members(rels, text_of):
@@ -882,8 +906,8 @@ def _tree_npm(texts):
 
 def project_names(root, kind, deadline, listed=None):
     """Имена манифестов реестра вида kind (manifests.registry) под root и, в git, манифестов и файлов _LEGACY
-    версии HEAD (_tree_names) с транзитивными и имена пакетов самого проекта этого реестра: манифестов версии HEAD
-    (кроме npm и PyPI) и членов npm workspace (_npm_member). Имя свежего манифеста вне workspace — не пакет
+    версии HEAD (_tree_names) с транзитивными и имена пакетов членов npm workspace (_npm_member); pyproject.toml члена
+    uv workspace — с источниками корня (_context). Имя свежего манифеста вне workspace — не пакет
     проекта: его пишет кто угодно, а проверяется только объявление зависимости. Файлы _LEGACY рабочего дерева имён
     не дают. Не разобранный и больший MAX_MANIFEST_BYTES манифест не даёт ничего. listed — перечень правки (listing)
     корня root: манифесты и режим — из него, дерево HEAD — из его listed.versions(), общего с head_names; None — свой
@@ -901,7 +925,7 @@ def project_names(root, kind, deadline, listed=None):
         other = watched_kind(rel)
         if manifests.registry(other) != registry:
             continue
-        known, own = _parse(os.path.join(root, rel), other, npm.of(other, rel))
+        known, own = _parse(os.path.join(root, rel), other, _context(other, rel, text_of, npm))
         out.update(_rooted(known, rel) or ())
         if _npm_member(rel, text_of):
             out.add(own)
@@ -913,7 +937,8 @@ def project_names(root, kind, deadline, listed=None):
 
 def check_edit(tool, tool_input, path, kind, project=frozenset, root=lambda: None, listed=None):
     """Новые имена правки манифеста path без подключений проверяемых манифестов (_unchecked) и с именами других
-    package.json, которые правка членов npm workspace переводит со связи на реестр (_edit_workspaces); project — как
+    package.json, которые правка членов npm workspace переводит со связи на реестр (_edit_workspaces), и других
+    pyproject.toml, которые правка корня uv workspace переводит с источника корня на другой (_edit_uv); project — как
     у fresh_names; root() — корень проекта для head_names и перечня или None, зовётся только для версий git,
     подключений и npm workspace; listed — перечень listing(root), его versions() читают версии git head_names, None —
     свой. None — правку не вычислить.
@@ -929,18 +954,56 @@ def check_edit(tool, tool_input, path, kind, project=frozenset, root=lambda: Non
     rel = _project_rel(path, root())
     listed = listed or listing(root)
     workspaces, effects = _edit_workspaces(kind, rel, before, after, root(), listed)
+    if kind == "pyproject" and root() is not None:
+        inherited = _uv_inherited(rel, _disk(root()))
+        workspaces = (inherited, inherited)
 
-    def own_project():
-        names = project()
-        if kind == "pyproject" and root() is not None:
-            names = names | _uv_inherited(rel, after, _disk(root()))
-        return names
     names = edit_names(kind, before, after,
                        lambda: _rooted(head_names(path, kind, HEAD_TIMEOUT, root(), listed.versions()), rel),
-                       own_project, rel, workspaces)
+                       project, rel, workspaces)
+    if root() is not None and not os.path.isabs(rel):
+        effects |= _edit_uv(kind, rel, before, after, root(), listed)
     if effects:
         effects -= project()
     return _unchecked(sorted(set(names) | effects), listed, kind)
+
+
+def _uv_signature(text):
+    """`[tool.uv]` pyproject.toml (workspace, sources), от которого зависят источники членов (_uv_inherited); не
+    разобранный — весь текст, None — файла нет. Одинаковые до и после — правка источники членов не меняет."""
+    if text is None:
+        return None
+    data = manifests._toml(text.removeprefix("\ufeff"))
+    if data is None:
+        return text
+    uv = manifests._table(data, "tool", "uv")
+    return uv.get("workspace"), uv.get("sources")
+
+
+def _edit_uv(kind, rel, before, after, root, listed):
+    """Новые имена других pyproject.toml проекта (перечень listed()), которые правка pyproject.toml rel с текстом
+    before на after меняет через источники корня uv workspace (_uv_inherited): корень убрал местный источник, сменил
+    его на удалённый, перестал включать члена — имя члена уходит в реестр или к источнику. Правка, не меняющая
+    `[tool.uv]` (_uv_signature), — пусто без перечня. Unavailable и TimeoutError — перечень не получен."""
+    if kind != "pyproject" or _uv_signature(before) == _uv_signature(after):
+        return set()
+    found = listed()
+    if found is None:
+        return set()
+    rel = rel.replace(os.sep, "/")
+    sides = (_disk(root, {rel: before}), _disk(root, {rel: after}))
+    effects = set()
+    for other in found[1]:
+        if other == rel or watched_kind(other) != "pyproject":
+            continue
+        contexts = [_uv_inherited(other, side) for side in sides]
+        text = sides[0](other)
+        if contexts[0] == contexts[1] or text is None:
+            continue
+        old, new = (manifests.names("pyproject", text, context) for context in contexts)
+        if old is not None and new is not None:
+            effects |= _rooted(new, other) - _rooted(old, other)
+    return effects
 
 
 def _edit_workspaces(kind, rel, before, after, root, listed):
@@ -1075,14 +1138,16 @@ def _parse(path, kind, workspace=None):
 
 
 def take(root, deadline):
-    """Снимок: {"root", "mode", "ts", "files": {путь: [size, mtime_ns, ctime_ns, имена с транзитивными (_dump_names)
-    или None, имя пакета манифеста или None]}, "npm": {каталог корня npm workspace: {имя члена: версия или None}}}
-    (_npm_members); package.json разбирается с этими членами (_Npm). Поле "known" (restored_names) добавляет
-    вызывающий. Файлы _LEGACY рабочего дерева в снимок не входят."""
+    """Снимок: {"root", "mode", "ts", "files": {путь: [size, mtime_ns, ctime_ns, имена с транзитивными (_dump_names) или
+    None, имя пакета манифеста или None]}, "npm": {каталог корня npm workspace: {имя члена: версия или None}}}
+    (_npm_members); package.json разбирается с этими членами (_Npm). "recheck" — пути членов uv workspace с
+    источниками корня (_context): compare сверяет их и без изменения файла — команда могла сменить источники корня.
+    Поле "known" (restored_names) добавляет вызывающий. Файлы _LEGACY рабочего дерева в снимок не входят."""
     mode, found = list_manifests(root, deadline)
     text_of = _disk(root)
     npm = _Npm(text_of, _npm_members(found, text_of))
     entry = {"root": str(root), "mode": mode, "ts": time.time(), "files": {}, "npm": npm.members}
+    recheck = []
     for rel in found:
         _remaining(deadline)
         path = os.path.join(root, rel)
@@ -1090,8 +1155,13 @@ def take(root, deadline):
         if st is None:
             continue
         kind = watched_kind(rel)
-        known, own = _parse(path, kind, npm.of(kind, rel))
+        context = _context(kind, rel, text_of, npm)
+        known, own = _parse(path, kind, context)
+        if kind == "pyproject" and context is not None:
+            recheck.append(rel)
         entry["files"][rel] = [*st, None if known is None else _dump_names(_rooted(known, rel)), own]
+    if recheck:
+        entry["recheck"] = recheck
     return entry
 
 
@@ -1116,18 +1186,17 @@ def compare(entry, deadline):
     """({путь: новые имена}, [пути, которые не проверить], причина, почему новые манифесты не проверены, или None)
     после команды против снимка entry.
 
-    Новый манифест и манифест, не разобранный в снимке и без версии git, сравниваются с пустым (fresh_names);
-    пропавший — ничего; манифест с тем же size, mtime и ctime не перечитывается; не разобранный после команды — в
-    списке непроверенных. Имя из любого манифеста того же реестра
-    (manifests.registry) в снимке, из ref до начала сессии (entry["known"], restored_names, с именами пакетов их
-    манифестов), в git — из манифестов и файлов _LEGACY версии HEAD и имена пакетов её манифестов (_tree_names,
-    читается, только если после old и версий файла что-то осталось; без имён пакетов npm и PyPI), имя пакета члена
-    npm workspace после команды (_npm_member; в снимке или в манифесте после команды) и, в члене uv workspace,
-    имя с местным источником корня (_uv_inherited) — не новое: перенос, копия, член workspace, возврат работы
-    автора. Подключение манифеста из перечня после команды — не новое имя (_unchecked). Версии git изменённых
-    package.json разбираются с одним _VersionNpm на сравнение. package.json
-    разбирается с членами npm workspace после команды (_Npm); члены изменились против снимка (entry["npm"]) — каждый
-    package.json перечитывается и с тем же size, mtime и ctime: зависимость на члена могла уйти со связи на реестр.
+    Новый манифест и манифест, не разобранный в снимке и без версии git, сравниваются с пустым (fresh_names); пропавший
+    — ничего; манифест с тем же size, mtime и ctime не перечитывается; не разобранный после команды — в списке
+    непроверенных. Имя из любого манифеста того же реестра (manifests.registry) в снимке, из ref до начала сессии
+    (entry["known"], restored_names), в git — из манифестов и файлов _LEGACY версии HEAD (_tree_names, читается, только
+    если после old и версий файла что-то осталось), имя пакета члена npm workspace после команды (_npm_member; в снимке
+    или в манифесте после команды) — не новое: перенос, копия, член workspace, возврат работы автора. Члены uv workspace
+    с источниками корня (entry["recheck"] и после команды) сверяются и с тем же size, mtime и ctime: команда могла
+    сменить источники корня. Подключение манифеста из перечня после команды — не новое имя (_unchecked). Версии git
+    изменённых package.json разбираются с одним _VersionNpm на сравнение. package.json разбирается с членами npm
+    workspace после команды (_Npm); члены изменились против снимка (entry["npm"]) — каждый package.json перечитывается и
+    с тем же size, mtime и ctime: зависимость на члена могла уйти со связи на реестр.
 
     Режим сменился за команду (`git init`) или манифестов теперь не перечислить (больше MAX_MANIFESTS, вне git
     файлов больше MAX_WALK_FILES) — сверяются только пути снимка, третий элемент — причина: новые манифесты не
@@ -1145,6 +1214,7 @@ def compare(entry, deadline):
     text_of = _disk(root)
     npm = _Npm(text_of, _npm_members(found, text_of), frozenset().union(*entry["npm"].values()))
     members_changed = npm.members != entry["npm"]
+    recheck = frozenset(entry.get("recheck", ()))
     versions = _VersionNpm(root)
     project = {registry: set(_load_names(names)) for registry, names in entry.get("known", {}).items()}
     for rel, (*_, known, own) in before.items():
@@ -1159,26 +1229,29 @@ def compare(entry, deadline):
         st = _stat(path)
         was = before.get(rel)
         kind = watched_kind(rel)
-        if st is None or isinstance(was, list) and was[:3] == st and not (members_changed and kind == "package.json"):
+        if st is None:
+            continue
+        context = _context(kind, rel, text_of, npm)
+        if (isinstance(was, list) and was[:3] == st and not (members_changed and kind == "package.json")
+                and rel not in recheck and not (kind == "pyproject" and context is not None)):
             continue
         text = text_of(rel)
-        new = None if text is None else _rooted(manifests.names(kind, text, npm.of(kind, rel)), rel)
+        new = None if text is None else _rooted(manifests.names(kind, text, context), rel)
         if new is None:
             unknown.append(rel)
             continue
         own = manifests.own_name(kind, text) if _npm_member(rel, text_of) else None
         project.setdefault(manifests.registry(kind), set()).update(() if own is None else (own,))
-        changed.append((rel, path, kind, new, was, _uv_inherited(rel, text, text_of)))
+        changed.append((rel, path, kind, new, was))
     head_tree = []
 
-    def project_of(kind, inherited):
+    def project_of(kind):
         if mode == "git" and not head_tree:
             head_tree.append(_tree_names(root, "HEAD", deadline, versions) or {})
         registry = manifests.registry(kind)
-        return frozenset(project.get(registry, ())).union(head_tree[0].get(registry, ()) if head_tree else (),
-                                                          inherited)
+        return frozenset(project.get(registry, ())).union(head_tree[0].get(registry, ()) if head_tree else ())
     added = {}
-    for rel, path, kind, new, was, inherited in changed:
+    for rel, path, kind, new, was in changed:
         if was is None:
             old = frozenset()
         else:
@@ -1187,7 +1260,7 @@ def compare(entry, deadline):
         def head(path=path, kind=kind, rel=rel):
             return _rooted(head_names(path, kind, _remaining(deadline), root, versions), rel) if mode == "git" else None
         names = _unchecked(fresh_names(old, new, head,
-                                       lambda kind=kind, inherited=inherited: project_of(kind, inherited)),
+                                       lambda kind=kind: project_of(kind)),
                            lambda: (root, found), kind)
         if names:
             added[rel] = names
@@ -1310,11 +1383,11 @@ def _old_trees(root, refs, start, deadline):
 
 
 def _tree_names(root, tree, deadline, versions=None):
-    """{реестр: имена с транзитивными и имена пакетов манифестов (кроме npm и PyPI, _WORKSPACE_ROOTS)} манифестов и
-    файлов _LEGACY (source_kind) дерева tree — ref или SHA дерева; None — git не прочитал дерево (нет HEAD, не
-    репозиторий) или его блобы. package.json разбирается с npm workspace того же дерева (_tree_npm). Пути с переводом
-    строки или возвратом каретки пропускаются. Дерево и блобы читает versions — _VersionNpm корня root, общий с
-    head_names правки или сравнения; None — свой. Unavailable — манифестов в дереве больше MAX_MANIFESTS;
+    """{реестр: имена с транзитивными} манифестов и файлов _LEGACY (source_kind) дерева tree — ref или SHA дерева;
+    None — git не прочитал дерево (нет HEAD, не репозиторий) или его блобы. package.json разбирается с npm workspace
+    того же дерева (_tree_npm), pyproject.toml — с источниками корня uv workspace того же дерева (_context). Пути с
+    переводом строки или возвратом каретки пропускаются. Дерево и блобы читает versions — _VersionNpm корня root,
+    общий с head_names правки или сравнения; None — свой. Unavailable — манифестов в дереве больше MAX_MANIFESTS;
     TimeoutError — срок deadline."""
     if versions is None:
         versions = _VersionNpm(root)
@@ -1333,12 +1406,11 @@ def _tree_names(root, tree, deadline, versions=None):
     blobs = [(path, read[entries[path]]) for path in paths if read[entries[path]] is not None]
     npm = _tree_npm({path: manifests.decode("package.json", data) for path, data in blobs
                      if source_kind(path) == "package.json"})
+    pyproject = {path: manifests.decode("pyproject", data) for path, data in blobs if source_kind(path) == "pyproject"}
     for path, data in blobs:
         kind = source_kind(path)
         text = manifests.decode(kind, data)
-        names = set(_rooted(_known(kind, text, npm.of(kind, path)), path) or ())
-        if kind not in _LEGACY and manifests.registry(kind) not in _WORKSPACE_ROOTS:
-            names.add(manifests.own_name(kind, text))
+        names = set(_rooted(_known(kind, text, _context(kind, path, pyproject.get, npm)), path) or ())
         names.discard(None)
         if names:
             known.setdefault(_registry(kind), set()).update(names)
@@ -1450,7 +1522,7 @@ def _old_patch_names(patches, start, base, deadline):
 
 
 def restored_names(root, command, start, deadline, cwd=None):
-    """{реестр: имена с транзитивными и имена пакетов (_tree_names, _dump_names)} манифестов и файлов _LEGACY ref,
+    """{реестр: имена с транзитивными (_tree_names, _dump_names)} манифестов и файлов _LEGACY ref,
     откуда command возвращает файлы (command_refs), если ref создан до start — начала сессии (session_start), и
     слова изменённых строк манифестов в файлах патчей `git apply` (command_patches), не менявшихся с start;
     относительный путь патча — от cwd, без него — от root. Это работа до сессии, после команды такие имена не
@@ -1520,6 +1592,8 @@ def pop(session, tool_use_id):
              and isinstance(entry.get("known", {}), dict)
              and all(_valid_names(v) for v in entry.get("known", {}).values())
              and isinstance(entry.get("npm"), dict)
+             and isinstance(entry.get("recheck", []), list)
+             and all(isinstance(r, str) for r in entry.get("recheck", []))
              and all(isinstance(members, dict) and all(v is None or isinstance(v, str) for v in members.values())
                      for members in entry["npm"].values()))
     return entry if valid else None

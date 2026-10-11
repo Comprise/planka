@@ -14,6 +14,7 @@
 """
 import bisect
 import codecs
+import functools
 import json
 import locale
 import re
@@ -83,6 +84,7 @@ _KINDS = {
     "pyproject.toml": "pyproject",
     "Cargo.toml": "cargo",
     "go.mod": "gomod",
+    "go.work": "gowork",
     "Gemfile": "gemfile",
     "gems.rb": "gemfile",
 }
@@ -181,6 +183,9 @@ def _json_object(text):
     return data if isinstance(data, dict) else None
 
 
+# Запомнен по тексту: один манифест разбирают names, known_names и own_name — без памяти снимок разбирал бы каждый
+# TOML-манифест по нескольку раз. Результат общий: вызывающие его не меняют.
+@functools.lru_cache(maxsize=32)
 def _toml(text):
     try:
         return tomllib.loads(text)
@@ -473,14 +478,18 @@ def _uv_local(sources):
 
 
 def uv_sources(text):
-    """{имя PEP 503: источник местный (_uv_local)} таблицы `[tool.uv.sources]` pyproject.toml; пусто — таблицы нет
-    или текст не разобран."""
+    """{имя PEP 503: [источник, …]} таблицы `[tool.uv.sources]` pyproject.toml — источник или список источников с
+    маркерами как список; пусто — таблицы нет или текст не разобран. Так корень uv workspace отдаёт источники членам
+    (names с inherited)."""
     sources = _table(_toml(text.removeprefix("\ufeff")) or {}, "tool", "uv", "sources")
-    return {_pep503(name): _uv_local(source if isinstance(source, list) else [source])
-            for name, source in sources.items()}
+    return {_pep503(name): source if isinstance(source, list) else [source] for name, source in sources.items()}
 
 
-def _pyproject(text):
+def _pyproject(text, inherited=None):
+    """inherited — источники `[tool.uv.sources]` корня uv workspace члена (uv_sources) или None: uv применяет их к
+    члену, если член не задал источник этого имени сам (docs.astral.sh/uv, «Workspaces»: «Any tool.uv.sources
+    definitions in the workspace root apply to all members, unless overridden in the tool.uv.sources of a specific
+    member»)."""
     data = _toml(text)
     if data is None:
         return None
@@ -528,16 +537,19 @@ def _pyproject(text):
         if isinstance(own, str):
             names.discard(_pep503(own))
     # Источник uv — член workspace или каталог; список источников с маркерами — местный, если местный хоть один,
-    # иначе каждый источник — имя с источником.
-    for name, source in _table(uv, "sources").items():
-        sources = source if isinstance(source, list) else [source]
+    # иначе каждый источник — имя с источником. Источник корня workspace (`[tool.uv.workspace]`) uv применяет и к
+    # членам: удалённый — имя с источником, даже если корень сам это имя не объявил.
+    own = {_pep503(name): source if isinstance(source, list) else [source]
+           for name, source in _table(uv, "sources").items()}
+    root = bool(_table(uv, "workspace"))
+    for name, sources in {**(inherited or {}), **own}.items():
         if _uv_local(sources):
-            names.discard(_pep503(name))
-        elif _pep503(name) in names:
+            names.discard(name)
+        elif name in names or root and name in own:
             remote = {_table_source(s) for s in sources} - {None}
             if remote:
-                names.discard(_pep503(name))
-                names.update(_sourced(_pep503(name), s) for s in remote)
+                names.discard(name)
+                names.update(_sourced(name, s) for s in remote)
     indexes = [index.get("url") for index in _list(uv.get("index")) + _list(poetry.get("source"))
                + _list(_table(data, "tool", "pdm").get("source")) if isinstance(index, dict)]
     indexes += [uv.get("index-url"), *_list(uv.get("extra-index-url")), *_list(uv.get("find-links"))]
@@ -866,24 +878,24 @@ def _go_path(token):
 
 
 def _go_replace(spec):
-    """((модуль, версия левой части или None), заменённый каталогом, или None; модуль-замена из другого пути или None)
-    директивы `replace <модуль> [версия] => <путь или модуль> [версия]`."""
+    """(модуль, версия левой части или None, каталог ли замена, модуль-замена или None) директивы `replace <модуль>
+    [версия] => <путь или модуль> [версия]`; None — не разобрана. Замена модулем — источник и тем же путём с другой
+    версией: она перекрывает замену каталогом (_gomod)."""
     left, arrow, right = spec.partition("=>")
     old, new = left.split(), right.split()
     if not (arrow and old and new):
-        return None, None
+        return None
     version = _go_path(old[1]) if len(old) > 1 else None
     old, new = _go_path(old[0]), _go_path(new[0])
-    if _go_directory(new):
-        return (old, version), None
-    return None, (new if new != old else None)
+    directory = bool(_go_directory(new))
+    return old, version, directory, None if directory else new
 
 
 def _gomod(text, indirect=False):
     """Пути модулей директив `require`; помеченные `// indirect` — только при indirect. Модуль,
-    заменённый каталогом (`replace x => ../x`), — местный, не входит, если у замены нет версии или она — версия из
-    `require` этого модуля (замена `x v1 => ./x` другой версии не касается); модуль-замена из другого пути
-    (`replace x => evil/x v1`) — входит.
+    заменённый каталогом (`replace x => ../x`), — местный, не входит, если для каждой его версии из `require`
+    действует замена каталогом: своя (`x v1 => ./x`), иначе общая без версии (замена версии перекрывает общую);
+    модуль-замена (`replace x => evil/x v1`, и тем же путём `x => x v1`) — входит.
 
     Незакрытый блок читается до конца файла.
     """
@@ -921,11 +933,31 @@ def _gomod(text, indirect=False):
                 names.add(path)
         elif m and m.group(1) == "replace":
             replaced.append(_go_replace(m.group(2)))
-    local = {old for (old, version), _ in filter(lambda r: r[0], replaced)
-             if version is None or version in versions.get(old, ())}
-    names = (names - local) | {new for _, new in replaced}
+    # go.dev/ref/mod, «replace directive»: замена с версией слева — только этой версии, без версии — всех; для версии
+    # действует своя, иначе общая. Модуль местный, если для каждой его версии из require действует замена каталогом.
+    effective = {}
+    for found in filter(None, replaced):
+        effective[found[:2]] = found[2]
+    local = {old for old, version in effective if old in versions and all(
+        effective.get((old, v), effective.get((old, None))) for v in versions[old] or {None})}
+    names = (names - local) | {found[3] for found in replaced if found}
     names.discard("")
     names.discard(None)
+    return frozenset(names)
+
+
+def _gowork(text):
+    """Модули-замены из другого пути директив `replace` go.work (`replace x => evil/x v1`): замены go.work
+    перекрывают замены go.mod рабочих модулей (go.dev/ref/mod, «go.work files»: «replace directives in the go.work
+    file override replace directives … in workspace modules»), go ставит такой модуль из прокси. Замена каталогом и
+    `use` имён не дают и модуль с каталогом не связывают: связь go — только `replace` каталогом в самом go.mod."""
+    names = set()
+    for directive, spec in _go_directives(text):
+        found = _go_replace(spec) if directive == "replace" else None
+        if found:
+            names.add(found[3])
+    names.discard(None)
+    names.discard("")
     return frozenset(names)
 
 
@@ -935,6 +967,32 @@ def _gomod_module(text):
         if m and m.group(1) == "module" and m.group(2).split():
             return _go_path(m.group(2).split()[0])
     return None
+
+
+_GO_LINE = re.compile(r"([a-z]+)\s+(.*)")
+
+
+def _go_directives(text):
+    """(директива, аргументы) go.mod и go.work по строкам: элемент блока `директива (` … `)` — своей строкой.
+    Незакрытый блок читается до конца файла."""
+    block = None
+    for line in text.removeprefix("\ufeff").splitlines():
+        line = _GO_COMMENT.sub("", line).strip()
+        if not line:
+            continue
+        if block is not None:
+            if line.startswith(")"):
+                block = None
+            else:
+                yield block, line
+            continue
+        m = _GO_BLOCK_START.match(line)
+        if m:
+            block = m.group(1)
+            continue
+        m = _GO_LINE.match(line)
+        if m:
+            yield m.group(1), m.group(2)
 
 
 # `gem 'имя'`, `gem("имя")`, `(gem "имя")` с буквальным именем; `plugin` — гем плагина Bundler, его ставит
@@ -1125,6 +1183,7 @@ _PARSERS = {
     "requirements": _requirements,
     "cargo": _cargo,
     "gomod": _gomod,
+    "gowork": _gowork,
     "gemfile": _gemfile,
 }
 
@@ -1143,6 +1202,7 @@ _REGISTRY = {
     "requirements": "pypi",
     "cargo": "crates.io",
     "gomod": "go",
+    "gowork": "go",
     "gemfile": "rubygems",
 }
 
@@ -1167,12 +1227,13 @@ def names(kind, text, workspace=None):
     неизвестен.
 
     requirements, go.mod и Gemfile разбираются построчно и None не дают. Транзитивные зависимости
-    не входят: `// indirect` go.mod. workspace — NpmWorkspace манифеста package.json или None.
+    не входят: `// indirect` go.mod. workspace — NpmWorkspace манифеста package.json, источники корня uv workspace
+    члена pyproject (uv_sources) или None.
     """
     parser = _PARSERS.get(kind)
     if parser is None:
         return None
-    return _parse(parser, text, workspace) if kind == "package.json" else _parse(parser, text)
+    return _parse(parser, text, workspace) if kind in ("package.json", "pyproject") else _parse(parser, text)
 
 
 def known_names(kind, text, workspace=None):

@@ -781,6 +781,103 @@ class ParserEdgeTest(unittest.TestCase):
         self.assertEqual(comments._comments("print $h{$k} <<FLAGS; # c1\n# c2\nFLAGS\n", "pl"),
                          [(1, "# c1"), (2, "# c2")])
 
+    def test_perl_declared_names_decide_slash_and_heredoc(self):
+        # Функция, объявленная в файле выше в том же пакете: без прототипа или с непустым — терм («/» — регулярка и
+        # через пробел, «<<» — heredoc и вплотную), «sub NAME()», «:prototype()», «use constant» — значение (деление,
+        # сдвиг).
+        # Ожидания сверены с perl -MO=Deparse (Perl 5.42).
+        cases = (("sub foo {1}\n$a = foo / 2;#/\n", []),
+                 ("sub foo;\n$a = foo /2; # c /\n", []),
+                 ("sub foo ($) {1}\n$a = foo / 2;#/\n", []),
+                 ("sub foo :lvalue {1}\n$a = foo / 2;#/\n", []),
+                 ("sub foo () {1}\n$a = foo /2; # c\n", [(2, "# c")]),
+                 ("sub foo ( ) {1}\n$a = foo /2; # c\n", [(2, "# c")]),
+                 ("sub foo();\n$a = foo /2; # c\n", [(2, "# c")]),
+                 ("sub foo :lvalue :prototype() {1}\n$a = foo /2; # c\n", [(2, "# c")]),
+                 ("use constant PI => 3;\n$a = PI /2; # c\n", [(2, "# c")]),
+                 ("use constant # x\n  PI => 3;\n$a = PI /2; # c\n", [(1, "# x"), (3, "# c")]),
+                 ('use constant "PI" => 3;\n$a = PI /2; # c\n', [(2, "# c")]),
+                 ("use constant PI, 3;\n$a = PI /2; # c\n", [(2, "# c")]),
+                 ("use constant {\n  A => 1,\n  B => [x => 2],\n};\n$a = B /2; # c\n", [(5, "# c")]),
+                 ("sub foo () {1}\nsub bar {\n  foo /2; # c\n}\n", [(3, "# c")]),
+                 ("sub foo {1}\n$a = foo <<b;\n# x\nb\n# c\n", [(5, "# c")]),
+                 ("sub foo ($) {1}\n$a = foo<<b;\n# x\nb\n# c\n", [(5, "# c")]),
+                 ("sub foo () {1}\n$a = foo <<EOF; # c1\n# c2\nEOF\n", [(2, "# c1"), (3, "# c2")]),
+                 ('use constant PI => 2;\n$a = PI << "EOF"; # c1\n# c2\nEOF\n', [(2, "# c1"), (3, "# c2")]))
+        for src, expected in cases:
+            self.assertEqual(comments._comments(src, "pl"), expected, src)
+
+    def test_perl_declared_names_follow_package_and_place(self):
+        # Имя чужого пакета без пакета, объявленное ниже, в строке, лексическое («my sub») — не объявлено: правило
+        # аргумента вызова («/» вплотную — регулярка). Встроенная функция сильнее своей (perl: CORE::time). С
+        # сигнатурами «sub NAME ()» — пустая сигнатура, терм. Сверено с perl -MO=Deparse.
+        cases = (("package X;\nsub foo () {1}\npackage main;\n$a = foo /2; # c\n$a = X::foo /2; # d\n", [(5, "# d")]),
+                 ("{ package X; sub foo () {1} }\n$a = foo /2; # c\n", []),
+                 ("{\n  package X;\n  sub foo () {1}\n}\n$a = foo /2; # c\n$a = X::foo /2; # d\n", [(6, "# d")]),
+                 ("package X { sub foo () {1} }\n$a = foo /2; # c\n", []),
+                 ("package X 1.0 { sub foo () {1} }\n$a = X::foo /2; # c\n", [(2, "# c")]),
+                 ("sub X::foo () {1}\npackage X;\n$a = foo /2; # c\n", [(3, "# c")]),
+                 ("sub foo () {1}\npackage X;\n$a = main::foo /2; # c\n$a = ::foo /2; # d\n",
+                  [(3, "# c"), (4, "# d")]),
+                 ("$a = foo /2; # c\nsub foo () {1}\n", []),
+                 ('$s = "sub foo () {1}";\n$a = foo /2; # c\n', []),
+                 ("# sub foo () {1}\n$a = foo /2; # c\n", [(1, "# sub foo () {1}")]),
+                 ("my sub foo () {1}\n$a = foo /2; # c\n", []),
+                 ("sub time {5}\n$a = time /2; # c\n", [(2, "# c")]),
+                 ("sub x {5}\n$a = $b x /2/; # c\n", [(2, "# c")]),
+                 ('use feature "signatures";\nsub foo () {1}\n$a = foo /2; # c /\n', []),
+                 ("use v5.36;\nsub foo () {1}\n$a = foo /2; # c /\n", []),
+                 ("use 5.010;\nsub foo () {1}\n$a = foo /2; # c\n", [(3, "# c")]),
+                 ("use v5.36;\nsub foo :prototype() {1}\n$a = foo /2; # c\n", [(3, "# c")]),
+                 # Ведущее «::» — пакет main: «::X::foo» — то же, что «X::foo».
+                 ("package X;\nsub foo () {1}\npackage main;\n$a = ::X::foo /2; # c\n$a = main::X::foo /2; # d\n",
+                  [(4, "# c"), (5, "# d")]),
+                 ("sub ::X::foo () {1}\npackage X;\n$a = foo /2; # c\n", [(3, "# c")]),
+                 ("sub ::main::foo () {1}\n$a = foo /2; # c\n$a = ::main::foo /2; # d\n", [(2, "# c"), (3, "# d")]))
+        for src, expected in cases:
+            self.assertEqual(comments._comments(src, "pl"), expected, src)
+
+    def test_perl_declared_name_after_operator_sign(self):
+        # «*» и «&» после операнда — умножение и битовое «и», «**» и «&&» — операторы, «.» — конкатенация: имя за
+        # ними — объявленное значение, «/» — деление. «*» в начале терма — glob, вызов через «&» — не имя.
+        # Сверено с perl -MO=Deparse (Perl 5.42).
+        src = ("use constant PI => 3;\n$a = 2*PI /2; # c\n$a = $b.PI /2; # d\n$a = $b&PI /2; # e\n"
+               "$a = 2**PI /2; # f\n$a = $b&&PI /2; # g\n$a = (1)*PI /2; # h\n$a = $h{x}*PI /2; # i\n")
+        self.assertEqual(comments._comments(src, "pl"),
+                         [(2, "# c"), (3, "# d"), (4, "# e"), (5, "# f"), (6, "# g"), (7, "# h"), (8, "# i")])
+        self.assertEqual(comments._comments("sub foo {1}\n$a = 2*foo /2; # c /;\n", "pl"), [])
+
+    def test_perl_sigil_at_term_start_is_operand(self):
+        # Glob «*name» и вызов «&name» в начале терма — операнды: «/» — деление, «<<» — сдвиг (и после print).
+        # «.» и «&» после операнда — операторы: слово за ними встроенное («$b.time» — значение, «$b.length»,
+        # «$b&length» — терм, «$b.lc<<EOS» — heredoc). Сверено с perl -MO=Deparse (Perl 5.42).
+        cases = (("print *PI /2; # c /;\n", [(1, "# c /;")]),
+                 ("$a = *length /2; # c /;\n", [(1, "# c /;")]),
+                 ("sub foo {1}\n$a = &foo /2; # c /;\n", [(2, "# c /;")]),
+                 ("sub length {1}\n$a = &length /2; # c /;\n", [(2, "# c /;")]),
+                 ("$a = $b.time /2; # c /;\n", [(1, "# c /;")]),
+                 ("$a = $b.length /2; # c /;\n", []),
+                 ("$a = $b&length /2; # c /;\n", []),
+                 ("$a = $b.lc<<EOS;\n# x\nEOS\n", []),
+                 ("$a = *FH <<EOS;\n# x\nEOS\n", [(2, "# x")]),
+                 ("print *STDOUT <<EOS;\n# x\nEOS\n", [(2, "# x")]),
+                 ("sub foo {1}\n$a = &foo <<EOS;\n# x\nEOS\n", [(3, "# x")]))
+        for src, expected in cases:
+            self.assertEqual(comments._comments(src, "pl"), expected, src)
+
+    def test_perl_sigil_before_closing_bracket_keeps_depth(self):
+        # Прототип и сигнатура анонимной функции («sub ($$)», «sub :prototype($$)», «sub ($x, $)») и «$$)» — не
+        # переменные «$)», «$]»: счёт скобок не уплывает, ключ «use constant {…}» после них найден. Сверено с
+        # perl -MO=Deparse (Perl 5.42).
+        cases = ("use constant {\n  A => sub ($$) {1},\n  B => 2,\n};\n$a = B /2; # c /\n",
+                 "use constant {\n  A => sub :prototype($$) {1},\n  B => 2,\n};\n$a = B /2; # c /\n",
+                 "use constant {\n  A => getpgrp($$),\n  B => 2,\n};\n$a = B /2; # c /\n",
+                 "use constant {\n  A => ($)),\n  B => 2,\n};\n$a = B /2; # c /\n")
+        for src in cases:
+            self.assertEqual(comments._comments(src, "pl"), [(5, "# c /")], src)
+        src = "use v5.36;\nuse constant {\n  A => sub ($x, $) {1},\n  B => 2,\n};\n$a = B /2; # c /\n"
+        self.assertEqual(comments._comments(src, "pl"), [(6, "# c /")])
+
     def test_shift_after_quoted_term_is_not_heredoc(self):
         for src in ('puts "a" <<EOF # c1\n# c2\nEOF\n', "puts 'a' <<EOF # c1\n# c2\nEOF\n",
                     "puts `a` <<EOF # c1\n# c2\nEOF\n"):
@@ -1167,6 +1264,15 @@ class RubyPerlElixirLiteralTest(unittest.TestCase):
                  ("$s =~ s{a}{ # c\n  f() # d\n}g; # e\n", [(3, "# e")]),
                  ("$s =~ s{a}{\n  f() # d\n  {x}\n}ge; # e\n", [(2, "# d"), (4, "# e")]),
                  ("$s =~ s{a}{\n  'x' # d\n};\n", []))
+        for src, expected in cases:
+            self.assertEqual(comments._comments(src, "pl"), expected, src)
+
+    def test_perl_substitution_code_drops_escaped_delimiters(self):
+        # Perl снимает «\» перед «{» и «}» второй части до разбора её кодом, пара «\\» остаётся (perl -MO=Deparse:
+        # «s{a}{f("\}")}e» — «f('}')»); имена, объявленные выше, видны и в ней.
+        cases = (('$s =~ s{a}{\n  f("\\}"); # c \\}\n}e;\n', [(2, "# c }")]),
+                 ('$s =~ s{a}{\n  f("\\{"); # c \\{ \\\\ \\x\n}e;\n', [(2, "# c { \\\\ \\x")]),
+                 ("sub foo () {1}\n$s =~ s{a}{\n  foo /2; # c\n}e;\n", [(3, "# c")]))
         for src, expected in cases:
             self.assertEqual(comments._comments(src, "pl"), expected, src)
 
@@ -1909,6 +2015,22 @@ class LinearParseTest(unittest.TestCase):
              1000),
             (lambda k: "".join(" " * d + "- with:\n" + " " * d + "    script: |\n" + " " * d + "      # a\n"
                                for d in range(k)), "yml", 100)))
+
+    def test_perl_declarations_are_linear(self):
+        # Объявления Perl: скобки, пакеты, ключи хеша use constant, длинные полные имена перед «/» и «<<».
+        self.assert_linear(((lambda k: "sub a {} " * k + "a /b", "pl", 5000),
+                            (lambda k: "package a { " * k + "a /b", "pl", 5000),
+                            (lambda k: "use constant { a => " * k, "pl", 5000),
+                            (lambda k: "use constant " * k + "\n", "pl", 5000),
+                            (lambda k: "use a " * k + "\n", "pl", 5000),
+                            (lambda k: "sub a :b(" * k, "pl", 5000),
+                            (lambda k: "a::" * k + "a /b <<c", "pl", 5000),
+                            (lambda k: "sub a () {} " + "a /b " * k, "pl", 5000),
+                            (lambda k: "use constant A => 1; " + "2*A /2 $b&A /2 " * k, "pl", 5000),
+                            (lambda k: "use constant A => 1; " + "A*" * k + "A /2", "pl", 5000),
+                            (lambda k: "($" * k + "$)" * k, "pl", 5000),
+                            (lambda k: "sub ($" * k + "sub :a" * k, "pl", 5000),
+                            (lambda k: "*a /2 &a <<b $c.time /2 " * k, "pl", 5000)))
 
     def test_many_closed_substitutions_on_one_line(self):
         # Пуст ли хвост строки за первой частью s{…}{…} — без копии хвоста; квадратичность видна от десятков тысяч

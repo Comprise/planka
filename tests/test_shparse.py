@@ -2,10 +2,12 @@ import contextlib
 import importlib.util
 import json
 import pathlib
+import re
 import signal
 import subprocess
 import sys
 import time
+import tracemalloc
 import unittest
 from unittest import mock
 
@@ -143,9 +145,10 @@ def _bashdiff():
     return module
 
 
-def out_of_bounds(text):
+def out_of_bounds(text, script=None):
     """Узлы дерева text, чьи позиции не в 0 ≤ start ≤ end ≤ len(text): (вид, start, end)."""
-    return [(type(n).__name__, n.start, n.end) for n in shparse.walk(shparse.parse(text))
+    script = shparse.parse(text) if script is None else script
+    return [(type(n).__name__, n.start, n.end) for n in shparse.walk(script)
             if not 0 <= n.start <= n.end <= len(text)]
 
 
@@ -187,18 +190,273 @@ class PositionsTest(unittest.TestCase):
                         with self.subTest(file=path.name, line=number):
                             self.fail(f"{bad[:3]}: {text[:200]!r}")
 
+    def test_node_text_in_reparsed_text(self):
+        # Повторные разборы напечатанного текста (`$((…) …)`, `<(…)` в `${…}` в арифметике и в "…", слово, раскрытое
+        # заново) переводят позиции по отметкам печати и посимвольно между ними, а не одним сдвигом: печать
+        # `$'\x41'` — `'A'`, `\` с переводом строки снят, и сдвиг уводил позиции следующих узлов на чужие символы.
+        for text in ["echo $((true \\\n$'a'${HOME%x}) )", "echo $((echo $'\\x41\\x42' \"$y\" ${z:-w}) )",
+                     "echo $(( ${x/<(echo $'\\x41' $y)/z} ))", "echo $(( ${x/<(echo \\\n$y)/z} ))",
+                     "echo \"${x:-<(echo $'\\x41' $y)}\"", "x=$(a=(\\'y) ; echo $'\\x41' \"$v\" ; b=(\\'))",
+                     "echo `echo $(( '\\$(echo a)' + $x ))`", "cat <<E\n$(( '$(echo a)' + 1 ))\nE",
+                     "echo $(( ${| case a in b) :;& a) echo;; esac; } 1 ))"]:
+            with self.subTest(text):
+                self.assertEqual(text_mismatches(text), [])
+
+    def test_rewritten_text(self):
+        # Текст, у которого нет посимвольного соответствия в исходном (Script.rewritten): значение `$'…'` в
+        # арифметике (раскрывается как '…': `` `…` `` в нём исполняется) — узлы в нём указывают на весь `$'…'`;
+        # заголовок heredoc, ждущего тела снова, печатается с новым терминатором — на исходное слово `E`.
+        text = "echo $(( $'`npm i x`' ))"
+        script = shparse.parse(text)
+        self.assertEqual(script.rewritten, [(9, 21)])
+        sub = [n for n in shparse.walk(script) if type(n) is shparse.Sub][0]
+        self.assertEqual((sub.start, sub.end, sub.kind), (9, 21, "`"))
+        self.assertTrue(runs(text))
+        text = "(($(<<E|a=($(npm i x)\nt)\"${ '''';}\nE)))"
+        script = shparse.parse(text)
+        self.assertIn((6, 7), script.rewritten)
+        self.assertEqual(text_mismatches(text, script), [])
+        # Незакрытая при раскрытии "…" — до конца слова.
+        text = 'echo $(( # "x\n1) )"\n\'$(npm i x)\'\n))'
+        dq = [n for n in shparse.walk(shparse.parse(text)) if type(n) is shparse.DQ][0]
+        self.assertEqual((text[dq.start], dq.end), ('"', len(text)))
+
+    def test_text_of_words_and_literals(self):
+        # Текст по позициям простой команды, слова и Lit — их текст: Lit перед `$имя` кончался на `$` (`D=$`).
+        for text in ["D=$S/x", "echo a$b", 'echo "a$1"', "cat <<E\n${HOME/${| echo $'a\nnpm i x'; }/x}\nE"]:
+            with self.subTest(text):
+                self.assertEqual(text_mismatches(text), [])
+        lits = [(n.start, n.end) for n in nodes("D=$S/x", shparse.Lit)]
+        self.assertEqual(lits, [(0, 2), (4, 6)])
+        # Комментарий в скобках присваивания массива bash отбрасывает: Lit не лежит поверх него.
+        text = 'a=(npm # c\n i lodash); "${a[@]}"'
+        self.assertEqual(text_mismatches(text), [])
+        self.assertEqual([(n.start, n.end) for n in nodes(text, shparse.Lit)][:2], [(0, 6), (12, 21)])
+        # Перед первым словом и за последним — так же.
+        for text, lits in [("a=(# c\n x)", [(0, 3), (8, 10)]), ("a=(x # c\n)", [(0, 4), (9, 10)])]:
+            with self.subTest(text):
+                self.assertEqual(text_mismatches(text), [])
+                self.assertEqual([(n.start, n.end) for n in nodes(text, shparse.Lit)], lits)
+
+    def test_array_close_at_end(self):
+        # `)` скобок массива с `\\` и переводом строки за ней в конце ввода: позиция `)` — её место, а не конец ввода
+        # (чтение заглянуло за неё): Lit кончался за концом текста.
+        for text in ["a=(x)\\\n", "a=($'x')\\\n", "a=('x')\\\n"]:
+            with self.subTest(text):
+                self.assertEqual(out_of_bounds(text), [])
+                self.assertEqual(text_mismatches(text), [])
+
+    def test_substitution_after_printed_newline(self):
+        # Печать `case` ставит перевод строки за `)` подстановки, которого нет в исходном тексте: он переводится не
+        # левее конца подстановки, и `)` остаётся в ней.
+        text = "x=$(cat <<E; true; case a in b) :;; *) v=$(npm i x);; esac\nE\n)"
+        self.assertEqual(text_mismatches(text), [])
+        self.assertIn((41, 51), [(n.start, n.end) for n in nodes(text, shparse.Sub)])
+
+    def test_heredoc_dolbrace_ansi_positions(self):
+        # Значение `$'…'` в слове `${имя OP …}` тела heredoc — переписанный кусок: команды из него начинаются в его
+        # начале и кончаются в его конце (на куски печати позиции не делятся).
+        text = "cat <<E\n${HOME/${| echo $'a\nnpm i x'; }/x}\nE"
+        script = shparse.parse(text)
+        self.assertIn((24, 36), script.rewritten)
+        found = [text[c.start:c.end] for c in shparse.simple_commands(script)]
+        self.assertEqual(found, ["cat <<E", "echo $'a\nnpm i x'", "$'a\nnpm i x'"])
+
+    def test_backquote_body_in_rewritten(self):
+        # Тело `` `…` ``, лежащее в переписанном куске (зерно 23, без исполнения, номер 2330): узлы, начатые в нём,
+        # кончаются в его конце, а не на символе за его началом.
+        bashdiff = _bashdiff()
+        text = bashdiff.generate(23, 2330, runtime=False)[0]
+        script = shparse.parse(text)
+        spans = script.rewritten
+        bad = [(type(n).__name__, n.start, n.end) for n in shparse.walk(script)
+               for a, b in spans if n.start == a < n.end < b]
+        self.assertEqual(bad, [])
+        self.assertEqual(text_mismatches(text, script), [])
+
+    def test_empty_arith_quote(self):
+        # Пустая '' в арифметике: перевод её позиций — пустой список кусков (разбор падал IndexError, ошибка
+        # INTERNAL; зерно 2, глубина 2, номер 9939).
+        for text in ["echo $(( '' 1 ))", "echo ${u1[$((a\nb ) |& : $(npm i x)\ncat <<E2'' | cat\nE2)0]}"]:
+            with self.subTest(text):
+                self.assertIsNone(shparse.parse(text).error)
+        self.assertTrue(runs("echo ${u1[$((a\nb ) |& : $(npm i x)\ncat <<E2'' | cat\nE2)0]}"))
+
+    def test_node_text_corpora(self):
+        root = pathlib.Path(__file__).parent / "fixtures"
+        for path in sorted(root.glob("bash-*.jsonl")):
+            with open(path, encoding="utf-8") as fh:
+                commands = [json.loads(line).get("command") for line in fh if line.strip()]
+            for number, text in enumerate(commands, 1):
+                if isinstance(text, str):
+                    bad = text_mismatches(text)
+                    if bad:
+                        with self.subTest(file=path.name, line=number):
+                            self.fail(f"{bad[:3]}: {text[:200]!r}")
+
     def test_fuzz_forms(self):
         # Зёрна 7 и 13, обе разновидности генератора: здесь находились позиции за концом текста (зерно 13, номера
-        # 2682, 3208; зерно 7 без исполнения, номер 1465) и конец раньше начала (зерно 13, номер 1649).
+        # 2682, 3208; зерно 7 без исполнения, номер 1465) и конец раньше начала (зерно 13, номер 1649). Текст каждого
+        # узла по позициям — его текст (text_mismatches): до перевода позиций по кускам нарушали 178 форм.
         bashdiff = _bashdiff()
         for seed in (7, 13):
             for runtime in (True, False):
                 for index in range(4000):
                     text = bashdiff.generate(seed, index, runtime=runtime)[0]
-                    bad = out_of_bounds(text)
+                    script = shparse.parse(text)
+                    bad = out_of_bounds(text, script) + text_mismatches(text, script)
                     if bad:
                         with self.subTest(seed=seed, runtime=runtime, index=index):
                             self.fail(f"{bad[:3]}: {text[:200]!r}")
+
+
+# Знаки начала и конца подстановки по виду (Sub.kind) — в исходном тексте по позициям узла.
+SUB_MARKS = {"$(": ("$(", ")"), "`": ("`", "`"), "${ ": ("${", "}"), "${|": ("${", "}"), "<(": ("<(", ")"),
+             ">(": (">(", ")")}
+BACKQUOTE_ESCAPE = re.compile(r'\\([\\`$"])')
+
+
+def unescaped(fragment):
+    """Варианты исходного текста, как его видит разбор: без `\\` с переводом строки и без `\\` перед `\\`, `` ` ``,
+    `$`, `"` по уровню на каждую вложенную `` `…` `` (её тело bash читает без одного уровня), в любом порядке."""
+    seen = {fragment}
+    todo = [fragment]
+    while todo and len(seen) < 64:
+        cur = todo.pop()
+        for nxt in (cur.replace("\\\n", ""), BACKQUOTE_ESCAPE.sub(r"\1", cur)):
+            if nxt not in seen:
+                seen.add(nxt)
+                todo.append(nxt)
+    return seen
+
+
+def _squeezed(text):
+    """Текст без пробелов, табуляций и переводов строки."""
+    return "".join(text.split())
+
+
+def text_mismatches(text, script=None):
+    """Узлы, чей текст по позициям не их текст в дереве: подстановка — от своего знака начала до знака конца,
+    параметр — с `$` (`${…}` — до `}`, `$x` — сам текст), '…' — её текст в кавычках, "…" — от `"` до `"` (без
+    закрывающей — до конца, где её нет: слово, раскрытое заново, берёт незакрытую "…" до конца), $'…' — с `$'` или `'`
+    (печать значения). Текст, который bash разбирает в печати, не идущей за исходным посимвольно (Script.rewritten:
+    значение `$'…'`, заголовок heredoc с новым терминатором, `in "$@"` у `for`), определён так: узел, начатый в таком
+    куске, начинается в его начале, кончающийся в нём — кончается в его конце; знак у такой границы не сверяется.
+    Подстановка с ошибкой в теле (не разобрана) не проверяется: её конец — конец текста. Простая команда и слово — от
+    начала первой части до конца последней (между ними и краем — только пробелы; у слова — `\\`, кавычки и `$`
+    пустых "", '', `$'`), Lit — его текст (_lit_texts). (вид, начало, конец, текст по позициям)."""
+    out = []
+    script = shparse.parse(text) if script is None else script
+    starts = {span[0] for span in script.rewritten or ()}
+    ends = {span[1] for span in script.rewritten or ()}
+    skip, bodies = _lit_exempt(script)
+    for node in shparse.walk(script):
+        kind = type(node)
+        frag = text[node.start:node.end]
+        head = tail = body = True
+        if kind is shparse.Lit:
+            if id(node) in skip or any(a < node.end and node.start < b for a, b in bodies):
+                continue
+            body = _norm(node.text) in _lit_texts(frag) or any(node.start < a < node.end for a in starts)
+        elif kind in (shparse.Word, shparse.Simple):
+            kids = node.parts if kind is shparse.Word else node.assigns + node.words + node.redirs
+            if not kids or id(node) in skip or any(_failed(k) for k in kids):
+                continue
+            first, last = min(k.start for k in kids), max(k.end for k in kids)
+            edge = "\\'\"$" if kind is shparse.Word else " \t\n"
+            # Тело heredoc (с переводом строки перед ним), прочитанное за закрывающей скобкой подстановки, — в слове
+            # вокруг неё.
+            gaps = [(node.start, first), (last, node.end)]
+            fine = [_blank(text[a:b], edge) or any(x - 1 <= a and b <= y for x, y in bodies) for a, b in gaps]
+            head = node.start <= first and (first in starts or fine[0])
+            tail = last <= node.end and (last in ends or fine[1])
+            if kind is shparse.Simple:
+                # Слова команды — по порядку текста: слово печати, переведённое не на своё место (в переписанный
+                # кусок за телом heredoc), стоит правее следующего.
+                order = [w.start for w in node.assigns + node.words]
+                if order != sorted(order):
+                    out.append((kind.__name__, node.start, node.end, frag[:40]))
+                    continue
+        elif kind is shparse.Sub:
+            if node.body.error is not None and not node.body.commands:
+                continue
+            first, last = SUB_MARKS[node.kind]
+            head = frag.startswith(first)
+            tail = frag.endswith(last) or node.kind == "`"
+        elif kind is shparse.Param:
+            head = frag.startswith("$")
+            if node.text.startswith("${"):
+                tail = frag.endswith("}")
+            else:
+                body = node.text in unescaped(frag)
+        elif kind is shparse.SQ:
+            head = frag.startswith("$'") or frag.startswith("'")
+            # Текст '…' в напечатанном тексте — печать (`$( : a)` — `$(: a)`): сверка без пробелов.
+            body = (frag.startswith("$'") or "'" + node.text + "'" in unescaped(frag)
+                    or _squeezed("'" + node.text + "'") in {_squeezed(v) for v in unescaped(frag)})
+        elif kind is shparse.DQ:
+            head = frag[:1] == '"' or frag[:2] == '$"'
+            tail = frag.endswith('"') or (head and shparse._skip_double_quoted(frag, frag.index('"') + 1) >= len(frag))
+        elif kind is shparse.AnsiC:
+            head = frag[:2] == "$'" or frag[:1] == "'"
+        if node.start == node.end:
+            # Последнюю лексему узла bash прочитал левее первой (отложенные куски ввода): конец — его начало.
+            continue
+        at_start, at_end = node.start in starts, node.end in ends
+        if not ((head or at_start) and (tail or at_end) and (body or at_start or at_end)):
+            out.append((kind.__name__, node.start, node.end, frag[:40]))
+    return out
+
+
+# '…' с подстановкой (с `$'…'`): в арифметике и в слове `${…}` в "…" её текст разбирается отдельно, в Lit его нет.
+SQ_WITH_SUB = re.compile(r"\$?'[^']*(?:\$\(|`)[^']*'")
+# Текст печати подстановки (print_comsub) в Lit: слово `${x:-<(…)}`, разобранное заново по печати.
+PRINTED_SUB = re.compile(r"[$<>]\(|\$\{[ |\t\n]|`")
+
+
+def _norm(text):
+    """Текст без пробелов, кавычек и `\\`: Lit хранит значение (кавычки и экранирование сняты)."""
+    return "".join(c for c in "".join(text.split()) if c not in "'\"\\")
+
+
+def _lit_texts(frag):
+    """Тексты Lit, которые дают исходные позиции frag: варианты unescaped, без '…' с подстановкой (SQ_WITH_SUB) и без
+    одной внутренней строки (терминатор heredoc, прочитанный внутри слова `a=(…)`)."""
+    out = set()
+    for v in unescaped(frag):
+        out.add(_norm(v))
+        out.add(_norm(SQ_WITH_SUB.sub("", v)))
+    lines = frag.split("\n")
+    if len(lines) < 64:
+        out |= {_norm("\n".join(lines[:k] + lines[k + 1:])) for k in range(1, len(lines) - 1)}
+    return out
+
+
+def _lit_exempt(script):
+    """Lit, слова и команды, чей текст — печать, а не исходный текст: в `${…}` и арифметике с подстановкой (разбор
+    по печати); Lit с печатью подстановки в тексте; диапазоны тел heredoc с их терминаторами."""
+    skip, bodies = set(), []
+    for node in shparse.walk(script):
+        kind = type(node)
+        if kind is shparse.Heredoc:
+            bodies.append((node.body_start, max(node.body_end, getattr(node, "term_end", None) or 0)))
+        elif kind in (shparse.Param, shparse.Arith):
+            inner = list(shparse.walk(node))
+            if any(type(n) is shparse.Sub and n.kind in ("<(", ">(", "$(") for n in inner):
+                skip.update(id(n) for n in inner if type(n) in (shparse.Lit, shparse.Word, shparse.Simple))
+        elif kind is shparse.Lit and PRINTED_SUB.search(node.text):
+            skip.add(id(node))
+    return skip, bodies
+
+
+def _failed(node):
+    """Подстановка, тело которой не разобрано: её позиции — место ошибки и конец текста."""
+    return type(node) is shparse.Sub and node.body.error is not None and not node.body.commands
+
+
+def _blank(gap, edge):
+    """Между краем узла и его частью — только знаки edge и `\\` с переводом строки."""
+    return not gap.replace("\\\n", "").strip(edge)
 
 
 # Вложенность на 10⁵ уровней каждого вида: (начало, открытие, середина, закрытие).
@@ -572,6 +830,284 @@ class ExpansionClassesTest(unittest.TestCase):
         self.assertEqual(shparse.parse("echo ''").commands[0].words[1].literal(), "")
 
 
+class DparenExpansionEndTest(unittest.TestCase):
+    """Конец `$((…)` при раскрытии находит extract_delimited_string (SX_COMMAND) по тексту слова, а не
+    parse_matched_pair чтения: `#` за пробелом — комментарий до конца строки, и подстановка кончается дальше.
+    Проверено прогоном bash 5.3 с `touch`."""
+
+    def test_comment_moves_end(self):
+        # Чтение кончает `$(( #))`; раскрытие — `( #))"⏎npm i x)`: скобки не сбалансированы, это подстановка команды.
+        for text in ['$(( #))"\nnpm i x))"', 'echo $()$(( #))"\nnpm i x))"', 'cat <<E\n$(( #))"\nnpm i x))"\nE']:
+            with self.subTest(text):
+                self.assertTrue(runs(text))
+
+    def test_same_or_no_end(self):
+        # В "…" раскрытие кончает на той же `)`; без закрывающей при раскрытии — bad substitution, тело не исполняется.
+        self.assertFalse(runs('echo "$(( #))\nnpm i x)"'))
+        self.assertFalse(runs("echo $((npm i x) #x)"))
+
+    def test_unclosed_quote_after_end(self):
+        # Остаток слова за концом подстановки раскрывается с открытой "…": string_extract_double_quoted берёт её
+        # до конца слова, подстановки в ней исполняются ('…' — нет).
+        self.assertTrue(runs('echo $(( # "x\n1) )"\n\'$(npm i x)\'\n))'))
+        self.assertFalse(runs('echo $(( # \'x\n1) )\'\n"$(npm i x)"\n))'))
+        # Зерно 7, глубина 2, номер 2814: исполнены P6, P7, P8.
+        text = ('v1=$(({ false; } || true # "|touch P3\ncat - <<END2) ) & echo $(function f3() { touch P7 | touch P8 ; '
+                'time -p echo -n $?\'a ba b\'\n}; f3)\n"touch P5\n\'$(touch P6)\'\n))\nEND2')
+        found = {c[1] for c in cmds(text) if c[:1] == ["touch"] and len(c) > 1}
+        self.assertEqual({"P6", "P7", "P8"} - found, set())
+
+    def test_fuzz_form(self):
+        # Зерно 17, глубина 2, номер 15006: `|& #xtouch P9) )` — комментарий до конца строки.
+        text = ('false || echo -n $( touch P1\ncat <<"E1" | cat\n\'touch P2\nx touch P3\nE1\n) $((cat <(touch P6\nt'
+                'ime touch P7) >/dev/null |& #xtouch P9) )"<<E$( cat < <(time -p echo -n \\"@ \'#$x\' >|/dev/null\nto'
+                'uch P11); : <(time touch P12))$(time (( $(touch P13) 1 ))\ntouch P14)"')
+        found = {c[1] for c in cmds(text) if c[:1] == ["touch"] and len(c) > 1}
+        self.assertEqual({"P1", "P6", "P7", "P11", "P12", "P13", "P14"} - found, set())
+
+
+class HeredocDolbraceTest(unittest.TestCase):
+    """`${имя OP слово}` с OP из `%#/^,:` прямо в теле heredoc: bash извлекает слово extract_heredoc_dolbrace_string и
+    переписывает его до раскрытия — `$'…'` значением; в теле `${| …; }`, `${ …; }` внутри слова (для этой функции —
+    вложенный `${`, состояние PARAM) значение без кавычек, и `\\n` в нём делит команды. Проверено прогоном bash 5.3 с
+    `touch`."""
+
+    def test_ansi_c_value_unquoted(self):
+        for text in ["cat <<E\n${HOME/${| echo $'a\\nnpm i x'; }/x}\nE",
+                     "cat <<E\n${HOME#${ echo $'a\\nnpm i x'; }}\nE",
+                     "cat <<E\n${HOME#$'x'}${HOME%${| echo $'a\\nnpm i x'; }}\nE"]:
+            with self.subTest(text):
+                self.assertTrue(runs(text))
+
+    def test_other_contexts_keep_value(self):
+        # `$(…)` слово переносит как есть; в "…" и без оператора `$'…'` — одно слово.
+        for text in ["cat <<E\n${HOME/$(echo $'a\\nnpm i x')}\nE", "echo \"${HOME/${| echo $'a\\nnpm i x'; }/x}\"",
+                     "cat <<E\n${| echo $'a\\nnpm i x'; }\nE"]:
+            with self.subTest(text):
+                self.assertFalse(runs(text))
+
+    def test_value_expanded_alone(self):
+        # Конец слова — по счёту `${`, `}` (тело `${ …; }` для этой функции — вложенный `${`): здесь `}` группы
+        # `{ false; }`. Образец раскрывается отдельно: `<(…)` исполняется, затем тело `${ …` без `}` — ошибка
+        # (зерно 5, глубина 2, номер 16786: исполнен P2).
+        text = ('touch P1 ; : && true <<EOF1\nx \\\\\n"${HOME/<(touch P2)${ { false; } || echo $\' \\\\\\\\\' a#b--opt='
+                "v; }$(: && echo -n $'\\'\\\\\\x41' a#b 2>&1)/x}\nEOF1")
+        self.assertIn(["touch", "P2"], cmds(text))
+        self.assertTrue(runs("cat <<E\n${HOME/<(npm i x)${ { a; } b; }/c}\nE"))
+
+    # Формы генератора фаззера (зерно 13, глубина 3): маркеры, которые исполнил bash.
+    FUZZ = {
+        7023: ('echo \'touch P1touch P2\'\\\\ >/dev/null;( read -r x <<< "touch P3"\ncat - <<-END1 |& cat >/dev/nu'
+               'll <<END3 >/dev/null ); ! time touch P12\n\t"${HOME/${| false || echo -n $\'touch P4\\ntouch P5\' '
+               ">|/dev/null\ntouch P7; }#/x}\n\tEND1\nEND3 x\nx touch P9\nEND3'\nEND3",
+               {"P5", "P7", "P12"}),
+        11307: ('cat - <<END1 | touch P8 \\\n; cat <<< `touch P14 && a3+=(\\`touch P9\\` \\$[ - 0 (1) \\$( touch P1'
+                "0 & touch P11) 1 ]\\\\; \\`[ -n a ] && touch P12\\`)`\n${HOME//x/${| echo $';touch P1;' [$( touch "
+                "P2)\n}`true \\\\\n{a,\\`{ false; } || touch P3\\`}{a,\\$( touch P5)} \\\\\n}`'a b'}\n; }\nEND1",
+                {"P1", "P2", "P3", "P5", "P8", "P9", "P10", "P11", "P14"}),
+    }
+
+    def test_fuzz_forms(self):
+        for index, (text, executed) in self.FUZZ.items():
+            with self.subTest(index):
+                found = {c[1] for c in cmds(text) if c[:1] == ["touch"] and len(c) > 1}
+                self.assertEqual(executed - found, set())
+
+
+def touched(text):
+    """Аргументы `touch` среди простых команд дерева."""
+    return {w for c in cmds(text) if c[:1] == ["touch"] for w in c[1:] if w}
+
+
+class GroupAnsiQuoteTest(unittest.TestCase):
+    """Группа `(…)` образца `=~` (и extglob): bash хранит её текстом parse_matched_pair, подстановки в ней не
+    разбирая, и `$'…'` вне "…" — значением: в '…' (sh_single_quote), а если разделитель — `"` (группа в подстановке
+    в "…": стек разделителей parse_comsub не сбрасывает) — без кавычек. Раскрытие группы (конец `$((…)` —
+    extract_delimited_string, тело подстановки) читает этот текст. Проверено прогоном bash 5.3 с `touch`."""
+
+    def test_dparen_end_after_ansi_quote(self):
+        # `$'\'…'` в `$((…) )` группы: в исходном тексте `'` после `\` закрывала бы '…', и конец `$((…)` при
+        # раскрытии не находился (тело терялось; зерно 23, глубина 3, номер 16571).
+        for text in ["[[ a =~ ($(( touch P2; : $'\\'x' ) )) ]]", "[[ a =~ x($(( touch P2; echo $'it\\'s' ) )) ]]",
+                     "[[ a =~ (x|$(( touch P2; echo $'it\\'s' ) )) ]]",
+                     "f() { [[ a =~ ($(( touch P2; echo $'it\\'s' ) )) ]]; }; f",
+                     "echo $( [[ a =~ ($(( touch P2; echo $'it\\'s' ) )) ]] )",
+                     "[[ a =~ ( \"$(( touch P2; : $'\\'' ) )\" ) ]]",
+                     "[[ a =~ ( $(( touch P2; : \"${x#$'\\''}\" ) ) ) ]]"]:
+            with self.subTest(text):
+                self.assertIn("P2", touched(text))
+        self.assertTrue(runs("[[ a =~ ($(( npm i x; echo $'it\\'s' ) )) ]]"))
+
+    def test_value_unquoted_in_double_quotes(self):
+        for text in ['echo "$( [[ a =~ ($(echo $\';touch P2\')) ]])"',
+                     'echo "${ [[ a =~ ($(echo $\';touch P2\')) ]];}"',
+                     # Зерно 31, глубина 2, номер 12932.
+                     "v1+=\"}$( [[ a =~ ($(echo -n $';touch P2' \\)\n[ -n a ] && echo -n $';' ]'$x')) ]])\\$\""]:
+            with self.subTest(text):
+                self.assertIn("P2", touched(text))
+
+    def test_value_quoted_elsewhere(self):
+        for text in ["echo $( [[ a =~ ($(echo $';touch P2')) ]])", "[[ a =~ ($(echo $';touch P2')) ]]",
+                     'echo "$( : $( [[ a =~ ($(echo $\';touch P2\')) ]]))"',
+                     'echo "$( [[ a =~ ("$(echo $\';touch P2\')") ]])"', 'echo "$( [[ a =~ ($\'x;touch P2\') ]])"']:
+            with self.subTest(text):
+                self.assertNotIn("P2", touched(text))
+
+    def test_positions(self):
+        # Позиции вне `$'…'` — по строке разбора (тело `` `…` `` без `\\`): зерно 13, номер 3480.
+        text = "v1+=[`[[ a =~ (\\$(echo {a,\\$(( (1) 1 ))}\\$'a\\`;' \\$(! false && touch P1))) ]];touch P3`"
+        self.assertEqual(text_mismatches(text), [])
+        self.assertEqual(touched(text), {"P1", "P3"})
+
+
+class PrintedSemicolonTest(unittest.TestCase):
+    """bash исполняет тело `$(…)`, `${ …; }`, `<(…)` по его печати (print_comsub), а печать (print_cmd.c) опускает `;`
+    сразу за телами heredoc (was_heredoc): следующая команда становится словами предыдущей. Сбрасывают это
+    перенаправления команды, конец `( )`, `{ }`, `then`, `do`, перевод строки; в функции вместо `;` печатается перевод
+    строки. Конец такой подстановки при раскрытии находит разбор печати со знаком конца: печать `case` бывает
+    раньше него, остаток печати — текст слова. Проверено прогоном bash 5.3 с `touch`."""
+
+    TOUCHED = {
+        "echo $(true <<E; touch; P1\nE\n)": {"P1"},
+        "echo $(true <<E\nE\ntouch; P1)": {"P1"},
+        "echo ${ true <<E; touch; P1\nE\n}": {"P1"},
+        "cat <(true <<E; touch; P1\nE\n)": {"P1"},
+        "echo $(true && true <<E; touch; P1\nE\n)": {"P1"},
+        "echo $(true <<E &\nE\ntouch; P1)": {"P1"},
+        "echo $(true <<E\nE\n( touch; P1 ))": {"P1"},
+        "echo $(echo $(true <<E; touch; P1\nE\n))": {"P1"},
+        "echo $(( $(true <<E; touch; P1\nE\n) ))": {"P1"},
+        "echo $(true <<E && touch P1; touch P2\nE\n)": {"P1", "P2", "touch"},
+        "echo $(true <<E; touch; P1; touch P2\nE\n)": {"P1", "P2"},
+        "echo $({ true <<E; }; touch; P1\nE\n)": set(),
+        "echo $(f() { true <<E; touch; P1; }\nE\nf)": set(),
+        "echo $(true <<E | true; touch; P1\nE\n)": set(),
+        "echo $(true <<E\nE\n:\ntouch; P1)": set(),
+        "echo `true <<E; touch; P1\nE\n`": set(),
+        # Тело heredoc раскрывается по исходному тексту: печати нет.
+        "cat <<X\n$(true <<E; touch; P1\nE\n)\nX": set(),
+        # `|&` печатается `2>&1 |`: перенаправление сбрасывает was_heredoc.
+        "v1+=${ true <<E; touch P3 |& touch P5\nE\n}": {"P3", "P5"},
+        # Печать `case` — на нескольких строках, конец подстановки — `)` образца; остаток печати раскрывается.
+        "x=$(cat <<E; touch P15;time case 'a' in b) :;& *) v=$(touch P17); : && a=(  );; esac\nE\n)": {"P15", "P17"},
+    }
+
+    def test_touched(self):
+        for text, expected in self.TOUCHED.items():
+            with self.subTest(text):
+                self.assertEqual(touched(text) & {"P1", "P2", "P3", "P5", "P15", "P17", "touch"}, expected)
+
+    def test_merged_command_positions(self):
+        # Слова команды за телом heredoc в печати переводятся на своё место в исходном тексте (не в переписанный
+        # кусок терминатора за телом): команда — от `npm` до `x`, слова по порядку. Сегмент детектора — её текст.
+        import depcheck
+        for text, segment in [("echo $(cat <<E\nE\nnpm; i x)", "npm; i x"), ("x=$(cat <<E; npm; i x\nE\n)", "npm; i x"),
+                              ("x=$(cat <<E && npm i x\nE\n)", "npm i x")]:
+            with self.subTest(text):
+                self.assertEqual(text_mismatches(text), [])
+                found = [text[c.start:c.end] for c in shparse.simple_commands(shparse.parse(text))]
+                self.assertIn(segment, found)
+                self.assertEqual(depcheck.dependency_add(text), segment)
+        self.assertFalse(runs("x=$(f() { cat <<E; npm; i x; }\nE\n)"))
+
+    # Формы генератора фаззера: (зерно, глубина, номер) → маркеры, которые исполнил bash.
+    FUZZ = {(23, 2, 6555): {"P2", "P3", "P6", "P7", "P11", "P13"}, (1, 3, 217): {"P3", "P4", "P12", "P15", "P17"},
+            (7, 3, 14475): {"P3", "P5", "P6", "P9"},
+            (13, 3, 13180): {"P1", "P2", "P4", "P5", "P9", "P11", "P13", "P15", "P16"}}
+
+    def test_fuzz_forms(self):
+        bashdiff = _bashdiff()
+        for (seed, depth, index), executed in self.FUZZ.items():
+            with self.subTest(seed=seed, depth=depth, index=index):
+                text = bashdiff.generate(seed, index, runtime=False, depth=depth)[0]
+                self.assertEqual(executed - bashdiff.parsed_markers(shparse, text), set())
+
+
+class FunsubInArithTest(unittest.TestCase):
+    """`${ …}` в "${…}" в `$((…)`: печать parse_comsub ставит перед `}` перевод строки, если тело кончил перевод строки
+    (`\\;` ⏎ `}` — `\\;` ⏎ ` }`, а не `\\; }`, где `}` — слово и тело не закрыто). Конец `$((…)`, который без разбора
+    вложенной подстановки не найти (в `${ …}` внутри "…"), — не расхождение чтения и раскрытия. Проверено прогоном
+    bash 5.3 с `touch` (зерно 43, глубина 3, номер 15654)."""
+
+    def test_body_runs(self):
+        for text in ['echo $(( "${u-${ touch P1;$()\\;\n}}" ))', 'x=$(("${u-${ touch P1;$()\\;\n}}"))',
+                     'echo $(("${u-${ touch P1; echo $(:)\\;\n}}"))']:
+            with self.subTest(text):
+                self.assertIn("P1", touched(text))
+                self.assertTrue(runs(text.replace("touch P1", "npm i x")))
+
+    def test_print_before_brace(self):
+        # Перед `}` печати — `;` по виду последней команды (was_semi), а не по последнему знаку печати: `\\;` — слово,
+        # `${ echo \\; ;}` печатается `{ echo \\;; }`; без `;` — только за фоновой командой и за переводом строки.
+        b = "\\"
+        for text, printed in [("echo ${ echo " + b + "; ;}", "{ echo " + b + ";; }"), ("echo ${ a; }", "{ a; }"),
+                              ("echo ${ a & }", "{ a & }"), ("echo ${ a\n}", "{ a\n }"), ("echo ${| a; }", "{|a; }")]:
+            with self.subTest(text):
+                sub = nodes(text, shparse.Sub)[0]
+                self.assertEqual(shparse._render([("sub", sub)]), printed)
+
+    def test_chain_depth(self):
+        # Цепочка не раскрывается заново на каждом уровне: 200 уровней — без DEPTH.
+        script = shparse.parse("echo " + '$(("${u-${ :;$() ' * 200)
+        self.assertNotEqual(getattr(script.error, "kind", None), shparse.DEPTH)
+
+
+class HeredocBodySubstitutionTest(unittest.TestCase):
+    """Подстановка в теле heredoc: конец находит xparse_dolparen — разбор со знаком конца, где строка тела
+    вложенного heredoc, начатая терминатором, со знаком конца в остатке кончает тело (make_here_document); исполняет
+    bash исходный текст до этого конца без знака конца (parse_and_execute), и та же строка там — строка тела.
+    Проверено прогоном bash 5.3 с `touch`."""
+
+    def test_line_with_terminator_is_body(self):
+        for text in ["cat <<E1\n$(cat <<E2\nE2\\\n'$(touch P4)'\nE2\n)\nE1",
+                     "cat <<E1\n$(cat <<E2\nE2'$(touch P4)'\nE2\n)\nE1",
+                     "cat <<E1\n${ cat <<E2\nE2'$(touch P4)'}\nE2\n}\nE1"]:
+            with self.subTest(text):
+                self.assertIn("P4", touched(text))
+
+    def test_outside_body_rule_stays(self):
+        # Вне тела heredoc печать — тело, прочитанное по правилу знака конца: остаток строки — команда в '…'.
+        self.assertNotIn("P4", touched("echo $(cat <<E2\nE2'$(touch P4)'\nE2\n)"))
+        self.assertNotIn("P1", touched("cat <<E1\n$(cat <<E2\nE2 ); touch P1\nE2\n)\nE1"))
+
+
+class CompoundAssignmentHeredocTest(unittest.TestCase):
+    """Перевод строки в скобках `a=(…)` читает тела ожидающих heredoc, а parse_compound_assignment затем возвращает
+    need_here_doc и redir_stack (restore_parser_state): heredoc ждёт тела снова, со следующего перевода строки, и его
+    терминатор — уже прочитанное тело (make_here_document заменило им слово). Тело с переводом строки не совпадает ни
+    с одной строкой — второе тело идёт до конца ввода; пустое кончает пустая строка. Проверено прогоном bash 5.3 с
+    `touch` (предупреждение «wanted `…'» называет второй терминатор)."""
+
+    def test_second_body_to_end(self):
+        text = "cat <<E; a=(x\nnpm i x\nE\ny)\nnpm i x\nE\nnpm i x"
+        self.assertEqual(cmds(text), [["cat"], []])
+        docs = nodes(text, shparse.Heredoc)
+        self.assertEqual((docs[0].term, docs[0].body_text), ("npm i x\n", "npm i x\nE\nnpm i x\n"))
+
+    def test_empty_first_body(self):
+        # Пустое тело: терминатор — пустая строка.
+        self.assertEqual(cmds("cat <<E; a=(x\nE\ny); npm i x\ntouch P2\n\nnpm i y"),
+                         [["cat"], [], ["npm", "i", "x"], ["npm", "i", "y"]])
+        self.assertEqual(cmds("cat <<E; a=(x\nE\ny); npm i x\ntouch P2\nE\nnpm i y"), [["cat"], [], ["npm", "i", "x"]])
+        # Слово в кавычках: терминатор — тело после снятия кавычек.
+        self.assertEqual(cmds("cat <<'E'; a=(x\n'E'\nE\ny); npm i x\nE\nnpm i y"), [["cat"], [], ["npm", "i", "x"]])
+
+    def test_dparen_subshell_printed(self):
+        # `((…)`, оказавшаяся подоболочкой: bash возвращает во ввод прочитанное с подстановками в печати. Заголовок
+        # heredoc, ждущего тела снова, печатается с новым терминатором (`<<t)"${ '''';}⏎`): `)` в нём кончает
+        # подстановку раньше, и `a=($(…))` — команда подоболочки (зерно 13, глубина 3, номер 15333; исполнены P1,
+        # P4, P5).
+        text = "(($(<<E|a=($(npm i x)\nt)\"${ '''';}\nE)))"
+        self.assertTrue(runs(text))
+        self.assertEqual(out_of_bounds(text), [])
+        text = ('(( $(:  <<-EOF1 | cat|a2=($( touch P4\ntouch P5)\ntouch P6) ; (: && (((test 1 && touch P7) )) )\n\t"${'
+                '| touch P1 | printf \'%s\\n\' \\"\'$(;\'; }\n\tEOF1\n) 1 ))\ntouch P10\ncat >/dev/null <<\'E3\'\nE3\''
+                '\nE3E3\nE3')
+        found = {c[1] for c in cmds(text) if c[:1] == ["touch"] and len(c) > 1}
+        self.assertEqual({"P1", "P4", "P5"} - found, set())
+        self.assertEqual(out_of_bounds(text), [])
+
+
 class SubscriptAssignmentTest(unittest.TestCase):
     """Конец индекса `имя[…]=` ищет skipsubscript (skip_matched_pair): `]` в `${…}`, `` `…` `` и вложенных `[…]`
     индекс не кончает. Проверено прогоном bash 5.3 с `touch`."""
@@ -865,13 +1401,41 @@ class HeredocTest(unittest.TestCase):
         self.assertEqual((doc.term, doc.quoted), ("${x:-'a'}", False))
 
     def test_terminator_print_unknown(self):
-        # Печать тела, которую разбор не повторяет (составная команда, `|&`, дублирование дескриптора, `!`,
-        # комментарий): тело кончить нечем — ошибка вида INTERNAL, а не тело до конца ввода.
-        for word in ["$(if b; then c; fi)", "$(b|&c)", "$(b 2>&1)", "$(! b)", "$(b # z\n)", "$(b # z\nc)",
-                     "$({ b; })", "$(b {x}>c)", "$( )", "$(cat <<E\nE\n)"]:
+        # Печать тела, которую разбор не повторяет (комментарий, `[[ … ]]`, `((…))`, coproc): тело кончить нечем —
+        # ошибка вида INTERNAL, а не тело до конца ввода.
+        for word in ["$(b # z\n)", "$(b # z\nc)", "$( )", "$([[ b ]])", "$( ((1)) )", "$(coproc b)"]:
             with self.subTest(word):
                 script = shparse.parse("cat <<" + word + "\nq\nnpm i x")
                 self.assertEqual(script.error, shparse.SyntaxIssue(0, True, shparse.INTERNAL))
+
+    def test_terminator_print_compound(self):
+        # `( … )`, `{ …; }`, `!`, `time`, `|&` (печать — `2>&1 |`), `<&`, `>&` и `{имя}` перед оператором: печать
+        # повторяется. Печать проверена declare -f bash 5.3 (зерно 2, глубина 3, номер 14404: `$(>&\\')` и
+        # `${|(:)|4⏎}` в терминаторе давали ошибку INTERNAL, и `$(touch P9)` той же команды терялся).
+        printed = {"$(b|&c)": "$(b 2>&1 | c)", "$(b 2>&1)": "$(b 2>&1)", "$(! b)": "$(! b)",
+                   "$({ b; })": "$({ b; })", "$(b {x}>c)": "$(b {x}> c)", "$(<&3)": "$(0<&3)", "$(>&-)": "$(1>&-)",
+                   "$(<&-)": "$(0>&-)", "$(2>&3-)": "$(2>&3-)", "$(>&x)": "$(>&x)", "$(4>&x-)": "$(4>&x-)",
+                   "$(<&007)": "$(0<&7)", "$({fd}>&2)": "$({fd}>&2)", "$(a {fd}<&-)": "$(a {fd}>&-)",
+                   "$(a >&2 <&0)": "$(a 1>&2 0<&0)", "$(a 1>&2x)": "$(a >&2x)", "$(a 0<&x)": "$(a <&x)",
+                   "$(>&\\')": "$(>&\\')", "$( (:) )": "$( ( : ))", "$({ a & })": "$({ a & })",
+                   "$( ( a; b ) )": "$( ( a; b ))", "$( (a) >x )": "$( ( a ) > x)", "$({ a; } 2>&1)": "$({ a; } 2>&1)",
+                   "$( (a)|&b )": "$( ( a ) 2>&1 | b)", "$(time (a))": "$(time ( a ))", "${ (a) }": "${ ( a ); }",
+                   "$(! time -p a | b)": "$(time -p ! a | b)", "$(a >x |& b 2>y)": "$(a > x 2>&1 | b 2> y)",
+                   "$(a>&'3'-)": "$(a 1>&'3'-)", "$(a>&3-)": "$(a 1>&3-)"}
+        for word, term in printed.items():
+            with self.subTest(word):
+                docs = nodes("cat <<" + word + "\nq", shparse.Heredoc)
+                self.assertEqual(docs[0].term, term)
+                self.assertEqual(cmds("cat <<" + word + "\nq\n" + term + "\nnpm i x"), [["cat"], ["npm", "i", "x"]])
+        # Составную команду на нескольких строках и heredoc bash печатает с переводом строки: такой терминатор не
+        # совпадает ни с одной строкой, тело — до конца ввода (проверено bash 5.3 с `touch`).
+        for word in ["$(if b; then c; fi)", "$(while :; do :; done)", "$(f() { a; })", "$(case a in b) c;; esac)",
+                     "$(cat <<E\nE\n)", "${|(:)|4\n}"]:
+            with self.subTest(word):
+                text = "cat <<" + word + "\nq\nnpm i x"
+                self.assertNotIn(["npm", "i", "x"], cmds(text))
+                self.assertIsNone(shparse.parse(text).error)
+        self.assertIn(["touch", "P9"], cmds("<<''\"``\"$(>&\\') $(touch P9)"))
 
     def test_terminator_print_newline(self):
         # Команды тела на разных строках print_comsub печатает через один `\n`, без отступов и пустых строк.
@@ -1119,6 +1683,14 @@ class LinearityTest(unittest.TestCase):
         "subscript_param": lambda n: "a[" + "${x:-" * n + "]" + "}" * n + "]=1 b",
         "subscript_nest": lambda n: "a[" + "${x[" * n + "]" + "]}" * n + "]=1 b",
         "subscript_dq": lambda n: "a[" + '"${x:-' * n + "]" + '}"' * n + "]=1 b",
+        # Конец `$((…)` при раскрытии — за комментарием: вложенные уровни в нём не читаются, концы вложенных
+        # `$((` запоминаются, тексты кусков не снимаются при повторной сборке (было время по квадрату глубины).
+        "arith_comment": lambda n: "echo " + "$(( #" * n + "x\n" + "))" * n,
+        "arith_comment_dq": lambda n: 'echo "' + "$(( #" * n + "x\n" + "))" * n + '"',
+        "arith_comment_heredoc": lambda n: "cat <<E\n" + "$(( #" * n + "x\n" + "))" * n + "\nE",
+        "arith_comment_array": lambda n: "a=(" + "$(( #" * n + "x\n" + "))" * n + ")",
+        "arith_comment_paren": lambda n: "echo " + "$(( #)" * n + "x\n" + "))" * n,
+        "arith_param_paren": lambda n: "echo " + "$(( ${x:-" * n + ")" + "}))" * n,
     }
     HEREDOCS = {
         "many": lambda n: "cat <<E\nx\nE\n" * n,
@@ -1167,8 +1739,42 @@ class LinearityTest(unittest.TestCase):
             with self.subTest(name):
                 self.check(make)
 
+    def test_param_text_memory(self):
+        # Текст `${…}` собирается по требованию (Param.text): строки уровней не повторяют текст вложенных `${…}`,
+        # память разбора линейна по глубине. Глубины — под пределом стека разбора (_STACK_MAX: около 2000 уровней).
+        def peak(n):
+            text = "echo " + "${a:-" * n + "x" + "}" * n
+            tracemalloc.start()
+            try:
+                script = shparse.parse(text)
+                size = tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+            self.assertIsNone(script.error)
+            params = [node for node in shparse.walk(script) if type(node) is shparse.Param]
+            self.assertEqual(len(params), n)
+            self.assertEqual(params[0].text, text[5:])
+            self.assertEqual(params[-1].text, "${a:-x}")
+            return size
+
+        small, large = peak(900), peak(1800)
+        self.assertLess(large, 2.5 * small)
+        small, large = "echo " + "${a:-" * 450 + "x" + "}" * 450, "echo " + "${a:-" * 1800 + "x" + "}" * 1800
+        assert_linear(self, lambda: shparse.parse(small), lambda: shparse.parse(large))
+
+    def test_array_comments(self):
+        # Комментарии между словами скобок массива: поиск по комментариям этих скобок, а не проход всех комментариев
+        # текста на каждое слово (на 250/1000 квадратичное время не видно).
+        make = lambda n: "a=(\n" + "x # c\n" * n + "); bash run.sh npm i x"  # noqa: E731
+        small, large = make(1000), make(4000)
+        assert_linear(self, lambda: self.walk_all(small), lambda: self.walk_all(large))
+
     def test_heredocs_line(self):
         small, large = "cat <<E " * 2000, "cat <<E " * 8000
+        assert_linear(self, lambda: shparse.heredocs(small), lambda: shparse.heredocs(large))
+        # Не закрытая до конца строки `` `…` `` с `\``: тело подстановки разбирается заново (bash читает её до
+        # закрывающей обратной кавычки).
+        small, large = "x=`" + "\\`" * 20000, "x=`" + "\\`" * 80000
         assert_linear(self, lambda: shparse.heredocs(small), lambda: shparse.heredocs(large))
 
     @mock.patch.object(shparse, "_STACK_MAX", 10 ** 9)
@@ -1194,6 +1800,65 @@ def chain(wrap, n):
     for i in range(n):
         text = wrap(text, i)
     return "echo " + text
+
+
+class MemoryLinearityTest(unittest.TestCase):
+    """Пик памяти разбора (tracemalloc) линеен по глубине вложенности под действующими пределами (_STACK_MAX, предел
+    повторного раскрытия): готовые тексты уровней (Param.text, печать и skel кусков, тела heredoc, записи подстановок)
+    — срезы общих строк, а не строка на каждый уровень с текстом всех более глубоких. Квадратичная память: при
+    удвоении глубины пик растёт вчетверо; линейная — вдвое (запас — на шаги роста словарей и списков)."""
+
+    EXTRA = {
+        "arith_paren_chain": lambda n: "echo " + "$((x " * n + ") " * n,
+        "funsub_seq": lambda n: "${ " * n + "echo x; }" * n,
+        "param_open": lambda n: "echo " + "${x:- " * n,
+        "param_index": lambda n: "echo " + "${a[ " * n,
+        "param_offset": lambda n: "echo " + "${x:" * n,
+        "param_offset_quote": lambda n: "echo " + "${a[1]:'" * n,
+        "param_dq_nest": lambda n: 'echo "' + '${x:-"' * n + "a" + '"}' * n + '"',
+        "param_comsub": lambda n: "echo " + "${x:-$(echo " * n + "a" + ")}" * n,
+        "arith_param_nest": lambda n: "echo $(( " + "${x:-$(( " * n + "1" + " ))}" * n + " ))",
+        "heredoc_in_param": lambda n: "echo " + "${x:-$(cat <<E\nx\nE\n)" * n + "}" * n,
+        "array_nest": lambda n: "a=(" + "$(b=(" * n + "x" + "))" * n + ")",
+        "quoted_name": lambda n: "echo " + '"$(' * n + "echo" + ')"' * n,
+        "reexpand_chain": lambda n: chain(lambda s, i: "$(a=(\\'y) ; " + s + " ; b=(\\'))", n),
+        # Тело heredoc с терминатором в кавычках (Lit в Heredoc.parts) на каждом уровне вложенности: `$((` читается
+        # сначала арифметикой, и вложенные уровни разбираются внутри тела.
+        "quoted_body_param": lambda n: chain(lambda s, i: f"${{x:-$((true) ; cat <<'E{i}'\n{s}\nE{i}\n)}}", n),
+        "quoted_body_reparse": lambda n: chain(lambda s, i: f"$((true) ; cat <<'E{i}'\n{s}\nE{i}\n)", n),
+    }
+    SIZES = (1000, 500, 250, 120, 60, 30, 15)
+
+    @staticmethod
+    def peak(text):
+        shparse.parse(text)  # кеши модулей (re) — до замера
+        tracemalloc.start()
+        try:
+            shparse.parse(text)
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    def test_nesting(self):
+        kinds = {**LinearityTest.KINDS, **LinearityTest.HEREDOCS, **self.EXTRA}
+        kinds.update({"reparse_" + name: (lambda wrap: lambda n: chain(wrap, n))(wrap)
+                      for name, wrap in ReparseLinearityTest.KINDS.items()})
+        for name, make in kinds.items():
+            with self.subTest(name):
+                n = next((n for n in self.SIZES
+                          if getattr(shparse.parse(make(2 * n)).error, "kind", None) != shparse.DEPTH), None)
+                self.assertIsNotNone(n)
+                small, large = self.peak(make(n)), self.peak(make(2 * n))
+                self.assertLessEqual(large, 2.5 * small + 256 * 1024, f"глубина {n}")
+
+    @mock.patch.object(shparse, "_STACK_MAX", 10 ** 9)  # память, а не предел (под пределом — test_nesting)
+    def test_heredoc_body_chain(self):
+        # Тело heredoc разбирается окном строки, где оно прочитано (_R с window), без копии: разборы тел вложенных
+        # уровней (heredoc в подстановке в теле внешнего) живут на стеке все сразу, и копия тела на каждом уровне
+        # давала пик по квадрату глубины.
+        make = LinearityTest.HEREDOCS["chain_in_body"]
+        small, large = self.peak(make(960)), self.peak(make(1920))
+        self.assertLessEqual(large, 2.5 * small + 256 * 1024)
 
 
 class DeadlineExpired(BaseException):
@@ -1304,6 +1969,23 @@ class ReparseLinearityTest(unittest.TestCase):
                 start = time.monotonic()
                 self.walk_all(text)
                 self.assertLess(time.monotonic() - start, 1)
+
+    @mock.patch.object(shparse, "_STACK_MAX", 10 ** 9)  # предел работы повторного раскрытия, а не стека
+    def test_reexpand_chain_limit(self):
+        # Цепочка, где каждый уровень раскрывается заново по напечатанному тексту (`\\'` в скобках массива делит слова
+        # при чтении и при раскрытии по-разному): каждый уровень перечитывает весь вложенный текст. Линейного разбора с
+        # точностью bash нет; сверх предела _REEXPAND_BASE + _REEXPAND_PER × длина — ошибка вида DEPTH (у детектора —
+        # сомнение). До предела команды каждого уровня найдены. До правки 200 уровней разбирались около 115 с.
+        wrap = lambda s, i: "$(a=(\\'y) ; " + s + " ; b=(\\'))"  # noqa: E731
+        script = shparse.parse(chain(wrap, 10))
+        self.assertIsNone(script.error)
+        self.assertEqual(len(shparse.simple_commands(script)), 31)
+        for n in (200, 400, 1000):
+            with self.subTest(n), deadline(self, 60):
+                start = time.process_time()
+                script = shparse.parse(chain(wrap, n))
+                self.assertEqual((script.error.kind, script.commands), (shparse.DEPTH, []))
+                self.assertLess(time.process_time() - start, 5)
 
     def test_arith_check_after_open_quote(self):
         # Незакрытая '…' в теле heredoc подстановки идёт в счёте chk_arithsub дальше: подстановка за ней с `\\'`

@@ -131,10 +131,15 @@ _WHY_RENAMED = ("имя команды — переменная, шаблон и
 _WHY_RUNTIME_NAME = ("имя команды — ссылка на переменную со значением в тексте команды или склейка с ней, но значение "
                      "имени известно только при исполнении (замена, обрезка, подстрока, смена регистра, косвенная "
                      "ссылка или слишком много сочетаний значений): под ним может стоять менеджер пакетов")
-# Разбор не дал дерева: вложенность глубже предела shparse (_STACK_MAX уровней стека разбора) или сбой разбора или
-# детектора на этом тексте. Добавляет ли команда пакет, неизвестно, а пропуск открыл бы обход проверки той же
-# установкой рядом с такой конструкцией (`npm i x; echo $(… ×5000 …)`): сомнение, маркер — в начале всей команды.
-_WHY_NESTING = (f"вложенность конструкций глубже предела разбора ({shparse._STACK_MAX} уровней стека разбора): "
+_WHY_INTERPRETER = ("код интерпретатора или аргумент скрипта содержит команду установки пакета: что он исполнит, "
+                    "известно только при исполнении")
+# Разбор не дал дерева: вложенность глубже предела shparse (_STACK_MAX уровней стека разбора), цепочка повторного
+# раскрытия сверх предела работы (_REEXPAND_BASE + _REEXPAND_PER × длина текста — подстановка в подстановке глубже
+# примерно 70 уровней; обе — ошибка DEPTH) или сбой разбора или детектора на этом тексте. Добавляет ли команда
+# пакет, неизвестно, а пропуск открыл бы обход проверки той же установкой рядом с такой конструкцией
+# (`npm i x; echo $(… ×5000 …)`): сомнение, маркер — в начале всей команды.
+_WHY_NESTING = (f"вложенность конструкций глубже предела разбора ({shparse._STACK_MAX} уровней стека разбора) или "
+                "цепочка подстановок, которые разбор читает заново на каждом уровне, сверх предела его работы: "
                 "команды не разобраны; маркер согласия — в начале всей команды")
 _WHY_UNPARSED = ("разбор команды не удался (внутренняя ошибка детектора): команды не разобраны; маркер согласия — в "
                  "начале всей команды")
@@ -1718,8 +1723,33 @@ _REF = re.compile(r"\$\{?([!#]?)([A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*])")
 # Имена переменных по началу: `${!начало*}`, `${!начало@}`.
 _NAMES_BY_PREFIX = re.compile(r"\$\{!([A-Za-z_][A-Za-z0-9_]*)[*@]\}")
 # Интерпретаторы, чьи строки и stdin — код своего языка, а не команды оболочки (ещё _PYTHON — шаблоном): строка
-# оболочки в нём — литерал другого языка, разбор оболочки её не видит.
-_CODE_PROGRAMS = {"node", "nodejs", "perl", "ruby", "php", "lua", "luajit", "r", "rscript", "julia", "osascript"}
+# оболочки в нём — литерал другого языка, его разбирает _code_doubt по отрезкам. tsx и ts-node — node с TypeScript
+# (`-e`/`--eval`, `-p`/`--print`, как у node).
+_CODE_PROGRAMS = {"node", "nodejs", "perl", "ruby", "php", "lua", "luajit", "r", "rscript", "julia", "osascript", "tsx",
+                  "ts-node"}
+# awk: программа — первое слово-не-флаг или значение `-e`/`--source` (gawk), её `system("…")` и `"…" | getline`
+# исполняют строку оболочкой. awk — программа-данные (_DATA_PROGRAMS): строкой команд его слова не считаются, кодом —
+# все слова за именем (_code_args).
+_AWKS = {"awk", "gawk", "mawk", "nawk"}
+# Флаги кода у bun (`bun -e|--eval`, `-p|--print`, bun 1.x `bun --help`); у deno код — подкоманда `deno eval`. bun и
+# deno — менеджеры пакетов: их слова — код только с этими флагами.
+_BUN_CODE_FLAGS = {"-e", "--eval", "-p", "--print"}
+# Символы, которых нет в слове командной строки внутри кода другого языка (_code_doubt): кавычки, скобки, `;`,
+# перевод строки, обратная кавычка, запятая. Отрезки между ними — кандидаты в командную строку; группа держит сам
+# символ: кавычка за отрезком, кончающимся пробельным символом, — конец литерала, склеенного со значением (_code_lines).
+_CODE_SPLIT = re.compile(r"([\"'()\[\]{};\n`,])")
+# Строковые литералы подряд через запятую — список аргументов в коде (`subprocess.run(['npm', 'i', 'x'])`,
+# `system('npm', 'i', 'x')`); литерал без кавычки, `\\` и перевода строки внутри: поиск линеен.
+_CODE_LITERAL = r"""(?:"[^"\\\n]*"|'[^'\\\n]*')"""
+_CODE_LIST = re.compile(_CODE_LITERAL + r"(?:\s*,\s*" + _CODE_LITERAL + ")+")
+_CODE_ITEM = re.compile(r""""([^"\\\n]*)"|'([^'\\\n]*)'""")
+# Вставка значения в строку языка — `{x}` f-строки Python, `${x}` шаблона JS, `#{x}` Ruby: значение неизвестно, в
+# отрезке оно — слово с раскрытием _PLACEHOLDER (`os.system(f"npm i {pkg}")` — пакет из переменной).
+_CODE_INTERP = re.compile(r"[$#]?\{[^{}\"'\n]*\}")
+# Значение, известное только при исполнении (_values: `read` из файла или конвейера, `mapfile`, индекс массива не
+# литералом; _key_values: присваивание из ссылки, которую разбор не вычисляет): символ с кодом 0 в значении bash не
+# бывает (bash 5.3 его отбрасывает), и склейки, срезы и сочетания значений его сохраняют.
+_RUNTIME_VALUE = "\0"
 # Имена, которые шаблон имён в имени команды может дать командой установки (_renamed): программы, разбор которых
 # детектор знает, и менеджеры с запускателями pkgmanagers._INSTALLERS, кроме программ-данных; имена, которые
 # разбор узнаёт регулярным выражением, — _NAME_FAMILIES.
@@ -1860,35 +1890,268 @@ def _git_texts(args):
     return out
 
 
-def _string_doubt(info, depth):
+def _word_values(word, context):
+    """Тексты слова команды word: оно само, а со ссылкой на переменную со значением в тексте команды — ещё значения
+    ссылки (_var_values) или склейки (_composed без кавычек: слово — одна строка) по значениям context() (_values):
+    `CMD='npm i x'; docker exec c sh -c "$CMD"`. Значение, известное только при исполнении (_RUNTIME_VALUE), и
+    значение из окружения не видны: остаётся текст слова."""
+    out = [word]
+    if getattr(word, "expands", False) and context is not None:
+        values = context()
+        own = _var_values(word, values) or _composed(word, values, quote=False) or []
+        out += [pkgmanagers._part_of(word, t) for t, _ in own if _RUNTIME_VALUE not in t]
+    return out
+
+
+def _string_doubt(info, depth, context=None):
     """Довод сомнения, если слово команды за именем или его значение за `=` разбирается как команда установки
     (_input_doubt; сверх остатка _INPUT_BUDGET — _WHY_INPUT): программа может исполнить строку (`docker exec c sh -c
     '…'`, `parallel ::: '…'`, `npm exec -c '…'`, `git -c core.pager='…'`, `git filter-branch --tree-filter '…'`).
-    Слова программ-данных
-    _DATA_PROGRAMS — текст, кроме git: он исполняет строки своих настроек и флагов (_git_texts). Строки оболочек
-    разбирают _inline_script, _heredoc_runs и _launched (`fish -C`), их позиционное слово — путь скрипта. Имя команды
-    строкой не исполняется: программы с пробелом в имени нет, а `sudo -s` экранирует пробелы слов (man sudo 1.9)."""
+    Слово со ссылкой на переменную со значением в тексте команды проверяется и значением (_word_values). Слова
+    программ-данных _DATA_PROGRAMS — текст, кроме git: он исполняет строки своих настроек и флагов (_git_texts).
+    Строки оболочек разбирают _inline_script, _heredoc_runs и _launched (`fish -C`), их позиционное слово — путь
+    скрипта (аргументы скрипта — _code_doubt). Имя команды строкой не исполняется: программы с пробелом в имени нет,
+    а `sudo -s` экранирует пробелы слов (man sudo 1.9)."""
     words = info.words
     if not _text_program(words, git=True) or pkgmanagers._basename(words[0]) in pkgmanagers._C_SHELLS:
         return None
     args = _git_texts(words[1:]) if pkgmanagers._basename(words[0]) == "git" else words[1:]
     for word in args:
-        for text in _string_texts(word):
-            why = _input_doubt(text, depth)
-            if why:
-                return why
+        for value in _word_values(word, context):
+            for text in _string_texts(value):
+                why = _input_doubt(text, depth)
+                if why:
+                    return why
     return None
 
 
-def _program_inputs(commands, feeds):
+def _launch_target(words):
+    """Слова программы, которую запускают слова words известного запускателя: `npx`/`bunx`/`pnpx` (версия `@…`
+    снята) и `corepack`, `<менеджер> run` (_RUNNERS; `hatch run env:cmd` — cmd), `<менеджер> exec|x|dlx` (_EXECS);
+    у программы, неизвестной детектору (не _KNOWN_PROGRAMS: `docker exec c`, `kubectl exec p --`, `direnv exec .`), —
+    слова с первого слова-интерпретатора, awk или оболочки (_code_program) не дальше _MAX_LAUNCH_PAIRS-го такого
+    места, у которого есть код (_code_args): программа может запустить их командой. None — запуска нет."""
+    name = pkgmanagers._basename(words[0])
+    if name == "corepack" or name in pkgmanagers._NPX:
+        rest = words[1:] if name == "corepack" else pkgmanagers._after_flags(words[1:], _NPX_VALUE_FLAGS)
+        return [_VERSION.sub("", rest[0]), *rest[1:]] if rest else None
+    if name in pkgmanagers._RUNNERS or name in _EXECS:
+        sub, args = pkgmanagers._sub_args(words, pkgmanagers._GLOBAL_FLAGS.get(name, pkgmanagers._NO_VALUE_FLAGS))
+        if sub == "run" and name in pkgmanagers._RUNNERS:
+            rest = pkgmanagers._after_flags(args, pkgmanagers._RUNNERS[name])
+            if name == "hatch" and rest:
+                rest = [rest[0].partition(":")[2] or rest[0], *rest[1:]]
+            return rest or None
+        if sub in _EXECS.get(name, ()):
+            rest = pkgmanagers._after_flags(args, _NPX_VALUE_FLAGS | pkgmanagers._GLOBAL_FLAGS.get(name, set()))
+            return [_VERSION.sub("", rest[0]), *rest[1:]] if rest else None
+        return None
+    if name in _KNOWN_PROGRAMS or "=" in name:
+        return None
+    tries = 0
+    for k in range(1, len(words)):
+        if _code_program(words[k]):
+            tries += 1
+            if tries > _MAX_LAUNCH_PAIRS:
+                return None
+            if _code_args(words[k:], launched=False):
+                return words[k:]
+    return None
+
+
+def _code_program(word):
+    """Слово — имя интерпретатора (_CODE_PROGRAMS, _PYTHON), awk (_AWKS), bun, deno или оболочки (_C_SHELLS)."""
+    name = pkgmanagers._basename(word)
+    return (name in _CODE_PROGRAMS or name in _AWKS or name in pkgmanagers._C_SHELLS or name in ("bun", "deno")
+            or bool(pkgmanagers._PYTHON.match(name)))
+
+
+def _code_args(words, launched=True):
+    """Слова, которые программа слов words может исполнить кодом другого языка или отдать скрипту: у интерпретатора
+    (_CODE_PROGRAMS, _PYTHON) — все за именем (код `-c`, `-e`, `-E`, `--eval`, `-p`, `-r`, склейки `-le` и
+    аргументы скрипта), у awk (_AWKS) — все за именем (программа — первое слово-не-флаг или `-e`), у bun — все за
+    именем с флагом кода _BUN_CODE_FLAGS, у `deno eval` — слова за `eval`, у оболочки со скриптом-файлом — слова за
+    скриптом (`bash run.sh 'npm i x'`): флаги — до первого позиционного слова или `--`, как у _heredoc_runs; строка
+    `-c`, stdin и только разбор (_noexec) — пусто. При launched программа ищется и за известным запускателем
+    (_launch_target: `uv run python -c`, `npx node -e`, `docker exec c python3 -c`). Слова `source`/`.` за скриптом
+    проверяет _string_doubt."""
+    name = pkgmanagers._basename(words[0]) if words else None
+    if name is None:
+        return []
+    if name in _CODE_PROGRAMS or name in _AWKS or pkgmanagers._PYTHON.match(name):
+        return words[1:]
+    if name == "bun" and any(w in _BUN_CODE_FLAGS or w.startswith(("--eval=", "--print=")) for w in words[1:]):
+        return words[1:]
+    if name == "deno" and words[1:2] == ["eval"]:
+        return words[2:]
+    if name not in pkgmanagers._C_SHELLS:
+        target = _launch_target(words) if launched else None
+        return _code_args(target, launched=False) if target else []
+    if pkgmanagers._inline_script(words) is not None or pkgmanagers._heredoc_runs(words):
+        return []
+    args, i, noexec = words[1:], 0, False
+    while i < len(args) and args[i] != "--" and args[i][:1] in ("-", "+") and len(args[i]) > 1:
+        noexec = pkgmanagers._noexec(args[i], args[i + 1:i + 2], noexec)
+        i += 2 if pkgmanagers._takes_value(args[i], pkgmanagers._SHELL_VALUE_FLAGS) else 1
+    i += args[i:i + 1] == ["--"]
+    return [] if noexec else args[i + 1:]
+
+
+def _code_lines(text):
+    """Кандидаты в командную строку в коде text со словом менеджера или запускателя (pkgmanagers._installer) — пары
+    (текст, склейка ли): отрезки между символами _CODE_SPLIT (вставка значения `{x}`, `${x}`, `#{x}` — слово с
+    раскрытием _PLACEHOLDER, _CODE_INTERP); отрезок, кончающийся пробельным символом перед кавычкой, — ещё и склейкой
+    со словом _PLACEHOLDER на конце: литерал склеен со значением (`'pip install ' + sys.argv[1]`, `"gem install " +
+    g`, `'npm i ' . $x`), имя пакета продолжается за литералом; список строковых литералов через запятую
+    (_CODE_LIST) — словами командной строки в кавычках shlex (`subprocess.run(['npm', 'i', 'x'])`). Поиск линеен:
+    отрезки и литералы списков не пересекаются."""
+    text = _CODE_INTERP.sub(" " + _PLACEHOLDER + " ", text)
+    parts = _CODE_SPLIT.split(text)
+    for k in range(0, len(parts), 2):
+        piece = parts[k]
+        if not any(pkgmanagers._installer(w) for w in piece.split()):
+            continue
+        yield piece, False
+        if piece[-1:].isspace() and k + 1 < len(parts) and parts[k + 1] in ("'", '"', "`"):
+            yield piece + _PLACEHOLDER, True
+    for m in _CODE_LIST.finditer(text):
+        items = [a or b for a, b in _CODE_ITEM.findall(m[0])]
+        if any(pkgmanagers._installer(w) for w in items):
+            yield " ".join(shlex.quote(w) for w in items), False
+
+
+def _code_doubt(texts, depth):
+    """Довод сомнения для кода интерпретатора или аргументов скрипта texts: _WHY_INTERPRETER, если кандидат в
+    командную строку (_code_lines: отрезок со словом менеджера или запускателя, склейка литерала со значением,
+    список аргументов) ставит пакет (_installs) или под сомнением (_find_doubt): `python3 -c "os.system('npm i x')"`,
+    `node -e`, `perl -e`, `bash run.sh 'npm i x'`. Литерал с командой установки (`print('npm i x')`) — ложный отказ,
+    обход — маркер. Код без слова менеджера только просматривается; остаток _INPUT_BUDGET вызова тратят кандидаты,
+    сверх него — _WHY_INPUT; каждый кандидат разбирается по разу: проход линеен."""
+    budget = _call[3] if _call is not None else [_INPUT_BUDGET]
+    for text in texts:
+        for line, glued in _code_lines(text):
+            budget[0] -= len(line)
+            if budget[0] < 0:
+                return _WHY_INPUT
+            # Склейка — только установкой: заглушка на месте подкоманды (`"gem " + x`) — не пакет.
+            if _installs(line, depth) or not glued and depth < _MAX_DEPTH and _find_doubt(line, depth + 1):
+                return _WHY_INTERPRETER
+    return None
+
+
+def _script_args(words):
+    """Аргументы скрипта, которые программа слов words (и за известным запускателем, _launch_target) отдаёт скрипту:
+    у оболочки — слова за скриптом-файлом (_code_args), с `-s` (скрипт со stdin) — позиционные слова за флагами; у
+    `source`/`.` — слова за файлом (`-p путь`, `--` сняты); у интерпретатора _CODE_PROGRAMS — слова за первым
+    словом-не-флагом (скрипт или код `-e`); у `deno|bun run <файл>` и `deno|bun <файл>` (сокращение `run`; файл — слово
+    с `.` или `/`, иначе подкоманда или скрипт package.json) — слова за файлом; у _PYTHON —
+    `sys.argv` кода: слова за скриптом или `-`, за кодом `-c` и за модулем `-m` после флагов."""
+    name = pkgmanagers._basename(words[0]) if words else None
+    if name is None:
+        return []
+    if name in pkgmanagers._SOURCES:
+        args = words[3:] if words[1:2] == ["-p"] else words[1:]
+        return args[2:] if args[:1] == ["--"] else args[1:]
+    if name in pkgmanagers._C_SHELLS:
+        if pkgmanagers._inline_script(words) is None and pkgmanagers._heredoc_runs(words):
+            # `bash -s a b < run.sh`: флаги — до первого позиционного слова или `--`, как у _code_args.
+            args, i = words[1:], 0
+            while i < len(args) and args[i] != "--" and args[i][:1] in ("-", "+") and len(args[i]) > 1:
+                i += 2 if pkgmanagers._takes_value(args[i], pkgmanagers._SHELL_VALUE_FLAGS) else 1
+            return args[i + (args[i:i + 1] == ["--"]):]
+        return _code_args(words, launched=False)
+    if name in _CODE_PROGRAMS:
+        rest = pkgmanagers._after_flags(words[1:], pkgmanagers._NO_VALUE_FLAGS)
+        return rest[1:]
+    if name in ("deno", "bun"):
+        flags = pkgmanagers._GLOBAL_FLAGS[name]
+        rest = pkgmanagers._after_flags(words[1:], flags)
+        run = rest[:1] == ["run"]
+        if run:
+            rest = pkgmanagers._after_flags(rest[1:], flags)
+        if not rest:
+            return []
+        return rest[1:] if run or "." in rest[0] or "/" in rest[0] else []
+    if not pkgmanagers._PYTHON.match(name):
+        # Слова запуска короче слов запускателя: спуск конечен.
+        target = _launch_target(words) if name not in _CODE_PROGRAMS and name not in _AWKS else None
+        return _script_args(target) if target else []
+    # Флаги — как у pkgmanagers._python_target: короткие склеиваются, `-W`/`-X` берут остаток слова или следующее.
+    i = 1
+    while i < len(words) and words[i].startswith("-"):
+        a = words[i]
+        if a == "-":
+            return words[i + 1:]
+        if a.startswith("--"):
+            i += 2 if a in pkgmanagers._PYTHON_LONG_VALUE_FLAGS else 1
+            continue
+        step = 1
+        for j, letter in enumerate(a[1:], 1):
+            rest = a[j + 1:]
+            if letter in "cm":
+                return words[i + 1:] if rest else words[i + 2:]
+            if "-" + letter in pkgmanagers._PYTHON_VALUE_FLAGS:
+                step = 1 if rest else 2
+                break
+        i += step
+    return words[i + 1:]
+
+
+def _interpreter_doubt(info, depth, context=None):
+    """Довод сомнения для кода интерпретатора и аргументов скрипта (_code_args) и их значений (_word_values) —
+    _code_doubt; затем слова за интерпретатором или скриптом оболочки, склеенные в команду: менеджер с глаголом
+    установки среди них (`bash run.sh npm i x`, `bash run.sh npm "i x"`, `python3 run.py npm install lodash`) —
+    _WHY_LAUNCHER, как у неизвестной программы (_launches_install: `./run.sh npm i x`)."""
+    args = _code_args(info.words)
+    why = args and _code_doubt([v for w in args for v in _word_values(w, context)], depth)
+    if why:
+        return why
+    # Аргументы скрипта — и значениями ссылок (_word_values: `P="npm i x"; bash -s $P < run.sh`); скрипт может
+    # склеить их в строку (`$*`, `eval "$@"`): слова делятся по пробельным символам, все значения слова — подряд
+    # (надмножество сочетаний).
+    texts = [v for w in _script_args(info.words) for v in _word_values(w, context)]
+    if not texts:
+        return None
+    # Код уже проверен у _code_args (оболочка со скриптом, интерпретатор): остаток _INPUT_BUDGET не тратится дважды.
+    why = None if args else _code_doubt(texts, depth)
+    if why:
+        return why
+    return _WHY_LAUNCHER if _launches_install([_PLACEHOLDER, *" ".join(texts).split()]) else None
+
+
+def _interpreter(word):
+    """Слово — имя интерпретатора, чей stdin — код его языка (_CODE_PROGRAMS, _PYTHON)."""
+    name = pkgmanagers._basename(word)
+    return name in _CODE_PROGRAMS or bool(pkgmanagers._PYTHON.match(name))
+
+
+def _stdin_code(words):
+    """stdin программы слов words — код интерпретатора: имя — интерпретатор, им начинается команда известного
+    запускателя (_launch_target: `uv run python`, `npx node`) или он — слово неизвестной программы (`docker exec -i c
+    python3`)."""
+    if _interpreter(words[0]):
+        return True
+    target = _launch_target(words)
+    if target:
+        return _interpreter(target[0])
+    name = pkgmanagers._basename(words[0])
+    return name not in _KNOWN_PROGRAMS and "=" not in name and any(_interpreter(w) for w in words[1:])
+
+
+def _program_inputs(commands, feeds, code=False):
     """Тексты, которые получает на stdin программа не из _DATA_PROGRAMS и не оболочка или `source` (их вход и скрипт
-    разбирает _heredoc_runs: вход исполняет оболочка без скрипта, `source` — только скриптом stdin): тела её heredoc
+    разбирает _heredoc_runs: вход исполняет оболочка без скрипта, `source` — только скриптом stdin), при code —
+    интерпретатор (_CODE_PROGRAMS, _PYTHON: stdin — код его языка, _code_doubt): тела её heredoc
     и here-string, вывод литерального `echo`/`printf` (_echo_texts) и тела heredoc
     `cat` (_heredoc_cat) по связям feeds; пары (сегмент программы, текст). Неизвестный вывод — не текст: что
     программа получит, неизвестно, сомнения нет."""
     def reads(info):
         words = info.words
-        return (not info.marker and _text_program(words)
+        if info.marker or not words:
+            return False
+        if code:
+            return _stdin_code(words)
+        return (_text_program(words)
                 and pkgmanagers._basename(words[0]) not in pkgmanagers._SHELLS | pkgmanagers._SOURCES)
 
     for info in commands:
@@ -1903,18 +2166,35 @@ def _program_inputs(commands, feeds):
             yield target.segment, text
 
 
+def _value_node(node):
+    """Узел значения присваивания node (слово `ИМЯ=…`, `a[i]=…`): части за первым `=` литерала — для _composed
+    (_key_values: значение из ссылки, которую разбор не вычисляет, известно только при исполнении); None — в
+    литералах нет `=`."""
+    for k, part in enumerate(node.parts):
+        if type(part) is shparse.Lit and "=" in part.text:
+            rest = part.text.partition("=")[2]
+            head = [shparse._node(shparse.Lit, part.end - len(rest), part.end, text=rest)] if rest else []
+            return shparse._node(shparse.Word, part.end, node.end, parts=head + node.parts[k + 1:])
+    return None
+
+
 def _assigned(word, src, out, alias=False):
     """Присваивание word (слово команды _Word или узел присваивания с исходным текстом src) пишет в out значение
     (текст, вычисляемое ли): у массива `a=(…)` — слова в скобках текстом; вычисляемое — с подстановкой
-    (_name_expands: `X=$(…)`, `${x:-…}`). Ключ — имя, у alias — ("alias", имя)."""
+    (_name_expands: `X=$(…)`, `${x:-…}`). Ключ — имя, у alias — ("alias", имя). Текст значения со ссылкой на
+    переменную — _Word с узлом значения (_value_node): _key_values вычисляет его склейкой (_composed)."""
     m = _VALUE.fullmatch(word)
     if not m:
         return
     value = m[2]
     raw = _VALUE.fullmatch(src)
-    if raw and raw[2].startswith("(") and value.startswith("(") and value.endswith(")"):
-        value = value[1:-1]
     node = getattr(word, "node", None)
+    if raw and raw[2].startswith("(") and value.startswith("(") and value.endswith(")"):
+        # Слова в скобках без комментариев и переводов строки (_array_items): текст значения — одна команда.
+        value = " ".join(item if key is None else f"[{key}]={item}" for key, item in _array_items(src))
+    elif node is not None and "$" in value:
+        value = _Word(value)
+        value.node = _value_node(node)
     out.setdefault(("alias", m[1]) if alias else m[1], []).append((value, node is not None and _name_expands(node)))
 
 
@@ -1939,9 +2219,144 @@ def _set_args(args):
 _POSITIONAL = ("set",)
 # Флаги `read` со значением (bash 5.3, `help read`).
 _READ_VALUE_FLAGS = {"-a", "-d", "-i", "-n", "-N", "-p", "-t", "-u"}
+# Флаги `mapfile`/`readarray` со значением (bash 5.3, `help mapfile`); без имени массив — MAPFILE.
+_MAPFILE_VALUE_FLAGS = {"-d", "-n", "-O", "-s", "-u", "-C", "-c"}
+# Встроенные, у которых флаг с буквой `n` делает имя ссылкой (nameref): `declare -n R=X`; у `export -n` — снятие
+# экспорта.
+_NAMEREF_DECLARES = {"declare", "typeset", "local"}
+# Элемент `[N]=x` в скобках `a=(…)` (присваивание элементу по индексу — _indexed).
+_ITEM_INDEX = re.compile(r"\[([^\]]*)\]=(.*)", re.S)
+# Имя массива целиком (`a=(…)`, `a+=(…)`) или переменной (`a=x`, `a+=x`) со значением.
+_WHOLE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(\+?)=(.*)", re.S)
 
 
-def _values(commands, loops):
+def _read_targets(words, value_flags, array_flag):
+    """Имена, в которые пишут `read` или `mapfile` по словам words за именем: флаги со значением value_flags снимают
+    и значение, у array_flag (`read -a`) значение — имя."""
+    args, targets = list(words), []
+    while args and args[0].startswith("-") and args[0] != "--":
+        if args[0] in value_flags:
+            targets += args[1:2] if args[0] == array_flag else []
+            args = args[1:]
+        args = args[1:]
+    return targets + args[args[:1] == ["--"]:]
+
+
+def _indexed(word):
+    """Присваивание элементу массива word (`a[1]=x`, `a[1]+=x`, `cmd[${#cmd[@]}]=x`): (имя, индекс, `+=` ли,
+    значение) или None. Индекс кончается на парной `]` с учётом вложенных `[…]` (`${#a[@]}` в индексе); индекс с
+    раскрытием — не литерал (_index: значение «все элементы» известно только при исполнении). Проход линеен."""
+    m = re.match(r"[A-Za-z_][A-Za-z0-9_]*\[", word)
+    if not m:
+        return None
+    depth, i = 1, m.end()
+    while i < len(word) and depth:
+        depth += {"[": 1, "]": -1}.get(word[i], 0)
+        i += 1
+    if depth:
+        return None
+    append = word.startswith("+=", i)
+    if not word.startswith("=", i + append):
+        return None
+    return word[:m.end() - 1], word[m.end():i - 1], append, word[i + append + 1:]
+
+
+def _index(text):
+    """Индекс элемента индексного массива по тексту в `[…]`: десятичный литерал без ведущих нулей; None — индекс
+    известен только при исполнении (арифметика, переменная, ключ ассоциативного массива)."""
+    text = text.strip()
+    return int(text) if text.isdecimal() and len(text) < 10 and (text == "0" or text[0] != "0") else None
+
+
+def _array_source(node, text):
+    """Исходный текст присваивания node в тексте text, где в скобках массива (`a=(…)`) переводы строки вне кавычек и
+    раскрытий — пробелы, а комментарии (`#` в начале слова до конца строки) — пробелы той же длины: в скобках bash
+    читает перевод строки разделителем слов, а не концом команды (bash 5.3: `a=(⏎npm⏎i x⏎); "${a[@]}"` исполняет
+    `npm i x`). Части-не-литералы (кавычки, раскрытия) остаются как есть; проход линеен."""
+    src = text[node.start:node.end]
+    if "\n" not in src:
+        return src
+    covered = [(p.start - node.start, p.end - node.start) for p in node.parts if type(p) is not shparse.Lit]
+    out, i, k, comment = list(src), 0, 0, False
+    while i < len(src):
+        while k < len(covered) and covered[k][1] <= i:
+            k += 1
+        if k < len(covered) and covered[k][0] <= i:
+            i = covered[k][1]
+            comment = False
+            continue
+        c = src[i]
+        if c == "\n":
+            out[i], comment = " ", False
+        elif comment:
+            out[i] = " "
+        elif c == "\\":
+            i += 1
+        elif c == "#" and i and src[i - 1] in " \t\n(":
+            out[i], comment = " ", True
+        i += 1
+    return "".join(out)
+
+
+def _array_items(src):
+    """Элементы скобок присваивания массива по его исходному тексту src (`a=(x "y z" [5]=q)`; переводы строки и
+    комментарии — пробелы, _array_source): пары (индекс или None — по порядку, или ключ `[N]` текстом, значение
+    _Word); разбор shparse слов в скобках как слов одной команды."""
+    cache = _call[1] if _call is not None else {}
+    if ("items", src) in cache:
+        return cache["items", src]
+    inner = src[src.find("(") + 1:src.rfind(")")]
+    text = ": " + inner
+    out = []
+    for simple in shparse.simple_commands(shparse.parse(text))[:1]:
+        for word in simple.words[1:]:
+            value = _word_text(word, text)
+            m = _ITEM_INDEX.fullmatch(value) if _word_lead(word, text).startswith("[") else None
+            out.append((m[1], _derived(value, m[2])) if m else (None, value))
+    cache["items", src] = out
+    return out
+
+
+def _array_value(events):
+    """Значение «все элементы» массива по событиям events в порядке текста (_values): склейка значений элементов по
+    порядку индексов (`a[1]=npm; a[2]=i; a[3]=lodash` — `npm i lodash`, bash 5.3); индекс не литералом
+    (_index) — _RUNTIME_VALUE. Пара (текст, вычисляемое ли)."""
+    # top — граница сверху индексов state: `a+=(…)` дописывает за ней (у bash — за последним элементом; убранный
+    # `unset` конец оставляет промежуток, порядок элементов тот же).
+    state, top = {}, 0
+    for kind, index, append, value in events:
+        computed = getattr(value, "expands", False)
+        if kind == "unset":
+            if index is None:
+                state, top = {}, 0
+            elif _index(index) is None:
+                return _RUNTIME_VALUE, True
+            else:
+                state.pop(_index(index), None)
+        elif kind == "items":
+            if not append:
+                state, top = {}, 0
+            k = top
+            for key, item in _array_items(value):
+                if key is not None:
+                    k = _index(key)
+                    if k is None:
+                        return _RUNTIME_VALUE, True
+                state[k] = (item, getattr(item, "expands", False))
+                k += 1
+                top = max(top, k)
+        else:
+            k = 0 if index is None else _index(index)
+            if k is None:
+                return _RUNTIME_VALUE, True
+            old = state.get(k, ("", False))
+            state[k] = (old[0] + value, old[1] or computed) if append else (value, computed)
+            top = max(top, k + 1)
+    items = [state[k] for k in sorted(state)]
+    return " ".join(t for t, _ in items), any(c for _, c in items)
+
+
+def _values(commands, loops, depth=0):
     """Значения переменных и alias текста: имя — список пар (текст значения, вычисляемое ли). Переменные —
     присваивания перед командой и в словах `export`/`declare`/`typeset`/`local`/`readonly` (массив `a=(…)` — слова в
     скобках, _assigned), слова цикла `for`, строка here-string или heredoc `read` во все её имена (вычисляемое) и
@@ -1949,49 +2364,136 @@ def _values(commands, loops):
     `alias имя=…`, ключ ("alias", имя); слово оператора `=`, `:=` в раскрытиях слов (_default_assigns). Одинаковые
     пары имени не повторяются. Позиционные параметры — слова `set` (_set_args) и сумма сдвигов `shift` (литерал N,
     без числа — 1, иначе — любой сдвиг) под ключом _POSITIONAL: их значения считает _var_values по ссылке
-    (_positional). Значения `read` из файла или конвейера, `mapfile` и `readarray` не видны."""
-    out, sets, shifts = {}, [], 0
-    for info in commands:
-        for word in info.simple.assigns:
-            _assigned(_word_text(word, info.text), info.text[word.start:word.end], out)
-        words = info.words
-        name = pkgmanagers._basename(words[0]) if words else None
-        if name in _DECLARES or name == "alias":
-            for word in words[1:]:
-                src = info.text[word.node.start:word.node.end] if getattr(word, "node", None) else word
-                _assigned(word, src, out, name == "alias")
-        elif name == "set":
-            args = _set_args(words[1:])
-            if args is not None:
-                sets.append(args)
-        elif name == "shift":
-            # `shift N` сдвигает на N, без числа — на 1; N не литералом может быть любым.
-            n = words[1] if len(words) == 2 else "1" if len(words) == 1 else ""
-            shifts += int(n) if n.isdecimal() and len(n) < 5 else _WORDS_LIMIT
-        elif name == "read":
-            args, targets = list(words[1:]), []
-            while args and args[0].startswith("-") and args[0] != "--":
-                if args[0] in _READ_VALUE_FLAGS:
-                    targets += args[1:2] if args[0] == "-a" else []
-                    args = args[1:]
-                args = args[1:]
-            targets += args[args[:1] == ["--"]:]
-            for text in chain(info.bodies, info.herestrings):
-                for target in targets:
-                    out.setdefault(target, []).append((text, True))
-        elif name == "printf" and words[1:2] == ["-v"] and len(words) > 3:
-            args = words[3 + (words[3] == "--"):]
-            text = _printf_output(args)
-            computed = text is None or any(getattr(w, "expands", False) for w in args)
-            out.setdefault(words[2], []).append((" ".join(args) if text is None else text, computed))
-        _default_assigns(info.simple, out)
-    for node, text in loops:
-        out.setdefault(text[node.name.start:node.name.end], []).extend(
-            (_word_text(w, text), False) for w in node.words)
+    (_positional).
+    Строка `eval` из литералов (_literal_eval) исполняется в той же оболочке: её команды входят в значения так же,
+    до _MAX_DEPTH (`eval set -- npm i x; "$@"`). Значение `read` не из here-string или heredoc (файл, конвейер) и
+    `mapfile`/`readarray` известно только при исполнении — _RUNTIME_VALUE. Массив с присваиванием по индексу
+    (`a[1]=npm`, `[N]=…` в скобках) получает ещё значение «все элементы» — склейку по порядку индексов
+    (_array_value; индекс не литералом — _RUNTIME_VALUE); `unset a[N]`, `unset a` убирают элементы. Ссылка
+    `declare -n R=X` (`typeset -n`, `local -n`; цель — и значение присваивания `R=X` ссылке без цели): значения R —
+    значения X (`${X}`), присваивания R пишут в X."""
+    out, sets = {}, []
+    shifts = [0]
+    events, indexed, refs = {}, set(), {}
+    # Значения IFS без повторов (_ifs_split) и сколько пар out["IFS"] в них уже вошло: каждый `read` читает только
+    # новые пары — проход линеен.
+    ifs, ifs_seen = {}, [0]
+
+    def event(name, kind, index, append, value):
+        events.setdefault(name, []).append((kind, index, append, value))
+        if index is not None or kind == "items" and "[" in value:
+            indexed.add(name)
+
+    def assignment(word, src):
+        m = _indexed(word)
+        if m:
+            event(m[0], "set", m[1], m[2], _derived(word, m[3]))
+            return
+        m = _WHOLE.fullmatch(word)
+        if m:
+            raw = _VALUE.fullmatch(src)
+            items = raw is not None and raw[2].startswith("(") and m[3].startswith("(")
+            event(m[1], "items" if items else "set", None, bool(m[2]), src if items else _derived(word, m[3]))
+
+    def collect(commands, loops, depth):
+        for info in commands:
+            for word in info.simple.assigns:
+                text, src = _word_text(word, info.text), _array_source(word, info.text)
+                _assigned(text, src, out)
+                assignment(text, src)
+            words = info.words
+            name = pkgmanagers._basename(words[0]) if words else None
+            if name in _DECLARES or name == "alias":
+                nameref = name in _NAMEREF_DECLARES and any(
+                    w[:1] == "-" and w != "--" and "n" in w[1:] for w in words[1:])
+                for word in words[1:]:
+                    src = _array_source(word.node, info.text) if getattr(word, "node", None) else word
+                    if nameref and not word.startswith("-"):
+                        ref, _, target = word.partition("=")
+                        refs.setdefault(ref, []).extend([target] if target else [])
+                        continue
+                    _assigned(word, src, out, name == "alias")
+                    if name != "alias":
+                        assignment(word, src)
+            elif name == "set":
+                args = _set_args(words[1:])
+                if args is not None:
+                    sets.append(args)
+            elif name == "shift":
+                # `shift N` сдвигает на N, без числа — на 1; N не литералом может быть любым.
+                n = words[1] if len(words) == 2 else "1" if len(words) == 1 else ""
+                shifts[0] += int(n) if n.isdecimal() and len(n) < 5 else _WORDS_LIMIT
+            elif name in ("read", "mapfile", "readarray"):
+                if name == "read":
+                    targets = _read_targets(words[1:], _READ_VALUE_FLAGS, "-a")
+                else:
+                    targets = _read_targets(words[1:], _MAPFILE_VALUE_FLAGS, None)[-1:] or ["MAPFILE"]
+                texts = list(chain(info.bodies, info.herestrings)) or [_RUNTIME_VALUE]
+                own = out.get("IFS", ())
+                ifs.update(dict.fromkeys(own[ifs_seen[0]:]))
+                ifs_seen[0] = len(own)
+                for text in _ifs_split(texts, ifs):
+                    for target in targets:
+                        out.setdefault(target, []).append((text, True))
+            elif name == "unset":
+                for word in words[1:]:
+                    m = _indexed(word + "=")
+                    if m:
+                        event(m[0], "unset", m[1], False, "")
+                    elif not word.startswith("-"):
+                        event(word, "unset", None, False, "")
+            elif name == "printf" and words[1:2] == ["-v"] and len(words) > 3:
+                args = words[3 + (words[3] == "--"):]
+                text = _printf_output(args)
+                computed = text is None or any(getattr(w, "expands", False) for w in args)
+                out.setdefault(words[2], []).append((" ".join(args) if text is None else text, computed))
+            elif depth < _MAX_DEPTH and _literal_eval(words) is not None:
+                inner = _analysis(_literal_eval(words))
+                collect(inner[0], inner[3], depth + 1)
+            _default_assigns(info.simple, out)
+        for node, text in loops:
+            out.setdefault(text[node.name.start:node.name.end], []).extend(
+                (_word_text(w, text), False) for w in node.words)
+
+    collect(commands, loops, depth)
+    # «Все элементы» — у массива с индексом и у имени с несколькими событиями: `a=(npm); a+=(i x)`, `a=npm; a+=(i
+    # x)` (bash 5.3: `a+=(…)` дописывает элементы за последним, `a=npm` у массива — элемент 0).
+    for name, own in events.items():
+        if name in indexed or len(own) > 1:
+            out.setdefault(name, []).append(_array_value(own))
+    for ref, targets in refs.items():
+        targets += [t for t, _ in out.get(ref, ()) if _VALUE.fullmatch(t + "=")]
+        for target in dict.fromkeys(targets):
+            if _VALUE.fullmatch(target + "="):
+                out.setdefault(target.partition("[")[0], []).extend(out.get(ref, ()))
+        out[ref] = [("${" + t + "}", False) for t in dict.fromkeys(targets) if _VALUE.fullmatch(t + "=")]
     # Одинаковые пары (повторный `set` с теми же словами) умножали бы сочетания _renamed: остаётся первая.
     out = {key: list(dict.fromkeys(pairs)) for key, pairs in out.items()}
-    out[_POSITIONAL] = (sets, shifts)
+    out[_POSITIONAL] = (sets, shifts[0])
     return out
+
+
+# Сколько разных значений IFS делят вход `read` (_ifs_split); больше — разбиение известно только при исполнении.
+_IFS_MAX = 16
+
+
+def _ifs_split(texts, ifs):
+    """Тексты входа `read` texts и они же, разделённые по значениям IFS из текста ifs (пары значений _values без
+    повторов, в том числе присваивание перед `read`: `IFS=, read X Y <<< "npm,i"`): символы IFS — пробелы, все
+    поля — в каждой цели (надмножество полей одной цели). Значение IFS, известное только при исполнении (с
+    раскрытием), больше _IFS_MAX значений и вход со ссылкой или подстановкой при заданном IFS (`IFS=: read -ra A
+    <<< "$P"`: делится значение ссылки, а не её текст) — _RUNTIME_VALUE."""
+    out = list(texts)
+    if not ifs:
+        return out
+    if len(ifs) > _IFS_MAX or any("$" in t or "`" in t for t in texts):
+        return out + [_RUNTIME_VALUE]
+    for value, computed in ifs:
+        if computed or "$" in value or "`" in value:
+            return out + [_RUNTIME_VALUE]
+        table = str.maketrans(dict.fromkeys(value, " "))
+        out += [t.translate(table) for t in texts if t != _RUNTIME_VALUE]
+    return list(dict.fromkeys(out))
 
 
 def _default_assigns(simple, out):
@@ -2094,9 +2596,20 @@ def _key_values(key, values, depth=0):
     cache = ("var", key, depth)
     if cache not in values:
         values[cache] = _capped(chain.from_iterable(
-            _ref_values(text, values, depth) or [(text, computed)]
+            _ref_values(text, values, depth) or _node_values(text, values, depth) or [(text, computed)]
             for text, computed in values.get(key, ())))
     return values[cache]
+
+
+def _node_values(text, values, depth):
+    """Значения текста значения text с узлом (_assigned: присваивание со ссылкой, `Y=${X}ash`, `Y=${X/q/z}`) — тем
+    же механизмом, что и у слова имени команды (_composed без кавычек: значение делится на слова при раскрытии) на
+    глубине ссылок depth + 1; известное только при исполнении — _RUNTIME_VALUE. Пусто — узла нет, ссылки без
+    значений в тексте или глубина достигла _REF_DEPTH."""
+    if depth >= _REF_DEPTH or getattr(text, "node", None) is None:
+        return []
+    own = _composed(text, values, quote=False, depth=depth + 1)
+    return [(_RUNTIME_VALUE, True)] if own is None else own
 
 
 def _ref_values(text, values, depth):
@@ -2166,7 +2679,7 @@ def _var_values(word, values, depth=0):
     return _key_values(m[1] or m[2] or m[3] or ("@::" if m[5] else "@:"), values, depth)
 
 
-def _valued_ref(text, values):
+def _valued_ref(text, values, depth=0):
     """Раскрытие параметра с текстом text ссылается на имя со значениями в тексте команды (values): переменную,
     массив, позиционные параметры, у косвенной `${!Y}` и ключей `${!a[@]}` — Y и a, у `${!начало*}` — переменную с
     таким началом. Длина `${#…}` — число, не ссылка на значение."""
@@ -2174,17 +2687,18 @@ def _valued_ref(text, values):
     if m:
         return any(type(key) is str and key.startswith(m[1]) for key in values)
     m = _REF.match(text)
-    return bool(m) and m[1] != "#" and bool(_key_values(m[2], values))
+    return bool(m) and m[1] != "#" and bool(_key_values(m[2], values, depth))
 
 
-def _composed(word, values):
+def _composed(word, values, quote=True, depth=0):
     """Значения слова word (узел shparse.Word), склеенного из литералов и ссылок на переменные (`${X}ash`,
     `$R/bin/run`, `${a[@]:1}ash`; части в "…" — тоже): сочетания значений частей (_var_values) склейкой, литерал — в
     кавычках shlex, ссылка без значения в тексте — пустая и вычисляемая (значение из окружения не видно). Пусто — у
     слова нет узла, в нём подстановка или арифметика (имя команды из них проверяет _name_doubt) или ни у одной
     ссылки нет значений в тексте. None — значение известно только при исполнении: в слове ссылка, которую разбор не
     вычисляет (замена, обрезка, подстрока, смена регистра, преобразование `@…`, косвенная `${!…}`), на имя со
-    значениями в тексте (_valued_ref), или тексты сочетаний длиннее остатка _NAME_BUDGET вызова."""
+    значениями в тексте (_valued_ref), или тексты сочетаний длиннее остатка _NAME_BUDGET вызова. Без quote литералы
+    — своим текстом (значение переменной или строка, а не слово); depth — глубина ссылок (_key_values)."""
     node = getattr(word, "node", None)
     if node is None:
         return []
@@ -2196,15 +2710,15 @@ def _composed(word, values):
         if kind is shparse.DQ:
             stack.extend(reversed(part.parts))
         elif kind is shparse.Param:
-            own = _var_values(part.text, values)
-            if not own and _valued_ref(part.text, values):
+            own = _var_values(part.text, values, depth)
+            if not own and _valued_ref(part.text, values, depth):
                 return None
             valued = valued or bool(own)
             options.append(own or [("", True)])
         elif kind is shparse.Lit or kind is shparse.SQ:
-            options.append([(shlex.quote(part.text), False)])
+            options.append([(shlex.quote(part.text) if quote else part.text, False)])
         elif kind is shparse.AnsiC:
-            options.append([(shlex.quote(part.value), False)])
+            options.append([(shlex.quote(part.value) if quote else part.value, False)])
         else:
             exact = False
     if not valued or not exact:
@@ -2232,13 +2746,16 @@ def _renamed(info, values, depth):
     значений частей (_composed); имя из ссылки, которую разбор не вычисляет (`${X/a/b}`, `${X,,}`, `${!Y}`), на имя
     со значениями в тексте и имя со сочетаниями сверх остатка у _composed — сомнение _WHY_RUNTIME_NAME; такое слово
     за именем остаётся своим текстом, и строка проверяется ещё как команда с раскрытием (_find_doubt: `npm ${Y,,}` —
-    подкоманда неизвестна)."""
+    подкоманда неизвестна). Известное значение переменной или alias со словами за именем своим текстом проходит
+    сначала проверку сомнений литерального имени (_find_doubt со значениями текста; довод — её): `PY=python3; $PY -c
+    "…os.system('npm i x')"` — _WHY_INTERPRETER."""
     words = info.words
     texts = _var_values(words[0], values) or _composed(words[0], values)
-    if texts is None:
+    if texts is None or any(_RUNTIME_VALUE in t for t, _ in texts):
         return _WHY_RUNTIME_NAME
     texts = list(texts)
     texts += values.get(("alias", words[0]), ())
+    named = len(texts)
     node = getattr(words[0], "node", None)
     if node is not None and any(type(p) is shparse.Lit and _globs(info.text, p) for p in node.parts):
         pattern = pkgmanagers._basename(words[0])
@@ -2250,7 +2767,10 @@ def _renamed(info, values, depth):
     options = []
     for w in words[1:]:
         own = _var_values(w, values) or _composed(w, values)
-        # Значение известно только при исполнении (None у _composed): слово — своим текстом, признак None.
+        if own and any(_RUNTIME_VALUE in t for t, _ in own):
+            own = None
+        # Значение известно только при исполнении (None у _composed, _RUNTIME_VALUE): слово — своим текстом, признак
+        # None.
         options.append(own or [(pkgmanagers._shell_join([w]), None if own is None else False)])
     budget = _call[2] if _call is not None else [_NAME_BUDGET]
     for text, computed in texts:
@@ -2268,14 +2788,32 @@ def _renamed(info, values, depth):
                     return _WHY_RENAMED
             elif _installs(line, depth):
                 return _WHY_RENAMED
+    if depth >= _MAX_DEPTH:
+        return None
+    # Известное значение переменной или alias со словами за именем своим текстом — та же проверка сомнений, что у
+    # литерального имени (_find_doubt со значениями текста: `PY=python3; $PY -c "…"`, `D=docker; $D exec c sh -c
+    # "$C"`); имена по шаблону проверены только установкой выше.
+    # Значение со ссылкой (цепочка `V0=$V1` за _REF_DEPTH) не разбирается заново; доводы о раскрытиях в словах за
+    # именем (_WHY_SUBCOMMAND, _WHY_NAME, _WHY_RUNTIME_NAME) не в счёт — эти слова со значениями проверены выше.
+    tail = pkgmanagers._shell_join(words[1:])
+    for text, computed in texts[:named]:
+        if computed or "$" in text or "`" in text:
+            continue
+        # Текст значения уже списан с остатка _NAME_BUDGET выше (каждое значение — хотя бы одним сочетанием): число
+        # строк ограничено им же.
+        found = _find_doubt(" ".join([text, tail]), depth + 1, values)
+        if found and found[1] not in (_WHY_SUBCOMMAND, _WHY_NAME, _WHY_RUNTIME_NAME):
+            return found[1]
     return None
 
 
-def _segment_doubt(info, depth):
+def _segment_doubt(info, depth, context=None):
     """Довод сомнения команды: её слова (_doubt; имя команды — вывод подстановки, _name_doubt, — _WHY_NAME на месте,
     где _doubt проверяет имя), вычисляемая строка `eval` или here-string (_computed_script), строки _scripts — как в
-    _segment_adds (на глубине _MAX_DEPTH вложенный текст проверяет _soup_add), последней — строка в словах, которую
-    программа может исполнить (_string_doubt)."""
+    _segment_adds (на глубине _MAX_DEPTH вложенный текст проверяет _soup_add; строка `eval` из литералов — со
+    значениями текста context(), _values: она исполняется в той же оболочке), затем строка в словах, которую
+    программа может исполнить (_string_doubt), последним — код интерпретатора и аргументы скрипта (_interpreter_doubt).
+    context — функция без аргументов, отдающая значения текста команды (_values)."""
     if info.marker:
         return None
     why = _doubt(info.words, info.xargs, info.cut, info.wrapped)
@@ -2289,25 +2827,45 @@ def _segment_doubt(info, depth):
         if any(_soup_add(t) for t in nested):
             return _WHY_DEPTH
     else:
+        inline = _literal_eval(info.words) if context is not None else None
         for text in nested:
-            found = _find_doubt(text, depth + 1)
+            found = _find_doubt(text, depth + 1, context() if inline is not None and text == inline else None)
             if found:
                 return found[1]
-    return _string_doubt(info, depth)
+    # Имя команды из ссылки: значения слов за ним подставляет _renamed.
+    context = None if info.words and getattr(info.words[0], "expands", False) else context
+    return _string_doubt(info, depth, context) or _interpreter_doubt(info, depth, context)
 
 
-def _find_doubt(command, depth):
+def _literal_eval(words):
+    """Строка `eval` из слов без внешнего раскрытия (pkgmanagers._inline_script) или None: её команды исполняются в
+    той же оболочке, и их присваивания, `set`, `shift` входят в значения текста (_values)."""
+    if not words or pkgmanagers._basename(words[0]) != "eval":
+        return None
+    if any(getattr(w, "expands", False) for w in words[1:]):
+        return None
+    return pkgmanagers._inline_script(words)
+
+
+def _find_doubt(command, depth, shared=None):
     """Первый сегмент текста с сомнением и довод (_segment_doubt, затем тела heredoc оболочки — с внешним раскрытием
     _WHY_COMPUTED — и _stdin_scripts: вход оболочки не из литерального `echo`/`printf`, heredoc `cat` и файлов —
-    _WHY_COMPUTED, затем входы программ _program_inputs — _input_doubt); None, если такого нет."""
+    _WHY_COMPUTED, затем входы программ _program_inputs — _input_doubt, затем входы интерпретаторов — _code_doubt);
+    None, если такого нет. shared — значения внешнего текста, если command — его строка `eval` из литералов: она
+    исполняется в той же оболочке (`set -- npm i x; eval '"$@"'`), её значения в них уже входят (_values)."""
     commands, feeds, scripts, loops = _analysis(command)
-    values = None
+    values = shared
+
+    def context():
+        nonlocal values
+        if values is None:
+            values = _values(commands, loops, depth)
+        return values
+
     for info in commands:
-        why = _segment_doubt(info, depth)
+        why = _segment_doubt(info, depth, context)
         if not why and not info.marker and info.words:
-            if values is None:
-                values = _values(commands, loops)
-            why = _renamed(info, values, depth)
+            why = _renamed(info, context(), depth)
         if why:
             return info.segment, why
     for segment, text in chain(((t.strip(), t) for t in scripts), _stdin_scripts(feeds)):
@@ -2325,12 +2883,11 @@ def _find_doubt(command, depth):
         why = _input_doubt(text, depth)
         if why:
             return segment, why
+    for segment, text in _program_inputs(commands, feeds, code=True):
+        why = _code_doubt([text], depth)
+        if why:
+            return segment, why
     return None
-
-
-def heredocs(line):
-    """Heredoc, открытые строкой, в порядке чтения их тел: (терминатор, снимать ли ведущие табы) — shparse.heredocs."""
-    return shparse.heredocs(line)
 
 
 def _segments(command):

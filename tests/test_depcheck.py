@@ -1690,9 +1690,6 @@ class BacktickInDoubleQuotesTest(unittest.TestCase):
             with self.subTest(cmd):
                 self.assertEqual(depcheck.dependency_add(cmd), segment)
 
-    def test_heredoc_opener_inside_backticks_ignored(self):
-        self.assertEqual(depcheck.heredocs('echo "`echo "x"` <<EOF"'), [])
-
     def test_linear(self):
         cases = [
             lambda n: 'echo "' + '`a "b"` ' * n + '"; npm install x',
@@ -2093,7 +2090,8 @@ class UserAndWatchWrappersTest(unittest.TestCase):
                 "su -lc 'make' app", "su -g npm app", "su - app",
                 "watch 'npm ls'", "watch -n 5 'ls -l'", "watch -x ls", "watch -s npm ls",
                 # Без `-c` и `-u`: первое слово — пользователь, остальные — аргументы оболочки без `-c`.
-                "su npm install x", "runuser npm i x", "su - npm i x", "su app -- script.sh npm i x",
+                # `su app -- script.sh npm i x` — не добавление, но аргументы скрипта — сомнение (InterpreterCodeTest).
+                "su npm install x", "runuser npm i x", "su - npm i x", "su app -- script.sh x",
                 # Без пользователя первое слово-не-флаг за `--` — имя пользователя (`-c`).
                 "su -- -c 'npm i x'",
                 # Без `-x` слова склеиваются в строку `sh -c npm i x`: оболочка запускает `npm` без аргументов.
@@ -2552,7 +2550,7 @@ class SourceStdinTest(unittest.TestCase):
 
     def test_not_adds(self):
         for cmd in ["echo 'npm i x' | source script.sh",
-              "fish --in 'npm i x'", "su -- -c 'npm i x'", "bash run.sh 'npm i x'", "source script.sh <<< 'npm i x'",
+              "fish --in 'npm i x'", "su -- -c 'npm i x'", "source script.sh <<< 'npm i x'",
                     "source s.sh <(echo npm i x)", ". s.sh <<'EOF'\nnpm i x\nEOF"]:
             with self.subTest(cmd):
                 self.assertIsNone(depcheck.dependency_add(cmd))
@@ -2932,11 +2930,6 @@ class ArithmeticSubstitutionTest(unittest.TestCase):
                          ["echo \"$((echo '$(npm i x)') )\"", "echo '$(npm i x)'"])
         self.assertIsNone(depcheck.dependency_add("echo \"$((echo '$(npm i x)') )\""))
 
-    def test_subshell_fallback_heredoc(self):
-        # `((` с подоболочкой: `<<` после её конца — heredoc.
-        self.assertEqual(depcheck.heredocs("((true) ) <<EOF"), [("EOF", False)])
-        self.assertEqual(depcheck.heredocs("(( x << 2 ))"), [])
-
     def test_not_adds(self):
         # После `))` арифметики в `"…"` снова двойные кавычки: `'` — символ.
         for cmd in ['echo "$(( 1 + 2 ))"', "echo \"$(( 1 ))'\" 'npm i x'", "cat <<EOF\n$(( 1 + 2 ))\nEOF",
@@ -3133,24 +3126,6 @@ class BacktickOutsideQuotesTest(unittest.TestCase):
             with self.subTest(cmd):
                 self.assertIsNone(depcheck.dependency_add(cmd))
                 self.assertIsNone(depcheck.dependency_doubt(cmd))
-
-    def test_heredoc_inside_backticks_ignored(self):
-        self.assertEqual(depcheck.heredocs("echo `cat <<EOF` <<END"), [("END", False)])
-
-    def test_heredoc_inside_open_backticks(self):
-        # `` `…` `` не закрыта до конца строки: тело heredoc в ней идёт следующими строками (bash читает подстановку
-        # до закрывающей обратной кавычки и разбирает тело заново).
-        self.assertEqual(depcheck.heredocs("x=`cat <<EOF"), [("EOF", False)])
-        # Тело heredoc из `` `…` `` идёт первым: bash читает подстановку до её конца со всеми телами, затем тела
-        # строки (5.3: `` cat <<A; x=`cat <<B `` ⏎ тело B ⏎ `B` ⏎ `` ` `` ⏎ тело A ⏎ `A`).
-        self.assertEqual(depcheck.heredocs("cat <<A; x=`cat <<-B"), [("B", True), ("A", False)])
-        self.assertEqual(depcheck.heredocs("x=\"`cat <<EOF"), [("EOF", False)])
-        self.assertEqual(depcheck.heredocs("x=`echo \\` <<B"), [("B", False)])
-        self.assertEqual(depcheck.heredocs("x=`cat <<B \\`"), [("B", False)])
-        self.assertEqual(depcheck.heredocs("x=`echo '<<B'"), [])
-        self.assertEqual(depcheck.heredocs("echo '`' <<A"), [("A", False)])
-        small, large = "x=`" + "\\`" * 20000, "x=`" + "\\`" * 80000
-        assert_linear(self, lambda: depcheck.heredocs(small), lambda: depcheck.heredocs(large))
 
     def test_linear(self):
         for make in [lambda n: "echo " + "`a 'b'` " * n + "; npm i x", lambda n: "echo `" + "a ' " * n,
@@ -3431,7 +3406,6 @@ class DoubleDollarTest(unittest.TestCase):
     def test_words(self):
         self.assertEqual([w for w, _ in depcheck._split("x=$${ a b }", braces=True)], ["x=$${", "a", "b", "}"])
         self.assertEqual([w for w, _ in depcheck._split("x=$${ a b }")], ["x=$${", "a", "b", "}"])
-        self.assertEqual(depcheck.heredocs("echo $${a; cat <<E"), [("E", False)])
 
     def test_linear(self):
         for make in [lambda n: "echo " + "$${ " * n, lambda n: "x=" + "$$" * n + "{ npm i x }",
@@ -3491,7 +3465,6 @@ class FunctionSubstitutionTest(unittest.TestCase):
         self.assertEqual(_commands(cmd), [cmd, "a"])
         self.assertTrue(any(type(n) is shparse.Group for n in shparse.walk(shparse.parse(cmd))))
         self.assertEqual([w for w, _ in depcheck._split("x=${ a b; } c", braces=True)], ["x=${ a b; }", "c"])
-        self.assertEqual(depcheck.heredocs('echo "${ cat <<E'), [("E", False)])
 
     @mock.patch.object(shparse, "_STACK_MAX", 10 ** 9)  # линейность разбора, а не предел (DepthLimitTest)
     def test_linear(self):
@@ -3575,8 +3548,6 @@ class EscapedBlankCommentTest(unittest.TestCase):
     def test_comment(self):
         self.assertIsNone(depcheck.dependency_add("echo \\\\ #$(npm i x)"))
         self.assertIsNone(depcheck.dependency_doubt("echo \\\\ #$(npm i x)"))
-        self.assertEqual(depcheck.heredocs("echo \\ #<<E"), [("E", False)])
-        self.assertEqual(depcheck.heredocs("echo \\\\ #<<E"), [])
 
     def test_linear(self):
         for make in [lambda n: "echo " + "\\ #" * n, lambda n: "echo " + "\\" * n + " #$(npm i x)",
@@ -3619,14 +3590,6 @@ class ArrayAssignmentHeredocTest(unittest.TestCase):
                 self.assertIsNone(depcheck.dependency_add(cmd))
                 self.assertIsNone(depcheck.dependency_doubt(cmd))
 
-    def test_heredocs(self):
-        self.assertEqual(depcheck.heredocs("x=(<<E"), [])
-        self.assertEqual(depcheck.heredocs("x=( $(cat <<E) )"), [("E", False)])
-        self.assertEqual(depcheck.heredocs("(cat <<E)"), [("E", False)])
-        self.assertEqual(depcheck.heredocs("x=( <(cat <<E) )"), [("E", False)])
-        self.assertEqual(depcheck.heredocs("cat <<E; x=( a ; b )"), [])
-        self.assertEqual(depcheck.heredocs("x=( a ) <<E"), [("E", False)])
-
     def test_linear(self):
         for make in [lambda n: "x=" + "(" * n + "<<E" * n, lambda n: "x=(\n" + "(<<E\n" * n,
                      lambda n: "x=( a ;" + " <<E" * n + "\nnpm i x\n" + "E\n" * n,
@@ -3657,7 +3620,6 @@ class WordWhitespaceTest(unittest.TestCase):
 
     def test_words(self):
         self.assertEqual([w for w, _ in depcheck._split("X=1\recho a")], ["X=1\recho", "a"])
-        self.assertEqual(depcheck.heredocs("echo a\r#<<E"), [("E", False)])
 
 
 class HeredocLineJoinTest(unittest.TestCase):
@@ -4178,7 +4140,8 @@ class ManagerFormsTest(unittest.TestCase):
 class UnknownLaunchFormsTest(unittest.TestCase):
     """Формы, где неизвестно, какую программу запустит команда (context/architecture.md, «Детектор зависимостей»):
     строка или stdin, отданные программе, имя команды из переменной, alias или шаблона имён — сомнение, если текст
-    разбирается как команда установки; сокращения длинных флагов su и runuser, `pwsh -EncodedCommand` и `fish -C` — добавление."""
+    разбирается как команда установки; сокращения длинных флагов su и runuser, `pwsh -EncodedCommand` и `fish -C` —
+    добавление."""
 
     STRING = ["docker exec c sh -c 'npm i x'", "parallel ::: 'npm i x'", "echo npm i x | parallel",
               "pnpm dlx -c 'npm i x'", "npm exec -c 'npm i x'", "echo 'npm i x' | su -s \"$VAR\" app",
@@ -4248,16 +4211,15 @@ class UnknownLaunchFormsTest(unittest.TestCase):
             "pwsh -EncodedCommand bgBwAG0AIABpACAAeAA=", "powershell -ec bgBwAG0AIABpACAAeAA=",
             "fish -C 'npm i x'", "fish -C'npm i x'", "fish --init-command 'npm i x'", "fish --ini='npm i x' -c true",
             "fish -iC 'npm i x'", "fish -lC 'npm i x' -c true", "fish -c 'echo' -C 'npm i x'"]
-    # Текст без команды установки, программа-данные, интерпретатор, оболочка только с разбором, маркер,
+    # Текст без команды установки, программа-данные, оболочка только с разбором, маркер,
     # неоднозначное сокращение su (su не запускается), переменная без значения в тексте, сообщение git, псевдоним
     # git без вызова, `sudo -s` со строкой (sudo экранирует пробелы: команда «npm i x» одним словом, man sudo 1.9),
     # stdin `source` со скриптом.
     PASSES = ["docker exec c sh -c 'npm test'", "parallel ::: 'make all'", "echo 'npm i x'",
               "git commit -m 'npm install x'", "git tag -a v1 --message='npm i x'", "git commit -m'npm i x'",
               "git -c alias.x='!npm i y' status", "sudo -s 'npm i x'", "echo 'npm i x' | source script.sh",
-              "fish --in 'npm i x'", "su -- -c 'npm i x'", "bash run.sh 'npm i x'",
-              "gh pr create --body 'npm i x'", "python3 -c \"cases = ['npm i x']\"", "python3 - <<'E'\nnpm i x\nE",
-              "node -e 'run(\"npm i x\")'", "bash -n -c 'npm i x'", "printf 'npm i x' | bash -n",
+              "fish --in 'npm i x'", "su -- -c 'npm i x'",
+              "gh pr create --body 'npm i x'", "bash -n -c 'npm i x'", "printf 'npm i x' | bash -n",
               "PLANKA_DEP_OK=1 parallel ::: 'npm i x'", "echo 'npm i x' | PLANKA_DEP_OK=1 parallel",
               "su --s 'npm i x'", "$X", 'X="ls -la"; $X', "ls /usr/bin/np?", "pwsh -e '!!!'",
               "echo 'npm i x' | grep npm", "cat <<E | tee f\nnpm i x\nE",
@@ -4268,8 +4230,7 @@ class UnknownLaunchFormsTest(unittest.TestCase):
               'set -euo pipefail; "$@"', "set -euo pipefail; $1",
               # `$10` — `$1` и «0».
               "set -- npm i x; $10",
-              # `-C` за скриптом — аргумент скрипта (optstring fish начинается с `+`).
-              "fish script.fish -C 'npm i x'", "fish --in 'npm i x'",
+              "fish --in 'npm i x'",
               # Значения без команды установки.
               'X="ls -la"; $X', 'a=(ls -la); "${a[@]}"', 'set -- a b; "$@"', "X=$(which ls); $X /tmp",
               "set -- ls -la; $1 $2", 'set -- a b c; shift; "$@"', 'set -- x ls -la; shift 5; "${@:2}"',
@@ -4279,13 +4240,14 @@ class UnknownLaunchFormsTest(unittest.TestCase):
               "read X <<< 'ls'; $X", "X=ls; Y=x; $X $Y", "/usr/bin/pyth?n3 script.py",
               # Значения по умолчанию без установки; `+` у непустого имени подставляет слово, `${@:-y}` — параметры.
               "${HOME:-/tmp}/bin/tool", '"${CC:-gcc}" -o a a.c', "${EDITOR:-vi} file", 'X="npm i x"; ${X+y}',
-              "set -- x npm i x; ${@:-y}", 'X=ls; ${X:-y} -la', 'a=(x ls -la); "${a[@]:1}"',
+              "set -- x ls -la; ${@:-y}", 'X=ls; ${X:-y} -la', 'a=(x ls -la); "${a[@]:1}"',
               'set -- x ls -la --dry-run; "${@:2:3}"',
               # Имя команды не из ссылки, ссылка без значений в тексте (окружение), склейка с безобидным значением,
               # слово за именем из ссылки без установки.
               "${HOME}/bin/tool", '"${PYTHON%3}" x.py', "f=a.txt; cat ${f%.txt}.md", "d=src; ls ${d}/x",
               "X=foo; echo ${X^^}", "R=/opt/app; $R/bin/run --x", "R=/opt/app; ${R}/bin/run",
-              "P=python3; f=a.txt; $P ${f%.txt}.py", "X=ls; Y=/tmp; $X ${Y,,}", "X=n; Y=pm; ${X}${Y}' i x'", "X=a; " + "${X}" * 40,
+              "P=python3; f=a.txt; $P ${f%.txt}.py", "X=ls; Y=/tmp; $X ${Y,,}", "X=n; Y=pm; ${X}${Y}' i x'",
+              "X=a; " + "${X}" * 40,
               "X=; " + "${X:+}" * 40,
               # Обычные команды со ссылками (ревью №5); `$0` — не позиционный параметр.
               "f=a.txt; ${EDITOR:-vi} $f", "VENV=.venv; ${VENV}/bin/pip list", "${NPM:-npm} run build",
@@ -4363,3 +4325,279 @@ class UnknownLaunchFormsTest(unittest.TestCase):
             with self.subTest(cmd):
                 self.assertIsNone(depcheck.dependency_add(cmd))
                 self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+
+class ValueFlowFormsTest(unittest.TestCase):
+    """Потоки значений к имени команды (context/architecture.md, «Детектор зависимостей», _values): строка `eval` из
+    литералов в том же контексте значений, ссылка `declare -n`, массив по индексам, присваивание из ссылки с
+    преобразованием, `read` из файла или конвейера и `mapfile`. Каждая форма проверена bash 5.3 (`env -i PATH= bash
+    -c` с `command_not_found_handle`): исполняет `npm i lodash`."""
+
+    RENAMED = ['eval set -- npm i lodash; "$@"', "eval 'set -- x npm i lodash'; shift; \"$@\"",
+               'set -- x npm i lodash; eval shift; "$@"', "eval 'X=\"npm i lodash\"'; $X",
+               "eval \"eval 'set -- npm i lodash'\"; \"$@\"",
+               'declare -n R=X; X="npm i lodash"; $R', 'typeset -n R=X; X="npm i lodash"; $R',
+               'f(){ local -n R=X; $R; }; X="npm i lodash"; f', 'declare -n R=X; R="npm i lodash"; $X',
+               'declare -n R; R=X; X="npm i lodash"; $R', 'declare -gn R=X; X="npm i lodash"; $R',
+               'a[1]=npm; a[2]=i; a[3]=lodash; "${a[@]}"', 'a=(x i lodash); a[0]=npm; "${a[@]}"',
+               'a=(npm i); a[5]=lodash; "${a[@]}"', "a[0]=x; a[1]=npm; a[2]=i; a[3]=lodash; unset 'a[0]'; \"${a[@]}\"",
+               'a=([2]=lodash [0]=npm [1]=i); "${a[@]}"', 'a[0]=npm; a+=(i lodash); "${a[@]}"',
+               'a[0]=np; a[0]+=m; a[1]="i lodash"; ${a[@]}', 'declare -a a; a[0]=npm a[1]=i a[2]=lodash; "${a[@]}"',
+               'X="npm i lod"; Y=${X}ash; $Y', 'X=npm; Y="$X i lodash"; $Y',
+               # `a+=(…)` без индекса дописывает элементы за последним; `a=npm` у массива — элемент 0.
+               'args=(npm); args+=(install lodash); "${args[@]}"', 'args=(npm install); args+=(lodash); "${args[@]}"',
+               "a=(npm); a+=(i x); ${a[@]}", 'declare -a args=(pip); args+=(install requests); "${args[@]}"',
+               "a=npm; a+=(i x); ${a[@]}",
+               # Перевод строки и комментарий в скобках массива — разделители слов.
+               'a=(\n  npm\n  install\n)\na[2]=lodash\n"${a[@]}"', "a=([0]=npm\n[1]=i [2]=x); ${a[@]}",
+               'a=(npm # c\n i lodash); "${a[@]}"', 'a=(\nnpm\ni\nlodash\n); "${a[@]}"',
+               'declare -a a=(\nnpm\ni lodash\n); "${a[@]}"',
+               # `read` делит вход по IFS: присваивание перед `read` и до него.
+               'IFS=, read X Y <<< "npm,i"; $X $Y lodash', 'IFS=: read -a A <<< "npm:i:lodash"; "${A[@]}"',
+               'IFS=,; read X Y <<< "npm,i"; $X $Y lodash']
+    RUNTIME = ['k=1; a[$k]=npm; a[2]=i; a[3]=lodash; "${a[@]}"', 'declare -A a; a[k]="npm i lodash"; ${a[@]}',
+               'X="npm i lodash"; Y=${X/q/z}; $Y', 'X="NPM I LODASH"; Y=${X,,}; $Y', 'X="xnpm i lodash"; Y=${X:1}; $Y',
+               'X="xnpm i lodash"; Y=${X#x}; $Y', 'X="npm i lodashx"; Y=${X%x}; $Y',
+               'X="npm i lodash"; Y="${X^^}"; Y=${Y,,}; $Y', 'X="npm i lodash"; Y=${X/q/z}; Z=$Y; $Z',
+               "read X < f; $X", "echo 'npm i lodash' | { read X; $X; }", "mapfile -t A < f; ${A[@]}",
+               "readarray A < f; ${A[0]}", 'mapfile < f; "${MAPFILE[@]}"', "read -a A < f; ${A[@]}",
+               "while read -r c; do $c; done < f",
+               # IFS из ссылки — разбиение известно только при исполнении; при заданном IFS вход со ссылкой делится
+               # по значению ссылки, а не по её тексту.
+               'IFS=$Q read X Y <<< "npm,i"; $X $Y lodash',
+               "P='npm:i:x'; IFS=: read -ra A <<< \"$P\"; \"${A[@]}\"",
+               # Индекс с `]` внутри (`${#a[@]}` — число элементов) — не литерал.
+               'cmd=(npm install); cmd[${#cmd[@]}]=lodash; "${cmd[@]}"',
+               'cmd=(npm); cmd[${#cmd[@]}]=install; cmd[${#cmd[@]}]=lodash; "${cmd[@]}"']
+    PASSES = ['a[0]=ls; a[1]=-la; "${a[@]}"', 'declare -n ref=arr; ref[0]=x; echo "${arr[@]}"',
+              'mapfile -t lines < f; for l in "${lines[@]}"; do echo $l; done', "read -r line < f; echo $line",
+              "X=/opt/app; Y=${X%/}; ls $Y", "eval 'set -- ls -la'; \"$@\"", 'k=1; a[$k]=x; echo "${a[@]}"',
+              'declare -n R=X; X="ls -la"; $R', "export -n X=npm; echo $X", 'X="npm i x"; Y=${#X}; $Y',
+              'a=(ls); a+=(-la); "${a[@]}"', 'a=(\nls\n-la\n); "${a[@]}"', 'a=(x # npm i x\n); "${a[@]}"',
+              'IFS=, read X Y <<< "ls,-la"; $X $Y']
+
+    def test_renamed_doubt(self):
+        for cmd in self.RENAMED:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_RENAMED)
+
+    def test_runtime_doubt(self):
+        for cmd in self.RUNTIME:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_RUNTIME_NAME)
+
+    def test_passes(self):
+        for cmd in self.PASSES:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_ifs_read_linear(self):
+        # Повторные `IFS=, read …` не растят значения IFS, которые делят вход каждого `read`.
+        def make(n):
+            return "; ".join("IFS=, read a b <<< 'x,y'" for _ in range(n)) + "; bash run.sh npm i x"
+        small, large = make(1000), make(4000)
+        assert_linear(self, lambda: depcheck.dependency_doubt(small), lambda: depcheck.dependency_doubt(large))
+
+    def test_renamed_budget_once(self):
+        # Значение имени списывается с остатка _NAME_BUDGET один раз: код без установки под именем из переменной —
+        # пропуск, как у литерального имени.
+        code = "import json\n" + "print(json.dumps({'k': 1}))\n" * 350
+        for cmd in [f'PY=python3; $PY -c "{code}"', f'python3 -c "{code}"']:
+            with self.subTest(cmd[:30]):
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_renamed_literal_doubt(self):
+        # Известное значение имени со словами за ним проходит проверку сомнений литерального имени (bash 5.3:
+        # `${@:-y}` — параметры целиком, исполняется `x npm i x`, как `./run.sh npm i x`).
+        for cmd in ["set -- x npm i x; ${@:-y}", "D=docker; $D exec c npm i x", "alias d=docker\nd exec c npm i x"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_LAUNCHER)
+        self.assertIsNone(depcheck.dependency_doubt("D=docker; $D exec c ls"))
+
+    def test_eval_outer_values(self):
+        # Строка `eval` исполняется в той же оболочке: её `"$@"` видит `set` снаружи; `eval` с внешним раскрытием —
+        # вычисляемая строка, как раньше.
+        self.assertIsNotNone(depcheck.dependency_doubt("set -- npm i lodash; eval '\"$@\"'"))
+        for cmd in ['X=y; eval "set -- $X"; "$@"', 'eval "$Z"; "$@"']:
+            with self.subTest(cmd):
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_COMPUTED)
+
+    def test_runtime_string(self):
+        # Строка `sh -c` из значения `read` — вычисляемая строка; строка `docker exec … sh -c` из переменной со
+        # значением в тексте — как литерал.
+        self.assertEqual(depcheck.dependency_doubt('read X < f; sh -c "$X"')[1], depcheck._WHY_COMPUTED)
+        for cmd in ["CMD='npm i x'; docker exec c sh -c \"$CMD\"",
+                    "CMD='npm i x'; docker exec c sh -c \"cd /a && $CMD\"",
+                    "C=x; CMD=\"npm i $C\"; parallel ::: \"$CMD\"",
+                    # Имя команды из переменной проверяется, как литеральное (_renamed): строка `sh -c` — значением.
+                    "D=docker; C='npm i x'; $D exec c sh -c \"$C\""]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_STRING)
+        self.assertIsNone(depcheck.dependency_doubt("CMD='make test'; docker exec c sh -c \"$CMD\""))
+
+    def test_linear(self):
+        cases = [lambda n: "eval 'set -- a b'; " * n + '"$@"',
+                 lambda n: "set -- x npm i x; " + "eval shift; " * n + '"$@"',
+                 lambda n: "".join(f"eval 'X{i}=a'; " for i in range(n)) + "$X0",
+                 lambda n: "".join(f"declare -n R{i}=X{i}; X{i}=a; $R{i}; " for i in range(n)),
+                 lambda n: "".join(f"declare -n R{i}=R{i + 1}; " for i in range(n)) + f"R{n}=a; $R0",
+                 lambda n: "".join(f"a[{i}]=w{i}; " for i in range(n)) + '"${a[@]}"',
+                 lambda n: "a+=(x); " * n + '"${a[@]}"',
+                 lambda n: "a=(" + " ".join(f"[{i}]=w" for i in range(n)) + '); "${a[@]}"',
+                 lambda n: 'X="npm i lodash"; ' + "".join(f"Y{i}=${{X/q/z}}; $Y{i}; " for i in range(n)),
+                 lambda n: "X=a; " + "X=${X}b; " * n + "$X",
+                 lambda n: "read X < f; " * n + "$X", lambda n: "mapfile A < f; " * n + '"${A[@]}"',
+                 lambda n: "CMD='ls'; " + 'docker exec c sh -c "$CMD"; ' * n,
+                 lambda n: "a=(x); " + "a+=(y z); " * n + '"${a[@]}"',
+                 lambda n: "a=(\n" + "w # c\n" * n + '); "${a[@]}"',
+                 lambda n: "".join(f"a{i}=x; a{i}+=(y); " for i in range(n)) + '"${a0[@]}"',
+                 lambda n: "IFS=,; " + "read X <<< 'a,b'; " * n + "$X"]
+        for make in cases:
+            small, large = make(250), make(1000)
+            with self.subTest(small[:40]):
+                assert_linear(self, lambda: depcheck.dependency_doubt(small), lambda: depcheck.dependency_doubt(large))
+
+
+class InterpreterCodeTest(unittest.TestCase):
+    """Код интерпретатора (аргументы `python -c`, `node -e`, `perl -e`, `ruby -e`, `php -r`, …, stdin из heredoc,
+    here-string и `echo`/`printf`) и аргументы скрипта оболочки: отрезок с командой установки — сомнение
+    _WHY_INTERPRETER (_code_doubt); литерал с ней — ложный отказ, обход — маркер."""
+
+    DOUBTS = ["python3 -c \"import os; os.system('npm i x')\"", "python3 -Bc \"import os; os.system('pip install x')\"",
+              "python3 -c \"import subprocess; subprocess.run('npm i x', shell=True)\"",
+              "python3 -c \"import os; os.system(f'npm i {pkg}')\"",
+              "node -e \"require('child_process').execSync('npm i x')\"", "node -pe '`npm i x`'",
+              "node --eval \"require('child_process').execSync('npm i x')\"", "perl -e 'system(\"npm i x\")'",
+              "perl -le 'print `npm i x`'", "ruby -e 'system \"npm i x\"'", "ruby -e '`npm i x`'",
+              "php -r 'system(\"npm i x\");'", "lua -e 'os.execute(\"npm i x\")'",
+              "osascript -e 'do shell script \"npm i x\"'", "Rscript -e 'system(\"npm i x\")'",
+              "julia -e 'run(`npm i x`)'", "python3 <<< \"import os; os.system('npm i x')\"",
+              "python3 - <<'E'\nimport os\nos.system('npm i x')\nE",
+              "echo \"import os; os.system('npm i x')\" | python3", "printf 'system(\"npm i x\")' | perl",
+              "cat <<'E' | node\nrequire('child_process').execSync('npm i x')\nE",
+              "bash run.sh 'npm i x'", "sh ./x.sh \"npm i x\"", "bash -x run.sh 'npm i x'", "bash -- run.sh 'npm i x'",
+              "bash -n +n run.sh 'npm i x'",
+              # Склейка литерала со значением: имя пакета продолжается за литералом (bash 5.3 и интерпретаторы
+              # исполняют `pip install <аргумент>`).
+              "python3 -c \"import os,sys; os.system('pip install ' + sys.argv[1])\" requests",
+              "node -e \"require('child_process').execSync('npm install ' + process.argv[1])\" lodash",
+              "ruby -e 'system(\"gem install \" + g)'",
+              "python3 -c \"import os; os.system('npm install ' + 'lodash')\"",
+              "perl -e 'system(\"npm i \" . $ARGV[0])' x",
+              # Интерпретатор за известным запускателем и за именем из переменной.
+              "docker exec c python3 -c \"import os; os.system('pip install x')\"",
+              "uv run python -c \"import os; os.system('pip install x')\"",
+              "poetry run python -c \"import os; os.system('pip install x')\"",
+              "npx node -e \"require('child_process').execSync('npm i x')\"",
+              "PY=python3; $PY -c \"import os; os.system('npm i x')\"",
+              "kubectl exec p -- python3 -c \"import os; os.system('npm i x')\"",
+              "docker exec -i c python3 <<'E'\nimport os; os.system('npm i x')\nE",
+              # bun, deno, tsx, ts-node, awk.
+              "bun -e \"Bun.spawnSync(['npm', 'i', 'x'])\"",
+              "bun --eval \"require('child_process').execSync('npm i x')\"",
+              "deno eval \"new Deno.Command('sh', {args: ['-c', 'npm i x']}).outputSync()\"",
+              "tsx -e \"require('child_process').execSync('npm i x')\"",
+              "ts-node -e \"require('child_process').execSync('npm i x')\"", "awk 'BEGIN{system(\"npm i x\")}'",
+              "gawk 'BEGIN { \"npm i x\" | getline }'",
+              # Список аргументов в коде.
+              "python3 -c \"import subprocess; subprocess.run(['npm', 'i', 'x'])\"",
+              "perl -e \"system('npm', 'i', 'x')\"", "ruby -e 'system(\"npm\", \"install\", \"lodash\")'",
+              # `-C` за скриптом — аргумент скрипта (optstring fish начинается с `+`), не строка fish.
+              "fish script.fish -C 'npm i x'", "CODE=\"os.system('npm i x')\"; python3 -c \"$CODE\"",
+              # Литерал с командой установки — ложный отказ (решение автора).
+              "python3 -c \"print('npm i x')\"", "python3 -c \"cases = ['npm i x']\"", "node -e 'run(\"npm i x\")'",
+              "python3 - <<'E'\nnpm i x\nE"]
+    PASSES = ["python3 -c 'print(1)'", "python3 script.py --install", "bash scripts/setup.sh --verbose",
+              "node -e \"console.log(require('./package.json').version)\"", "perl -ne 'print if /npm/' file",
+              "python3 - <<'E'\nimport json\nprint(json.dumps({\"a\": 1}))\nE", "bash -n run.sh 'npm i x'",
+              "bash -o noexec run.sh 'npm i x'", "su -- -c 'npm i x'",
+              # Склейка на месте подкоманды — не пакет; запускатель с кодом без установки; bun и deno без кода.
+              "python3 -c \"t = 'gem ' + x\"", "docker exec c python3 -c 'print(1)'", "PY=python3; $PY -c 'print(1)'",
+              "uv run python -c 'print(1)'", "bun run build", "bun -e 'console.log(1)'", "deno eval 'console.log(1)'",
+              "awk '{print $1}' f", "python3 -c \"subprocess.run(['ls', '-la'])\"",
+              "PLANKA_DEP_OK=1 python3 -c \"import os; os.system('npm i x')\"",
+              "PLANKA_DEP_OK=1 python3 - <<'E'\nnpm i x\nE"]
+
+    def test_doubt(self):
+        for cmd in self.DOUBTS:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_INTERPRETER)
+
+    def test_passes(self):
+        for cmd in self.PASSES:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    # Аргументы скрипта оболочки и `sys.argv` кода python, склеенные в команду (скрипт может исполнить `$*`):
+    # менеджер с глаголом установки — как у неизвестной программы (`./run.sh npm i x`).
+    LAUNCHERS = ["bash run.sh npm i x", "sh run.sh npm install lodash", 'bash run.sh npm "i x"',
+                 "python3 run.py npm install lodash", "python3 -W ignore run.py npm i x", "python3 -c 'f()' npm i x",
+                 "uv run python run.py npm i x", "su app -- script.sh npm i x",
+                 # Скрипт `source`/`.`, оболочка `-s` со скриптом на stdin, `deno run`, `bun <файл>`, node.
+                 "source ./env.sh npm install lodash", ". ./run.sh npm i x", "source -- ./run.sh npm i x",
+                 "bash -s npm i x < run.sh", "bash -s -- npm i x < run.sh", "cat run.sh | bash -s npm i x",
+                 "deno run -A main.ts npm install lodash", "bun ./main.ts npm install lodash",
+                 "bun run main.ts npm i x", "node run.js npm i x", "perl x.pl npm i x",
+                 # `deno <файл>` — сокращение `deno run` (Deno 2).
+                 "deno main.ts npm i x", "deno ./main.ts npm i x", "deno -A main.ts npm i x"]
+
+    def test_launchers(self):
+        for cmd in self.LAUNCHERS:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertEqual(depcheck.dependency_doubt(cmd)[1], depcheck._WHY_LAUNCHER)
+        self.assertEqual(depcheck.dependency_doubt("./run.sh npm i x")[1], depcheck._WHY_LAUNCHER)
+        for cmd in ["bash run.sh --verbose x", "python3 run.py pip list", "python3 -m pip install --dry-run x",
+                    "source ./env.sh", "bash -s < run.sh", "deno run -A main.ts --port 1", "bun run build",
+                    "node run.js --watch", "deno task build",
+                    # Голое `bun <слово>` без `.` и `/` — подкоманда или скрипт package.json, не файл: аргументы не
+                    # проверяются (README, «Известные ограничения»).
+                    "bun script npm i x"]:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_doubt(cmd))
+
+    def test_script_arg_values(self):
+        # Аргументы скрипта из ссылок проверяются значениями (bash 5.3: `P="npm i x"; bash -s $P` — `$1…$3` скрипта
+        # stdin — npm, i, x).
+        for cmd in ['P="npm i x"; bash -s $P < run.sh', 'P="npm i x"; bash -s "$P" < run.sh',
+                    'A=(npm i x); bash -s "${A[@]}" < run.sh', 'P="npm i x"; cat run.sh | bash -s $P',
+                    'P="npm i x"; source ./env.sh $P', 'A=(npm i x); python3 run.py "${A[@]}"']:
+            with self.subTest(cmd):
+                self.assertIsNone(depcheck.dependency_add(cmd))
+                self.assertIn(depcheck.dependency_doubt(cmd)[1],
+                              (depcheck._WHY_INTERPRETER, depcheck._WHY_LAUNCHER, depcheck._WHY_STRING))
+        self.assertIsNone(depcheck.dependency_doubt("P=x; bash -s $P < run.sh"))
+
+    def test_input_budget(self):
+        # Код без слова менеджера только просматривается: длинный heredoc python без установки — пропуск. Остаток
+        # _INPUT_BUDGET тратят отрезки со словом менеджера: сверх него — сомнение без разбора.
+        code = "python3 - <<'E'\n" + "print(1)\n" * 10000 + "E"
+        self.assertGreater(len(code), depcheck._INPUT_BUDGET)
+        self.assertIsNone(depcheck.dependency_doubt(code))
+        self.assertIsNone(depcheck.dependency_doubt("python3 -c '" + "print(1); " * 8000 + "'"))
+        code = "python3 -c '" + "print(\"pip list x\"); " * 8000 + "'"
+        self.assertEqual(depcheck.dependency_doubt(code)[1], depcheck._WHY_INPUT)
+
+    def test_linear(self):
+        cases = [lambda n: "python3 -c \"" + "os.system('npm test'); " * n + "\"",
+                 lambda n: "python3 - <<'E'\n" + "print('pip list x')\n" * n + "E",
+                 lambda n: "bash run.sh " + "'pip list' " * n,
+                 lambda n: "node -e '" + "f(a, b, [c, d]); " * n + "'",
+                 lambda n: "python3 -c \"" + "f('npm test ' + x); " * n + "\"",
+                 lambda n: "python3 -c \"" + "f(['npm', 'test'], 'a'); " * n + "\"",
+                 lambda n: "python3 -c \"" + "'a', " * n + "\"", lambda n: "python3 -c \"" + "'" * n + "\"",
+                 lambda n: "docker exec c " + "x " * n + "python3 -c 'print(1)'",
+                 lambda n: "docker exec c " + "python3 " * n, lambda n: "docker exec c " + "sh -c a " * n,
+                 lambda n: "bash run.sh " + "npm test " * n, lambda n: "python3 run.py " + "pip list " * n,
+                 lambda n: "PY=python3; " + "$PY -c 'print(1)'; " * n]
+        for make in cases:
+            small, large = make(250), make(1000)
+            with self.subTest(small[:40]):
+                assert_linear(self, lambda: depcheck.dependency_doubt(small), lambda: depcheck.dependency_doubt(large))

@@ -654,6 +654,233 @@ _RUBY_BEG = frozenset(("if", "unless", "while", "until", "and", "or", "when", "i
 _RUBY_VALUE = frozenset(("self", "nil", "true", "false", "__FILE__", "__LINE__", "__ENCODING__", "end", "redo",
                          "retry"))
 
+# Объявления в коде Perl (_PerlNames.code): скобки, «package NAME;» и «package NAME {», «sub NAME» с прототипом,
+# «use constant NAME =>», «use constant {» и ключи «NAME =>» его хеша; прототип или сигнатура анонимной «sub (…)»
+# (anon) пропускается целиком: «$)» и «$]» в ней — сигил и скобка, а не переменные. Слово перед ними с сигилом, «->»,
+# «::» — не объявление.
+_PERL_DECL = re.compile(r"""
+    (?P<open>[{(\[]) | (?P<close>[})\]])
+  | (?<![\w$@%&*:>'])package\s+(?P<pkg>(?:::)?[A-Za-z_]\w*(?:::\w+)*)(?:\s+v?[\d._]+)?\s*(?P<end>[;{])
+  | (?<![\w$@%&*:>'])sub\s+(?P<sub>(?:::)?[A-Za-z_]\w*(?:::\w+)*)(?:\s*\((?P<proto>[^()]*)\))?
+  | (?<![\w$@%&*:>'])sub\b(?!\s*=>)(?:\s*\([^()]*\))?(?P<anon>)
+  | (?<![\w$@%&*:>'])use\s+constant\b(?:\s*(?:(?P<const>[A-Za-z_]\w*)\s*(?:=>|,)|(?P<hash>\{))|(?P<more>\s*$))
+  | (?<![\w$@%&*:>'])(?P<key>[A-Za-z_]\w*)\s*=>
+""", re.X)
+# Продолжение «use constant» на следующей строке кода: имя или «{»; имя в кавычках сразу за «use constant».
+_PERL_CONST_NEXT = re.compile(r"\s*(?:(?P<const>[A-Za-z_]\w*)\s*(?:=>|,)|(?P<hash>\{))")
+_PERL_CONST_QUOTED = re.compile(r"""(["'])([A-Za-z_]\w*)\1\s*(?:=>|,)""")
+# Атрибут функции Perl после имени и прототипа: «:lvalue», «:prototype($)», «: method lvalue».
+_PERL_ATTR = re.compile(r"\s*(:\s*)?(\w+)(?:\(([^()]*)\))?")
+# Включены ли в файле сигнатуры Perl: «use feature 'signatures'», «use experimental qw(signatures)», «use Mojo::Base
+# -signatures», «use v5.36» и новее. Хвост use — не длиннее 200 знаков: поиск линеен.
+_PERL_SIGNATURES = re.compile(r"\buse\s+[\w:]++[^;\n]{0,200}?\bsignatures\b|\buse\s+(v?)5\.(\d+)(\.\d+)?")
+# Слова Perl, которые объявленная функция с тем же именем не заменяет: оператор повторения x и ключевые слова.
+_PERL_NOT_SUB = frozenset(("x", "my", "our", "local", "state", "sub", "package", "use", "no", "format", "for",
+                           "foreach", "else", "BEGIN", "END", "INIT", "CHECK", "UNITCHECK"))
+
+
+def _perl_signatures(text):
+    """Включает ли файл Perl сигнатуры функций (_PERL_SIGNATURES): с ними «sub NAME ()» — пустая сигнатура, не
+    прототип. Решает весь файл, без области видимости feature."""
+    for m in _PERL_SIGNATURES.finditer(text):
+        if m.group(2) is None:
+            return True
+        minor = m.group(2)
+        if not m.group(1) and not m.group(3):
+            # Десятичная запись версии: «5.036» — 5.36, «5.04» — 5.40.
+            minor = minor[:3].ljust(3, "0")
+        if int(minor) >= 36:
+            return True
+    return False
+
+
+def _perl_package(name):
+    """Пакет полного имени Perl без последней части: «» и «main» — main, ведущие «::» и «main::» снимаются
+    («::foo» — main, «::X::foo», «main::X::foo», «::main::X::foo» — X)."""
+    while True:
+        if name.startswith("::"):
+            name = name[2:]
+        elif name.startswith("main::"):
+            name = name[6:]
+        else:
+            return name or "main"
+
+
+class _PerlNames:
+    """Функции и константы, объявленные в файле Perl до места разбора, по пакетам (perl -MO=Deparse, Perl 5.42):
+    «sub NAME» без прототипа или с непустым — терм (за ним «/» — регулярка, «<<» — heredoc), «sub NAME()»,
+    «:prototype()», «use constant NAME», ключи «use constant {…}» — значение («/» — деление, «<<» — сдвиг). С
+    сигнатурами (_perl_signatures) «sub NAME ()» — терм. Имя чужого пакета без пакета («package X; sub f {}» и
+    «f» в main) и объявленное ниже — не объявлено. Пакет «package NAME;» действует до конца блока, «package NAME {}» —
+    в блоке: блоки считаются по скобкам кода (code). Лексические «my sub», «our sub», «state sub» не учитываются.
+    frozen — только чтение: код второй части s{…}{…}e видит имена файла, но не меняет их."""
+
+    def __init__(self, signatures, frozen=False):
+        self.signatures, self.frozen = signatures, frozen
+        # Глубина «{}», глубина «()» и «[]»; стек (глубина, пакет); {(пакет, имя): "term" | "value"}; (глубины)
+        # открытого хеша «use constant {» или None.
+        self.braces, self.brackets, self.packages, self.subs, self.consts = 0, 0, [(0, "main")], {}, None
+        # Кончился ли прошлый код словами «use constant» (имя — в следующем).
+        self.more = False
+
+    def frozen_copy(self):
+        """Имена для разбора второй части s{…}{…}e: тот же словарь, без копии (разбор вложенной части кончается до
+        следующего объявления), пакет — текущий."""
+        copy = _PerlNames(self.signatures, True)
+        copy.packages, copy.subs = [self.packages[-1]], self.subs
+        return copy
+
+    def _add(self, name, kind):
+        if "::" in name:
+            pkg, _, name = name.rpartition("::")
+            pkg = _perl_package(pkg)
+        else:
+            pkg = self.packages[-1][1]
+        self.subs[(pkg, name)] = kind
+
+    def code(self, raw, a, b):
+        """Учесть код raw[a:b] — без литералов, комментариев и тел heredoc."""
+        if self.frozen:
+            return
+        if self.more:
+            self.more = False
+            m = _PERL_CONST_NEXT.match(raw, a, b)
+            if m and m.group("const"):
+                self._add(m.group("const"), "value")
+                a = m.end()
+            elif m:
+                self.braces += 1
+                self.consts = (self.braces, self.brackets)
+                a = m.end()
+        pos = a
+        while True:
+            m = _PERL_DECL.search(raw, pos, b)
+            if m is None:
+                break
+            pos, c = m.end(), m.group()
+            if m.group("more") is not None:
+                quoted = _PERL_CONST_QUOTED.match(raw, b)
+                if quoted:
+                    # «use constant "PI" => 3»: строка с именем — следующий литерал.
+                    self._add(quoted.group(2), "value")
+                else:
+                    self.more = True
+            elif m.group("open"):
+                if c == "{":
+                    self.braces += 1
+                elif not _perl_punct_var(raw, m.start()):
+                    self.brackets += 1
+            elif m.group("close"):
+                if c == "}":
+                    self.braces = max(0, self.braces - 1)
+                    while len(self.packages) > 1 and self.packages[-1][0] > self.braces:
+                        self.packages.pop()
+                    if self.consts and self.braces < self.consts[0]:
+                        self.consts = None
+                elif not _perl_punct_var(raw, m.start()):
+                    self.brackets = max(0, self.brackets - 1)
+            elif m.group("pkg"):
+                pkg = _perl_package(m.group("pkg"))
+                if m.group("end") == "{":
+                    self.braces += 1
+                    self.packages.append((self.braces, pkg))
+                elif self.packages[-1][0] == self.braces:
+                    self.packages[-1] = (self.braces, pkg)
+                else:
+                    self.packages.append((self.braces, pkg))
+            elif m.group("sub"):
+                pos = self._sub(raw, m, b)
+            elif m.group("anon") is not None:
+                # Атрибуты анонимной функции («sub :prototype($$) {») — не скобки кода.
+                pos = _perl_attrs(raw, pos, b)[0]
+            elif m.group("const"):
+                self._add(m.group("const"), "value")
+            elif m.group("hash"):
+                self.braces += 1
+                self.consts = (self.braces, self.brackets)
+            elif self.consts == (self.braces, self.brackets):
+                self._add(m.group("key"), "value")
+
+    def _sub(self, raw, m, b):
+        """Объявление «sub NAME»: вид по прототипу и атрибуту «:prototype(…)». Возвращает конец атрибутов: их
+        скобки — не скобки кода."""
+        pos, attr_proto = _perl_attrs(raw, m.end(), b)
+        p = _back(raw, m.start(), str.isspace)
+        if raw[_back(raw, p, _is_word):p] in ("my", "our", "state"):
+            return pos
+        proto = m.group("proto") if not self.signatures else None
+        if attr_proto is not None:
+            proto = attr_proto
+        self._add(m.group("sub"), "value" if proto is not None and not proto.strip() else "term")
+        return pos
+
+    def _lookup(self, raw, k, j):
+        """Вид объявленного имени raw[k:j] без проверки знака перед ним (kind)."""
+        name = raw[k:j]
+        if not name or name[0].isdigit():
+            return None
+        if "::" in name:
+            pkg, _, name = name.rpartition("::")
+            pkg = _perl_package(pkg)
+        elif name in _PERL_TERM or name in _PERL_VALUE or name in _PERL_NOT_SUB:
+            return None
+        else:
+            pkg = self.packages[-1][1]
+        return self.subs.get((pkg, name))
+
+    def _operand_before(self, raw, p):
+        """Кончается ли перед p (через пробелы) операнд Perl: скобка «)», «]», «}», кавычка, число, переменная,
+        слово из _PERL_VALUE или объявленное значение. Тогда «*» и «&» в p — умножение и битовое «и», а не сигил."""
+        q = _back(raw, p, str.isspace)
+        if not q:
+            return False
+        if raw[q - 1] in ")]}\"'`":
+            return True
+        w = _back(raw, q, _is_word)
+        if w == q:
+            return False
+        while w >= 2 and raw[w - 2:w] == "::":
+            w = _back(raw, w - 2, _is_word)
+        return (raw[w].isdigit() or w and raw[w - 1] in "$@%" or raw[w:q] in _PERL_VALUE
+                or self._lookup(raw, w, q) == "value")
+
+    def kind(self, raw, j):
+        """Вид имени Perl, кончающегося перед j («foo», «X::foo», «::foo»): "term", "value" или None — не объявлено,
+        встроенное слово, переменная, метод."""
+        k = _back(raw, j, _is_word)
+        while k >= 2 and raw[k - 2:k] == "::":
+            k = _back(raw, k - 2, _is_word)
+        if k and (raw[k - 1] in "$@%'" or raw[k - 2:k] == "->") or self.sigil(raw, k):
+            return None
+        return self._lookup(raw, k, j)
+
+    def sigil(self, raw, k):
+        """Стоит ли перед словом в k сигил «*» или «&» в начале терма: glob «*name» и вызов «&name» — операнды
+        (за ними «/» — деление, «<<» — сдвиг). После операнда («2*PI», «$b&PI») и в «**», «&&» — оператор; «.» перед
+        словом — конкатенация (perl -MO=Deparse)."""
+        return (bool(k) and raw[k - 1] in "*&" and raw[k - 2:k - 1] != raw[k - 1]
+                and not self._operand_before(raw, k - 1))
+
+
+def _perl_punct_var(raw, i):
+    """Стоит ли скобка в i в переменной Perl «$(», «$)», «$[», «$]»: перед ней нечётное число «$» («$$)» —
+    переменная «$$» и скобка)."""
+    k = _back(raw, i, lambda c: c == "$")
+    return (i - k) % 2 == 1
+
+
+def _perl_attrs(raw, pos, b):
+    """Атрибуты функции Perl с pos («:lvalue», «:prototype($)», «: method lvalue»): (конец, прототип из
+    «:prototype(…)» или None)."""
+    proto, first = None, True
+    while True:
+        attr = _PERL_ATTR.match(raw, pos, b)
+        if attr is None or attr.end() == pos or first and not attr.group(1):
+            return pos, proto
+        if attr.group(2) == "prototype" and attr.group(3) is not None:
+            proto = attr.group(3)
+        pos, first = attr.end(), False
+
 
 def _print_word(raw, k):
     """Кончается ли перед k отдельное слово print, printf или say Perl."""
@@ -696,18 +923,24 @@ def _print_block(raw, j):
     return b is not None and raw[b + 1:b + 2] in ("$", "*") and _print_word(raw, _back(raw, b, str.isspace))
 
 
-def _member(raw, k):
+def _member(raw, k, names=None):
     """Стоит ли перед словом, начатым в k, сигил «$», «@», «%», «&», «.», «->» или «::»: это переменная, метод или
-    имя пакета, а не встроенное слово языка."""
+    имя пакета, а не встроенное слово языка. У Perl (names — _PerlNames) «.» — конкатенация, «&» и «*» — сигил только
+    в начале терма (_PerlNames.sigil): «$b.time», «$b&length» — встроенные слова."""
+    if isinstance(names, _PerlNames):
+        return bool(k) and (raw[k - 1] in "$@%" or raw[k - 2:k] in ("->", "::") or names.sigil(raw, k))
     return bool(k) and (raw[k - 1] in "$@%&." or raw[k - 2:k] in ("->", "::"))
 
 
-def _tight_heredoc(raw, i, perl):
+def _tight_heredoc(raw, i, perl, names=None):
     """Стоит ли перед «<<» в i вплотную слово, после которого идёт heredoc: в Perl — из _PERL_TIGHT («print<<EOT»,
-    «lc<<EOS») или дескриптор из заглавных и «_» после print, printf, say («print CSS<<EOF»); в Ruby — из
-    _RUBY_BEG («return<<EOS»)."""
+    «lc<<EOS»), объявленная в файле функция-терм (names — _PerlNames: «sub foo {…}» выше, «foo<<eos») или дескриптор
+    из заглавных и «_» после print, printf, say («print CSS<<EOF»); в Ruby — из _RUBY_BEG («return<<EOS»)."""
+    kind = names.kind(raw, i) if perl and names else None
+    if kind:
+        return kind == "term"
     k = _back(raw, i, _is_word)
-    if k == i or _member(raw, k) or k and raw[k - 1] == ">":
+    if k == i or _member(raw, k, names if perl else None) or k and raw[k - 1] == ">":
         return False
     word = raw[k:i]
     if not perl:
@@ -722,7 +955,8 @@ def _heredoc_ok(raw, i, m, perl=False, names=frozenset()):
     пробела: за скобкой или кавычкой — терм, сдвиг; за переменной Perl («$a», «@a») — сдвиг. За словом Ruby — как
     лексер Ruby: за числом, локальной переменной (names из _ruby_locals, не после «.») и словом из _RUBY_VALUE —
     сдвиг и добавление, за прочим словом (метод, константа) — heredoc. За словом Perl: из _PERL_TERM — heredoc, из
-    _PERL_VALUE — сдвиг; за прочим (своя функция, константа: решают объявления и импорт) — heredoc, если
+    _PERL_VALUE — сдвиг; за функцией, объявленной в файле выше (names — _PerlNames у Perl), — по её виду: терм —
+    heredoc и вплотную, значение — сдвиг; за прочим (импорт: решает исполнение import) — heredoc, если
     идентификатор с «-», «~», в кавычках или с заглавной буквы («foo <<EOF»), иначе сдвиг («a <<b»). За любым
     другим знаком («=», «(», «,») и в начале строки — heredoc.
 
@@ -735,8 +969,8 @@ def _heredoc_ok(raw, i, m, perl=False, names=frozenset()):
         return True
     if _is_word(raw[i - 1]) or raw[i - 1] in ")]}" or not perl and raw[i - 1] in "?!" and _is_word(raw[i - 2:i - 1]):
         # «foo?<<x» Ruby — сдвиг за методом.
-        return _is_word(raw[i - 1]) and _tight_heredoc(raw, i, perl) or perl and raw[i - 1] == "}" and _print_block(
-            raw, i)
+        return (_is_word(raw[i - 1]) and _tight_heredoc(raw, i, perl, names)
+                or perl and raw[i - 1] == "}" and _print_block(raw, i))
     j = _back(raw, i, str.isspace)
     if j == i or not j:
         return True
@@ -749,6 +983,9 @@ def _heredoc_ok(raw, i, m, perl=False, names=frozenset()):
         return True
     if k and raw[k - 1] in "$@":
         return perl and raw[k - 1] == "$" and _after_print(raw, k - 1)
+    if perl and isinstance(names, _PerlNames) and names.sigil(raw, k):
+        # «*FH <<EOS», «&foo <<EOS» — операнд и сдвиг, и после print.
+        return False
     if perl and raw[k:j] in ("STDOUT", "STDERR") and _after_print(raw, k):
         return True
     word = raw[k:j]
@@ -756,8 +993,11 @@ def _heredoc_ok(raw, i, m, perl=False, names=frozenset()):
         if word[0].isdigit():
             return False
         return _member(raw, k) or word not in _RUBY_VALUE and word not in names
-    if not _member(raw, k) and (word in _PERL_TERM or word in _PERL_VALUE):
+    if not _member(raw, k, names) and (word in _PERL_TERM or word in _PERL_VALUE):
         return word in _PERL_TERM
+    kind = names.kind(raw, j) if perl and names else None
+    if kind:
+        return kind == "term"
     ident = m.group(3).lstrip("_")
     return bool(m.group(1) or m.group(2) or ident[:1].isupper())
 
@@ -1218,7 +1458,8 @@ def _literal_opens(raw, i, fresh, lang, names=frozenset()):
     _VALUE_WORDS («time /2», «self /a»), числа, переменной («$a /2», «@n /2») и локальной переменной Ruby из names не
     после «.» («a = 4» раньше, «a /b»), перед пробелом и перед «=»: в Ruby всегда («a /=2»), в Perl — с пробелом за
     ним («$a /= 2»); символ Ruby «:/», «:%». Слово из _TERM_WORDS и _VALUE_WORDS после «.», «->», «::» и сигила —
-    метод или переменная.
+    метод или переменная. У Perl names — _PerlNames: за функцией-термом, объявленной в файле выше, — "expr" (и
+    вплотную, и через пробел: «foo / 2;#/» — регулярка), за значением («use constant PI», «sub PI()») — None.
     """
     if lang == "ruby" and i and raw[i - 1] == ":" and raw[i - 2:i - 1] != ":":
         return None
@@ -1230,17 +1471,24 @@ def _literal_opens(raw, i, fresh, lang, names=frozenset()):
     if not j or not (_is_word(raw[j - 1]) or method):
         return None
     k = _back(raw, j - method, _is_word)
-    member = _member(raw, k)
+    perl_names = names if lang == "perl" and isinstance(names, _PerlNames) else None
+    if perl_names and perl_names.sigil(raw, k):
+        # Glob «*PI», вызов «&foo» — операнды: деление.
+        return None
+    member = _member(raw, k, perl_names)
     if raw[k:j] in _TERM_WORDS[lang] and not member:
         return "expr"
     if raw[k:j] in _VALUE_WORDS[lang] and not member:
         return None
+    kind = names.kind(raw, j) if lang == "perl" and names else None
+    if kind:
+        return "expr" if kind == "term" else None
     nxt = raw[i + 1:i + 2]
     if j == i or nxt in ("", " ", "\t") or nxt == "=" and (lang == "ruby" or raw[i + 2:i + 3] in ("", " ", "\t")):
         return None
     if raw[k].isdigit() or k and raw[k - 1] in "$@%":
         return None
-    return None if raw[k:j] in names and not (k and raw[k - 1] == ".") else "arg"
+    return None if lang == "ruby" and raw[k:j] in names and not (k and raw[k - 1] == ".") else "arg"
 
 
 # Локальные переменные Ruby: присваивание («a = 1», «a ||= 1», «a += 1», «a, b = …»), параметры метода в скобках
@@ -1582,6 +1830,12 @@ _MAX_REPARSE = 8
 # (разбор линеен при любой вложенности), вложенность — не глубже _MAX_CODE_DEPTH (предел рекурсии Python).
 _CODE_BUDGET = 4
 _MAX_CODE_DEPTH = 64
+# Escape второй части s{…}{…}e: обратная косая и следующий знак; перед «{», «}» косая снимается (_perl_unescape).
+_PERL_UNESCAPE = re.compile(r"\\[\s\S]")
+
+
+def _perl_unescape(m):
+    return m.group()[1] if m.group()[1] in "{}" else m.group()
 
 
 # Блоки однофайлового компонента: комментарий разметки и открывающие теги «<script>», «<style>»; атрибуты тега — до
@@ -1733,11 +1987,12 @@ def _reparse(text, syn, deadline):
     return out
 
 
-def _parse(text, syn, deadline, banned, level=0, budget=None):
+def _parse(text, syn, deadline, banned, level=0, budget=None, perl_names=None):
     """(комментарии, открытия без закрытия к концу файла: heredoc, теги JSX, строки с подстановками, многострочные
     литералы); banned — позиции открытий, не открывающихся. level — вложенность text во вторые части s{…}{…}e Perl,
     budget — [остаток знаков их повторного разбора] на весь файл, _CODE_BUDGET·len(text) у внешнего разбора: часть
-    длиннее остатка и глубже _MAX_CODE_DEPTH не разбирается кодом, и разбор остаётся линейным."""
+    длиннее остатка и глубже _MAX_CODE_DEPTH не разбирается кодом, и разбор остаётся линейным. perl_names — имена,
+    объявленные в файле до второй части (_PerlNames только для чтения); у внешнего разбора Perl — свои."""
     out = []
     if budget is None:
         budget = [_CODE_BUDGET * len(text)]
@@ -1771,6 +2026,9 @@ def _parse(text, syn, deadline, banned, level=0, budget=None):
     xre, body = None, None
     # Локальные переменные Ruby, введённые строками до текущей и ею (_ruby_locals): «/» и «%» после них — деление.
     names = set()
+    if syn.regex == "perl":
+        # Функции и константы Perl, объявленные в коде выше (_PerlNames): их вид решает «/» и «<<» за ними.
+        names = perl_names if perl_names is not None else _PerlNames(_perl_signatures(text))
     # Ждёт ли Perl в начале строки новый оператор (toke.c, PL_expect == XSTATE): только там «=слово» открывает POD,
     # посреди оператора «\n=shift» — присваивание. Решает конец прошлой строки кода (_statement_end); в Ruby
     # «=begin» с первой колонки — комментарий в любом месте кода.
@@ -1898,6 +2156,9 @@ def _parse(text, syn, deadline, banned, level=0, budget=None):
                     act = _markup(raw, i, ctx, n, banned, syn.sfc)
                 else:
                     m = (syn.code_starts if top == "code" else syn.starts).search(raw, i)
+                    if syn.regex == "perl":
+                        # Код до следующего литерала или комментария: объявления и скобки.
+                        names.code(raw, i, len(raw) if m is None else m.start())
                     if m is None:
                         break
                     i = m.start()
@@ -1921,10 +2182,12 @@ def _parse(text, syn, deadline, banned, level=0, budget=None):
                     out.extend(_vue_expr(body, deadline))
                     body = None
                 if then == "code":
-                    code = "\n".join(t for _, t in body)
+                    # Perl снимает «\» перед разделителем «{», «}» второй части до разбора её кодом (toke.c, scan_str):
+                    # «s{a}{f("\}")}e» — код «f("}")»; пара «\\» остаётся.
+                    code = "\n".join(_PERL_UNESCAPE.sub(_perl_unescape, t) for _, t in body)
                     if "e" in flags and level < _MAX_CODE_DEPTH and budget[0] >= len(code):
                         budget[0] -= len(code)
-                        found = _parse(code, syn, deadline, frozenset(), level + 1, budget)[0]
+                        found = _parse(code, syn, deadline, frozenset(), level + 1, budget, names.frozen_copy())[0]
                         out.extend((body[k - 1][0], c) for k, c in found)
                     body = None
                 if xre is not None and (flags is not None or act is None):

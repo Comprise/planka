@@ -1239,6 +1239,18 @@ class ManifestBashTest(unittest.TestCase):
                   "pip freeze | tee requirements.txt")
     GENERATED = "httpx==0.27.0\nrich==13.7.1\nanyio==4.4.0\ncertifi==2024.7.4\n"
 
+    def test_go_work_module_blocked(self):
+        # go.work не связывает модуль с каталогом: require модуля workspace без `replace` в go.mod — блок.
+        for rel, text in [("w/go.work", "go 1.22\nuse ./a\nuse ./b\n"), ("w/b/go.mod", "module example.com/b\n"),
+                          ("w/a/go.mod", "module example.com/a\n")]:
+            (self.p / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.p / rel).write_text(text, encoding="utf-8")
+        # go вызван прямо из каталога модуля — всё равно блок (go на машине может не быть: правку делает effect).
+        r = self.run_command("cd w/a && go mod edit -require=example.com/b@v1.0.0",
+                             effect="printf 'require example.com/b v1.0.0\\n' >> w/a/go.mod")
+        self.assertEqual(output(r)["decision"], "block", r.stderr)
+        self.assertIn("w/a/go.mod: example.com/b", output(r)["reason"])
+
     def test_generators_blocked(self):
         for command in self.GENERATORS:
             with self.subTest(command=command):
@@ -2417,6 +2429,13 @@ class ManifestWatchStateTest(unittest.TestCase):
         nested = {**entry, "npm": {"web": {"a": "1.0.0", "b": None}}}
         self.in_process(manifest_watch.store, "s", "d", nested)
         self.assertEqual(self.in_process(manifest_watch.pop, "s", "d"), nested)
+        # recheck — пути членов uv workspace (manifest_watch.take).
+        for i, extra in enumerate([{"recheck": "pyproject.toml"}, {"recheck": [1]}]):
+            self.in_process(manifest_watch.store, "s", f"e{i}", {**nested, **extra})
+            self.assertIsNone(self.in_process(manifest_watch.pop, "s", f"e{i}"), extra)
+        linked = {**nested, "recheck": ["packages/a/pyproject.toml"]}
+        self.in_process(manifest_watch.store, "s", "f", linked)
+        self.assertEqual(self.in_process(manifest_watch.pop, "s", "f"), linked)
 
     def test_store_drops_expired_entries(self):
         now = time.time()
